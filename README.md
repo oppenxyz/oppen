@@ -43,7 +43,7 @@ Official builds attach a builder code to every order. The fee is small, capped b
 | P6 | Quant features | cross-checked against hand computation |
 | P7 | Approval mode, skill, threat model, release | fresh machine to testnet trade in 10 minutes |
 
-Full specification: [docs/spec.md](docs/spec.md).
+Full specification: [docs/spec.md](docs/spec.md). Item-level checklist for every phase and the versions after v1: [ROADMAP.md](ROADMAP.md).
 
 ## Development
 
