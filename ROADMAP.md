@@ -4,7 +4,7 @@ Everything mapped so far, from the v1 MVP through the versions after it. Numbers
 
 Legend: `[x]` shipped on `main` or in an open PR · `[ ]` not started · **gate** = what proves the phase.
 
-Status as of 2026-09-03: P0 on `main`; P1 in PR #1 (signing) and PR #2 (clients, validation, gate); the P1 gate is waiting on a funded testnet agent key.
+Status as of 2026-09-03: P0 and the P1 code are on `main` (PRs #1–#4 merged); the P1 gate is waiting on a funded testnet agent key.
 
 ---
 
@@ -19,7 +19,7 @@ Status as of 2026-09-03: P0 on `main`; P1 in PR #1 (signing) and PR #2 (clients,
 - [x] Design system in `docs/design/`, ASCII primitives and the shared 90 ms motion clock in the app shell [36]
 - **Gate:** app launches, CI green ✔
 
-### P1 · Hyperliquid protocol crate — in review
+### P1 · Hyperliquid protocol crate — code merged, gate pending
 
 - [x] L1 signing: msgpack action hash, phantom agent, k256 signer, 40 official SDK vectors, mutation-tested [6] — PR #1
 - [x] `WireFloat` normalization so a trailing zero can never reach the hash [6] — PR #1
