@@ -7,6 +7,20 @@
 //!
 //! This crate is the only place in oppen that ever holds a private key in
 //! memory. See `AGENTS.md` invariant 2.
+//!
+//! Every wire rule implemented here cites `docs/hl-signing.md`; the official
+//! SDK vectors in `tests/vectors/signing.json` pin the behaviour.
+
+pub mod action;
+pub mod address;
+pub mod exchange;
+pub mod signing;
+pub mod wire;
+
+pub use action::Action;
+pub use address::Address;
+pub use exchange::{ExchangeRequest, NonceAllocator};
+pub use signing::{AgentKey, Signature};
 
 /// Which Hyperliquid network a client talks to. Testnet is the default
 /// everywhere in oppen; mainnet is an explicit, persisted operator choice.
@@ -35,7 +49,7 @@ impl Network {
 
     /// Value of the `hyperliquidChain` field on user-signed (EIP-712)
     /// actions. This field, not the domain chain id, binds a signature to a
-    /// network — see `docs/hl-signing.md`.
+    /// network — see `docs/hl-signing.md` §3.1.
     pub fn hyperliquid_chain(self) -> &'static str {
         match self {
             Network::Testnet => "Testnet",
@@ -45,11 +59,25 @@ impl Network {
 
     /// `source` field of the phantom agent used to sign L1 actions. The
     /// phantom-agent domain chain id is the constant 1337 on both networks;
-    /// only this byte carries the network.
+    /// only this byte carries the network (`docs/hl-signing.md` §2.2).
     pub fn phantom_agent_source(self) -> &'static str {
         match self {
             Network::Testnet => "b",
             Network::Mainnet => "a",
         }
     }
+}
+
+/// Errors from the protocol layer. Every variant is a distinct, typed
+/// failure so callers never have to parse a message.
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error(transparent)]
+    Wire(#[from] wire::WireError),
+    #[error("invalid address: {0}")]
+    Address(String),
+    #[error("invalid private key")]
+    InvalidKey,
+    #[error("msgpack encoding failed: {0}")]
+    Msgpack(#[from] rmp_serde::encode::Error),
 }
