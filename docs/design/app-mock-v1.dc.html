@@ -1,0 +1,693 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Archivo:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  body { margin: 0; background: #0A0B0C; }
+  a { color: #FFD400; text-decoration: none; border-bottom: 1px solid currentColor; }
+  a:hover { color: #FFE766; }
+  ::-webkit-scrollbar { width: 6px; height: 6px; }
+  ::-webkit-scrollbar-thumb { background: #1A1D20; }
+</style>
+</helmet>
+
+<div data-screen-label="oppen app" style="min-height: 100vh; min-width: 1280px; background: #0A0B0C; color: #E7E9EA; font-family: 'Space Mono', monospace; font-size: 11px; -webkit-font-smoothing: antialiased; display: flex; flex-direction: column">
+
+  <div style="height: 44px; border-bottom: 1px solid #1A1D20; display: flex; align-items: stretch; padding: 0 16px; gap: 24px; flex: none">
+    <div style="display: flex; align-items: center; gap: 10px; cursor: pointer" onClick="{{ goTrade }}">
+      <svg width="16" height="16" viewBox="0 0 100 100" fill="none" aria-hidden="true"><rect x="4" y="4" width="92" height="92" fill="#E7E9EA"></rect><circle cx="50" cy="50" r="30" fill="#0A0B0C"></circle><rect x="44" y="0" width="12" height="100" fill="#0A0B0C"></rect></svg>
+      <span style="font-weight: 700; font-size: 14px; letter-spacing: -0.02em; display: flex"><span>OPP</span><span style="display: inline-block; transform: scaleX(-1)">E</span><span>N</span></span>
+    </div>
+    <div style="display: flex; align-items: stretch; gap: 2px">
+      <sc-for list="{{ navItems }}" as="item" hint-placeholder-count="5">
+        <div onClick="{{ item.go }}" style="display: flex; align-items: center; padding: 0 12px; letter-spacing: 0.18em; text-transform: uppercase; font-size: 10px; cursor: pointer; color: {{ item.color }}; border-bottom: 1px solid {{ item.border }}; margin-bottom: -1px">{{ item.label }}</div>
+      </sc-for>
+    </div>
+    <div style="flex: 1"></div>
+    <div style="display: flex; align-items: center; gap: 20px; font-size: 10px; letter-spacing: 0.14em; text-transform: uppercase; color: #4A5057">
+      <span>LOCAL · <span style="color: #8A9198">RUNTIME OK</span></span>
+      <span>HYPERLIQUID · <span style="color: #8A9198">OK</span></span>
+      <span style="border: 1px solid #FFD400; color: #FFD400; padding: 4px 8px; letter-spacing: 0.2em">TESTNET</span>
+      <span>LAT · <span style="color: #8A9198">{{ latency }}MS</span></span>
+      <span>EQUITY · <span style="color: #E7E9EA">{{ equity }}</span></span>
+      <span onClick="{{ goOnboarding }}" style="cursor: pointer; color: #4A5057; border-bottom: 1px solid #1A1D20">SETUP</span>
+      <span style="border: 1px solid #FF4D2E; color: #FF4D2E; padding: 6px 10px; letter-spacing: 0.2em; cursor: pointer">HALT ALL</span>
+    </div>
+  </div>
+
+  <sc-if value="{{ isTrade }}" hint-placeholder-val="{{ true }}">
+  <div data-screen-label="Trade" style="flex: 1; display: grid; grid-template-columns: 200px minmax(0, 1fr) 300px; gap: 8px; padding: 8px; min-height: 0">
+
+    <div style="display: grid; grid-template-rows: auto 1fr; grid-template-columns: minmax(0, 1fr); gap: 8px; min-height: 0; min-width: 0">
+      <div style="border: 1px solid #1A1D20; background: #0D0F11">
+        <div style="padding: 10px 12px; border-bottom: 1px solid #1A1D20; font-size: 9px; letter-spacing: 0.24em; text-transform: uppercase; color: #4A5057">MARKETS</div>
+        <sc-for list="{{ markets }}" as="m" hint-placeholder-count="6">
+          <div onClick="{{ m.select }}" style="display: grid; grid-template-columns: 1fr auto; gap: 8px; padding: 8px 12px; border-bottom: 1px solid #12141700; cursor: pointer; background: {{ m.bg }}">
+            <div><div style="font-weight: 700; font-size: 11px; color: {{ m.nameColor }}">{{ m.sym }}</div><div style="font-size: 9px; color: #4A5057; margin-top: 2px; letter-spacing: 0.08em">{{ m.venue }}</div></div>
+            <div style="text-align: right"><div style="font-size: 11px; color: #8A9198">{{ m.px }}</div><div style="font-size: 9px; margin-top: 2px; color: {{ m.chgColor }}">{{ m.chg }}</div></div>
+          </div>
+        </sc-for>
+      </div>
+      <div style="border: 1px solid #1A1D20; background: #0D0F11; display: flex; flex-direction: column; min-height: 0">
+        <div style="padding: 10px 12px; border-bottom: 1px solid #1A1D20; font-size: 9px; letter-spacing: 0.24em; text-transform: uppercase; color: #4A5057; display: flex; justify-content: space-between"><span>AGENTS ON {{ activeSym }}</span><span style="color: #8A9198">{{ agentsOnMarket }}</span></div>
+        <sc-for list="{{ agentsShort }}" as="a" hint-placeholder-count="3">
+          <div style="padding: 10px 12px; border-bottom: 1px solid #1A1D20">
+            <div style="display: flex; justify-content: space-between; align-items: center"><span style="font-weight: 700; font-size: 11px">{{ a.name }}</span><span style="font-size: 9px; letter-spacing: 0.16em; color: {{ a.statusColor }}">{{ a.status }}</span></div>
+            <div style="display: flex; justify-content: space-between; margin-top: 6px; font-size: 10px"><span style="color: #4A5057">{{ a.source }}</span><span style="color: {{ a.pnlColor }}">{{ a.pnl }}</span></div>
+            <div style="white-space: pre; font-size: 9px; color: #4A5057; margin-top: 6px; letter-spacing: 0.06em; overflow: hidden">{{ a.heart }}</div>
+          </div>
+        </sc-for>
+        <div style="flex: 1"></div>
+        <div style="padding: 10px 12px; font-size: 9px; letter-spacing: 0.16em; text-transform: uppercase; color: #4A5057; border-top: 1px solid #1A1D20">AUTONOMOUS · POLICY-BOUND</div>
+      </div>
+    </div>
+
+    <div style="display: grid; grid-template-rows: auto 1fr 240px; grid-template-columns: minmax(0, 1fr); gap: 8px; min-height: 0; min-width: 0">
+      <div style="border: 1px solid #1A1D20; background: #0D0F11; padding: 12px 16px; display: flex; align-items: center; gap: 28px; min-width: 0; overflow: hidden">
+        <div>
+          <div style="font-size: 9px; letter-spacing: 0.24em; text-transform: uppercase; color: #4A5057">{{ activeSym }}</div>
+          <div style="font-weight: 700; font-size: 26px; letter-spacing: -0.03em; line-height: 1; margin-top: 4px; display: flex"><span>{{ priceStable }}</span><span style="color: #FFD400">{{ priceChanged }}</span></div>
+        </div>
+        <div style="display: grid; grid-template-columns: repeat(5, auto); gap: 24px; font-size: 10px">
+          <div><div style="color: #4A5057; letter-spacing: 0.16em; font-size: 9px">24H</div><div style="margin-top: 4px; color: #FFD400">{{ chg24 }}</div></div>
+          <div><div style="color: #4A5057; letter-spacing: 0.16em; font-size: 9px">MARK</div><div style="margin-top: 4px; color: #8A9198">{{ markPx }}</div></div>
+          <div><div style="color: #4A5057; letter-spacing: 0.16em; font-size: 9px">FUNDING</div><div style="margin-top: 4px; color: #8A9198">0.0041% <span style="white-space: pre; color: #4A5057">{{ fundCd }}</span></div></div>
+          <div><div style="color: #4A5057; letter-spacing: 0.16em; font-size: 9px">OI</div><div style="margin-top: 4px; color: #8A9198">2.41B</div></div>
+          <div><div style="color: #4A5057; letter-spacing: 0.16em; font-size: 9px">SPREAD</div><div style="margin-top: 4px; color: #E7E9EA">{{ spreadBps }} BPS</div></div>
+        </div>
+        <div style="flex: 1"></div>
+        <div style="white-space: pre; font-size: 10px; color: #4A5057; letter-spacing: 0.04em; overflow: hidden; flex: 0 1 auto; min-width: 0">{{ sparkFrame }}</div>
+      </div>
+
+      <div style="position: relative; border: 1px solid #1A1D20; background: #0D0F11; min-height: 0; display: flex; flex-direction: column">
+        <div style="position: absolute; top: -1px; left: -1px; width: 12px; height: 12px; border-top: 1px solid #4A5057; border-left: 1px solid #4A5057"></div>
+        <div style="position: absolute; bottom: -1px; right: -1px; width: 12px; height: 12px; border-bottom: 1px solid #4A5057; border-right: 1px solid #4A5057"></div>
+        <div style="padding: 10px 12px; border-bottom: 1px solid #1A1D20; display: flex; justify-content: space-between; font-size: 9px; letter-spacing: 0.24em; text-transform: uppercase; color: #4A5057">
+          <div style="display: flex; gap: 16px"><span style="color: #E7E9EA">1M</span><span>5M</span><span>15M</span><span>1H</span><span>4H</span><span>1D</span></div>
+          <span>AGENT FILLS MARKED +</span>
+        </div>
+        <div style="flex: 1; position: relative; min-height: 0; overflow: hidden">
+          <div style="position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; overflow: hidden"><div style="white-space: pre; font-size: 9px; line-height: 1.12; color: #15181B">{{ chartField }}</div></div>
+          <svg viewBox="0 0 400 160" preserveAspectRatio="none" style="position: absolute; inset: 0; width: 100%; height: 100%">
+            <polyline points="{{ chartPoints }}" fill="none" stroke="#B9BFC4" stroke-width="1.2" vector-effect="non-scaling-stroke"></polyline>
+            <polyline points="{{ chartArea }}" fill="#E7E9EA" fill-opacity="0.04" stroke="none"></polyline>
+            <line x1="0" x2="400" y1="{{ chartLastY }}" y2="{{ chartLastY }}" stroke="#FFD400" stroke-width="1" stroke-dasharray="2 4" vector-effect="non-scaling-stroke"></line>
+          </svg>
+          <div style="position: absolute; right: 10px; top: 10px; font-size: 10px; color: #FFD400">{{ priceLive }}</div>
+          <sc-for list="{{ fillMarks }}" as="f" hint-placeholder-count="0">
+            <div style="position: absolute; left: {{ f.left }}; top: {{ f.top }}; transform: translate(0, -50%); display: flex; align-items: center; gap: 6px; font-size: 10px; color: #FFD400; line-height: 1; white-space: nowrap"><span style="font-size: 13px; margin-left: -4px">+</span><span style="opacity: 0.75">[{{ f.label }}]</span></div>
+          </sc-for>
+        </div>
+        <div style="height: 54px; border-top: 1px solid #1A1D20; display: grid; grid-template-columns: repeat(48, 1fr); gap: 2px; padding: 8px 12px; align-items: end">
+          <sc-for list="{{ volBars }}" as="v" hint-placeholder-count="48">
+            <div style="height: {{ v.h }}; background: {{ v.c }}"></div>
+          </sc-for>
+        </div>
+      </div>
+
+      <div style="border: 1px solid #1A1D20; background: #0D0F11; display: flex; flex-direction: column; min-height: 0; min-width: 0; overflow: auto">
+        <div style="padding: 0 12px; border-bottom: 1px solid #1A1D20; display: flex; gap: 20px; font-size: 9px; letter-spacing: 0.24em; text-transform: uppercase; color: #4A5057; height: 34px; align-items: stretch">
+          <span style="display: flex; align-items: center; color: #E7E9EA; border-bottom: 1px solid #E7E9EA; margin-bottom: -1px">POSITIONS · {{ posCount }}</span>
+          <span style="display: flex; align-items: center">OPEN ORDERS · 4</span>
+          <span style="display: flex; align-items: center">FILLS</span>
+          <span style="flex: 1"></span>
+          <span style="display: flex; align-items: center; color: #8A9198">3 AGENT-HELD · 1 MANUAL</span>
+        </div>
+        <div style="display: grid; grid-template-columns: 1.2fr 0.8fr 1fr 1fr 1fr 1fr 1fr 1.2fr; gap: 8px; padding: 8px 12px; font-size: 9px; letter-spacing: 0.16em; text-transform: uppercase; color: #4A5057; border-bottom: 1px solid #1A1D20">
+          <span>MARKET</span><span>SIDE</span><span>SIZE</span><span>ENTRY</span><span>MARK</span><span>LIQ</span><span>PNL</span><span>AGENT · SUB-ACCT</span>
+        </div>
+        <div style="overflow: auto; min-height: 0">
+          <sc-for list="{{ positions }}" as="p" hint-placeholder-count="4">
+            <div style="display: grid; grid-template-columns: 1.2fr 0.8fr 1fr 1fr 1fr 1fr 1fr 1.2fr; gap: 8px; padding: 8px 12px; font-size: 10px; border-bottom: 1px solid #12141700; color: #8A9198">
+              <span style="color: #E7E9EA; font-weight: 700">{{ p.sym }}</span><span style="color: {{ p.sideColor }}">{{ p.side }}</span><span>{{ p.size }}</span><span>{{ p.entry }}</span><span>{{ p.mark }}</span><span style="color: {{ p.liqColor }}">{{ p.liq }}</span><span style="color: {{ p.pnlColor }}">{{ p.pnl }}</span><span style="color: #4A5057">{{ p.agent }}</span>
+            </div>
+          </sc-for>
+        </div>
+      </div>
+    </div>
+
+    <div style="display: grid; grid-template-rows: 1fr auto auto; grid-template-columns: minmax(0, 1fr); gap: 8px; min-height: 0; min-width: 0">
+      <div style="border: 1px solid #1A1D20; background: #0D0F11; display: flex; flex-direction: column; min-height: 0">
+        <div style="padding: 10px 12px; border-bottom: 1px solid #1A1D20; display: flex; justify-content: space-between; font-size: 9px; letter-spacing: 0.24em; text-transform: uppercase; color: #4A5057"><span>BOOK · HYPERLIQUID</span><span>L2 · 5 SIGFIG</span></div>
+        <div style="flex: 1; display: flex; flex-direction: column; justify-content: center; min-height: 0; padding: 6px 0">
+          <sc-for list="{{ asks }}" as="r" hint-placeholder-count="9">
+            <div style="display: grid; grid-template-columns: 74px 1fr 48px; gap: 8px; padding: 2px 12px; font-size: 10px; align-items: center">
+              <span style="color: #8A9198">{{ r.px }}</span><span style="white-space: pre; text-align: right; color: #4A5057; letter-spacing: 0.04em; overflow: hidden">{{ r.ramp }}</span><span style="text-align: right; color: #6E757B">{{ r.sz }}</span>
+            </div>
+          </sc-for>
+          <div style="display: flex; justify-content: space-between; padding: 8px 12px; margin: 4px 0; border-top: 1px solid #1A1D20; border-bottom: 1px solid #1A1D20; font-weight: 700; font-size: 12px"><span style="display: flex"><span>{{ priceStable }}</span><span style="color: #FFD400">{{ priceChanged }}</span></span><span style="color: #4A5057; font-weight: 400; font-size: 9px; letter-spacing: 0.16em; align-self: center">SPREAD 0.5 · {{ spreadBps }} BPS</span></div>
+          <sc-for list="{{ bids }}" as="r" hint-placeholder-count="9">
+            <div style="display: grid; grid-template-columns: 74px 1fr 48px; gap: 8px; padding: 2px 12px; font-size: 10px; align-items: center">
+              <span style="color: #E7E9EA">{{ r.px }}</span><span style="white-space: pre; text-align: right; color: #8A9198; letter-spacing: 0.04em; overflow: hidden">{{ r.ramp }}</span><span style="text-align: right; color: #6E757B">{{ r.sz }}</span>
+            </div>
+          </sc-for>
+        </div>
+      </div>
+
+      <div style="position: relative; border: 1px solid #1A1D20; background: #0D0F11; padding: 12px">
+        <div style="position: absolute; top: -1px; right: -1px; width: 12px; height: 12px; border-top: 1px solid #4A5057; border-right: 1px solid #4A5057"></div>
+        <div style="display: flex; justify-content: space-between; font-size: 9px; letter-spacing: 0.24em; text-transform: uppercase; color: #4A5057"><span>FEATURES</span><span>GET_FEATURES · LIVE</span></div>
+        <div style="margin-top: 8px; font-size: 10px; line-height: 2; letter-spacing: 0.04em">
+          <div style="display: flex; justify-content: space-between; border-bottom: 1px solid #1A1D20"><span style="color: #4A5057">depth ±10bps</span><span style="color: #8A9198">{{ depthBid }} / {{ depthAsk }}</span></div>
+          <div style="display: flex; justify-content: center; padding: 2px 0; border-bottom: 1px solid #1A1D20; white-space: pre; font-size: 10px"><span style="color: #8A9198">{{ imbBarL }}</span><span style="color: #4A5057">|</span><span style="color: #4A5057">{{ imbBarR }}</span></div>
+          <div style="display: flex; justify-content: space-between; border-bottom: 1px solid #1A1D20"><span style="color: #4A5057">imbalance</span><span style="color: #E7E9EA">{{ imbalance }}</span></div>
+          <div style="display: flex; justify-content: space-between; border-bottom: 1px solid #1A1D20"><span style="color: #4A5057">rv_1h</span><span style="color: #8A9198">{{ rv1h }} bps</span></div>
+          <div style="display: flex; justify-content: space-between; border-bottom: 1px solid #1A1D20"><span style="color: #4A5057">vol_ratio</span><span style="color: #8A9198">{{ volRatio }}</span></div>
+          <div style="display: flex; justify-content: space-between"><span style="color: #4A5057">basis</span><span style="color: #8A9198">{{ basisBps }} bps</span></div>
+        </div>
+      </div>
+
+      <div style="border: 1px solid #1A1D20; background: #0D0F11; padding: 12px">
+        <div style="display: flex; justify-content: space-between; font-size: 9px; letter-spacing: 0.24em; text-transform: uppercase; color: #4A5057"><span>MANUAL ORDER</span><span>OVERRIDES POLICY · LOGGED</span></div>
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 10px">
+          <div style="border: 1px solid #1A1D20; padding: 8px 10px"><div style="font-size: 9px; letter-spacing: 0.16em; color: #4A5057">SIZE</div><div style="margin-top: 4px; color: #E7E9EA">0.50 <span style="color: #4A5057">BTC</span></div></div>
+          <div style="border: 1px solid #1A1D20; padding: 8px 10px"><div style="font-size: 9px; letter-spacing: 0.16em; color: #4A5057">LEVERAGE</div><div style="margin-top: 4px; color: #E7E9EA">5×</div></div>
+          <div style="border: 1px solid #1A1D20; padding: 8px 10px"><div style="font-size: 9px; letter-spacing: 0.16em; color: #4A5057">TYPE</div><div style="margin-top: 4px; color: #E7E9EA">MARKET</div></div>
+          <div style="border: 1px solid #1A1D20; padding: 8px 10px"><div style="font-size: 9px; letter-spacing: 0.16em; color: #4A5057">EST. FILL</div><div style="margin-top: 4px; color: #8A9198">{{ priceLive }}</div></div>
+        </div>
+        <div style="margin-top: 8px; font-size: 9px; letter-spacing: 0.06em; color: #4A5057; line-height: 1.8">PREFLIGHT · IMPACT <span style="color: #8A9198">{{ pfImpact }} BPS</span> · MAX@10BPS <span style="color: #8A9198">{{ pfMax }} BTC</span><br>GUARDRAIL <span style="color: #8A9198">OK · NOTIONAL 42,300 / 50,000</span></div>
+        <div style="display: flex; gap: 8px; margin-top: 10px; font-size: 10px; letter-spacing: 0.22em; text-transform: uppercase">
+          <div style="flex: 1; background: #E7E9EA; color: #0A0B0C; text-align: center; padding: 11px; font-weight: 700; cursor: pointer">LONG</div>
+          <div style="flex: 1; border: 1px solid #2A2E32; color: #8A9198; text-align: center; padding: 11px; cursor: pointer">SHORT</div>
+        </div>
+      </div>
+    </div>
+  </div>
+  </sc-if>
+
+  <sc-if value="{{ isAgents }}" hint-placeholder-val="{{ false }}">
+  <div data-screen-label="Agents" style="flex: 1; display: grid; grid-template-columns: 380px minmax(0, 1fr); gap: 8px; padding: 8px; min-height: 0">
+    <div style="border: 1px solid #1A1D20; background: #0D0F11; display: flex; flex-direction: column; min-height: 0; min-width: 0">
+      <div style="padding: 10px 12px; border-bottom: 1px solid #1A1D20; display: flex; justify-content: space-between; align-items: center; font-size: 9px; letter-spacing: 0.24em; text-transform: uppercase; color: #4A5057">
+        <span>AGENTS · {{ agentCount }} · LOCAL RUNTIME</span>
+        <span onClick="{{ goBuilder }}" style="cursor: pointer; border: 1px solid #2A2E32; padding: 5px 9px; color: #E7E9EA">+ NEW</span>
+      </div>
+      <sc-for list="{{ agents }}" as="a" hint-placeholder-count="4">
+        <div onClick="{{ a.select }}" style="padding: 12px; border-bottom: 1px solid #1A1D20; cursor: pointer; background: {{ a.bg }}; border-left: 2px solid {{ a.edge }}">
+          <div style="display: flex; justify-content: space-between; align-items: center"><span style="font-weight: 700; font-size: 12px">{{ a.name }}</span><span style="font-size: 9px; letter-spacing: 0.16em; color: {{ a.statusColor }}">{{ a.status }}</span></div>
+          <div style="display: flex; justify-content: space-between; margin-top: 6px; font-size: 10px; color: #4A5057"><span>{{ a.source }}</span><span>{{ a.markets }}</span></div>
+          <div style="white-space: pre; font-size: 9px; color: {{ a.heartColor }}; margin-top: 8px; letter-spacing: 0.06em; overflow: hidden">{{ a.heart }}</div>
+          <div style="font-size: 9px; letter-spacing: 0.12em; margin-top: 6px; color: {{ a.warnColor }}">{{ a.warnLine }}</div>
+          <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; margin-top: 8px; font-size: 10px">
+            <div><div style="font-size: 9px; letter-spacing: 0.14em; color: #4A5057">PNL 24H</div><div style="margin-top: 2px; color: {{ a.pnlColor }}">{{ a.pnl }}</div></div>
+            <div><div style="font-size: 9px; letter-spacing: 0.14em; color: #4A5057">EXPOSURE</div><div style="margin-top: 2px; color: #8A9198">{{ a.exposure }}</div></div>
+            <div><div style="font-size: 9px; letter-spacing: 0.14em; color: #4A5057">CAP USED</div><div style="margin-top: 2px; color: #8A9198; white-space: pre">{{ a.capBar }} {{ a.capUsed }}</div></div>
+          </div>
+        </div>
+      </sc-for>
+      <div style="flex: 1"></div>
+      <div style="padding: 12px; border-top: 1px solid #1A1D20; font-size: 9px; letter-spacing: 0.16em; text-transform: uppercase; color: #4A5057; line-height: 1.9">New agents start in approval mode with tight caps.<br>Autonomy is granted per policy — revoked in one click.</div>
+    </div>
+
+    <div style="display: grid; grid-template-rows: auto 1fr; grid-template-columns: minmax(0, 1fr); gap: 8px; min-height: 0; min-width: 0">
+      <div style="position: relative; border: 1px solid #1A1D20; background: #0D0F11; padding: 14px 16px; display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 24px; align-items: start; overflow: hidden">
+        <div style="position: absolute; top: -1px; left: -1px; width: 12px; height: 12px; border-top: 1px solid #4A5057; border-left: 1px solid #4A5057"></div>
+        <div>
+          <div style="display: flex; align-items: baseline; gap: 14px"><span style="font-weight: 700; font-size: 20px; letter-spacing: -0.02em">{{ sel.name }}</span><span style="font-size: 9px; letter-spacing: 0.18em; color: {{ sel.statusColor }}">{{ sel.status }}</span><span style="font-size: 10px; color: #4A5057">{{ sel.id }} · {{ sel.source }}</span></div>
+          <div style="display: flex; flex-wrap: wrap; gap: 14px 28px; margin-top: 16px; font-size: 11px">
+            <div><div style="font-size: 9px; letter-spacing: 0.16em; color: #4A5057">PNL 24H</div><div style="margin-top: 4px; color: {{ sel.pnlColor }}">{{ sel.pnl }}</div></div>
+            <div><div style="font-size: 9px; letter-spacing: 0.16em; color: #4A5057">EXPOSURE</div><div style="margin-top: 4px; color: #8A9198">{{ sel.exposure }}</div></div>
+            <div><div style="font-size: 9px; letter-spacing: 0.16em; color: #4A5057">CAP</div><div style="margin-top: 4px; color: #8A9198">{{ sel.cap }}</div></div>
+            <div><div style="font-size: 9px; letter-spacing: 0.16em; color: #4A5057">MAX LEV</div><div style="margin-top: 4px; color: #8A9198">{{ sel.lev }}</div></div>
+            <div><div style="font-size: 9px; letter-spacing: 0.16em; color: #4A5057">DECISIONS 24H</div><div style="margin-top: 4px; color: #8A9198">{{ sel.decisions }}</div></div>
+            <div><div style="font-size: 9px; letter-spacing: 0.16em; color: #4A5057">REFUSED</div><div style="margin-top: 4px; color: {{ sel.refusedColor }}">{{ sel.refused }}</div></div>
+            <div><div style="font-size: 9px; letter-spacing: 0.16em; color: #4A5057">LAST SEEN</div><div style="margin-top: 4px; color: #8A9198">{{ sel.seen }}</div></div>
+          </div>
+        </div>
+        <div style="display: flex; gap: 8px; font-size: 10px; letter-spacing: 0.2em; text-transform: uppercase">
+          <span style="border: 1px solid #2A2E32; padding: 9px 14px; color: #8A9198; cursor: pointer">EDIT POLICY</span>
+          <span style="border: 1px solid #2A2E32; padding: 9px 14px; color: #E7E9EA; cursor: pointer">PAUSE</span>
+          <span style="border: 1px solid #FF4D2E; padding: 9px 14px; color: #FF4D2E; cursor: pointer">HALT</span>
+        </div>
+      </div>
+
+      <div style="display: grid; grid-template-columns: minmax(0, 1fr) 320px; gap: 8px; min-height: 0">
+        <div style="border: 1px solid #1A1D20; background: #0D0F11; display: flex; flex-direction: column; min-height: 0; min-width: 0; overflow: hidden">
+          <div style="padding: 10px 12px; border-bottom: 1px solid #1A1D20; display: flex; justify-content: space-between; font-size: 9px; letter-spacing: 0.24em; text-transform: uppercase; color: #4A5057"><span>DECISION LOG · LIVE</span><span>EVERY DECISION, INCLUDING HOLDS</span></div>
+          <div style="flex: 1; overflow: hidden; padding: 8px 12px; min-height: 0; display: flex; flex-direction: column; justify-content: flex-end">
+            <sc-for list="{{ log }}" as="l" hint-placeholder-count="10">
+              <div style="display: grid; grid-template-columns: 62px 96px minmax(0, 1fr); gap: 12px; padding: 4px 0; font-size: 10px; border-bottom: 1px solid #12141700">
+                <span style="color: #4A5057; opacity: {{ l.age }}">{{ l.time }}</span><span style="color: #8A9198; opacity: {{ l.age }}">{{ l.agent }}</span><span style="color: {{ l.color }}; opacity: {{ l.age }}; overflow: hidden; text-overflow: ellipsis; white-space: nowrap">{{ l.text }}{{ l.cursor }}</span>
+              </div>
+            </sc-for>
+          </div>
+        </div>
+        <div style="display: grid; grid-template-rows: auto auto 1fr; gap: 8px; min-height: 0">
+          <div style="border: 1px solid #1A1D20; background: #0D0F11; padding: 12px">
+            <div style="font-size: 9px; letter-spacing: 0.24em; text-transform: uppercase; color: #4A5057">POLICY · {{ sel.name }}</div>
+            <div style="margin-top: 10px; font-size: 10px; line-height: 2; letter-spacing: 0.06em">
+              <sc-for list="{{ sel.rules }}" as="r" hint-placeholder-count="5">
+                <div style="display: flex; justify-content: space-between; border-bottom: 1px solid #1A1D20; padding: 2px 0"><span style="color: #4A5057">{{ r.k }}</span><span style="color: #8A9198">{{ r.v }}</span></div>
+              </sc-for>
+            </div>
+          </div>
+          <div style="position: relative; border: 1px solid #1A1D20; background: #0D0F11; padding: 12px">
+            <div style="position: absolute; bottom: -1px; right: -1px; width: 12px; height: 12px; border-bottom: 1px solid #4A5057; border-right: 1px solid #4A5057"></div>
+            <div style="display: flex; justify-content: space-between; font-size: 9px; letter-spacing: 0.24em; text-transform: uppercase; color: #4A5057"><span>APPROVALS</span><span style="color: #E7E9EA">1 PENDING</span></div>
+            <div style="margin-top: 10px; border: 1px solid #1A1D20; padding: 10px">
+              <div style="display: flex; justify-content: space-between; font-size: 10px"><span style="font-weight: 700">funding-arb</span><span style="color: #4A5057">S-03</span></div>
+              <div style="margin-top: 6px; font-size: 11px; color: #E7E9EA">LONG 0.40 BTC @ <span style="color: #8A9198">{{ priceLive }}</span></div>
+              <div style="margin-top: 4px; font-size: 9px; letter-spacing: 0.08em; color: #4A5057">reason · <span style="color: #8A9198">funding 12.4% apr 3 intervals · depth ok</span></div>
+              <div style="margin-top: 6px; display: flex; justify-content: space-between; align-items: center; font-size: 9px; letter-spacing: 0.1em"><span style="white-space: pre; color: #4A5057">{{ apTtlBar }}</span><span style="color: #8A9198">DRIFT {{ apDrift }} BPS · {{ apTtl }}S</span></div>
+              <div style="display: flex; gap: 6px; margin-top: 10px; font-size: 9px; letter-spacing: 0.2em; text-transform: uppercase">
+                <div style="flex: 1; background: #E7E9EA; color: #0A0B0C; text-align: center; padding: 8px; font-weight: 700; cursor: pointer">APPROVE</div>
+                <div style="flex: 1; border: 1px solid #2A2E32; color: #8A9198; text-align: center; padding: 8px; cursor: pointer">REJECT</div>
+              </div>
+            </div>
+            <div style="margin-top: 8px; font-size: 9px; letter-spacing: 0.1em; color: #4A5057">RE-PRICED AT APPROVAL · EXPIRES UNSENT</div>
+          </div>
+          <div style="border: 1px solid #1A1D20; background: #0D0F11; padding: 12px; display: flex; flex-direction: column; min-height: 0">
+            <div style="font-size: 9px; letter-spacing: 0.24em; text-transform: uppercase; color: #4A5057">RUNTIME</div>
+            <div style="flex: 1; display: flex; align-items: center; justify-content: center; min-height: 0; overflow: hidden">
+              <div style="white-space: pre; font-size: 6px; line-height: 1.05; color: #3E4348">{{ pulseFrame }}</div>
+            </div>
+            <div style="font-size: 10px; line-height: 2; letter-spacing: 0.06em">
+              <div style="display: flex; justify-content: space-between; border-bottom: 1px solid #1A1D20"><span style="color: #4A5057">PROCESS</span><span style="color: #8A9198">local · pid 48211</span></div>
+              <div style="display: flex; justify-content: space-between; border-bottom: 1px solid #1A1D20"><span style="color: #4A5057">KEYS</span><span style="color: #8A9198">never leave device</span></div>
+              <div style="display: flex; justify-content: space-between"><span style="color: #4A5057">MODEL CALLS</span><span style="color: #8A9198">{{ sel.modelCalls }}</span></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+  </sc-if>
+
+  <sc-if value="{{ isBuilder }}" hint-placeholder-val="{{ false }}">
+  <div data-screen-label="Builder" style="flex: 1; display: grid; grid-template-columns: 260px minmax(0, 1fr) 340px; gap: 8px; padding: 8px; min-height: 0">
+    <div style="border: 1px solid #1A1D20; background: #0D0F11; display: flex; flex-direction: column">
+      <div style="padding: 10px 12px; border-bottom: 1px solid #1A1D20; font-size: 9px; letter-spacing: 0.24em; text-transform: uppercase; color: #4A5057">01 · SOURCE</div>
+      <div style="padding: 12px; border-bottom: 1px solid #1A1D20; border-left: 2px solid #E7E9EA"><div style="font-weight: 700">External via MCP</div><div style="font-size: 10px; color: #4A5057; margin-top: 4px">Claude Code or any MCP client. Agent lives elsewhere, keys stay here.</div></div>
+      <div style="padding: 12px; border-bottom: 1px solid #1A1D20; border-left: 2px solid transparent"><div style="font-weight: 700; color: #8A9198">oppen template</div><div style="font-size: 10px; color: #4A5057; margin-top: 4px">Policy + prompt file for your agent. basis-carry · funding-arb · momentum</div></div>
+      <div style="padding: 12px; border-bottom: 1px solid #1A1D20; border-left: 2px solid transparent"><div style="display: flex; justify-content: space-between; align-items: center"><span style="font-weight: 700; color: #4A5057">Bring-your-own model</span><span style="font-size: 9px; letter-spacing: 0.16em; color: #4A5057; border: 1px solid #1A1D20; padding: 2px 6px">V1.5</span></div><div style="font-size: 10px; color: #2A2E32; margin-top: 4px">Hosted loop via API key. Planned.</div></div>
+      <div style="padding: 12px; border-bottom: 1px solid #1A1D20; border-left: 2px solid transparent"><div style="display: flex; justify-content: space-between; align-items: center"><span style="font-weight: 700; color: #4A5057">Script strategy</span><span style="font-size: 9px; letter-spacing: 0.16em; color: #4A5057; border: 1px solid #1A1D20; padding: 2px 6px">V2</span></div><div style="font-size: 10px; color: #2A2E32; margin-top: 4px">Sandboxed Python/TS runtime. Planned.</div></div>
+      <div style="flex: 1"></div>
+      <div style="padding: 12px; font-size: 9px; letter-spacing: 0.16em; text-transform: uppercase; color: #4A5057; border-top: 1px solid #1A1D20">02 · POLICY  →  03 · TESTNET  →  04 · ARM</div>
+    </div>
+
+    <div style="display: grid; grid-template-rows: auto 1fr; gap: 8px; min-height: 0">
+      <div style="border: 1px solid #1A1D20; background: #0D0F11; padding: 12px 14px; display: flex; align-items: center; gap: 16px">
+        <div style="font-size: 9px; letter-spacing: 0.24em; text-transform: uppercase; color: #4A5057">NAME</div>
+        <div style="font-weight: 700; font-size: 16px; letter-spacing: -0.02em">eth-basis-02<span style="color: #4A5057; font-weight: 400">_</span></div>
+        <div style="flex: 1"></div>
+        <div style="font-size: 10px; color: #4A5057; letter-spacing: 0.14em">CLIENT · <span style="color: #8A9198">claude code · mcp · token oppn-a7f2 · revocable</span></div>
+      </div>
+      <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px; min-height: 0">
+        <div style="position: relative; border: 1px solid #1A1D20; background: #0D0F11; display: flex; flex-direction: column; min-height: 0">
+          <div style="position: absolute; top: -1px; left: -1px; width: 12px; height: 12px; border-top: 1px solid #4A5057; border-left: 1px solid #4A5057"></div>
+          <div style="padding: 10px 12px; border-bottom: 1px solid #1A1D20; font-size: 9px; letter-spacing: 0.24em; text-transform: uppercase; color: #4A5057">02 · POLICY — HARD LIMITS, ENFORCED BY RUNTIME</div>
+          <div style="padding: 6px 12px; font-size: 11px; line-height: 2.1; letter-spacing: 0.04em">
+            <div style="display: flex; justify-content: space-between; border-bottom: 1px solid #1A1D20"><span style="color: #4A5057">markets</span><span style="color: #E7E9EA">ETH-PERP, BTC-PERP</span></div>
+            <div style="display: flex; justify-content: space-between; border-bottom: 1px solid #1A1D20"><span style="color: #4A5057">sub_account</span><span style="color: #E7E9EA">S-05 · auto-created</span></div>
+            <div style="display: flex; justify-content: space-between; border-bottom: 1px solid #1A1D20"><span style="color: #4A5057">notional_cap</span><span style="color: #E7E9EA">50,000 USDC</span></div>
+            <div style="display: flex; justify-content: space-between; border-bottom: 1px solid #1A1D20"><span style="color: #4A5057">max_leverage</span><span style="color: #E7E9EA">5×</span></div>
+            <div style="display: flex; justify-content: space-between; border-bottom: 1px solid #1A1D20"><span style="color: #4A5057">daily_loss_halt</span><span style="color: #E7E9EA">−1,500 USDC</span></div>
+            <div style="display: flex; justify-content: space-between; border-bottom: 1px solid #1A1D20"><span style="color: #4A5057">max_order</span><span style="color: #E7E9EA">2.0 ETH</span></div>
+            <div style="display: flex; justify-content: space-between; border-bottom: 1px solid #1A1D20"><span style="color: #4A5057">sides</span><span style="color: #E7E9EA">long, short</span></div>
+            <div style="display: flex; justify-content: space-between; border-bottom: 1px solid #1A1D20"><span style="color: #4A5057">approval</span><span style="color: #E7E9EA">queue — new agent default</span></div>
+            <div style="display: flex; justify-content: space-between"><span style="color: #4A5057">model_calls_per_min</span><span style="color: #E7E9EA">12</span></div>
+          </div>
+          <div style="flex: 1"></div>
+          <div style="padding: 10px 12px; border-top: 1px solid #1A1D20; font-size: 9px; letter-spacing: 0.16em; text-transform: uppercase; color: #4A5057">Policy is checked before every order. The model cannot change it.</div>
+        </div>
+        <div style="border: 1px solid #1A1D20; background: #0D0F11; display: flex; flex-direction: column; min-height: 0">
+          <div style="padding: 10px 12px; border-bottom: 1px solid #1A1D20; font-size: 9px; letter-spacing: 0.24em; text-transform: uppercase; color: #4A5057">INSTRUCTIONS — WHAT THE MODEL SEES</div>
+          <div style="flex: 1; padding: 12px; font-family: 'Archivo', sans-serif; font-size: 13px; line-height: 1.7; color: #B9BFC4; overflow: auto; text-wrap: pretty">You trade the ETH basis between spot-equivalent funding and the perp. Enter when annualised funding exceeds 12% for three consecutive intervals and the book shows depth above 400 ETH within 10bps. Exit when funding reverts below 4% or the position is 48h old. Rest orders under 1 ETH; cross only when the signal horizon is shorter than the median time-to-fill. Log the reason for every hold.</div>
+          <div style="padding: 10px 12px; border-top: 1px solid #1A1D20; display: flex; justify-content: space-between; font-size: 9px; letter-spacing: 0.16em; text-transform: uppercase; color: #4A5057"><span>TOOLS · state, features, preflight, place, cancel, journal</span><span>612 TOKENS</span></div>
+        </div>
+      </div>
+    </div>
+
+    <div style="display: grid; grid-template-rows: 1fr auto; gap: 8px; min-height: 0">
+      <div style="border: 1px solid #1A1D20; background: #0D0F11; display: flex; flex-direction: column; min-height: 0">
+        <div style="padding: 10px 12px; border-bottom: 1px solid #1A1D20; display: flex; justify-content: space-between; font-size: 9px; letter-spacing: 0.24em; text-transform: uppercase; color: #4A5057"><span>03 · TESTNET RUN</span><span style="color: #8A9198">TESTNET · LIVE FEEDS</span></div>
+        <div style="padding: 12px; white-space: pre; font-size: 10px; line-height: 1.85; color: #8A9198">{{ bootFrame }}</div>
+        <div style="flex: 1; display: flex; align-items: center; justify-content: center; overflow: hidden; min-height: 0">
+          <div style="white-space: pre; font-size: 6px; line-height: 1.05; color: #3E4348">{{ sweepFrame }}</div>
+        </div>
+        <div style="padding: 12px; border-top: 1px solid #1A1D20; display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; font-size: 11px">
+          <div><div style="font-size: 9px; letter-spacing: 0.16em; color: #4A5057">TRADES</div><div style="margin-top: 4px; color: #8A9198">41</div></div>
+          <div><div style="font-size: 9px; letter-spacing: 0.16em; color: #4A5057">PNL</div><div style="margin-top: 4px; color: #E7E9EA">+2,184</div></div>
+          <div><div style="font-size: 9px; letter-spacing: 0.16em; color: #4A5057">REFUSED</div><div style="margin-top: 4px; color: #8A9198">3</div></div>
+        </div>
+      </div>
+      <div style="border: 1px solid #1A1D20; background: #0D0F11; padding: 12px">
+        <div style="font-size: 9px; letter-spacing: 0.24em; text-transform: uppercase; color: #4A5057">04 · ARM</div>
+        <p style="margin: 8px 0 0; font-family: 'Archivo', sans-serif; font-size: 12px; line-height: 1.6; color: #8A9198">Arming pairs the agent on testnet first. Promote to mainnet from the roster once it has earned it — approval mode stays on until you turn it off.</p>
+        <div style="display: flex; gap: 8px; margin-top: 12px; font-size: 10px; letter-spacing: 0.22em; text-transform: uppercase">
+          <div style="flex: 1; border: 1px solid #2A2E32; color: #8A9198; text-align: center; padding: 11px">SAVE DRAFT</div>
+          <div style="flex: 1; background: #E7E9EA; color: #0A0B0C; text-align: center; padding: 11px; font-weight: 700">ARM AGENT</div>
+        </div>
+      </div>
+    </div>
+  </div>
+  </sc-if>
+
+  <sc-if value="{{ isPortfolio }}" hint-placeholder-val="{{ false }}">
+  <div data-screen-label="Portfolio" style="flex: 1; display: grid; grid-template-rows: auto 1fr; gap: 8px; padding: 8px; min-height: 0; min-width: 0">
+    <div style="display: grid; grid-template-columns: 1.4fr 1fr 1fr 1fr 1fr; gap: 8px">
+      <div style="position: relative; border: 1px solid #1A1D20; background: #0D0F11; padding: 14px 16px">
+        <div style="position: absolute; top: -1px; left: -1px; width: 12px; height: 12px; border-top: 1px solid #4A5057; border-left: 1px solid #4A5057"></div>
+        <div style="font-size: 9px; letter-spacing: 0.24em; text-transform: uppercase; color: #4A5057">EQUITY · UNIFIED MARGIN</div>
+        <div style="font-weight: 700; font-size: 30px; letter-spacing: -0.03em; line-height: 1; margin-top: 8px">{{ equity }}</div>
+        <div style="white-space: pre; font-size: 10px; color: #4A5057; margin-top: 10px; overflow: hidden">{{ sparkFrame }}</div>
+      </div>
+      <div style="border: 1px solid #1A1D20; background: #0D0F11; padding: 14px 16px"><div style="font-size: 9px; letter-spacing: 0.24em; text-transform: uppercase; color: #4A5057">PNL 24H</div><div style="font-weight: 700; font-size: 22px; letter-spacing: -0.02em; margin-top: 8px; color: #FFD400">{{ pnl24 }}</div><div style="font-size: 10px; color: #4A5057; margin-top: 6px">price +2,410 · funding −92 · fees −83</div></div>
+      <div style="border: 1px solid #1A1D20; background: #0D0F11; padding: 14px 16px"><div style="font-size: 9px; letter-spacing: 0.24em; text-transform: uppercase; color: #4A5057">EXPOSURE</div><div style="font-weight: 700; font-size: 22px; letter-spacing: -0.02em; margin-top: 8px">184,220</div><div style="font-size: 10px; color: #4A5057; margin-top: 6px">2.1× of equity</div></div>
+      <div style="border: 1px solid #1A1D20; background: #0D0F11; padding: 14px 16px"><div style="font-size: 9px; letter-spacing: 0.24em; text-transform: uppercase; color: #4A5057">MARGIN USED</div><div style="font-weight: 700; font-size: 22px; letter-spacing: -0.02em; margin-top: 8px">41.8%</div><div style="font-size: 10px; color: #4A5057; margin-top: 6px; white-space: pre">{{ marginBar }} halt 85%</div></div>
+      <div style="border: 1px solid #1A1D20; background: #0D0F11; padding: 14px 16px"><div style="font-size: 9px; letter-spacing: 0.24em; text-transform: uppercase; color: #4A5057">NEAREST LIQ</div><div style="font-weight: 700; font-size: 22px; letter-spacing: -0.02em; margin-top: 8px; color: #8A9198">−18.4%</div><div style="font-size: 10px; color: #4A5057; margin-top: 6px">SOL-PERP · momentum-sol</div></div>
+    </div>
+    <div style="display: grid; grid-template-columns: 1fr 360px; gap: 8px; min-height: 0">
+      <div style="border: 1px solid #1A1D20; background: #0D0F11; display: flex; flex-direction: column; min-height: 0">
+        <div style="padding: 10px 12px; border-bottom: 1px solid #1A1D20; display: flex; justify-content: space-between; font-size: 9px; letter-spacing: 0.24em; text-transform: uppercase; color: #4A5057"><span>POSITIONS · HYPERLIQUID</span><span>{{ posCount }} OPEN</span></div>
+        <div style="display: grid; grid-template-columns: 1.2fr 0.8fr 1fr 1fr 1fr 1fr 1fr 1.2fr; gap: 8px; padding: 8px 12px; font-size: 9px; letter-spacing: 0.16em; text-transform: uppercase; color: #4A5057; border-bottom: 1px solid #1A1D20">
+          <span>MARKET</span><span>SIDE</span><span>SIZE</span><span>ENTRY</span><span>MARK</span><span>LIQ</span><span>PNL</span><span>AGENT · SUB-ACCT</span>
+        </div>
+        <sc-for list="{{ positions }}" as="p" hint-placeholder-count="4">
+          <div style="display: grid; grid-template-columns: 1.2fr 0.8fr 1fr 1fr 1fr 1fr 1fr 1.2fr; gap: 8px; padding: 9px 12px; font-size: 10px; border-bottom: 1px solid #1A1D20; color: #8A9198">
+            <span style="color: #E7E9EA; font-weight: 700">{{ p.sym }}</span><span style="color: {{ p.sideColor }}">{{ p.side }}</span><span>{{ p.size }}</span><span>{{ p.entry }}</span><span>{{ p.mark }}</span><span style="color: {{ p.liqColor }}">{{ p.liq }}</span><span style="color: {{ p.pnlColor }}">{{ p.pnl }}</span><span style="color: #4A5057">{{ p.agent }}</span>
+          </div>
+        </sc-for>
+      </div>
+      <div style="display: grid; grid-template-rows: auto 1fr; gap: 8px; min-height: 0">
+        <div style="border: 1px solid #1A1D20; background: #0D0F11; padding: 12px">
+          <div style="font-size: 9px; letter-spacing: 0.24em; text-transform: uppercase; color: #4A5057">EXPOSURE BY AGENT</div>
+          <div style="margin-top: 10px; font-size: 10px">
+            <sc-for list="{{ agents }}" as="a" hint-placeholder-count="4">
+              <div style="padding: 6px 0; border-bottom: 1px solid #1A1D20">
+                <div style="display: flex; justify-content: space-between"><span style="color: #E7E9EA">{{ a.name }}</span><span style="color: #8A9198">{{ a.exposure }}</span></div>
+                <div style="white-space: pre; font-size: 9px; color: #6E757B; margin-top: 4px; letter-spacing: 0.04em; overflow: hidden">{{ a.expBar }}</div>
+              </div>
+            </sc-for>
+          </div>
+        </div>
+        <div style="border: 1px solid #1A1D20; background: #0D0F11; padding: 12px">
+          <div style="font-size: 9px; letter-spacing: 0.24em; text-transform: uppercase; color: #4A5057">BY SUB-ACCOUNT</div>
+          <div style="margin-top: 10px; font-size: 10px; line-height: 2.2; letter-spacing: 0.06em">
+            <div style="display: flex; justify-content: space-between; border-bottom: 1px solid #1A1D20"><span style="color: #4A5057">S-01 · basis-carry</span><span style="color: #8A9198">42,300 · 23%</span></div>
+            <div style="display: flex; justify-content: space-between; border-bottom: 1px solid #1A1D20"><span style="color: #4A5057">S-02 · momentum-sol</span><span style="color: #8A9198">61,020 · 33%</span></div>
+            <div style="display: flex; justify-content: space-between; border-bottom: 1px solid #1A1D20"><span style="color: #4A5057">S-04 · desk-router</span><span style="color: #8A9198">80,900 · 44%</span></div>
+            <div style="display: flex; justify-content: space-between"><span style="color: #4A5057">EXTERNAL · MANUAL</span><span style="color: #8A9198">0 · 0%</span></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+  </sc-if>
+
+  <sc-if value="{{ isSettings }}" hint-placeholder-val="{{ false }}">
+  <div data-screen-label="Settings" style="flex: 1; display: grid; grid-template-columns: 220px 1fr; gap: 8px; padding: 8px; min-height: 0">
+    <div style="border: 1px solid #1A1D20; background: #0D0F11; font-size: 10px; letter-spacing: 0.16em; text-transform: uppercase">
+      <div style="padding: 12px; border-bottom: 1px solid #1A1D20; color: #E7E9EA; border-left: 2px solid #E7E9EA">Permissions &amp; limits</div>
+      <div style="padding: 12px; border-bottom: 1px solid #1A1D20; color: #4A5057">Keys &amp; venues</div>
+      <div style="padding: 12px; border-bottom: 1px solid #1A1D20; color: #4A5057">Models &amp; API keys</div>
+      <div style="padding: 12px; border-bottom: 1px solid #1A1D20; color: #4A5057">Local data</div>
+      <div style="padding: 12px; border-bottom: 1px solid #1A1D20; color: #4A5057">MCP server</div>
+      <div style="padding: 12px; color: #4A5057">Display</div>
+    </div>
+    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px; align-content: start">
+      <div style="position: relative; border: 1px solid #1A1D20; background: #0D0F11; padding: 14px">
+        <div style="position: absolute; top: -1px; left: -1px; width: 12px; height: 12px; border-top: 1px solid #4A5057; border-left: 1px solid #4A5057"></div>
+        <div style="font-size: 9px; letter-spacing: 0.24em; text-transform: uppercase; color: #4A5057">GLOBAL LIMITS — APPLY ABOVE EVERY AGENT POLICY</div>
+        <div style="margin-top: 10px; font-size: 11px; line-height: 2.2; letter-spacing: 0.04em">
+          <div style="display: flex; justify-content: space-between; border-bottom: 1px solid #1A1D20"><span style="color: #4A5057">total_notional_cap</span><span style="color: #E7E9EA">250,000 USDC</span></div>
+          <div style="display: flex; justify-content: space-between; border-bottom: 1px solid #1A1D20"><span style="color: #4A5057">total_daily_loss_halt</span><span style="color: #E7E9EA">−5,000 USDC</span></div>
+          <div style="display: flex; justify-content: space-between; border-bottom: 1px solid #1A1D20"><span style="color: #4A5057">margin_halt</span><span style="color: #E7E9EA">85%</span></div>
+          <div style="display: flex; justify-content: space-between; border-bottom: 1px solid #1A1D20"><span style="color: #4A5057">max_agents_running</span><span style="color: #E7E9EA">8</span></div>
+          <div style="display: flex; justify-content: space-between; border-bottom: 1px solid #1A1D20"><span style="color: #4A5057">venue_allowlist</span><span style="color: #E7E9EA">HYPERLIQUID</span></div>
+          <div style="display: flex; justify-content: space-between"><span style="color: #4A5057">human_approval</span><span style="color: #E7E9EA">queue — default for new agents</span></div>
+        </div>
+      </div>
+      <div style="border: 1px solid #1A1D20; background: #0D0F11; padding: 14px">
+        <div style="font-size: 9px; letter-spacing: 0.24em; text-transform: uppercase; color: #4A5057">PER-AGENT CAPS</div>
+        <div style="margin-top: 10px; font-size: 10px">
+          <div style="display: grid; grid-template-columns: 1.4fr 1fr 1fr 1fr; gap: 8px; padding: 4px 0; border-bottom: 1px solid #1A1D20; font-size: 9px; letter-spacing: 0.14em; color: #4A5057"><span>AGENT</span><span>NOTIONAL</span><span>MAX LEV</span><span>LOSS HALT</span></div>
+          <sc-for list="{{ agents }}" as="a" hint-placeholder-count="4">
+            <div style="display: grid; grid-template-columns: 1.4fr 1fr 1fr 1fr; gap: 8px; padding: 8px 0; border-bottom: 1px solid #1A1D20"><span style="color: #E7E9EA">{{ a.name }}</span><span style="color: #8A9198">{{ a.cap }}</span><span style="color: #8A9198">{{ a.lev }}</span><span style="color: #8A9198">{{ a.lossHalt }}</span></div>
+          </sc-for>
+        </div>
+      </div>
+      <div style="border: 1px solid #1A1D20; background: #0D0F11; padding: 14px">
+        <div style="font-size: 9px; letter-spacing: 0.24em; text-transform: uppercase; color: #4A5057">KILL SWITCH</div>
+        <p style="margin: 8px 0 0; font-family: 'Archivo', sans-serif; font-size: 12px; line-height: 1.6; color: #8A9198">Halts every agent, cancels resting orders, and locks the runtime until you unlock it locally. Positions are not closed. The halt survives restart, and a venue-side dead-man cancel is armed while any agent runs.</p>
+        <div style="display: flex; gap: 8px; margin-top: 12px; font-size: 10px; letter-spacing: 0.22em; text-transform: uppercase">
+          <span style="border: 1px solid #2A2E32; padding: 9px 14px; color: #8A9198">HOTKEY · ⌘⇧H</span>
+          <span style="border: 1px solid #FF4D2E; padding: 9px 14px; color: #FF4D2E">HALT ALL</span>
+        </div>
+      </div>
+      <div style="border: 1px solid #1A1D20; background: #0D0F11; padding: 14px">
+        <div style="font-size: 9px; letter-spacing: 0.24em; text-transform: uppercase; color: #4A5057">LOCAL</div>
+        <div style="margin-top: 10px; font-size: 10px; line-height: 2.2; letter-spacing: 0.04em">
+          <div style="display: flex; justify-content: space-between; border-bottom: 1px solid #1A1D20"><span style="color: #4A5057">runtime</span><span style="color: #8A9198">oppen-core 0.9.2 · pid 48211</span></div>
+          <div style="display: flex; justify-content: space-between; border-bottom: 1px solid #1A1D20"><span style="color: #4A5057">keys</span><span style="color: #8A9198">OS keychain · never on disk</span></div>
+          <div style="display: flex; justify-content: space-between; border-bottom: 1px solid #1A1D20"><span style="color: #4A5057">decision_log</span><span style="color: #8A9198">~/.oppen/log · 1.2 GB</span></div>
+          <div style="display: flex; justify-content: space-between; border-bottom: 1px solid #1A1D20"><span style="color: #4A5057">network</span><span style="color: #FFD400">testnet · mainnet is a switch</span></div>
+          <div style="display: flex; justify-content: space-between"><span style="color: #4A5057">telemetry</span><span style="color: #8A9198">none</span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+  </sc-if>
+
+  <sc-if value="{{ isOnboarding }}" hint-placeholder-val="{{ false }}">
+  <div data-screen-label="Onboarding" style="flex: 1; display: grid; grid-template-columns: 1fr 1fr; gap: 8px; padding: 8px; min-height: 0">
+    <div style="position: relative; border: 1px solid #1A1D20; background: #0D0F11; overflow: hidden; display: flex; align-items: center; justify-content: center">
+      <div style="position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; overflow: hidden">
+        <div style="white-space: pre; font-size: 9px; line-height: 1.12; color: #1E2226">{{ coverField }}</div>
+      </div>
+      <div style="position: relative; text-align: center">
+        <div style="font-weight: 700; font-size: 72px; letter-spacing: -0.035em; line-height: 0.9; display: flex; justify-content: center"><span>OPP</span><span style="display: inline-block; transform: scaleX(-1); color: #FFD400">E</span><span>N</span></div>
+        <div style="margin-top: 20px; font-size: 10px; letter-spacing: 0.3em; text-transform: uppercase; color: #4A5057">Local-first · Agentic · Perps</div>
+      </div>
+    </div>
+    <div style="display: grid; grid-template-rows: auto 1fr auto; gap: 8px; min-height: 0">
+      <div style="border: 1px solid #1A1D20; background: #0D0F11; display: grid; grid-template-columns: repeat(4, 1fr)">
+        <div style="padding: 12px; border-right: 1px solid #1A1D20; border-bottom: 1px solid #E7E9EA"><div style="font-size: 9px; letter-spacing: 0.2em; color: #4A5057">01</div><div style="margin-top: 4px; color: #E7E9EA">Runtime</div></div>
+        <div style="padding: 12px; border-right: 1px solid #1A1D20"><div style="font-size: 9px; letter-spacing: 0.2em; color: #4A5057">02</div><div style="margin-top: 4px; color: #4A5057">Agent wallet</div></div>
+        <div style="padding: 12px; border-right: 1px solid #1A1D20"><div style="font-size: 9px; letter-spacing: 0.2em; color: #4A5057">03</div><div style="margin-top: 4px; color: #4A5057">Approve · master</div></div>
+        <div style="padding: 12px"><div style="font-size: 9px; letter-spacing: 0.2em; color: #4A5057">04</div><div style="margin-top: 4px; color: #4A5057">Pair agent</div></div>
+      </div>
+      <div style="position: relative; border: 1px solid #1A1D20; background: #0D0F11; padding: 20px; display: flex; flex-direction: column; min-height: 0">
+        <div style="position: absolute; top: -1px; right: -1px; width: 12px; height: 12px; border-top: 1px solid #4A5057; border-right: 1px solid #4A5057"></div>
+        <div style="font-size: 9px; letter-spacing: 0.24em; text-transform: uppercase; color: #4A5057">01 · INSTALLING LOCAL RUNTIME</div>
+        <div style="white-space: pre; font-size: 11px; line-height: 1.9; color: #8A9198; margin-top: 14px; flex: 1">{{ bootFrame }}</div>
+        <p style="margin: 0; font-family: 'Archivo', sans-serif; font-size: 13px; line-height: 1.65; color: #8A9198; max-width: 52ch">Everything runs on this machine: your keys, your agents, the execution engine. Your master wallet signs three approvals once, in your own wallet — it never enters oppen. You start on testnet; mainnet is an explicit switch.</p>
+      </div>
+      <div style="display: flex; gap: 8px; font-size: 10px; letter-spacing: 0.22em; text-transform: uppercase">
+        <div style="flex: 1; border: 1px solid #2A2E32; color: #8A9198; text-align: center; padding: 12px">IMPORT AGENT WALLET</div>
+        <div onClick="{{ goTrade }}" style="flex: 1; background: #E7E9EA; color: #0A0B0C; text-align: center; padding: 12px; font-weight: 700; cursor: pointer">GENERATE AGENT WALLET →</div>
+      </div>
+    </div>
+  </div>
+  </sc-if>
+
+  <div style="height: 26px; border-top: 1px solid #1A1D20; display: flex; align-items: center; padding: 0 16px; gap: 24px; font-size: 9px; letter-spacing: 0.16em; text-transform: uppercase; color: #4A5057; flex: none; overflow: hidden; white-space: nowrap">
+    <span style="color: #8A9198">LAST DECISION</span>
+    <span style="color: #4A5057">{{ lastLogTime }}</span>
+    <span style="color: #8A9198">{{ lastLogAgent }}</span>
+    <span style="color: {{ lastLogColor }}">{{ lastLogText }}</span>
+    <span style="flex: 1"></span>
+    <span style="white-space: pre; color: #2A2E32; overflow: hidden">{{ ribbonFrame }}</span>
+    <span>FEEDS · <span style="color: #8A9198">WS·MKT OK · WS·USER OK · REST OK</span></span>
+    <span>{{ decisionsTotal }} DECISIONS TODAY · {{ refusedTotal }} REFUSED</span>
+  </div>
+</div>
+
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{}">
+class Component extends DCLogic {
+  state = { view: 'trade', t: 0, px: 112480.5, hist: [], log: [], sel: 0, market: 0, fills: [], hb: [[], [], [], []] };
+  prevPrice = '';
+
+  componentDidMount() {
+    this.seedLog();
+    this.timer = setInterval(() => this.tick(), 90);
+  }
+  componentWillUnmount() { clearInterval(this.timer); }
+
+  agentDefs = [
+    { id: 'S-01', name: 'basis-carry', source: 'MCP · claude code', status: 'RUNNING', seen: '2s', pnl: 1284.2, exposure: 42300, cap: '50,000', lev: '5×', lossHalt: '−1,500', markets: 'ETH · BTC', decisions: 312, refused: 0, modelCalls: 'ext · mcp', rules: [{ k: 'sub_account', v: 'S-01' }, { k: 'markets', v: 'ETH, BTC' }, { k: 'notional_cap', v: '50,000' }, { k: 'max_leverage', v: '5×' }, { k: 'max_slippage_bps', v: '8' }, { k: 'daily_loss_halt', v: '−1,500' }, { k: 'approval', v: 'none — graduated' }] },
+    { id: 'S-02', name: 'momentum-sol', source: 'MCP · custom bot', status: 'RUNNING', seen: '1s', pnl: -312.4, exposure: 61020, cap: '75,000', lev: '10×', lossHalt: '−2,000', markets: 'SOL', decisions: 1188, refused: 2, modelCalls: 'ext · mcp', rules: [{ k: 'sub_account', v: 'S-02' }, { k: 'markets', v: 'SOL' }, { k: 'notional_cap', v: '75,000' }, { k: 'max_leverage', v: '10×' }, { k: 'max_slippage_bps', v: '10' }, { k: 'daily_loss_halt', v: '−2,000' }, { k: 'approval', v: 'none — graduated' }] },
+    { id: 'S-03', name: 'funding-arb', source: 'oppen template', status: 'APPROVAL', seen: '4s', pnl: 402.1, exposure: 12100, cap: '40,000', lev: '3×', lossHalt: '−800', markets: 'BTC · ETH · HYPE', decisions: 96, refused: 0, modelCalls: 'ext · mcp', rules: [{ k: 'sub_account', v: 'S-03' }, { k: 'markets', v: 'BTC, ETH, HYPE' }, { k: 'notional_cap', v: '40,000' }, { k: 'max_leverage', v: '3×' }, { k: 'max_slippage_bps', v: '6' }, { k: 'daily_loss_halt', v: '−800' }, { k: 'approval', v: 'queue — new agent' }] },
+    { id: 'S-04', name: 'desk-router', source: 'MCP · external', status: 'IDLE 6M', seen: '6m', warn: '! IDLE 6M · POSITION OPEN', pnl: 861.7, exposure: 80900, cap: '100,000', lev: '4×', lossHalt: '−3,000', markets: 'BTC · ETH', decisions: 540, refused: 5, modelCalls: 'ext · mcp', rules: [{ k: 'sub_account', v: 'S-04' }, { k: 'markets', v: 'BTC, ETH' }, { k: 'notional_cap', v: '100,000' }, { k: 'max_leverage', v: '4×' }, { k: 'max_slippage_bps', v: '8' }, { k: 'daily_loss_halt', v: '−3,000' }, { k: 'approval', v: 'none — graduated' }] }
+  ];
+
+  marketDefs = [
+    { sym: 'BTC-PERP', base: 112480.5, venue: 'FUNDING +10.8% APR', chg: '+1.86%' },
+    { sym: 'ETH-PERP', base: 4318.72, venue: 'FUNDING +14.2% APR', chg: '+2.14%' },
+    { sym: 'SOL-PERP', base: 241.18, venue: 'FUNDING −3.1% APR', chg: '−0.42%' },
+    { sym: 'HYPE-PERP', base: 48.61, venue: 'FUNDING +22.6% APR', chg: '+4.02%' },
+    { sym: 'AVAX-PERP', base: 37.35, venue: 'FUNDING +1.9% APR', chg: '−1.10%' },
+    { sym: 'XRP-PERP', base: 3.14, venue: 'FUNDING +0.4% APR', chg: '+0.36%' }
+  ];
+
+  fmt(n, d) { return n.toLocaleString('en-US', { minimumFractionDigits: d, maximumFractionDigits: d }); }
+  signed(n, d) { return (n >= 0 ? '+' : '−') + this.fmt(Math.abs(n), d); }
+  clock(t) { const s = 51240 + Math.floor(t * 0.09); const h = Math.floor(s / 3600) % 24, m = Math.floor(s / 60) % 60, ss = s % 60; return [h, m, ss].map(v => String(v).padStart(2, '0')).join(':'); }
+
+  seedLog() {
+    const log = [];
+    for (let i = 0; i < 14; i++) log.push(this.mkLog(i * 7 - 98));
+    this.setState({ log });
+  }
+  mkLog(t) {
+    const a = this.agentDefs[Math.floor(Math.random() * 4)];
+    const px = this.state.px;
+    const kinds = [
+      { text: `hold · funding 0.0041% below entry threshold`, color: '#4A5057' },
+      { text: `read features · depth 412 ETH @ 10bps · imbalance +0.18`, color: '#8A9198' },
+      { text: `preflight ok · impact 2.1bps · max@10bps 4.2 BTC`, color: '#8A9198' },
+      { text: `fill LONG 0.${20 + Math.floor(Math.random() * 60)} BTC @ ${this.fmt(px, 2)} · slip 1.8bps`, color: '#FFD400', fill: true },
+      { text: `reduce SOL 120 → 80 · pnl lock`, color: '#8A9198' },
+      { text: `refused · guardrail notional_cap · attempted 62,400 / 50,000`, color: '#FF4D2E' },
+      { text: `venue reject · price >5 sigfigs · rounded + resent`, color: '#8A9198' },
+      { text: `proposed · LONG 0.40 BTC @ ${this.fmt(px, 2)} · queued 90s`, color: '#E7E9EA' },
+      { text: `policy check ok · notional 42,300 / 50,000`, color: '#4A5057' }
+    ];
+    const w = [3, 2, 2, 1.6, 1, 0.35, 0.3, 0.5, 2];
+    let r = Math.random() * w.reduce((x, y) => x + y, 0), k = 0;
+    while (r > w[k]) { r -= w[k]; k++; }
+    const it = kinds[k];
+    return { time: this.clock(t), agent: a.name, text: it.text, color: it.color, fill: !!it.fill, t };
+  }
+
+  tick() {
+    this.setState(s => {
+      const px = Math.max(1, s.px + (Math.random() - 0.5) * 26);
+      const hist = s.hist.concat(px).slice(-120);
+      let log = s.log, fills = s.fills;
+      if (s.t % 9 === 0) {
+        const entry = this.mkLog(s.t);
+        log = log.concat(entry).slice(-14);
+        if (entry.fill) fills = fills.concat({ i: hist.length - 1, px, label: entry.agent + ' ' + (entry.text.match(/0\.\d+/) || [''])[0] }).slice(-4);
+      }
+      fills = fills.map(f => ({ i: f.i - 1, px: f.px, label: f.label })).filter(f => f.i >= 0);
+      let hb = s.hb;
+      if (s.t % 3 === 0) hb = hb.map((arr, i) => { const running = this.agentDefs[i].status === 'RUNNING'; const v = running ? Math.max(0, Math.min(1, (arr[arr.length - 1] ?? 0.4) + (Math.random() - 0.5) * 0.5)) : 0; return arr.concat(v).slice(-26); });
+      return { t: s.t + 1, px, hist, log, fills, hb };
+    });
+  }
+
+  matrix(t, opts) {
+    const o = opts || {}; const W = 44, H = 22; const ramp = ['+', '*', ':', '-', '.'];
+    const r = 0.30 + (o.breathe ? 0.022 * Math.sin(t / 7) : 0);
+    const sweep = o.sweep ? (t * 0.14) % (Math.PI * 2) : null;
+    const rows = [];
+    for (let y = 0; y < H; y++) {
+      let row = '';
+      for (let x = 0; x < W; x++) {
+        const nx = (x + 0.5) / W, ny = (y + 0.5) / H, dx = nx - 0.5, dy = ny - 0.5, d = Math.sqrt(dx * dx + dy * dy);
+        if (nx < 0.04 || nx > 0.96 || ny < 0.04 || ny > 0.96 || d < r || Math.abs(dx) < 0.06) { row += ' '; continue; }
+        let f = Math.min(1, Math.abs(d - r) / 0.34);
+        if (sweep !== null) { let a = Math.atan2(dy, dx); if (a < 0) a += Math.PI * 2; let ad = Math.abs(a - sweep); if (ad > Math.PI) ad = Math.PI * 2 - ad; f = Math.max(0, Math.min(1, f - Math.max(0, 1 - ad / 0.6) * 0.85 + 0.25)); }
+        row += ramp[Math.min(4, Math.floor(f * 5))];
+      }
+      rows.push(row.replace(/\s+$/, ''));
+    }
+    return rows.join('\n');
+  }
+
+  field(t, W, H) {
+    const ramp = [' ', '.', '-', ':', '*', '+']; const src = [[0.18, 0.5], [0.5, 0.22], [0.82, 0.62]]; const rows = [];
+    for (let y = 0; y < H; y++) { let row = ''; for (let x = 0; x < W; x++) { const nx = x / W, ny = y / H; let v = 0; for (const s of src) { const dx = (nx - s[0]) * 2, dy = ny - s[1]; v += Math.sin(Math.sqrt(dx * dx + dy * dy) * 34 - t * 0.35); } v = Math.pow((v / 3 + 1) / 2, 2.2); row += ramp[Math.min(5, Math.floor(v * 6))]; } rows.push(row.replace(/\s+$/, '')); }
+    return rows.join('\n');
+  }
+
+  boot(t) {
+    const lines = ['> oppen.init                       ok', '> keys.keychain                    ok', '> venue.hyperliquid   connect     14ms', '> subaccounts         mapped        4', '> mcp.server          127.0.0.1  live', '> guardrails          loaded   6 rules', '> deadman.schedule    armed        ok', '> net                 TESTNET       ·', '> ready.'];
+    const p = t % 260; let chars = Math.floor(p * 2.4); const out = [];
+    for (const l of lines) { if (chars <= 0) break; out.push(chars >= l.length ? l : l.slice(0, chars) + '\u2588'); chars -= l.length + 4; }
+    return out.join('\n');
+  }
+  spark(hist) { if (!hist.length) return ''; const ramp = ['.', '-', ':', '*', '+']; const h = hist.slice(-56); const min = Math.min.apply(null, h), max = Math.max.apply(null, h), span = (max - min) || 1; return h.map(v => ramp[Math.min(4, Math.floor(((v - min) / span) * 5))]).join(''); }
+  ramp(v, n) { const r = ['.', '-', ':', '*', '+']; let s = ''; for (let i = 0; i < n; i++) { const f = i / n; s += f < v ? r[Math.min(4, Math.floor((v - f) / v * 5))] : ' '; } return s.split('').reverse().join(''); }
+  heart(arr) { const r = ['.', '-', ':', '*', '+']; return arr.map(v => v === 0 ? ' ' : r[Math.min(4, Math.floor(v * 5))]).join('').padStart(26, ' '); }
+  ribbon(t) { const out = []; for (let i = 0; i < 40; i++) { const ph = (i + t * 1.6) % 18; out.push(ph < 1.6 ? '\u2588' : (i % 2 ? '|' : ' ')); } return out.join(''); }
+  gauge(v, n) { const r = ['+', '*', ':', '-', '.']; const filled = Math.max(0, Math.min(n, Math.round(v * n))); let out = ''; for (let i = 0; i < n; i++) out += i < filled ? r[Math.min(4, Math.floor((i / Math.max(filled, 1)) * 5))] : ' '; return out; }
+
+  renderVals() {
+    const s = this.state, t = s.t, px = s.px, view = s.view;
+    const set = v => () => this.setState({ view: v });
+    const navDefs = [['trade', 'TRADE'], ['agents', 'AGENTS'], ['builder', 'BUILDER'], ['portfolio', 'PORTFOLIO'], ['settings', 'SETTINGS']];
+    const navItems = navDefs.map(([k, label]) => ({ label, go: set(k), color: view === k ? '#E7E9EA' : '#4A5057', border: view === k ? '#E7E9EA' : 'transparent' }));
+
+    const depthB = 4.1 + Math.sin(t / 6) * 0.9, depthA = 3.4 + Math.cos(t / 7) * 0.8;
+    const imb = (depthB - depthA) / (depthB + depthA);
+    const spreadBps = this.fmt(0.4 + Math.abs(Math.sin(t / 9)) * 0.3, 2);
+    const fundFrac = 0.42 + 0.0002 * (t % 200);
+    const fundCd = this.gauge(1 - fundFrac, 8) + ' ' + Math.ceil((1 - fundFrac) * 60) + 'M';
+    const apTtl = 90 - Math.floor((t * 0.09) % 90);
+
+    const hist = s.hist.length ? s.hist : [px];
+    const min = Math.min.apply(null, hist), max = Math.max.apply(null, hist), span = (max - min) || 1;
+    const pts = hist.map((v, i) => [(i / 119) * 400, 150 - ((v - min) / span) * 130]);
+    const chartPoints = pts.map(p => p[0].toFixed(1) + ',' + p[1].toFixed(1)).join(' ');
+    const chartArea = chartPoints + ` ${pts[pts.length - 1][0].toFixed(1)},160 0,160`;
+    const chartLastY = pts[pts.length - 1][1].toFixed(1);
+    const fillMarks = s.fills.filter(f => f.i < hist.length).map(f => ({ label: f.label || 'fill', left: ((f.i / 119) * 100).toFixed(2) + '%', top: (((150 - ((f.px - min) / span) * 130) / 160) * 100).toFixed(2) + '%' }));
+    const volBars = Array.from({ length: 48 }, (_, i) => { const h = 20 + 70 * Math.abs(Math.sin(i * 1.7 + t * 0.02)); return { h: h.toFixed(0) + '%', c: i === 47 ? '#FFD400' : '#22262A' }; });
+
+    const mk = (i, sign) => Array.from({ length: 9 }, (_, k) => { const sz = (0.2 + Math.abs(Math.sin(k * 2.1 + t * 0.05 + i)) * 4).toFixed(2); return { px: this.fmt(px + sign * (k + 1) * 0.5, 1), sz, v: ['HL', 'AS', 'LT'][(k + i) % 3], ramp: this.ramp(parseFloat(sz) / 4.4, 16) }; });
+    const asks = mk(1, 1).reverse(), bids = mk(2, -1);
+
+    const marketBase = this.marketDefs[s.market];
+    const markets = this.marketDefs.map((m, i) => { const live = i === 0 ? px : m.base * (1 + Math.sin(t / 9 + i) * 0.0004); return { sym: m.sym, venue: m.venue, px: this.fmt(live, live > 1000 ? 1 : 2), chg: m.chg, chgColor: m.chg.startsWith('+') ? '#8A9198' : '#4A5057', bg: i === s.market ? '#0A0B0C' : 'transparent', nameColor: i === s.market ? '#E7E9EA' : '#8A9198', select: () => this.setState({ market: i }) }; });
+    const activePx = s.market === 0 ? px : marketBase.base * (1 + Math.sin(t / 9 + s.market) * 0.0004);
+
+    const agents = this.agentDefs.map((a, i) => ({
+      ...a, pnl: this.signed(a.pnl, 2), pnlColor: a.pnl >= 0 ? '#E7E9EA' : '#8A9198', exposure: this.fmt(a.exposure, 0), expBar: this.gauge(a.exposure / 184220, 30),
+      capUsed: Math.round(a.exposure / parseFloat(a.cap.replace(/,/g, '')) * 100) + '%', capBar: this.gauge(a.exposure / parseFloat(a.cap.replace(/,/g, '')), 8),
+      warnLine: a.warn || '', warnColor: '#FF4D2E',
+      statusColor: a.status === 'RUNNING' ? '#FFD400' : (a.status.indexOf('IDLE') === 0 ? '#FF4D2E' : '#4A5057'), refusedColor: a.refused ? '#FF4D2E' : '#8A9198',
+      heart: this.heart(s.hb[i] || []), heartColor: a.status === 'RUNNING' ? '#6E757B' : '#2A2E32',
+      bg: i === s.sel ? '#0A0B0C' : 'transparent', edge: i === s.sel ? '#E7E9EA' : 'transparent', select: () => this.setState({ sel: i })
+    }));
+    const sel = agents[s.sel];
+
+    const positions = [
+      { sym: 'BTC-PERP', side: 'LONG', size: '0.85 BTC', entry: 111420.00, live: px, liq: 101232, agent: 'desk-router · S-04' },
+      { sym: 'ETH-PERP', side: 'LONG', size: '9.80 ETH', entry: 4290.10, live: 4318.72 + Math.sin(t / 7) * 1.2, liq: 3612, agent: 'basis-carry · S-01' },
+      { sym: 'SOL-PERP', side: 'SHORT', size: '240 SOL', entry: 238.40, live: 241.18 + Math.sin(t / 5) * 0.2, liq: 285.6, agent: 'momentum-sol · S-02' },
+      { sym: 'ETH-PERP', side: 'SHORT', size: '3.00 ETH', entry: 4340.00, live: 4318.72 + Math.sin(t / 7) * 1.2, liq: 5184, agent: 'manual · external' }
+    ].map(p => { const qty = parseFloat(p.size); const pnl = (p.side === 'LONG' ? 1 : -1) * (p.live - p.entry) * qty; const liqDist = Math.abs(p.liq - p.live) / p.live; return { ...p, entry: this.fmt(p.entry, 2), mark: this.fmt(p.live, 2), liq: this.fmt(p.liq, 1), pnl: this.signed(pnl, 2), pnlColor: pnl >= 0 ? '#E7E9EA' : '#8A9198', sideColor: p.side === 'LONG' ? '#E7E9EA' : '#8A9198', liqColor: liqDist < 0.1 ? '#FF4D2E' : '#4A5057' }; });
+
+    const last = s.log[s.log.length - 1] || { time: '', agent: '', text: '', color: '#4A5057' };
+    const equityN = 87800 + (px - 112480.5) * 0.85 + Math.sin(t / 30) * 40;
+    const priceStr = this.fmt(activePx, 2);
+    let cut = 0; while (cut < priceStr.length && cut < this.prevPrice.length && priceStr[cut] === this.prevPrice[cut]) cut++;
+    if (t % 4 === 0) this.prevPrice = priceStr;
+    const priceStable = priceStr.slice(0, cut), priceChanged = priceStr.slice(cut);
+    const logAged = s.log.map((l, i, arr) => ({ ...l, age: (0.35 + 0.65 * (i + 1) / arr.length).toFixed(2), cursor: i === arr.length - 1 && (t % 10 < 5) ? ' \u2588' : '' }));
+
+    return {
+      navItems, goTrade: set('trade'), goBuilder: set('builder'), goOnboarding: set('onboarding'),
+      isTrade: view === 'trade', isAgents: view === 'agents', isBuilder: view === 'builder', isPortfolio: view === 'portfolio', isSettings: view === 'settings', isOnboarding: view === 'onboarding',
+      latency: 12 + Math.floor(Math.abs(Math.sin(t / 11)) * 5), equity: this.fmt(equityN, 2), pnl24: this.signed(2235.6 + (px - 112480.5) * 0.85, 2),
+      activeSym: marketBase.sym, priceLive: this.fmt(activePx, 2), markPx: this.fmt(activePx - 0.3, 2), chg24: marketBase.chg,
+      spreadBps, fundCd, depthBid: this.fmt(depthB, 1) + 'M', depthAsk: this.fmt(depthA, 1) + 'M',
+      imbBarL: this.ramp(depthB / 6, 12), imbBarR: this.ramp(depthA / 6, 12).split('').reverse().join(''),
+      imbalance: this.signed(imb, 2), rv1h: this.fmt(38 + Math.sin(t / 8) * 6, 0), volRatio: this.fmt(1.12 + Math.sin(t / 15) * 0.2, 2), basisBps: this.signed(Math.sin(t / 11) * 2.4, 1),
+      pfImpact: this.fmt(1.6 + Math.abs(Math.sin(t / 10)) * 1.2, 1), pfMax: this.fmt(3.4 + Math.sin(t / 12) * 0.8, 1),
+      apTtl, apTtlBar: this.gauge(apTtl / 90, 14), apDrift: this.signed(Math.sin(t / 13) * 1.4, 1), marginBar: this.gauge(0.418, 14),
+      priceStable, priceChanged, chartField: this.field(t, 110, 24),
+      sparkFrame: this.spark(s.hist), ribbonFrame: this.ribbon(t), pulseFrame: this.matrix(t, { breathe: true }), sweepFrame: this.matrix(t, { sweep: true }), bootFrame: this.boot(t), coverField: this.field(t, 120, 60),
+      chartPoints, chartArea, chartLastY, fillMarks, volBars, asks, bids, markets,
+      agents, agentsShort: agents.filter(a => a.status === 'RUNNING').slice(0, 3), agentsOnMarket: agents.filter(a => a.status === 'RUNNING').length, agentCount: agents.length, sel,
+      positions, posCount: positions.length, log: logAged,
+      lastLogTime: last.time, lastLogAgent: last.agent, lastLogText: last.text, lastLogColor: last.color,
+      decisionsTotal: this.fmt(2136 + Math.floor(t / 9), 0), refusedTotal: 7
+    };
+  }
+}
+</script>
+</body>
+</html>
