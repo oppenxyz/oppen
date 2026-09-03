@@ -8,14 +8,14 @@ Source of truth: `brand-book.dc.html` (open in a browser next to `support.js`). 
 |---|---|
 | ground / void | `#0A0B0C` |
 | surface / plate | `#0D0F11` |
-| edge / rule | `#1A1D20` |
-| label / bracket | `#4A5057` |
-| body | `#8A9198` |
+| edge / rule | `#24282C` |
+| label / bracket | `#7A8188` |
+| body | `#A9AFB5` |
 | signal | `#E7E9EA` |
 | uranium (accent) | `#FFD400` — ≤2% of any surface; `#C79E00` on light |
 | hazard | `#FF4D2E` — liquidation and errors only |
 
-Type: **Space Mono** 400/700 for display, numerals, labels and the character matrix; **Archivo** 400–600 for body and long copy. Numerals tabular by default. Labels 9–10px, +24% tracking, uppercase.
+Type: **Space Mono** 400/700 for display, numerals, labels and the character matrix; **Archivo** 400–600 for body and long copy. Numerals tabular by default. Labels 10–11px, +24% tracking, uppercase.
 
 ## Rules
 
