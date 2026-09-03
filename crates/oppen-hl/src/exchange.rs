@@ -1,10 +1,12 @@
-//! `POST /exchange` request envelope and per-signer nonce allocation
-//! (`docs/hl-signing.md` §8–9).
+//! `POST /exchange`: request envelope, per-signer nonce allocation, the
+//! HTTP client and response parsing (`docs/hl-signing.md` §5, §8–9).
 
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde::Serialize;
+use reqwest::Client;
+use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
 
 use crate::{Action, Address, AgentKey, Error, Network, Signature};
 
@@ -41,6 +43,120 @@ impl ExchangeRequest {
             vault_address,
             expires_after,
         })
+    }
+}
+
+/// One entry of `response.data.statuses`, aligned with the request's
+/// orders or cancels.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", rename_all_fields = "camelCase")]
+pub enum Status {
+    Resting {
+        oid: u64,
+    },
+    Filled {
+        total_sz: Decimal,
+        avg_px: Decimal,
+        oid: u64,
+    },
+    Error(String),
+    /// Cancels report the bare string `"success"`.
+    #[serde(rename = "success")]
+    Success,
+    /// Trigger orders rest off-book until they trigger.
+    WaitingForTrigger,
+    WaitingForFill,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct StatusData {
+    statuses: Vec<Status>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+enum ResponseBody {
+    Order {
+        data: StatusData,
+    },
+    Cancel {
+        data: StatusData,
+    },
+    #[serde(other)]
+    Default,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(tag = "status", content = "response", rename_all = "camelCase")]
+enum RawResponse {
+    Ok(ResponseBody),
+    Err(String),
+}
+
+/// A parsed `status: "ok"` exchange response. Actions without a payload
+/// (leverage, sub-account, scheduleCancel) yield an empty list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExchangeResponse {
+    pub statuses: Vec<Status>,
+}
+
+impl ExchangeResponse {
+    pub fn parse(json: &str) -> Result<Self, Error> {
+        let raw: RawResponse = serde_json::from_str(json).map_err(|e| Error::Venue {
+            status: 200,
+            message: format!("unparseable exchange response: {e}; body: {json}"),
+        })?;
+        match raw {
+            RawResponse::Err(message) => Err(Error::Venue {
+                status: 200,
+                message,
+            }),
+            RawResponse::Ok(ResponseBody::Order { data } | ResponseBody::Cancel { data }) => {
+                Ok(ExchangeResponse {
+                    statuses: data.statuses,
+                })
+            }
+            RawResponse::Ok(ResponseBody::Default) => Ok(ExchangeResponse {
+                statuses: Vec::new(),
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ExchangeClient {
+    http: Client,
+    url: String,
+}
+
+impl ExchangeClient {
+    pub fn new(network: Network) -> Result<Self, Error> {
+        Ok(Self::with_client(network, Client::builder().build()?))
+    }
+
+    pub fn with_client(network: Network, http: Client) -> Self {
+        ExchangeClient {
+            http,
+            url: format!("{}/exchange", network.api_url()),
+        }
+    }
+
+    /// Posts an already-signed request. A non-2xx status, a `status: "err"`
+    /// body and a transport failure are all distinct errors; a transport
+    /// failure after the request left the process is the
+    /// `timeout_unknown_outcome` case and the caller must reconcile by
+    /// cloid, never resend.
+    pub async fn post(&self, request: &ExchangeRequest) -> Result<ExchangeResponse, Error> {
+        let response = self.http.post(&self.url).json(request).send().await?;
+        let status = response.status();
+        let body = response.text().await?;
+        if !status.is_success() {
+            return Err(Error::Venue {
+                status: status.as_u16(),
+                message: body,
+            });
+        }
+        ExchangeResponse::parse(&body)
     }
 }
 
@@ -91,6 +207,55 @@ mod tests {
         assert_eq!(n.next_at(1_000), 1_002);
         assert_eq!(n.next_at(5_000), 5_000);
         assert_eq!(n.next_at(4_000), 5_001);
+    }
+
+    /// DOC-EXCH response examples verbatim.
+    #[test]
+    fn parses_documented_responses() {
+        let resting = r#"{"status":"ok","response":{"type":"order","data":{"statuses":[{"resting":{"oid":77738308}}]}}}"#;
+        assert_eq!(
+            ExchangeResponse::parse(resting).unwrap().statuses,
+            vec![Status::Resting { oid: 77738308 }]
+        );
+        let filled = r#"{"status":"ok","response":{"type":"order","data":{"statuses":[{"filled":{"totalSz":"0.02","avgPx":"1891.4","oid":77747314}}]}}}"#;
+        assert_eq!(
+            ExchangeResponse::parse(filled).unwrap().statuses,
+            vec![Status::Filled {
+                total_sz: "0.02".parse().unwrap(),
+                avg_px: "1891.4".parse().unwrap(),
+                oid: 77747314
+            }]
+        );
+        let err = r#"{"status":"ok","response":{"type":"order","data":{"statuses":[{"error":"Order must have minimum value of $10."}]}}}"#;
+        assert_eq!(
+            ExchangeResponse::parse(err).unwrap().statuses,
+            vec![Status::Error(
+                "Order must have minimum value of $10.".into()
+            )]
+        );
+        let cancel =
+            r#"{"status":"ok","response":{"type":"cancel","data":{"statuses":["success"]}}}"#;
+        assert_eq!(
+            ExchangeResponse::parse(cancel).unwrap().statuses,
+            vec![Status::Success]
+        );
+        let cancel_err = r#"{"status":"ok","response":{"type":"cancel","data":{"statuses":[{"error":"Order was never placed, already canceled, or filled."}]}}}"#;
+        assert!(matches!(
+            ExchangeResponse::parse(cancel_err).unwrap().statuses[0],
+            Status::Error(_)
+        ));
+        let default = r#"{"status":"ok","response":{"type":"default"}}"#;
+        assert!(
+            ExchangeResponse::parse(default)
+                .unwrap()
+                .statuses
+                .is_empty()
+        );
+        let rejected = r#"{"status":"err","response":"User or API Wallet 0x0123 does not exist."}"#;
+        assert!(matches!(
+            ExchangeResponse::parse(rejected),
+            Err(Error::Venue { status: 200, .. })
+        ));
     }
 
     #[test]

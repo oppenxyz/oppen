@@ -14,12 +14,19 @@
 pub mod action;
 pub mod address;
 pub mod exchange;
+pub mod info;
+pub mod meta;
+pub mod order;
 pub mod signing;
+pub mod types;
 pub mod wire;
 
 pub use action::Action;
 pub use address::Address;
-pub use exchange::{ExchangeRequest, NonceAllocator};
+pub use exchange::{ExchangeClient, ExchangeRequest, ExchangeResponse, NonceAllocator, Status};
+pub use info::{InfoClient, OrderRef};
+pub use meta::{Asset, Universe, ValidationError};
+pub use order::{OrderKind, OrderSpec};
 pub use signing::{AgentKey, Signature};
 
 /// Which Hyperliquid network a client talks to. Testnet is the default
@@ -80,4 +87,9 @@ pub enum Error {
     InvalidKey,
     #[error("msgpack encoding failed: {0}")]
     Msgpack(#[from] rmp_serde::encode::Error),
+    #[error("http transport: {0}")]
+    Http(#[from] reqwest::Error),
+    /// Non-2xx from the venue, or a `status: "err"` exchange response.
+    #[error("venue rejected the request (http {status}): {message}")]
+    Venue { status: u16, message: String },
 }
