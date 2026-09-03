@@ -32,6 +32,8 @@ Third-party facts the rust-SDK vectors depend on: alloy `Signature` byte layout 
 
 Test vectors: `crates/oppen-hl/tests/vectors/signing.json` (40 vectors, all copied verbatim from PY-TESTS, RS-SIG and RS-EXCH; see [Test vectors](#test-vectors)).
 
+Implementation map: §2 → `crates/oppen-hl/src/signing/mod.rs` (`action_hash`, `phantom_agent_digest`, `AgentKey`), §2.3–2.5 → `src/action.rs` + `src/wire.rs`, §3 → `src/signing/eip712.rs` + `src/signing/user_signed.rs`, §4 → `wire::float_to_wire`, §8–9 → `src/exchange.rs`. Harness: `tests/vectors.rs`.
+
 ---
 
 ## 1. Two signing schemes
