@@ -67,26 +67,26 @@
   /* Ink ladder: structure → content → primary → live. */
   --void: #0a0b0c;        /* ground */
   --plate: #0d0f11;       /* surface / housing */
-  --rule: #1a1d20;        /* edge */
-  --rule-strong: #2a2e32; /* control outlines */
-  --bracket: #4a5057;     /* label / bracket corner */
-  --body-dim: #6e757b;
-  --body: #8a9198;
-  --signal-dim: #b9bfc4;
+  --rule: #24282c;        /* edge */
+  --rule-strong: #3a3f45; /* control outlines */
+  --bracket: #7a8188;     /* label / bracket corner — 4.9:1 on void */
+  --body-dim: #8f969c;
+  --body: #a9afb5;
+  --signal-dim: #cdd1d5;
   --signal: #e7e9ea;
   --uranium: #ffd400;     /* ≤ 2% of any surface; the one live element */
   --hazard: #ff4d2e;      /* liquidation, errors, kill switch only */
 
   /* Fields render at bracket grey or below. Never at body brightness. */
-  --ink-field: #1e2226;
-  --ink-matrix: #3e4348;
+  --ink-field: #262a2e;
+  --ink-matrix: #4a5057;
 
   /* Type */
   --font-mono: "Space Mono", ui-monospace, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
   --font-sans: "Archivo", system-ui, -apple-system, "Segoe UI", "Helvetica Neue", Arial, sans-serif;
 
-  --fs-label: 9px;
-  --fs-label-lg: 10px;
+  --fs-label: 10px;
+  --fs-label-lg: 11px;
   --ls-label: 0.24em;
   --ls-label-tight: 0.16em;
   --ls-nav: 0.18em;
