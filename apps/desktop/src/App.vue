@@ -1,0 +1,50 @@
+<script setup lang="ts">
+import { computed, type Component } from "vue";
+import AppHeader from "./components/shell/AppHeader.vue";
+import AppStatusBar from "./components/shell/AppStatusBar.vue";
+import { shell, type View } from "./stores/shell";
+import AgentsView from "./views/AgentsView.vue";
+import BuilderView from "./views/BuilderView.vue";
+import OnboardingView from "./views/OnboardingView.vue";
+import PortfolioView from "./views/PortfolioView.vue";
+import SettingsView from "./views/SettingsView.vue";
+import TradeView from "./views/TradeView.vue";
+
+const VIEWS: Record<View, Component> = {
+  trade: TradeView,
+  agents: AgentsView,
+  builder: BuilderView,
+  portfolio: PortfolioView,
+  settings: SettingsView,
+  onboarding: OnboardingView,
+};
+
+const current = computed(() => VIEWS[shell.view]);
+</script>
+
+<template>
+  <div class="app">
+    <AppHeader />
+    <main class="app__main">
+      <component :is="current" />
+    </main>
+    <AppStatusBar />
+  </div>
+</template>
+
+<style scoped>
+.app {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-width: 1280px;
+  background: var(--void);
+  color: var(--signal);
+}
+
+.app__main {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+}
+</style>

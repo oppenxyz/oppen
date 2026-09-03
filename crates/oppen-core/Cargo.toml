@@ -1,0 +1,18 @@
+[package]
+name = "oppen-core"
+description = "oppen core: append-only event ledger, guardrails, kill switch, alerts, agent journal, quant features"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+oppen-hl = { path = "../oppen-hl" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]

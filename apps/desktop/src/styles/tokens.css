@@ -1,0 +1,249 @@
+/*
+ * oppen design tokens — dark only.
+ * Source of truth: docs/design/README.md and docs/design/brand-book.dc.html.
+ * No radius, no shadows, no gradients, no easing anywhere in the app.
+ */
+
+/* ---- Fonts (bundled; the Tauri CSP forbids remote fonts) ------------- */
+/* Space Mono and Archivo are SIL OFL 1.1 — see public/fonts/OFL-*.txt.  */
+
+@font-face {
+  font-family: "Space Mono";
+  font-style: normal;
+  font-weight: 400;
+  font-display: block;
+  src: url("/fonts/SpaceMono-Regular-latin-ext.woff2") format("woff2");
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+@font-face {
+  font-family: "Space Mono";
+  font-style: normal;
+  font-weight: 400;
+  font-display: block;
+  src: url("/fonts/SpaceMono-Regular-latin.woff2") format("woff2");
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+@font-face {
+  font-family: "Space Mono";
+  font-style: normal;
+  font-weight: 700;
+  font-display: block;
+  src: url("/fonts/SpaceMono-Bold-latin-ext.woff2") format("woff2");
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+@font-face {
+  font-family: "Space Mono";
+  font-style: normal;
+  font-weight: 700;
+  font-display: block;
+  src: url("/fonts/SpaceMono-Bold-latin.woff2") format("woff2");
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+/* Archivo ships as one variable file covering 400–600. */
+@font-face {
+  font-family: "Archivo";
+  font-style: normal;
+  font-weight: 400 600;
+  font-stretch: 100%;
+  font-display: block;
+  src: url("/fonts/Archivo-Variable-latin-ext.woff2") format("woff2");
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+@font-face {
+  font-family: "Archivo";
+  font-style: normal;
+  font-weight: 400 600;
+  font-stretch: 100%;
+  font-display: block;
+  src: url("/fonts/Archivo-Variable-latin.woff2") format("woff2");
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+
+/* ---- Tokens ----------------------------------------------------------- */
+
+:root {
+  color-scheme: dark;
+
+  /* Ink ladder: structure → content → primary → live. */
+  --void: #0a0b0c;        /* ground */
+  --plate: #0d0f11;       /* surface / housing */
+  --rule: #1a1d20;        /* edge */
+  --rule-strong: #2a2e32; /* control outlines */
+  --bracket: #4a5057;     /* label / bracket corner */
+  --body-dim: #6e757b;
+  --body: #8a9198;
+  --signal-dim: #b9bfc4;
+  --signal: #e7e9ea;
+  --uranium: #ffd400;     /* ≤ 2% of any surface; the one live element */
+  --hazard: #ff4d2e;      /* liquidation, errors, kill switch only */
+
+  /* Fields render at bracket grey or below. Never at body brightness. */
+  --ink-field: #1e2226;
+  --ink-matrix: #3e4348;
+
+  /* Type */
+  --font-mono: "Space Mono", ui-monospace, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  --font-sans: "Archivo", system-ui, -apple-system, "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+
+  --fs-label: 9px;
+  --fs-label-lg: 10px;
+  --ls-label: 0.24em;
+  --ls-label-tight: 0.16em;
+  --ls-nav: 0.18em;
+  --ls-chip: 0.2em;
+  --ls-button: 0.22em;
+  --ls-tagline: 0.3em;
+
+  --fs-body-sm: 10px;
+  --fs-body: 11px;
+  --fs-copy-sm: 12px;
+  --fs-copy: 13px;
+
+  --fs-display-xs: 14px;
+  --fs-display-sm: 16px;
+  --fs-display-md: 20px;
+  --fs-display-lg: 22px;
+  --fs-display-xl: 26px;
+  --fs-display-2xl: 30px;
+  --fs-display-cover: 72px;
+  --ls-display: -0.02em;
+  --ls-display-tight: -0.03em;
+
+  /* Spacing — 4px base */
+  --s-1: 4px;
+  --s-2: 8px;
+  --s-3: 12px;
+  --s-4: 16px;
+  --s-5: 20px;
+  --s-6: 24px;
+  --s-7: 28px;
+
+  /* Shell geometry */
+  --header-h: 44px;
+  --statusbar-h: 26px;
+  --housing-head-h: 32px;
+  --bracket-size: 14px;
+  --panel-gap: var(--s-2);
+
+  /* Motion: one clock, steps only. Documented here; owned by src/lib/clock.ts. */
+  --tick: 90ms;
+}
+
+/* ---- Reset ------------------------------------------------------------ */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+  border-radius: 0;
+  box-shadow: none;
+  text-shadow: none;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+}
+
+html {
+  background: var(--void);
+}
+
+body {
+  min-width: 1280px;
+  overflow: hidden;
+  background: var(--void);
+  color: var(--signal);
+  font: 400 var(--fs-body) / 1.4 var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+  color: inherit;
+  letter-spacing: inherit;
+  background: none;
+  border: 0;
+}
+
+button {
+  cursor: pointer;
+}
+
+button:disabled {
+  cursor: not-allowed;
+}
+
+a {
+  color: var(--uranium);
+  text-decoration: none;
+  border-bottom: 1px solid currentColor;
+}
+
+pre {
+  font: inherit;
+}
+
+ul,
+ol {
+  list-style: none;
+}
+
+:focus-visible {
+  outline: 1px solid var(--signal);
+  outline-offset: -1px;
+}
+
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--rule);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation: none !important;
+    transition: none !important;
+  }
+}
+
+/* ---- Type utilities --------------------------------------------------- */
+
+.label {
+  font-family: var(--font-mono);
+  font-size: var(--fs-label);
+  letter-spacing: var(--ls-label);
+  text-transform: uppercase;
+  color: var(--bracket);
+}
+
+.label--tight {
+  letter-spacing: var(--ls-label-tight);
+}
+
+.copy {
+  font-family: var(--font-sans);
+  font-size: var(--fs-copy);
+  line-height: 1.65;
+  color: var(--body);
+  text-wrap: pretty;
+}
+
+.copy--sm {
+  font-size: var(--fs-copy-sm);
+  line-height: 1.6;
+}

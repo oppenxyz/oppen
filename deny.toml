@@ -1,0 +1,58 @@
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+# Every entry below is an `unmaintained` notice (not a vulnerability) on a
+# crate pulled in transitively by Tauri 2's Linux stack (wry/tao/muda/gtk3).
+# oppen has no direct dependency on any of them. Re-evaluate on each Tauri
+# minor release; drop entries as Tauri moves off GTK3 / html5ever's unic-*.
+ignore = [
+  { id = "RUSTSEC-2024-0411", reason = "gtk3-rs bindings unmaintained; transitive via tauri/tao/muda" },
+  { id = "RUSTSEC-2024-0412", reason = "gtk3-rs bindings unmaintained; transitive via tauri/tao/muda" },
+  { id = "RUSTSEC-2024-0413", reason = "gtk3-rs bindings unmaintained; transitive via tauri/tao/muda" },
+  { id = "RUSTSEC-2024-0414", reason = "gtk3-rs bindings unmaintained; transitive via tauri/tao/muda" },
+  { id = "RUSTSEC-2024-0415", reason = "gtk3-rs bindings unmaintained; transitive via tauri/tao/muda" },
+  { id = "RUSTSEC-2024-0416", reason = "gtk3-rs bindings unmaintained; transitive via tauri/tao/muda" },
+  { id = "RUSTSEC-2024-0417", reason = "gtk3-rs bindings unmaintained; transitive via tauri/tao/muda" },
+  { id = "RUSTSEC-2024-0418", reason = "gtk3-rs bindings unmaintained; transitive via tauri/tao/muda" },
+  { id = "RUSTSEC-2024-0419", reason = "gtk3-rs bindings unmaintained; transitive via tauri/tao/muda" },
+  { id = "RUSTSEC-2024-0420", reason = "gtk3-rs bindings unmaintained; transitive via tauri/tao/muda" },
+  { id = "RUSTSEC-2024-0370", reason = "proc-macro-error unmaintained; transitive via tauri build tooling" },
+  { id = "RUSTSEC-2025-0075", reason = "unic-common unmaintained; transitive via tauri" },
+  { id = "RUSTSEC-2025-0080", reason = "unic-char-range unmaintained; transitive via tauri" },
+  { id = "RUSTSEC-2025-0081", reason = "unic-char-property unmaintained; transitive via tauri" },
+  { id = "RUSTSEC-2025-0098", reason = "unic-ucd-ident unmaintained; transitive via tauri" },
+  { id = "RUSTSEC-2025-0100", reason = "unic-ucd-version unmaintained; transitive via tauri" },
+]
+
+[licenses]
+version = 2
+allow = [
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "MIT",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Zlib",
+  "Unicode-3.0",
+  "MPL-2.0",
+  "CC0-1.0",
+  "OpenSSL",
+]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# workspace crates reference each other by path without a version
+allow-wildcard-paths = true
+deny = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

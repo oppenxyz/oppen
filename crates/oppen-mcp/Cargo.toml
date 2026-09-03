@@ -1,0 +1,19 @@
+[package]
+name = "oppen-mcp"
+description = "oppen MCP gateway: localhost HTTP server, agent pairing tokens, tool schemas, typed error taxonomy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+oppen-core = { path = "../oppen-core" }
+oppen-hl = { path = "../oppen-hl" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]

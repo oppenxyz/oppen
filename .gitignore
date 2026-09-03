@@ -1,0 +1,32 @@
+# rust
+target/
+**/*.rs.bk
+
+# node / bun
+node_modules/
+dist/
+.vite/
+*.tsbuildinfo
+
+# tauri
+apps/desktop/src-tauri/gen/schemas/
+
+# env / secrets — never commit keys
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# local runtime data
+.oppen/
+
+# os / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json
+
+# claude scratch
+.claude/todo.md
