@@ -1,0 +1,89 @@
+[
+ [
+  "0G",
+  [
+   [
+    "BinPerp",
+    {
+     "fundingRate": "0.00005",
+     "nextFundingTime": 1788465600000,
+     "fundingIntervalHours": 4
+    }
+   ],
+   [
+    "HlPerp",
+    {
+     "fundingRate": "0.0000125",
+     "nextFundingTime": 1788458400000,
+     "fundingIntervalHours": 1
+    }
+   ],
+   [
+    "BybitPerp",
+    {
+     "fundingRate": "0.00005",
+     "nextFundingTime": 1788465600000,
+     "fundingIntervalHours": 4
+    }
+   ]
+  ]
+ ],
+ [
+  "BTC",
+  [
+   [
+    "BinPerp",
+    {
+     "fundingRate": "0.00009858",
+     "nextFundingTime": 1788480000000,
+     "fundingIntervalHours": 8
+    }
+   ],
+   [
+    "HlPerp",
+    {
+     "fundingRate": "0.0012026746",
+     "nextFundingTime": 1788458400000,
+     "fundingIntervalHours": 1
+    }
+   ],
+   [
+    "BybitPerp",
+    {
+     "fundingRate": "0.00009661",
+     "nextFundingTime": 1788480000000,
+     "fundingIntervalHours": 8
+    }
+   ]
+  ]
+ ],
+ [
+  "ETH",
+  [
+   [
+    "BinPerp",
+    {
+     "fundingRate": "0.0001",
+     "nextFundingTime": 1788480000000,
+     "fundingIntervalHours": 8
+    }
+   ],
+   [
+    "HlPerp",
+    {
+     "fundingRate": "-0.0010026023",
+     "nextFundingTime": 1788458400000,
+     "fundingIntervalHours": 1
+    }
+   ],
+   [
+    "BybitPerp",
+    {
+     "fundingRate": "0.0001",
+     "nextFundingTime": 1788480000000,
+     "fundingIntervalHours": 8
+    }
+   ]
+  ]
+ ]
+]
