@@ -1,0 +1,963 @@
+[
+  {
+    "name": "py/test_phantom_agent_creation_matches_production",
+    "source_url": "https://github.com/hyperliquid-dex/hyperliquid-python-sdk/blob/master/tests/signing_test.py",
+    "source_commit": "2fdb18f9517675ea03695a0962bd19eece9c83f0",
+    "network": "mainnet",
+    "kind": "l1",
+    "private_key": null,
+    "action": {
+      "type": "order",
+      "orders": [
+        {
+          "a": 4,
+          "b": true,
+          "p": "1670.1",
+          "s": "0.0147",
+          "r": false,
+          "t": { "limit": { "tif": "Ioc" } }
+        }
+      ],
+      "grouping": "na"
+    },
+    "nonce": 1677777606040,
+    "vault_address": null,
+    "expires_after": null,
+    "expected": {
+      "connection_id": "0x0fcbeda5ae3c4950a548021552a4fea2226858c4453571bf3f24ba017eac2908"
+    },
+    "notes": "connection_id = keccak(msgpack(action) || nonce_be64 || 0x00). Source builds the action with order_request_to_order_wire({coin:'ETH', is_buy:True, sz:0.0147, limit_px:1670.1, reduce_only:False, order_type:{limit:{tif:'Ioc'}}, cloid:None}, asset=4). No private key involved; construct_phantom_agent(hash, True) only sets source='a'."
+  },
+  {
+    "name": "py/test_l1_action_signing_matches/mainnet",
+    "source_url": "https://github.com/hyperliquid-dex/hyperliquid-python-sdk/blob/master/tests/signing_test.py",
+    "source_commit": "2fdb18f9517675ea03695a0962bd19eece9c83f0",
+    "network": "mainnet",
+    "kind": "l1",
+    "private_key": "0x0123456789012345678901234567890123456789012345678901234567890123",
+    "action": { "type": "dummy", "num": 100000000000 },
+    "nonce": 0,
+    "vault_address": null,
+    "expires_after": null,
+    "expected": {
+      "r": "0x53749d5b30552aeb2fca34b530185976545bb22d0b3ce6f62e31be961a59298",
+      "s": "0x755c40ba9bf05223521753995abb2f73ab3229be8ec921f350cb447e384d8ed8",
+      "v": 27
+    },
+    "notes": "num = float_to_int_for_hashing(1000) = 1000 * 10^8. r/s are eth_utils.to_hex(int) == Python hex(): minimal-length hex, not zero-padded (62-64 hex chars across the python vectors); compare as integers."
+  },
+  {
+    "name": "py/test_l1_action_signing_matches/testnet",
+    "source_url": "https://github.com/hyperliquid-dex/hyperliquid-python-sdk/blob/master/tests/signing_test.py",
+    "source_commit": "2fdb18f9517675ea03695a0962bd19eece9c83f0",
+    "network": "testnet",
+    "kind": "l1",
+    "private_key": "0x0123456789012345678901234567890123456789012345678901234567890123",
+    "action": { "type": "dummy", "num": 100000000000 },
+    "nonce": 0,
+    "vault_address": null,
+    "expires_after": null,
+    "expected": {
+      "r": "0x542af61ef1f429707e3c76c5293c80d01f74ef853e34b76efffcb57e574f9510",
+      "s": "0x17b8b32f086e8cdede991f1e2c529f5dd5297cbe8128500e00cbaf766204a613",
+      "v": 28
+    }
+  },
+  {
+    "name": "py/test_l1_action_signing_order_matches/mainnet",
+    "source_url": "https://github.com/hyperliquid-dex/hyperliquid-python-sdk/blob/master/tests/signing_test.py",
+    "source_commit": "2fdb18f9517675ea03695a0962bd19eece9c83f0",
+    "network": "mainnet",
+    "kind": "l1",
+    "private_key": "0x0123456789012345678901234567890123456789012345678901234567890123",
+    "action": {
+      "type": "order",
+      "orders": [
+        {
+          "a": 1,
+          "b": true,
+          "p": "100",
+          "s": "100",
+          "r": false,
+          "t": { "limit": { "tif": "Gtc" } }
+        }
+      ],
+      "grouping": "na"
+    },
+    "nonce": 0,
+    "vault_address": null,
+    "expires_after": null,
+    "expected": {
+      "r": "0xd65369825a9df5d80099e513cce430311d7d26ddf477f5b3a33d2806b100d78e",
+      "s": "0x2b54116ff64054968aa237c20ca9ff68000f977c93289157748a3162b6ea940e",
+      "v": 28
+    },
+    "notes": "Source: order_request_to_order_wire({coin:'ETH', is_buy:True, sz:100, limit_px:100, reduce_only:False, order_type:{limit:{tif:'Gtc'}}, cloid:None}, asset=1); float_to_wire(100) == '100'."
+  },
+  {
+    "name": "py/test_l1_action_signing_order_matches/testnet",
+    "source_url": "https://github.com/hyperliquid-dex/hyperliquid-python-sdk/blob/master/tests/signing_test.py",
+    "source_commit": "2fdb18f9517675ea03695a0962bd19eece9c83f0",
+    "network": "testnet",
+    "kind": "l1",
+    "private_key": "0x0123456789012345678901234567890123456789012345678901234567890123",
+    "action": {
+      "type": "order",
+      "orders": [
+        {
+          "a": 1,
+          "b": true,
+          "p": "100",
+          "s": "100",
+          "r": false,
+          "t": { "limit": { "tif": "Gtc" } }
+        }
+      ],
+      "grouping": "na"
+    },
+    "nonce": 0,
+    "vault_address": null,
+    "expires_after": null,
+    "expected": {
+      "r": "0x82b2ba28e76b3d761093aaded1b1cdad4960b3af30212b343fb2e6cdfa4e3d54",
+      "s": "0x6b53878fc99d26047f4d7e8c90eb98955a109f44209163f52d8dc4278cbbd9f5",
+      "v": 27
+    }
+  },
+  {
+    "name": "py/test_l1_action_signing_order_with_cloid_matches/mainnet",
+    "source_url": "https://github.com/hyperliquid-dex/hyperliquid-python-sdk/blob/master/tests/signing_test.py",
+    "source_commit": "2fdb18f9517675ea03695a0962bd19eece9c83f0",
+    "network": "mainnet",
+    "kind": "l1",
+    "private_key": "0x0123456789012345678901234567890123456789012345678901234567890123",
+    "action": {
+      "type": "order",
+      "orders": [
+        {
+          "a": 1,
+          "b": true,
+          "p": "100",
+          "s": "100",
+          "r": false,
+          "t": { "limit": { "tif": "Gtc" } },
+          "c": "0x00000000000000000000000000000001"
+        }
+      ],
+      "grouping": "na"
+    },
+    "nonce": 0,
+    "vault_address": null,
+    "expires_after": null,
+    "expected": {
+      "r": "0x41ae18e8239a56cacbc5dad94d45d0b747e5da11ad564077fcac71277a946e3",
+      "s": "0x3c61f667e747404fe7eea8f90ab0e76cc12ce60270438b2058324681a00116da",
+      "v": 27
+    },
+    "notes": "cloid = Cloid.from_str('0x00000000000000000000000000000001').to_raw(); 'c' is appended AFTER 't' in the order wire map."
+  },
+  {
+    "name": "py/test_l1_action_signing_order_with_cloid_matches/testnet",
+    "source_url": "https://github.com/hyperliquid-dex/hyperliquid-python-sdk/blob/master/tests/signing_test.py",
+    "source_commit": "2fdb18f9517675ea03695a0962bd19eece9c83f0",
+    "network": "testnet",
+    "kind": "l1",
+    "private_key": "0x0123456789012345678901234567890123456789012345678901234567890123",
+    "action": {
+      "type": "order",
+      "orders": [
+        {
+          "a": 1,
+          "b": true,
+          "p": "100",
+          "s": "100",
+          "r": false,
+          "t": { "limit": { "tif": "Gtc" } },
+          "c": "0x00000000000000000000000000000001"
+        }
+      ],
+      "grouping": "na"
+    },
+    "nonce": 0,
+    "vault_address": null,
+    "expires_after": null,
+    "expected": {
+      "r": "0xeba0664bed2676fc4e5a743bf89e5c7501aa6d870bdb9446e122c9466c5cd16d",
+      "s": "0x7f3e74825c9114bc59086f1eebea2928c190fdfbfde144827cb02b85bbe90988",
+      "v": 28
+    }
+  },
+  {
+    "name": "py/test_l1_action_signing_matches_with_vault/mainnet",
+    "source_url": "https://github.com/hyperliquid-dex/hyperliquid-python-sdk/blob/master/tests/signing_test.py",
+    "source_commit": "2fdb18f9517675ea03695a0962bd19eece9c83f0",
+    "network": "mainnet",
+    "kind": "l1",
+    "private_key": "0x0123456789012345678901234567890123456789012345678901234567890123",
+    "action": { "type": "dummy", "num": 100000000000 },
+    "nonce": 0,
+    "vault_address": "0x1719884eb866cb12b2287399b15f7db5e7d775ea",
+    "expires_after": null,
+    "expected": {
+      "r": "0x3c548db75e479f8012acf3000ca3a6b05606bc2ec0c29c50c515066a326239",
+      "s": "0x4d402be7396ce74fbba3795769cda45aec00dc3125a984f2a9f23177b190da2c",
+      "v": 28
+    },
+    "notes": "With a vault address the hash input is msgpack(action) || nonce_be64 || 0x01 || 20 raw address bytes."
+  },
+  {
+    "name": "py/test_l1_action_signing_matches_with_vault/testnet",
+    "source_url": "https://github.com/hyperliquid-dex/hyperliquid-python-sdk/blob/master/tests/signing_test.py",
+    "source_commit": "2fdb18f9517675ea03695a0962bd19eece9c83f0",
+    "network": "testnet",
+    "kind": "l1",
+    "private_key": "0x0123456789012345678901234567890123456789012345678901234567890123",
+    "action": { "type": "dummy", "num": 100000000000 },
+    "nonce": 0,
+    "vault_address": "0x1719884eb866cb12b2287399b15f7db5e7d775ea",
+    "expires_after": null,
+    "expected": {
+      "r": "0xe281d2fb5c6e25ca01601f878e4d69c965bb598b88fac58e475dd1f5e56c362b",
+      "s": "0x7ddad27e9a238d045c035bc606349d075d5c5cd00a6cd1da23ab5c39d4ef0f60",
+      "v": 27
+    }
+  },
+  {
+    "name": "py/test_l1_action_signing_tpsl_order_matches/mainnet",
+    "source_url": "https://github.com/hyperliquid-dex/hyperliquid-python-sdk/blob/master/tests/signing_test.py",
+    "source_commit": "2fdb18f9517675ea03695a0962bd19eece9c83f0",
+    "network": "mainnet",
+    "kind": "l1",
+    "private_key": "0x0123456789012345678901234567890123456789012345678901234567890123",
+    "action": {
+      "type": "order",
+      "orders": [
+        {
+          "a": 1,
+          "b": true,
+          "p": "100",
+          "s": "100",
+          "r": false,
+          "t": { "trigger": { "isMarket": true, "triggerPx": "103", "tpsl": "sl" } }
+        }
+      ],
+      "grouping": "na"
+    },
+    "nonce": 0,
+    "vault_address": null,
+    "expires_after": null,
+    "expected": {
+      "r": "0x98343f2b5ae8e26bb2587daad3863bc70d8792b09af1841b6fdd530a2065a3f9",
+      "s": "0x6b5bb6bb0633b710aa22b721dd9dee6d083646a5f8e581a20b545be6c1feb405",
+      "v": 27
+    },
+    "notes": "Source order_type {trigger:{triggerPx:103, isMarket:True, tpsl:'sl'}}; order_type_to_wire re-emits the trigger map in the order isMarket, triggerPx, tpsl with triggerPx = float_to_wire(103) == '103'."
+  },
+  {
+    "name": "py/test_l1_action_signing_tpsl_order_matches/testnet",
+    "source_url": "https://github.com/hyperliquid-dex/hyperliquid-python-sdk/blob/master/tests/signing_test.py",
+    "source_commit": "2fdb18f9517675ea03695a0962bd19eece9c83f0",
+    "network": "testnet",
+    "kind": "l1",
+    "private_key": "0x0123456789012345678901234567890123456789012345678901234567890123",
+    "action": {
+      "type": "order",
+      "orders": [
+        {
+          "a": 1,
+          "b": true,
+          "p": "100",
+          "s": "100",
+          "r": false,
+          "t": { "trigger": { "isMarket": true, "triggerPx": "103", "tpsl": "sl" } }
+        }
+      ],
+      "grouping": "na"
+    },
+    "nonce": 0,
+    "vault_address": null,
+    "expires_after": null,
+    "expected": {
+      "r": "0x971c554d917c44e0e1b6cc45d8f9404f32172a9d3b3566262347d0302896a2e4",
+      "s": "0x206257b104788f80450f8e786c329daa589aa0b32ba96948201ae556d5637eac",
+      "v": 28
+    }
+  },
+  {
+    "name": "py/test_sign_usd_transfer_action",
+    "source_url": "https://github.com/hyperliquid-dex/hyperliquid-python-sdk/blob/master/tests/signing_test.py",
+    "source_commit": "2fdb18f9517675ea03695a0962bd19eece9c83f0",
+    "network": "testnet",
+    "kind": "user",
+    "private_key": "0x0123456789012345678901234567890123456789012345678901234567890123",
+    "action": {
+      "destination": "0x5e9ee1089755c3435139848e47e6635505d5a13a",
+      "amount": "1",
+      "time": 1687816341423,
+      "signatureChainId": "0x66eee",
+      "hyperliquidChain": "Testnet"
+    },
+    "nonce": null,
+    "vault_address": null,
+    "expires_after": null,
+    "primary_type": "HyperliquidTransaction:UsdSend",
+    "eip712_types": [
+      { "name": "hyperliquidChain", "type": "string" },
+      { "name": "destination", "type": "string" },
+      { "name": "amount", "type": "string" },
+      { "name": "time", "type": "uint64" }
+    ],
+    "expected": {
+      "r": "0x637b37dd731507cdd24f46532ca8ba6eec616952c56218baeff04144e4a77073",
+      "s": "0x11a6a24900e6e314136d2592e2f8d502cd89b7c15b198e1bee043c9589f9fad7",
+      "v": 27
+    },
+    "notes": "Source passes {destination, amount, time}; sign_user_signed_action injects signatureChainId='0x66eee' and hyperliquidChain='Testnet' before signing. Domain: name 'HyperliquidSignTransaction', version '1', chainId 0x66eee (421614), verifyingContract 0x0. No outer nonce in the test; 'time' is the action's nonce field."
+  },
+  {
+    "name": "py/test_sign_withdraw_from_bridge_action",
+    "source_url": "https://github.com/hyperliquid-dex/hyperliquid-python-sdk/blob/master/tests/signing_test.py",
+    "source_commit": "2fdb18f9517675ea03695a0962bd19eece9c83f0",
+    "network": "testnet",
+    "kind": "user",
+    "private_key": "0x0123456789012345678901234567890123456789012345678901234567890123",
+    "action": {
+      "destination": "0x5e9ee1089755c3435139848e47e6635505d5a13a",
+      "amount": "1",
+      "time": 1687816341423,
+      "signatureChainId": "0x66eee",
+      "hyperliquidChain": "Testnet"
+    },
+    "nonce": null,
+    "vault_address": null,
+    "expires_after": null,
+    "primary_type": "HyperliquidTransaction:Withdraw",
+    "eip712_types": [
+      { "name": "hyperliquidChain", "type": "string" },
+      { "name": "destination", "type": "string" },
+      { "name": "amount", "type": "string" },
+      { "name": "time", "type": "uint64" }
+    ],
+    "expected": {
+      "r": "0x8363524c799e90ce9bc41022f7c39b4e9bdba786e5f9c72b20e43e1462c37cf9",
+      "s": "0x58b1411a775938b83e29182e8ef74975f9054c8e97ebf5ec2dc8d51bfc893881",
+      "v": 28
+    },
+    "notes": "Same message as the UsdSend vector; only the primaryType differs. Demonstrates that the primaryType string is part of the hash."
+  },
+  {
+    "name": "py/test_create_sub_account_action/mainnet",
+    "source_url": "https://github.com/hyperliquid-dex/hyperliquid-python-sdk/blob/master/tests/signing_test.py",
+    "source_commit": "2fdb18f9517675ea03695a0962bd19eece9c83f0",
+    "network": "mainnet",
+    "kind": "l1",
+    "private_key": "0x0123456789012345678901234567890123456789012345678901234567890123",
+    "action": { "type": "createSubAccount", "name": "example" },
+    "nonce": 0,
+    "vault_address": null,
+    "expires_after": null,
+    "expected": {
+      "r": "0x51096fe3239421d16b671e192f574ae24ae14329099b6db28e479b86cdd6caa7",
+      "s": "0xb71f7d293af92d3772572afb8b102d167a7cef7473388286bc01f52a5c5b423",
+      "v": 27
+    }
+  },
+  {
+    "name": "py/test_create_sub_account_action/testnet",
+    "source_url": "https://github.com/hyperliquid-dex/hyperliquid-python-sdk/blob/master/tests/signing_test.py",
+    "source_commit": "2fdb18f9517675ea03695a0962bd19eece9c83f0",
+    "network": "testnet",
+    "kind": "l1",
+    "private_key": "0x0123456789012345678901234567890123456789012345678901234567890123",
+    "action": { "type": "createSubAccount", "name": "example" },
+    "nonce": 0,
+    "vault_address": null,
+    "expires_after": null,
+    "expected": {
+      "r": "0xa699e3ed5c2b89628c746d3298b5dc1cca604694c2c855da8bb8250ec8014a5b",
+      "s": "0x53f1b8153a301c72ecc655b1c315d64e1dcea3ee58921fd7507e35818fcc1584",
+      "v": 28
+    }
+  },
+  {
+    "name": "py/test_sub_account_transfer_action/mainnet",
+    "source_url": "https://github.com/hyperliquid-dex/hyperliquid-python-sdk/blob/master/tests/signing_test.py",
+    "source_commit": "2fdb18f9517675ea03695a0962bd19eece9c83f0",
+    "network": "mainnet",
+    "kind": "l1",
+    "private_key": "0x0123456789012345678901234567890123456789012345678901234567890123",
+    "action": {
+      "type": "subAccountTransfer",
+      "subAccountUser": "0x1d9470d4b963f552e6f671a81619d395877bf409",
+      "isDeposit": true,
+      "usd": 10
+    },
+    "nonce": 0,
+    "vault_address": null,
+    "expires_after": null,
+    "expected": {
+      "r": "0x43592d7c6c7d816ece2e206f174be61249d651944932b13343f4d13f306ae602",
+      "s": "0x71a926cb5c9a7c01c3359ec4c4c34c16ff8107d610994d4de0e6430e5cc0f4c9",
+      "v": 28
+    },
+    "notes": "usd is a msgpack integer (10), not a string."
+  },
+  {
+    "name": "py/test_sub_account_transfer_action/testnet",
+    "source_url": "https://github.com/hyperliquid-dex/hyperliquid-python-sdk/blob/master/tests/signing_test.py",
+    "source_commit": "2fdb18f9517675ea03695a0962bd19eece9c83f0",
+    "network": "testnet",
+    "kind": "l1",
+    "private_key": "0x0123456789012345678901234567890123456789012345678901234567890123",
+    "action": {
+      "type": "subAccountTransfer",
+      "subAccountUser": "0x1d9470d4b963f552e6f671a81619d395877bf409",
+      "isDeposit": true,
+      "usd": 10
+    },
+    "nonce": 0,
+    "vault_address": null,
+    "expires_after": null,
+    "expected": {
+      "r": "0xe26574013395ad55ee2f4e0575310f003c5bb3351b5425482e2969fa51543927",
+      "s": "0xefb08999196366871f919fd0e138b3a7f30ee33e678df7cfaf203e25f0a4278",
+      "v": 28
+    }
+  },
+  {
+    "name": "py/test_schedule_cancel_action/no_time/mainnet",
+    "source_url": "https://github.com/hyperliquid-dex/hyperliquid-python-sdk/blob/master/tests/signing_test.py",
+    "source_commit": "2fdb18f9517675ea03695a0962bd19eece9c83f0",
+    "network": "mainnet",
+    "kind": "l1",
+    "private_key": "0x0123456789012345678901234567890123456789012345678901234567890123",
+    "action": { "type": "scheduleCancel" },
+    "nonce": 0,
+    "vault_address": null,
+    "expires_after": null,
+    "expected": {
+      "r": "0x6cdfb286702f5917e76cd9b3b8bf678fcc49aec194c02a73e6d4f16891195df9",
+      "s": "0x6557ac307fa05d25b8d61f21fb8a938e703b3d9bf575f6717ba21ec61261b2a0",
+      "v": 27
+    },
+    "notes": "The 'time' key is absent (not null) when unset."
+  },
+  {
+    "name": "py/test_schedule_cancel_action/no_time/testnet",
+    "source_url": "https://github.com/hyperliquid-dex/hyperliquid-python-sdk/blob/master/tests/signing_test.py",
+    "source_commit": "2fdb18f9517675ea03695a0962bd19eece9c83f0",
+    "network": "testnet",
+    "kind": "l1",
+    "private_key": "0x0123456789012345678901234567890123456789012345678901234567890123",
+    "action": { "type": "scheduleCancel" },
+    "nonce": 0,
+    "vault_address": null,
+    "expires_after": null,
+    "expected": {
+      "r": "0xc75bb195c3f6a4e06b7d395acc20bbb224f6d23ccff7c6a26d327304e6efaeed",
+      "s": "0x342f8ede109a29f2c0723bd5efb9e9100e3bbb493f8fb5164ee3d385908233df",
+      "v": 28
+    }
+  },
+  {
+    "name": "py/test_schedule_cancel_action/with_time/mainnet",
+    "source_url": "https://github.com/hyperliquid-dex/hyperliquid-python-sdk/blob/master/tests/signing_test.py",
+    "source_commit": "2fdb18f9517675ea03695a0962bd19eece9c83f0",
+    "network": "mainnet",
+    "kind": "l1",
+    "private_key": "0x0123456789012345678901234567890123456789012345678901234567890123",
+    "action": { "type": "scheduleCancel", "time": 123456789 },
+    "nonce": 0,
+    "vault_address": null,
+    "expires_after": null,
+    "expected": {
+      "r": "0x609cb20c737945d070716dcc696ba030e9976fcf5edad87afa7d877493109d55",
+      "s": "0x16c685d63b5c7a04512d73f183b3d7a00da5406ff1f8aad33f8ae2163bab758b",
+      "v": 28
+    }
+  },
+  {
+    "name": "py/test_schedule_cancel_action/with_time/testnet",
+    "source_url": "https://github.com/hyperliquid-dex/hyperliquid-python-sdk/blob/master/tests/signing_test.py",
+    "source_commit": "2fdb18f9517675ea03695a0962bd19eece9c83f0",
+    "network": "testnet",
+    "kind": "l1",
+    "private_key": "0x0123456789012345678901234567890123456789012345678901234567890123",
+    "action": { "type": "scheduleCancel", "time": 123456789 },
+    "nonce": 0,
+    "vault_address": null,
+    "expires_after": null,
+    "expected": {
+      "r": "0x4e4f2dbd4107c69783e251b7e1057d9f2b9d11cee213441ccfa2be63516dc5bc",
+      "s": "0x706c656b23428c8ba356d68db207e11139ede1670481a9e01ae2dfcdb0e1a678",
+      "v": 27
+    }
+  },
+  {
+    "name": "rs/test_sign_l1_action/mainnet",
+    "source_url": "https://github.com/hyperliquid-dex/hyperliquid-rust-sdk/blob/master/src/signature/create_signature.rs",
+    "source_commit": "aac75585daf12d0a3761126cc7da7a5e035b5853",
+    "network": "mainnet",
+    "kind": "l1",
+    "private_key": "e908f86dbb4d55ac876378565aafeabc187f6690f046459397b17d9b9a19688e",
+    "action": null,
+    "connection_id": "0xde6c4037798a4434ca03cd05f00e3b803126221375cd1e7eaaaf041768be06eb",
+    "nonce": null,
+    "vault_address": null,
+    "expires_after": null,
+    "expected": {
+      "signature_hex": "0xfa8a41f6a3fa728206df80801a83bcbfbab08649cd34d9c0bfba7c7b2f99340f53a00226604567b98a1492803190d65a201d6805e5831b7044f17fd530aec7841c"
+    },
+    "notes": "Tests only the phantom-agent EIP-712 step: the 32-byte connection_id is given directly (no action/msgpack). signature_hex is alloy Signature::to_string() = 0x || r(32 bytes) || s(32 bytes) || v where v = 27 + y_parity. Private key is written without 0x in the source."
+  },
+  {
+    "name": "rs/test_sign_l1_action/testnet",
+    "source_url": "https://github.com/hyperliquid-dex/hyperliquid-rust-sdk/blob/master/src/signature/create_signature.rs",
+    "source_commit": "aac75585daf12d0a3761126cc7da7a5e035b5853",
+    "network": "testnet",
+    "kind": "l1",
+    "private_key": "e908f86dbb4d55ac876378565aafeabc187f6690f046459397b17d9b9a19688e",
+    "action": null,
+    "connection_id": "0xde6c4037798a4434ca03cd05f00e3b803126221375cd1e7eaaaf041768be06eb",
+    "nonce": null,
+    "vault_address": null,
+    "expires_after": null,
+    "expected": {
+      "signature_hex": "0x1713c0fc661b792a50e8ffdd59b637b1ed172d9a3aa4d801d9d88646710fb74b33959f4d075a7ccbec9f2374a6da21ffa4448d58d0413a0d335775f680a881431c"
+    }
+  },
+  {
+    "name": "rs/test_sign_usd_transfer_action",
+    "source_url": "https://github.com/hyperliquid-dex/hyperliquid-rust-sdk/blob/master/src/signature/create_signature.rs",
+    "source_commit": "aac75585daf12d0a3761126cc7da7a5e035b5853",
+    "network": "testnet",
+    "kind": "user",
+    "private_key": "e908f86dbb4d55ac876378565aafeabc187f6690f046459397b17d9b9a19688e",
+    "action": {
+      "type": "usdSend",
+      "signatureChainId": "0x66eee",
+      "hyperliquidChain": "Testnet",
+      "destination": "0x0D1d9635D0640821d15e323ac8AdADfA9c111414",
+      "amount": "1",
+      "time": 1690393044548
+    },
+    "nonce": null,
+    "vault_address": null,
+    "expires_after": null,
+    "primary_type": "HyperliquidTransaction:UsdSend",
+    "eip712_types": [
+      { "name": "hyperliquidChain", "type": "string" },
+      { "name": "destination", "type": "string" },
+      { "name": "amount", "type": "string" },
+      { "name": "time", "type": "uint64" }
+    ],
+    "expected": {
+      "signature_hex": "0x214d507bbdaebba52fa60928f904a8b2df73673e3baba6133d66fe846c7ef70451e82453a6d8db124e7ed6e60fa00d4b7c46e4d96cb2bd61fd81b6e8953cc9d21b"
+    },
+    "notes": "Source struct UsdSend { signature_chain_id: 421614, hyperliquid_chain: 'Testnet', destination: '0x0D1d9635D0640821d15e323ac8AdADfA9c111414', amount: '1', time: 1690393044548 }; 421614 == 0x66eee. destination is a `string` EIP-712 field: it is keccak'd as the exact mixed-case text, so case is part of the hash. The 'type' key is implied by the Actions::UsdSend variant and is not part of the EIP-712 message."
+  },
+  {
+    "name": "rs/test_sign_withdraw_from_bridge_action",
+    "source_url": "https://github.com/hyperliquid-dex/hyperliquid-rust-sdk/blob/master/src/signature/create_signature.rs",
+    "source_commit": "aac75585daf12d0a3761126cc7da7a5e035b5853",
+    "network": "testnet",
+    "kind": "user",
+    "private_key": "e908f86dbb4d55ac876378565aafeabc187f6690f046459397b17d9b9a19688e",
+    "action": {
+      "type": "withdraw3",
+      "signatureChainId": "0x66eee",
+      "hyperliquidChain": "Testnet",
+      "destination": "0x0D1d9635D0640821d15e323ac8AdADfA9c111414",
+      "amount": "1",
+      "time": 1690393044548
+    },
+    "nonce": null,
+    "vault_address": null,
+    "expires_after": null,
+    "primary_type": "HyperliquidTransaction:Withdraw",
+    "eip712_types": [
+      { "name": "hyperliquidChain", "type": "string" },
+      { "name": "destination", "type": "string" },
+      { "name": "amount", "type": "string" },
+      { "name": "time", "type": "uint64" }
+    ],
+    "expected": {
+      "signature_hex": "0xb3172e33d2262dac2b4cb135ce3c167fda55dafa6c62213564ab728b9f9ba76b769a938e9f6d603dae7154c83bf5a4c3ebab81779dc2db25463a3ed663c82ae41c"
+    },
+    "notes": "Source struct Withdraw3 with the same field values as the UsdSend vector; primaryType 'HyperliquidTransaction:Withdraw' (not 'Withdraw3')."
+  },
+  {
+    "name": "rs/test_limit_order_action_hashing/mainnet",
+    "source_url": "https://github.com/hyperliquid-dex/hyperliquid-rust-sdk/blob/master/src/exchange/exchange_client.rs",
+    "source_commit": "aac75585daf12d0a3761126cc7da7a5e035b5853",
+    "network": "mainnet",
+    "kind": "l1",
+    "private_key": "e908f86dbb4d55ac876378565aafeabc187f6690f046459397b17d9b9a19688e",
+    "action": {
+      "type": "order",
+      "orders": [
+        {
+          "a": 1,
+          "b": true,
+          "p": "2000.0",
+          "s": "3.5",
+          "r": false,
+          "t": { "limit": { "tif": "Ioc" } }
+        }
+      ],
+      "grouping": "na"
+    },
+    "nonce": 1583838,
+    "vault_address": null,
+    "expires_after": null,
+    "expected": {
+      "signature_hex": "0x77957e58e70f43b6b68581f2dc42011fc384538a2e5b7bf42d5b936f19fbb67360721a8598727230f67080efee48c812a6a4442013fd3b0eed509171bef9f23f1c"
+    },
+    "notes": "WARNING: the source passes limit_px as the literal string '2000.0' (trailing zero, NOT normalized). The signature is over that exact string; a normalizer producing '2000' yields a different hash. Use this vector to test the raw hash/sign pipeline only, never as an example of a valid wire price. Field order from serde struct order: type, orders, grouping (builder omitted when None); order: a, b, p, s, r, t (c omitted when None)."
+  },
+  {
+    "name": "rs/test_limit_order_action_hashing/testnet",
+    "source_url": "https://github.com/hyperliquid-dex/hyperliquid-rust-sdk/blob/master/src/exchange/exchange_client.rs",
+    "source_commit": "aac75585daf12d0a3761126cc7da7a5e035b5853",
+    "network": "testnet",
+    "kind": "l1",
+    "private_key": "e908f86dbb4d55ac876378565aafeabc187f6690f046459397b17d9b9a19688e",
+    "action": {
+      "type": "order",
+      "orders": [
+        {
+          "a": 1,
+          "b": true,
+          "p": "2000.0",
+          "s": "3.5",
+          "r": false,
+          "t": { "limit": { "tif": "Ioc" } }
+        }
+      ],
+      "grouping": "na"
+    },
+    "nonce": 1583838,
+    "vault_address": null,
+    "expires_after": null,
+    "expected": {
+      "signature_hex": "0xcd0925372ff1ed499e54883e9a6205ecfadec748f80ec463fe2f84f1209648776377961965cb7b12414186b1ea291e95fd512722427efcbcfb3b0b2bcd4d79d01c"
+    },
+    "notes": "See mainnet twin: p '2000.0' is un-normalized in the source."
+  },
+  {
+    "name": "rs/test_limit_order_action_hashing_with_cloid/mainnet",
+    "source_url": "https://github.com/hyperliquid-dex/hyperliquid-rust-sdk/blob/master/src/exchange/exchange_client.rs",
+    "source_commit": "aac75585daf12d0a3761126cc7da7a5e035b5853",
+    "network": "mainnet",
+    "kind": "l1",
+    "private_key": "e908f86dbb4d55ac876378565aafeabc187f6690f046459397b17d9b9a19688e",
+    "action": {
+      "type": "order",
+      "orders": [
+        {
+          "a": 1,
+          "b": true,
+          "p": "2000.0",
+          "s": "3.5",
+          "r": false,
+          "t": { "limit": { "tif": "Ioc" } },
+          "c": "0x1e60610f0b3d420597c88c1fed2ad5ee"
+        }
+      ],
+      "grouping": "na"
+    },
+    "nonce": 1583838,
+    "vault_address": null,
+    "expires_after": null,
+    "expected": {
+      "signature_hex": "0xd3e894092eb27098077145714630a77bbe3836120ee29df7d935d8510b03a08f456de5ec1be82aa65fc6ecda9ef928b0445e212517a98858cfaa251c4cd7552b1c"
+    },
+    "notes": "Source cloid is uuid '1e60610f-0b3d-4205-97c8-8c1fed2ad5ee' passed through uuid_to_hex_string (helpers.rs): '0x' + lowercase hex of the 16 uuid bytes = the dashes removed. p '2000.0' un-normalized as in the sibling vectors."
+  },
+  {
+    "name": "rs/test_limit_order_action_hashing_with_cloid/testnet",
+    "source_url": "https://github.com/hyperliquid-dex/hyperliquid-rust-sdk/blob/master/src/exchange/exchange_client.rs",
+    "source_commit": "aac75585daf12d0a3761126cc7da7a5e035b5853",
+    "network": "testnet",
+    "kind": "l1",
+    "private_key": "e908f86dbb4d55ac876378565aafeabc187f6690f046459397b17d9b9a19688e",
+    "action": {
+      "type": "order",
+      "orders": [
+        {
+          "a": 1,
+          "b": true,
+          "p": "2000.0",
+          "s": "3.5",
+          "r": false,
+          "t": { "limit": { "tif": "Ioc" } },
+          "c": "0x1e60610f0b3d420597c88c1fed2ad5ee"
+        }
+      ],
+      "grouping": "na"
+    },
+    "nonce": 1583838,
+    "vault_address": null,
+    "expires_after": null,
+    "expected": {
+      "signature_hex": "0x3768349dbb22a7fd770fc9fc50c7b5124a7da342ea579b309f58002ceae49b4357badc7909770919c45d850aabb08474ff2b7b3204ae5b66d9f7375582981f111c"
+    }
+  },
+  {
+    "name": "rs/test_tpsl_order_action_hashing/tp/mainnet",
+    "source_url": "https://github.com/hyperliquid-dex/hyperliquid-rust-sdk/blob/master/src/exchange/exchange_client.rs",
+    "source_commit": "aac75585daf12d0a3761126cc7da7a5e035b5853",
+    "network": "mainnet",
+    "kind": "l1",
+    "private_key": "e908f86dbb4d55ac876378565aafeabc187f6690f046459397b17d9b9a19688e",
+    "action": {
+      "type": "order",
+      "orders": [
+        {
+          "a": 1,
+          "b": true,
+          "p": "2000.0",
+          "s": "3.5",
+          "r": false,
+          "t": { "trigger": { "isMarket": true, "triggerPx": "2000.0", "tpsl": "tp" } }
+        }
+      ],
+      "grouping": "na"
+    },
+    "nonce": 1583838,
+    "vault_address": null,
+    "expires_after": null,
+    "expected": {
+      "signature_hex": "0xb91e5011dff15e4b4a40753730bda44972132e7b75641f3cac58b66159534a170d422ee1ac3c7a7a2e11e298108a2d6b8da8612caceaeeb3e571de3b2dfda9e41b"
+    },
+    "notes": "Trigger struct field order (order.rs): isMarket, triggerPx, tpsl. Both p and triggerPx are the un-normalized literal '2000.0' in the source."
+  },
+  {
+    "name": "rs/test_tpsl_order_action_hashing/tp/testnet",
+    "source_url": "https://github.com/hyperliquid-dex/hyperliquid-rust-sdk/blob/master/src/exchange/exchange_client.rs",
+    "source_commit": "aac75585daf12d0a3761126cc7da7a5e035b5853",
+    "network": "testnet",
+    "kind": "l1",
+    "private_key": "e908f86dbb4d55ac876378565aafeabc187f6690f046459397b17d9b9a19688e",
+    "action": {
+      "type": "order",
+      "orders": [
+        {
+          "a": 1,
+          "b": true,
+          "p": "2000.0",
+          "s": "3.5",
+          "r": false,
+          "t": { "trigger": { "isMarket": true, "triggerPx": "2000.0", "tpsl": "tp" } }
+        }
+      ],
+      "grouping": "na"
+    },
+    "nonce": 1583838,
+    "vault_address": null,
+    "expires_after": null,
+    "expected": {
+      "signature_hex": "0x6df38b609904d0d4439884756b8f366f22b3a081801dbdd23f279094a2299fac6424cb0cdc48c3706aeaa368f81959e91059205403d3afd23a55983f710aee871b"
+    }
+  },
+  {
+    "name": "rs/test_tpsl_order_action_hashing/sl/mainnet",
+    "source_url": "https://github.com/hyperliquid-dex/hyperliquid-rust-sdk/blob/master/src/exchange/exchange_client.rs",
+    "source_commit": "aac75585daf12d0a3761126cc7da7a5e035b5853",
+    "network": "mainnet",
+    "kind": "l1",
+    "private_key": "e908f86dbb4d55ac876378565aafeabc187f6690f046459397b17d9b9a19688e",
+    "action": {
+      "type": "order",
+      "orders": [
+        {
+          "a": 1,
+          "b": true,
+          "p": "2000.0",
+          "s": "3.5",
+          "r": false,
+          "t": { "trigger": { "isMarket": true, "triggerPx": "2000.0", "tpsl": "sl" } }
+        }
+      ],
+      "grouping": "na"
+    },
+    "nonce": 1583838,
+    "vault_address": null,
+    "expires_after": null,
+    "expected": {
+      "signature_hex": "0x8456d2ace666fce1bee1084b00e9620fb20e810368841e9d4dd80eb29014611a0843416e51b1529c22dd2fc28f7ff8f6443875635c72011f60b62cbb8ce90e2d1c"
+    }
+  },
+  {
+    "name": "rs/test_tpsl_order_action_hashing/sl/testnet",
+    "source_url": "https://github.com/hyperliquid-dex/hyperliquid-rust-sdk/blob/master/src/exchange/exchange_client.rs",
+    "source_commit": "aac75585daf12d0a3761126cc7da7a5e035b5853",
+    "network": "testnet",
+    "kind": "l1",
+    "private_key": "e908f86dbb4d55ac876378565aafeabc187f6690f046459397b17d9b9a19688e",
+    "action": {
+      "type": "order",
+      "orders": [
+        {
+          "a": 1,
+          "b": true,
+          "p": "2000.0",
+          "s": "3.5",
+          "r": false,
+          "t": { "trigger": { "isMarket": true, "triggerPx": "2000.0", "tpsl": "sl" } }
+        }
+      ],
+      "grouping": "na"
+    },
+    "nonce": 1583838,
+    "vault_address": null,
+    "expires_after": null,
+    "expected": {
+      "signature_hex": "0xeb5bdb52297c1d19da45458758bd569dcb24c07e5c7bd52cf76600fd92fdd8213e661e21899c985421ec018a9ee7f3790e7b7d723a9932b7b5adcd7def5354601c"
+    }
+  },
+  {
+    "name": "rs/test_cancel_action_hashing/mainnet",
+    "source_url": "https://github.com/hyperliquid-dex/hyperliquid-rust-sdk/blob/master/src/exchange/exchange_client.rs",
+    "source_commit": "aac75585daf12d0a3761126cc7da7a5e035b5853",
+    "network": "mainnet",
+    "kind": "l1",
+    "private_key": "e908f86dbb4d55ac876378565aafeabc187f6690f046459397b17d9b9a19688e",
+    "action": { "type": "cancel", "cancels": [ { "a": 1, "o": 82382 } ] },
+    "nonce": 1583838,
+    "vault_address": null,
+    "expires_after": null,
+    "expected": {
+      "signature_hex": "0x02f76cc5b16e0810152fa0e14e7b219f49c361e3325f771544c6f54e157bf9fa17ed0afc11a98596be85d5cd9f86600aad515337318f7ab346e5ccc1b03425d51b"
+    },
+    "notes": "CancelRequest serde renames (cancel.rs): asset -> 'a', oid -> 'o'. No 'f' (fast) key: the docs say f must be omitted when false."
+  },
+  {
+    "name": "rs/test_cancel_action_hashing/testnet",
+    "source_url": "https://github.com/hyperliquid-dex/hyperliquid-rust-sdk/blob/master/src/exchange/exchange_client.rs",
+    "source_commit": "aac75585daf12d0a3761126cc7da7a5e035b5853",
+    "network": "testnet",
+    "kind": "l1",
+    "private_key": "e908f86dbb4d55ac876378565aafeabc187f6690f046459397b17d9b9a19688e",
+    "action": { "type": "cancel", "cancels": [ { "a": 1, "o": 82382 } ] },
+    "nonce": 1583838,
+    "vault_address": null,
+    "expires_after": null,
+    "expected": {
+      "signature_hex": "0x6ffebadfd48067663390962539fbde76cfa36f53be65abe2ab72c9db6d0db44457720db9d7c4860f142a484f070c84eb4b9694c3a617c83f0d698a27e55fd5e01c"
+    }
+  },
+  {
+    "name": "rs/test_approve_builder_fee_signing/mainnet",
+    "source_url": "https://github.com/hyperliquid-dex/hyperliquid-rust-sdk/blob/master/src/exchange/exchange_client.rs",
+    "source_commit": "aac75585daf12d0a3761126cc7da7a5e035b5853",
+    "network": "mainnet",
+    "kind": "user",
+    "private_key": "e908f86dbb4d55ac876378565aafeabc187f6690f046459397b17d9b9a19688e",
+    "action": {
+      "type": "approveBuilderFee",
+      "signatureChainId": "0x66eee",
+      "hyperliquidChain": "Mainnet",
+      "builder": "0x1234567890123456789012345678901234567890",
+      "maxFeeRate": "0.001%",
+      "nonce": 1583838
+    },
+    "nonce": 1583838,
+    "vault_address": null,
+    "expires_after": null,
+    "primary_type": "HyperliquidTransaction:ApproveBuilderFee",
+    "eip712_types": [
+      { "name": "hyperliquidChain", "type": "string" },
+      { "name": "maxFeeRate", "type": "string" },
+      { "name": "builder", "type": "address" },
+      { "name": "nonce", "type": "uint64" }
+    ],
+    "expected": {
+      "signature_hex": "0x343c9078af7c3d6683abefd0ca3b2960de5b669b716863e6dc49090853a4a3cd6c016301239461091a8ca3ea5ac783362526c4d9e9e624ffc563aea93d6ac2391b"
+    },
+    "notes": "Source: ApproveBuilderFee { signature_chain_id: 421614, hyperliquid_chain: 'Mainnet', builder: address!('0x1234567890123456789012345678901234567890'), max_fee_rate: '0.001%', nonce: 1583838 }. Note hyperliquidChain 'Mainnet' is combined with signatureChainId 0x66eee (Arbitrum Sepolia): the SDKs treat signatureChainId as the wallet's signing chain, independent of the Hyperliquid network. builder is an EIP-712 `address` (abi-encoded 20 bytes), so its text case does not matter."
+  },
+  {
+    "name": "rs/test_approve_builder_fee_signing/testnet",
+    "source_url": "https://github.com/hyperliquid-dex/hyperliquid-rust-sdk/blob/master/src/exchange/exchange_client.rs",
+    "source_commit": "aac75585daf12d0a3761126cc7da7a5e035b5853",
+    "network": "testnet",
+    "kind": "user",
+    "private_key": "e908f86dbb4d55ac876378565aafeabc187f6690f046459397b17d9b9a19688e",
+    "action": {
+      "type": "approveBuilderFee",
+      "signatureChainId": "0x66eee",
+      "hyperliquidChain": "Testnet",
+      "builder": "0x1234567890123456789012345678901234567890",
+      "maxFeeRate": "0.001%",
+      "nonce": 1583838
+    },
+    "nonce": 1583838,
+    "vault_address": null,
+    "expires_after": null,
+    "primary_type": "HyperliquidTransaction:ApproveBuilderFee",
+    "eip712_types": [
+      { "name": "hyperliquidChain", "type": "string" },
+      { "name": "maxFeeRate", "type": "string" },
+      { "name": "builder", "type": "address" },
+      { "name": "nonce", "type": "uint64" }
+    ],
+    "expected": {
+      "signature_hex": "0x2ada43eeebeba9cfe13faf95aa84e5b8c4885c3a07cbf4536f2df5edd340d4eb1ed0e24f60a80d199a842258d5fa737a18d486f7d4e656268b434d226f2811d71c"
+    }
+  },
+  {
+    "name": "rs/test_approve_builder_fee_hash",
+    "source_url": "https://github.com/hyperliquid-dex/hyperliquid-rust-sdk/blob/master/src/exchange/exchange_client.rs",
+    "source_commit": "aac75585daf12d0a3761126cc7da7a5e035b5853",
+    "network": "mainnet",
+    "kind": "l1",
+    "private_key": null,
+    "action": {
+      "type": "approveBuilderFee",
+      "signatureChainId": "0x66eee",
+      "hyperliquidChain": "Mainnet",
+      "builder": "0x1234567890123456789012345678901234567890",
+      "maxFeeRate": "0.001%",
+      "nonce": 1583838
+    },
+    "nonce": 1583838,
+    "vault_address": null,
+    "expires_after": null,
+    "expected": {
+      "action_hash": "0xbe889a23135fce39a37315424cc4ae910edea7b42a075457b15bf4a9f0a8cfa4"
+    },
+    "notes": "CAUTION - non-standard encoding. This is Actions::ApproveBuilderFee(..).hash(1583838, None) from the rust SDK, i.e. keccak(rmp_serde::to_vec_named(struct) || nonce_be64 || 0x00). rmp_serde's default config is NOT human-readable (rmp-serde config.rs DefaultConfig::is_human_readable -> false), and alloy's FixedBytes/Address serializes as raw bytes in that mode (alloy-rs/core crates/primitives/src/bits/serde.rs), so `builder` is a msgpack bin8 of 20 raw bytes here, NOT the string '0x1234...7890'. Map key order: type, signatureChainId, hyperliquidChain, builder, maxFeeRate, nonce. The python SDK msgpacks addresses as lowercase strings; this vector therefore does NOT match a string-address encoding and is included only to pin the msgpack||nonce||0x00||keccak pipeline. approveBuilderFee is a user-signed action in practice and is never L1-hashed for submission."
+  },
+  {
+    "name": "rs/test_claim_rewards_action_hashing/mainnet",
+    "source_url": "https://github.com/hyperliquid-dex/hyperliquid-rust-sdk/blob/master/src/exchange/exchange_client.rs",
+    "source_commit": "aac75585daf12d0a3761126cc7da7a5e035b5853",
+    "network": "mainnet",
+    "kind": "l1",
+    "private_key": "e908f86dbb4d55ac876378565aafeabc187f6690f046459397b17d9b9a19688e",
+    "action": { "type": "claimRewards" },
+    "nonce": 1583838,
+    "vault_address": null,
+    "expires_after": null,
+    "expected": {
+      "signature_hex": "0xe13542800ba5ec821153401e1cafac484d1f861adbbb86c00b580ec2560c153248b8d9f0e004ecc86959c07d44b591861ebab2167b54651a81367e2c3d472d4e1c"
+    },
+    "notes": "ClaimRewards is a unit struct under #[serde(tag = \"type\")]; serialized as a one-entry map {type: 'claimRewards'}."
+  },
+  {
+    "name": "rs/test_claim_rewards_action_hashing/testnet",
+    "source_url": "https://github.com/hyperliquid-dex/hyperliquid-rust-sdk/blob/master/src/exchange/exchange_client.rs",
+    "source_commit": "aac75585daf12d0a3761126cc7da7a5e035b5853",
+    "network": "testnet",
+    "kind": "l1",
+    "private_key": "e908f86dbb4d55ac876378565aafeabc187f6690f046459397b17d9b9a19688e",
+    "action": { "type": "claimRewards" },
+    "nonce": 1583838,
+    "vault_address": null,
+    "expires_after": null,
+    "expected": {
+      "signature_hex": "0x16de9b346ddd8e200492a2db45ec9104dcdfc7fbfdbcd85890a6063bdd56df2c44846714c261a431de7095ad52e07143346eb26d9e66c6aed4674f120a1048131c"
+    }
+  }
+]
