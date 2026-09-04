@@ -120,7 +120,7 @@ What N does change is the user's side of the line, and it belongs here rather th
 `get_events`, the live activity stream and the audit log are the same append-only SQLite ledger. Monotonic rowid is the agent cursor; the stream renders from it; export dumps it; rows are hash-chained.
 
 ### D7 · Builder code default-on in official builds
-Hard enforcement is impossible (open source, and the protocol requires a user-signed fee approval with a cap). So: default-on via `OPPEN_BUILDER_ADDRESS`, transparent in README and onboarding, small fee, trademark keeps forks from shipping as "oppen". Apache-2.0 with a CLA.
+Hard enforcement is impossible (open source, and the protocol requires a user-signed fee approval with a cap). So: default-on via `OPPEN_BUILDER_ADDRESS`, transparent in README and onboarding, small fee, trademark keeps forks from shipping as "oppen". Open core with a CLA — the fee constant lives in `oppen-hl`, which is Apache-2.0, so this stays true under L1 and is not an argument for closing the core. [decisions.md](decisions.md) L5 sizes the leak this concedes.
 
 ### D8 · Two screens plus a drawer
 **Watch** (activity stream + annotated chart) and **Control** (roster + risk console + approval queue), with the manual escape hatch as a drawer. The stream is the heart of the app. The shipped design expands this to five tabs (Trade, Agents, Builder, Portfolio, Settings); Trade ≈ Watch + drawer, Agents ≈ Control.

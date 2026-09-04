@@ -377,10 +377,32 @@ See [docs/spec.md](docs/spec.md) decision D7.
 
 ## License
 
-[Apache-2.0](LICENSE), with a [CLA](CLA.md) for contributions. Third-party
-attributions in [NOTICE](NOTICE).
+Open core. The line is the one [docs/threat-model.md](docs/threat-model.md)
+already draws, not a commercial one:
 
-"oppen" is a trademark. The code may be forked and modified freely; forks may not
+| | Licence | What it is |
+|---|---|---|
+| `crates/oppen-hl`, `crates/oppen-core`, `crates/oppen-mcp` | [Apache-2.0](LICENSE) | Signing, guardrails, the ledger, the MCP surface — the code that carries every safety claim |
+| `apps/desktop` | [Commercial Source](apps/desktop/LICENSE) | The Tauri shell, the operator console, the quant layer, the workflow engine — source published and readable, not open source |
+
+The core is open because its claims are claims about an *absence*: exactly one
+code path to the signer, no private key in TypeScript, no agent-reachable path to
+the guardrails, no account-owner key in the app. You cannot observe an absence
+from outside a binary, so a closed core would reduce all four to *trust us* — the
+posture this project exists to replace. Everything above the core renders and
+does not sign, carries no such claim, and is licensed accordingly. The source of
+both halves is published; only the core may be redistributed.
+
+The commercial licence does not restrict trading: build it, run it, trade it for
+profit, on your own account or your firm's, with no separate agreement. What it
+reserves is redistribution and resale. Reasoning, and the two alternatives that
+were rejected, are decisions L1–L7 in [docs/decisions.md](docs/decisions.md).
+
+Contributions to either half are under the [CLA](CLA.md), which already licenses
+them "under any license" and so needs no amendment. Third-party attributions in
+[NOTICE](NOTICE). Source opens Q4 2026 for the Apache-2.0 crates (L6).
+
+"oppen" is a trademark. The core may be forked and modified freely; forks may not
 ship under the oppen name. The safety claims here are claims about a particular
 build with particular invariants — a fork that removes the guardrail check and
 keeps the name would be a security problem for users, not merely a branding one.

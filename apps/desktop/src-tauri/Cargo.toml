@@ -3,7 +3,9 @@ name = "oppen-desktop"
 description = "oppen desktop shell: Tauri 2 host for the operator console and the in-process trading core"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
+# Not `license.workspace`: the shell is above the trusted computing base and is
+# commercial, not Apache-2.0. Decisions L1 and L2 in docs/decisions.md.
+license-file = "../LICENSE"
 repository.workspace = true
 rust-version.workspace = true
 publish = false

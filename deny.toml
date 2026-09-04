@@ -45,6 +45,12 @@ allow = [
   "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.9
+# `oppen-desktop` is `publish = false` and carries the oppen Commercial Source
+# Licence (apps/desktop/LICENSE), which has no SPDX identifier — decisions L1
+# and L2. This list is about third-party dependencies; skipping unpublished
+# workspace members keeps it that way rather than inventing a LicenseRef for a
+# crate that is never published.
+private = { ignore = true }
 
 [bans]
 multiple-versions = "warn"
