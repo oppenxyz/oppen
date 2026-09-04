@@ -30,41 +30,106 @@ Account 1: `0xBF829199c1AE7f0Caf21FB6FC45e10EdFf25B7D2`
 
 ## 0. Where you actually are
 
-Verified against the live venue on 2026-09-04. Start here; steps 1–3 assume
-exactly this state.
+Verified against the live venue on 2026-09-04, on both networks.
 
 | | Testnet | Mainnet |
 |---|---|---|
-| Spot USDC | 999 mock | 29.699177 |
-| Perps USDC | 0.0 | 0.0 |
+| Spot USDC | 999.0 mock | 29.699177 |
+| `clearinghouseState.marginSummary.accountValue` | 0.0 | 0.0 |
+| `webData2.cumLedger` | 999.0 | 29.69 |
+| Available to Trade, perps ticket | 999.00 USDC | 29.70 USDC |
 | `userRole` | `user` | `user` |
 | Sub-accounts | 0 | 0 |
-| API (agent) wallets | 0 | 0 |
+| API (agent) wallets | **1 already approved** | **1 already approved** |
 
-Two things this table settles:
+Three things this table settles, and the first two reverse what the 2026-09-03
+version of this file told you to do.
 
+- **Hyperliquid margin is unified. There is no spot-to-perps transfer to make.**
+  The perps order ticket carries a `Cross | 20x | Unified` control and reads
+  `Available to Trade 999.00 USDC` against a spot balance of 999 and a perps
+  `accountValue` of 0.0. The spot USDC *is* the perps collateral.
+- **`accountValue` is therefore not the balance.** It reads 0.0 on an account
+  with 999 USDC of buying power, on both networks. Anything that gates on it —
+  ours included — reports a funded account as empty. `webData2.cumLedger` and
+  `portfolio`'s `accountValueHistory` both return the real figure; the perps
+  ticket agrees with them. This is tracked as a bug against oppen's equity read,
+  not a venue problem.
 - **The faucet is already claimed.** It pays 1,000 mock USDC and only pays an
   address that has previously deposited on mainnet; the 29.699177 USDC mainnet
   deposit is what satisfied that, and it is why `userRole` reads `user` rather
   than `missing`. You do not need to claim anything again.
-- **Nothing below works yet**, because the perps balance is 0.0. Step 1 is not
-  optional and not reorderable.
 
-## 1. Move the testnet spot balance to perps
+## 1. Nothing to move
 
-In the web UI: the transfer control between the Spot and Perps balances. Move
-the whole 999 — v1 trades perps only, and spot has no role until v2
-(`ROADMAP.md`, v2+: "Vaults and spot").
+This step used to say "move the testnet spot balance to perps" and it was wrong.
+Under unified margin the balance is already collateral, `usdClassTransfer` is not
+part of provisioning, and the perps ticket will let you place an order against
+the spot 999 as it stands.
 
-On the wire this is `usdClassTransfer` with `toPerp: true`, a **user-signed**
-EIP-712 action, not an L1 action ([hl-signing.md](../hl-signing.md) §1 and §3.2).
-MetaMask signs a typed message; there is no chain transaction and no gas.
+`usdClassTransfer` with `toPerp: true` is still a real user-signed action
+([hl-signing.md](../hl-signing.md) §1 and §3.2) and oppen still implements it. It
+is simply not a precondition for trading.
 
-Confirm the perps balance reads ~999 before continuing.
+> If you went looking for that transfer in the UI and hit
+> `Insufficient USDC or HYPE balance for token transfer gas.`, that is the **spot
+> send** control, not a class transfer. Spot sends charge gas in the token being
+> sent or in HYPE; class transfers charge nothing because no chain transaction
+> exists. The error was telling you that you were on the wrong control, and the
+> right answer was that neither control was needed.
 
 ## 2. One API wallet on account 1, then the P1 gate
 
-More → API. Generate one wallet, name it, sign the approval in MetaMask.
+**Before you start: there is already an agent on this account.** `webData2`
+reports one on both networks, created by the Hyperliquid web app for its own
+order flow:
+
+| Network | `agentAddress` | `agentValidUntil` |
+|---|---|---|
+| Testnet | `0x7d6707a343e712a79cebced9e843c50d2978e82a` | 2026-09-18T11:57:33Z |
+| Mainnet | `0x010a99f82d04b3ecaa3504b75b4a4c49db5c20ec` | 2026-09-18T11:57:57Z |
+
+Either one *would* satisfy the P1 gate, and its private key is in the browser,
+under the `localStorage` key `hyperliquid_agent_<your address>` on the matching
+Hyperliquid origin. Do not use it for oppen. It is the web app's wallet: it is
+unnamed, it expires in about two weeks rather than on oppen's 90-day schedule,
+and reusing it means oppen and the web app share a nonce space, which is exactly
+what spec item 7's nonce isolation exists to prevent. Create your own below.
+
+**The ceremony, in order.** More → API.
+
+1. Type the name into the name box.
+2. Click **Generate**. This fills the API wallet *address* only. It does not
+   authorize anything and it does not touch your wallet.
+3. Click **Authorize API Wallet**. A modal opens.
+4. The modal has a required **Days Valid** field with a `MAX` link beside it.
+   It starts empty and the flow will not complete until you fill it. `MAX` is
+   180; oppen's default is 90 (D-b).
+5. The private key appears once, in a red box. Copy it to your password manager
+   now.
+6. Click **Authorize** and sign in MetaMask.
+
+> **If Authorize appears to do nothing, the button is not the problem.** Verified
+> on 2026-09-04: the button carries no `disabled` attribute, `pointer-events` is
+> `auto` and the click lands. What fails is the wallet call behind it. In the
+> observed case `wallet_getPermissions` returned `[]` and `eth_accounts` returned
+> `[]` for `app.hyperliquid-testnet.xyz` while MetaMask was unlocked — the site
+> had no account permission at all, and was showing the address from its own
+> cache. The console says so at page load:
+>
+> ```
+> Wallet did not respond to eth_accounts. Defaulting to prefetched accounts.
+> Must call 'eth_requestAccounts' before other methods
+> ```
+>
+> Every signature request then throws immediately and the page swallows it. A
+> second symptom stacks on top: once one permission request is queued, MetaMask
+> answers the next with `Request of type 'wallet_requestPermissions' already
+> pending for origin ... Please wait.` and opens nothing. Fix it by clearing the
+> pending MetaMask notification, then reconnecting the site to the account —
+> after which `wallet_getPermissions` returns a non-empty array. Check that
+> before re-reading any of oppen's signing code.
+
 
 | Name | Signs for | Purpose |
 |---|---|---|
@@ -84,15 +149,15 @@ Three rules that come from the protocol, not from taste:
   approved wallet and up to 3 named ones. And additional 2 named agents are
   allowed per subaccount." With zero sub-accounts that is 3 named wallets on
   account 1 — enough to hold an old and a new wallet live during a rotation.
-- **Expiry is encoded in the name.** Same source: "A custom expiration can be set
-  by appending `valid_until {timestamp}` after the name. The expiration can be at
-  most 180 days in the future." Decision D-b sets oppen's default at 90 days,
-  warned from 14, so from 2026-09-04 the name is
-  `oppen-alpha-2026q4 valid_until 1796256000000` (2026-12-03T00:00:00Z).
-  *Not confirmed:* whether the web UI's name box passes that suffix through
-  unaltered. Read the expiry back off the resulting agent; if the UI does not
-  take it, the wallet is a no-expiry wallet — record the creation date and
-  rotate on the calendar instead.
+- **Expiry is set in the modal, not in the name.** DOC-EXCH documents a name
+  suffix: "A custom expiration can be set by appending `valid_until {timestamp}`
+  after the name. The expiration can be at most 180 days in the future." The web
+  UI does not need it — the authorize modal has its own **Days Valid** field,
+  capped at the same 180, and that is what you fill. An earlier version of this
+  file said it was unconfirmed whether the name box passed the suffix through;
+  the question is moot in the UI. Keep the suffix in mind only for agents oppen
+  approves programmatically. Decision D-b sets oppen's default at 90 days,
+  warned from 14.
 
 Then run the gate:
 
@@ -113,7 +178,11 @@ Expected, line by line:
 
 - `agent 0x…` equals the API wallet address shown in the app. If not, the key
   was pasted wrong.
-- `equity …` is non-zero. If it reads 0, step 1 did not land.
+- `equity …` — **expect 0 today, and that is not a failure.** It is read from
+  `clearinghouseState.marginSummary.accountValue`, which reports 0.0 on a funded
+  unified account (§0). Judge funding by `webData2.cumLedger` or the perps
+  ticket, not by this line. Once oppen's equity read is fixed this line becomes
+  meaningful again.
 - `place [Resting { oid: … }]`
 - `status open oid=… cloid=Some(…)`
 - `cancel [Success]`
@@ -365,6 +434,9 @@ stated it. If it is windowed, an interrupted run can decay.
 | `OPPEN_TESTNET_VAULT` set to the sub-account address for P2 | Unset | There is no sub-account to route through |
 | A `manual` sub-account so no operator key sits on the master | The manual ticket signs from the account it is intervening in | An API wallet cannot sign for an unrelated top-level account, so a single operator signer no longer exists |
 | A `spare` sub-account as a rotation target | A second named agent wallet on the same account | Rotation is a new wallet, not a new account. Three named slots is enough for an overlap |
+| Step 1: move the spot balance to perps with `usdClassTransfer` | Nothing to move | Hyperliquid margin is unified. The perps ticket shows `Available to Trade 999.00 USDC` against a spot 999 and a perps `accountValue` of 0.0 |
+| "`equity` is non-zero; if it reads 0, step 1 did not land" | Expect 0; judge funding by `webData2.cumLedger` | `accountValue` reads 0.0 on a funded unified account, on both networks |
+| Step 2 was three sentences, with the `valid_until` name suffix flagged unconfirmed | Six numbered steps, including the required **Days Valid** field | The authorize modal has its own expiry field, so the suffix is moot in the UI |
 
 ### Corrected later the same day
 
