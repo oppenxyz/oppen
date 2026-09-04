@@ -6,7 +6,7 @@ use std::collections::HashMap;
 
 use rust_decimal::Decimal;
 
-use crate::types::{AssetInfo, Meta};
+use crate::types::{AssetCtx, AssetInfo, Meta};
 
 /// Perp prices: 5 significant figures and at most `6 - szDecimals`
 /// decimals. Spot would be 8; v1 is perps only.
@@ -53,6 +53,30 @@ impl Asset {
 
     pub fn max_price_decimals(&self) -> u32 {
         PERP_MAX_DECIMALS.saturating_sub(self.info.sz_decimals)
+    }
+
+    /// Whether this asset can be traded right now, judged by the only
+    /// invariant the live API supports: it has a book.
+    ///
+    /// `docs/specs/fair-value.md` §14.4 correction 2 — the invariant is
+    /// `ctx.openInterest == 0` for "has no book", holding on 233/233 mainnet
+    /// assets on 2026-09-03. **It is not `isDelisted`.** Testnet PURR carries
+    /// no `isDelisted` flag, zero open interest and `premium`/`midPx`/
+    /// `impactPxs` all `null`; a caller gated on `isDelisted` would treat it
+    /// as live and build components from nothing. The two agree on mainnet
+    /// today (56 delisted, the same 56 nulled), which is exactly why a test
+    /// written against mainnet alone would not catch the difference.
+    ///
+    /// `isDelisted` remains a separate, stronger fact — the venue will refuse
+    /// the order outright — and [`Asset::validate_order`] still rejects on it.
+    /// This method answers a different question: whether a price can be
+    /// formed at all.
+    ///
+    /// The `ctx` must be the one at this asset's index; see
+    /// [`crate::types::MetaAndAssetCtxs::iter`], which pairs them and
+    /// preserves the on-chain asset id.
+    pub fn is_tradable(&self, ctx: &AssetCtx) -> bool {
+        ctx.has_book()
     }
 
     /// The SDK's market-order price: 5 significant figures, then at most
@@ -141,6 +165,14 @@ pub struct Universe {
 }
 
 impl Universe {
+    /// Every entry is kept, including delisted and bookless assets.
+    ///
+    /// The universe array is **never compacted**: a position in it is the
+    /// on-chain asset id (`docs/spec.md` item 8,
+    /// `docs/specs/fair-value.md` §14.4 correction 2). Dropping the 56
+    /// bookless mainnet assets here would renumber every asset after the
+    /// first one dropped and send orders to the wrong instrument. Filter at
+    /// the point of use with [`Asset::is_tradable`].
     pub fn from_meta(meta: &Meta) -> Self {
         let by_name = meta
             .universe
@@ -173,6 +205,10 @@ impl Universe {
         self.by_name.is_empty()
     }
 
+    /// Iteration order is the map's and therefore unspecified. Anything
+    /// hashed, serialized or rendered in a fixed order must iterate
+    /// [`crate::types::MetaAndAssetCtxs::iter`] instead, which walks the
+    /// response's own universe order (`AGENTS.md`, determinism).
     pub fn iter(&self) -> impl Iterator<Item = &Asset> {
         self.by_name.values()
     }
@@ -271,5 +307,83 @@ mod tests {
             u.get("NOPE"),
             Err(ValidationError::UnknownAsset(_))
         ));
+    }
+
+    /// Testnet PURR and SAGA, captured verbatim on 2026-09-03. PURR is the
+    /// live-but-null counterexample that makes `isDelisted` the wrong
+    /// invariant (`docs/specs/fair-value.md` §14.4 correction 2); SAGA is a
+    /// second one the audit does not mention — it has open interest, volume
+    /// and a `midPx` but a `null` `premium` and `impactPxs`.
+    const TESTNET_PURR: &str = r#"{"info":{"szDecimals":0,"name":"PURR","maxLeverage":3,"marginTableId":3,"onlyIsolated":true,"marginMode":"strictIsolated"},"ctx":{"funding":"0.0","openInterest":"0.0","prevDayPx":"2.0","dayNtlVlm":"0.0","premium":null,"oraclePx":"4.60235","markPx":"2.0","midPx":null,"impactPxs":null,"dayBaseVlm":"0.0"}}"#;
+    const TESTNET_SAGA: &str = r#"{"info":{"szDecimals":1,"name":"SAGA","maxLeverage":3,"marginTableId":3},"ctx":{"funding":"0.0","openInterest":"1146084.0","prevDayPx":"0.01518","dayNtlVlm":"38000.72228","premium":null,"oraclePx":"0.01482","markPx":"0.01483","midPx":"0.01513","impactPxs":null,"dayBaseVlm":"2496048.2999999998"}}"#;
+
+    #[derive(serde::Deserialize)]
+    struct Pair {
+        info: AssetInfo,
+        ctx: crate::types::AssetCtx,
+    }
+
+    fn pair(json: &str) -> (Asset, crate::types::AssetCtx) {
+        let p: Pair = serde_json::from_str(json).unwrap();
+        (
+            Asset {
+                index: 0,
+                info: p.info,
+            },
+            p.ctx,
+        )
+    }
+
+    /// The invariant is open interest, not `isDelisted`.
+    #[test]
+    fn tradability_is_open_interest_not_is_delisted() {
+        let (purr, ctx) = pair(TESTNET_PURR);
+        assert!(!purr.info.is_delisted, "PURR carries no isDelisted flag");
+        assert!(
+            !purr.is_tradable(&ctx),
+            "zero open interest means no book, whatever isDelisted says"
+        );
+        assert_eq!(ctx.premium, None);
+        assert_eq!(ctx.mid_px_no_fallback(), None);
+
+        // A delisted asset with the same zero open interest agrees.
+        let mut gone = asset(2);
+        gone.info.is_delisted = true;
+        assert!(!gone.is_tradable(&ctx));
+
+        // And a real book makes a live asset tradable.
+        let btc = asset(5);
+        let live: crate::types::AssetCtx = serde_json::from_str(
+            r#"{"funding":"0.0000052764","openInterest":"36295.80812","prevDayPx":"77759.0","dayNtlVlm":"4490636711.43","premium":"-0.0005540084","oraclePx":"80684.7","markPx":"80639.0","midPx":"80639.5","impactPxs":["80635.5","80640.0"]}"#,
+        )
+        .unwrap();
+        assert!(btc.is_tradable(&live));
+    }
+
+    /// The three nullable fields are not co-null in practice: SAGA has open
+    /// interest and a mid while `impactPxs` is `null`, so "has a book" does
+    /// not imply the §3.1 premium inputs exist.
+    #[test]
+    fn a_book_does_not_guarantee_impact_prices() {
+        let (saga, ctx) = pair(TESTNET_SAGA);
+        assert!(saga.is_tradable(&ctx), "SAGA has 1,146,084 open interest");
+        assert!(ctx.mid_px_no_fallback().is_some());
+        assert_eq!(ctx.premium, None);
+        assert_eq!(ctx.impact_pxs, None, "carry is unconstructible here");
+    }
+
+    /// Filtering must never renumber: the asset id is the array position.
+    #[test]
+    fn bookless_assets_keep_their_asset_id() {
+        let meta: Meta = serde_json::from_str(include_str!("../tests/fixtures/meta.json")).unwrap();
+        let u = Universe::from_meta(&meta);
+        assert_eq!(
+            u.len(),
+            meta.universe.len(),
+            "the universe is not compacted"
+        );
+        // MATIC is delisted and sits at index 3; ETH before it keeps index 2.
+        assert_eq!(u.get("ETH").unwrap().index, 2);
+        assert_eq!(u.get("MATIC").unwrap().index, 3);
     }
 }
