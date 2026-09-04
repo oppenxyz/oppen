@@ -8,6 +8,9 @@
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use oppen_core::guardrail::{AgentId, GuardrailEngine, SqliteGuardrailStore};
+use oppen_core::keys::KeychainKeyStore;
+use oppen_core::ledger::{Ledger, LedgerAuditSink};
 use oppen_mcp::Network;
 use oppen_mcp::auth::TokenStore;
 use oppen_mcp::server::{MCP_PATH, router};
@@ -29,8 +32,37 @@ fn fixture() -> (axum::Router, String) {
     let mut store = TokenStore::new();
     let issued = store.issue().expect("entropy");
     let token = issued.reveal().to_owned();
-    let gateway = Gateway::new(Network::Testnet, account()).expect("gateway");
-    (router(gateway, Arc::new(RwLock::new(store))), token)
+    (router(gateway(), Arc::new(RwLock::new(store))), token)
+}
+
+/// A gateway whose engine is backed by a throwaway database.
+///
+/// No test in this file reaches a tool, so nothing here touches the venue or
+/// signs anything; the engine only has to exist.
+fn gateway() -> Gateway {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ledger = Arc::new(
+        Ledger::open_at(&dir.path().join("testnet.db"), Network::Testnet).expect("ledger"),
+    );
+    let engine = Arc::new(
+        GuardrailEngine::new(
+            Arc::new(SqliteGuardrailStore::open(dir.path().join("guardrails.db")).expect("store")),
+            Arc::new(LedgerAuditSink::new(ledger)),
+            Arc::new(KeychainKeyStore::new(Network::Testnet)),
+            Network::Testnet,
+        )
+        .expect("engine"),
+    );
+    // The tempdir must outlive the gateway; leaking the handle is fine in a
+    // test process that is about to exit.
+    std::mem::forget(dir);
+    Gateway::new(
+        Network::Testnet,
+        account(),
+        AgentId::new("agent-alpha"),
+        engine,
+    )
+    .expect("gateway")
 }
 
 /// A syntactically valid MCP initialize call, so that anything reaching the
@@ -135,8 +167,7 @@ async fn a_revoked_pairing_is_refused_at_the_door() {
     let token = issued.reveal().to_owned();
     store.revoke(issued.id);
 
-    let gateway = Gateway::new(Network::Testnet, account()).expect("gateway");
-    let router = router(gateway, Arc::new(RwLock::new(store)));
+    let router = router(gateway(), Arc::new(RwLock::new(store)));
     let auth = format!("Bearer {token}");
     assert_eq!(
         status(router, post("127.0.0.1:7433", None, Some(&auth))).await,
