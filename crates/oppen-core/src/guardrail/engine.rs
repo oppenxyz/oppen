@@ -1,19 +1,35 @@
-//! The engine, and the type that proves it ran.
+//! The engine, the type that proves it ran, and the signing call it gates.
 //!
 //! [`Cleared`] is the whole point of the module. It has private fields, no
 //! `Clone`, no `Default`, and a constructor that is private to this file —
 //! reachable only from the success branch of [`GuardrailEngine::decide`].
-//! [`super::sign_cleared`] takes one by value.
+//! [`GuardrailEngine::sign_cleared`] takes one by value.
 //!
-//! What that buys, exactly: **a `Cleared` cannot exist unless an evaluation
-//! produced it**, and it authorises one call to `sign_cleared`. That much the
-//! compiler checks. It is not the same claim as "there is no code path to the
-//! signer without a guardrail evaluation" — `oppen_hl::ExchangeRequest`
-//! exposes `sign_unchecked`, and `AgentKey::sign_l1_action` below it, so a
-//! module that wants to sign without a clearance can. Those are named to be
-//! greppable rather than hidden, and closing them is an `oppen-hl` change (a
-//! workspace `clippy.toml` `disallowed-methods` entry); see
-//! [`super::sign_cleared`].
+//! The engine is also the gate itself: it implements
+//! [`oppen_hl::exchange::PreSignCheck`], so the evaluation runs *inside*
+//! `ExchangeRequest::sign_checked`, after the request is fully assembled and
+//! before the key is touched (`AGENTS.md` invariant 1: "checked in Rust
+//! immediately before signing").
+//!
+//! What the compiler checks, exactly:
+//!
+//! 1. **A `Cleared` cannot exist unless an evaluation produced it.** No
+//!    public constructor, no `Clone`, no `Default`.
+//! 2. **One clearance authorises one signature.** `sign_cleared` takes it by
+//!    value and `Cleared` is not `Clone`.
+//! 3. **`sign_cleared` cannot skip the gate.** It has no parameter for the
+//!    checker; it passes `self`.
+//!
+//! What it does not check: that nothing *else* signs.
+//! `oppen_hl::ExchangeRequest::sign_unchecked` and
+//! `AgentKey::sign_l1_action` are `pub`, so a module that wants to sign
+//! without a clearance can. They are named to be greppable rather than
+//! hidden, `oppen-core`'s
+//! `no_call_site_in_oppen_core_reaches_the_signer_unchecked` test fails the
+//! suite if one appears in this crate, and closing them workspace-wide is a
+//! `clippy.toml` `disallowed-methods` entry that does not exist yet. So the
+//! honest statement is: a bypass cannot happen by accident, and every
+//! deliberate one is one grep away.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -21,10 +37,11 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use rust_decimal::Decimal;
 use serde::Serialize;
 
+use oppen_hl::exchange::{PreSign, PreSignCheck, SignError};
 use oppen_hl::meta::Asset;
 use oppen_hl::order::{OrderKind, OrderSpec};
 use oppen_hl::wire::{BuilderInfo, CancelByCloidWire, CancelWire, Cloid, Grouping};
-use oppen_hl::{Action, Address, Network};
+use oppen_hl::{Action, Address, AgentKey, ExchangeRequest, Network};
 
 use super::AgentId;
 use super::breaker;
@@ -1446,6 +1463,204 @@ impl GuardrailEngine {
             },
         ))
     }
+
+    // ---- the signer ------------------------------------------------------
+
+    /// Signs a cleared action, with this engine as the gate that runs inside
+    /// the signer. **This is the only signing entry point `oppen-core`
+    /// offers** (`AGENTS.md` invariant 1).
+    ///
+    /// It takes [`Cleared`] **by value** on purpose: a clearance is spent by
+    /// the signature it authorises, so the same evaluation cannot be replayed
+    /// into a second order. The returned [`Clearance`] is the audit record of
+    /// the evaluation that authorised this exact request, for the
+    /// hash-chained ledger (D6).
+    ///
+    /// **There is no checker parameter.** It passes `self`, so a caller
+    /// cannot supply a permissive gate for one call; the only way to sign
+    /// through `oppen-core` is to sign through the engine that evaluated the
+    /// order.
+    ///
+    /// **The sub-account and the network are not parameters either.** They
+    /// come out of the clearance, which took them from the engine's own
+    /// per-agent registry and its constructor-time network. When a caller
+    /// supplied them, a clearance evaluated against agent X's positions and
+    /// caps could be signed with agent Y's `vaultAddress`, and one evaluated
+    /// by the testnet engine against testnet limits could be signed for
+    /// mainnet — which R4 calls the worst bug this product can ship. The
+    /// nonce and `expires_after` stay parameters: they belong to the submit
+    /// queue (spec item 7), not to the risk decision.
+    ///
+    /// The gate re-runs at the signer rather than trusting the clearance, so
+    /// a kill switch engaged in the gap between evaluating and signing still
+    /// stops the order — see the [`PreSignCheck`] implementation below. That
+    /// refusal lands in the ledger, which is why `now_ms` is a parameter:
+    /// `oppen-core` reads no clock of its own (R1), so every timestamp comes
+    /// in from the caller exactly as it does for [`GuardrailEngine::evaluate`].
+    pub fn sign_cleared(
+        &self,
+        key: &AgentKey,
+        cleared: Cleared,
+        nonce: u64,
+        expires_after: Option<u64>,
+        now_ms: u64,
+    ) -> Result<(ExchangeRequest, Clearance), SignClearedError> {
+        let (action, clearance) = cleared.into_parts();
+        let request = ExchangeRequest::sign_checked(
+            key,
+            action,
+            nonce,
+            clearance.vault_address,
+            expires_after,
+            clearance.network,
+            self,
+        )
+        .map_err(|e| match e {
+            SignError::Refused(refusal) => {
+                self.record_pre_sign_refusal(clearance.agent.as_ref(), now_ms, &refusal);
+                SignClearedError::Refused(refusal)
+            }
+            SignError::Signing(e) => SignClearedError::Signing(e),
+        })?;
+        Ok((request, clearance))
+    }
+
+    /// Writes the ledger row for a refusal that happened at the signer rather
+    /// than at [`GuardrailEngine::evaluate`].
+    ///
+    /// `evaluate` has already written a *clearance* row by the time this gate
+    /// runs, so without this an audit export would show an order cleared and
+    /// never explain why no fill followed — which is the question D6 built
+    /// the chain to answer, and item 18 names guardrail trips as events.
+    ///
+    /// A failed write is logged, never a reason to sign. This is the same
+    /// reading as [`GuardrailEngine::record`]'s refusal branch: losing the
+    /// row is bad, but the safe outcome has already happened.
+    fn record_pre_sign_refusal(&self, agent: Option<&AgentId>, now_ms: u64, refusal: &Refusal) {
+        let entry = AuditEntry {
+            agent,
+            at_ms: now_ms,
+            reason: "pre-sign gate",
+            outcome: AuditOutcome::Refused(refusal),
+        };
+        if let Err(e) = self.sink.record(&entry) {
+            tracing::warn!(
+                agent = ?agent,
+                error = %e,
+                "a pre-sign refusal was not recorded in the ledger; the refusal still stands"
+            );
+        }
+    }
+}
+
+/// The guardrail engine *is* the pre-sign gate.
+///
+/// `AGENTS.md` invariant 1 wants the check in Rust immediately before
+/// signing. This runs inside `ExchangeRequest::sign_checked`, on the
+/// assembled request, after the last thing a caller could have changed and
+/// before the key is read.
+///
+/// It deliberately does **not** re-run the full order evaluation. It cannot:
+/// a [`PreSign`] carries the wire action, not the market tick or the account
+/// snapshot the notional, slippage and leverage caps were measured against,
+/// and re-fetching those here would be evaluating an order against a
+/// different world than the one that cleared it. What it re-checks is
+/// everything that is knowable from the engine's own state at this instant,
+/// and that is exactly the set of things that can change *after* an
+/// evaluation and *before* a signature:
+///
+/// - **The network (R4).** A clearance minted by the testnet engine cannot be
+///   signed through the mainnet one, and vice versa.
+/// - **The sub-account (D1).** The `vaultAddress` on the request must be one
+///   this engine has paired to an agent, or absent for the operator-scoped
+///   dead-man's switch.
+/// - **The kill switch (spec item 26), read fresh.** An operator pressing the
+///   switch, or another agent's loss breaker tripping `Global`, between
+///   `evaluate` and `sign_cleared` stops this order too. That gap is real:
+///   the submit queue of item 7 sits in it.
+///
+/// Cancels and `scheduleCancel` are exempt from the switch and only from the
+/// switch, because item 26 makes cancelling resting orders part of what
+/// engaging it *does*, and item 10 requires headroom for risk-reducing
+/// actions.
+impl PreSignCheck for GuardrailEngine {
+    /// The engine's own taxonomy, not a string (`AGENTS.md` invariant 8), so
+    /// a refusal from the signer reads the same as one from `evaluate` and
+    /// `oppen-mcp` maps it with the same code.
+    type Refusal = Refusal;
+
+    fn check(&self, request: PreSign<'_>) -> Result<(), Refusal> {
+        let state = self.state();
+        if request.network != self.network {
+            return Err(Unevaluable::WrongNetwork {
+                expected: self.network,
+                supplied: request.network,
+            }
+            .into());
+        }
+        // Deterministic: `vaults` is a `BTreeMap` and D1 makes the mapping
+        // 1:1, so at most one agent matches and the scan order is fixed.
+        let agent = match request.vault_address {
+            None => None,
+            Some(vault) => Some(
+                state
+                    .vaults
+                    .iter()
+                    .find(|(_, bound)| **bound == vault)
+                    .map(|(agent, _)| agent.clone())
+                    .ok_or(Unevaluable::UnknownSubAccount {
+                        vault_address: vault,
+                    })?,
+            ),
+        };
+        if is_risk_reducing(request.action) {
+            return Ok(());
+        }
+        let blocking = match &agent {
+            Some(agent) => state.kill.blocking(agent),
+            // No sub-account means the master account — item 33's manual
+            // path. Only a global engagement speaks for it.
+            None => state.kill.global().map(|e| (KillScope::Global, e)),
+        };
+        if let Some((scope, engagement)) = blocking {
+            return Err(Refusal::TradingPaused {
+                scope,
+                since_ms: engagement.engaged_at_ms,
+                reason: engagement.reason.clone(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Whether the action removes exposure rather than adding it.
+///
+/// Only these three clear while the kill switch is engaged (spec item 26,
+/// item 10). Everything else — orders, and the leverage, margin and
+/// sub-account actions — is gated, because a paused account changing its
+/// leverage is not risk-reducing and the fail-closed reading is the one this
+/// module takes everywhere else.
+fn is_risk_reducing(action: &Action) -> bool {
+    matches!(
+        action,
+        Action::Cancel { .. } | Action::CancelByCloid { .. } | Action::ScheduleCancel { .. }
+    )
+}
+
+/// Why a cleared action was not signed.
+///
+/// Distinct from [`Refusal`] only in that it also carries a signing failure;
+/// the refusal it wraps is the engine's ordinary typed one, so a caller
+/// renders both the same way.
+#[derive(Debug, thiserror::Error)]
+pub enum SignClearedError {
+    /// The pre-sign gate refused. Reachable in normal operation: the kill
+    /// switch can engage between the evaluation and the signature.
+    #[error("refused at the signer: {0}")]
+    Refused(#[source] Refusal),
+    /// The gate passed and signing itself failed.
+    #[error(transparent)]
+    Signing(#[from] oppen_hl::Error),
 }
 
 /// Whether this evaluation is an agent's first attempt or an operator

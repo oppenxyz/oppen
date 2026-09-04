@@ -17,6 +17,7 @@ use serde::Serialize;
 use oppen_hl::meta::ValidationError;
 use oppen_hl::order::OrderError;
 use oppen_hl::wire::WireError;
+use oppen_hl::{Address, Network};
 
 use super::AgentId;
 use super::breaker::LossKind;
@@ -312,6 +313,26 @@ impl From<OrderError> for VenueRule {
 pub enum Unevaluable {
     #[error("{agent} is not a paired agent")]
     UnknownAgent { agent: AgentId },
+
+    /// The request arriving at the signer is for a different network than the
+    /// engine gating it. `docs/decisions.md` R4 calls a mainnet number that
+    /// is really a testnet number the worst bug this product can ship, and
+    /// gives each network its own engine and database file; this is that
+    /// boundary asserted at the last instant, in the
+    /// [`super::GuardrailEngine`]'s own [`oppen_hl::exchange::PreSignCheck`]
+    /// implementation, rather than assumed from how the caller was written.
+    #[error("this engine is bound to {expected:?} but the request is for {supplied:?}")]
+    WrongNetwork {
+        expected: Network,
+        supplied: Network,
+    },
+
+    /// The request routes through a `vaultAddress` that is not any paired
+    /// agent's sub-account. D1 maps the agent roster 1:1 onto sub-accounts,
+    /// so an address this engine does not know is capital it never measured
+    /// a limit against.
+    #[error("{vault_address} is not a paired agent's sub-account")]
+    UnknownSubAccount { vault_address: Address },
 
     /// The asset or the market tick the caller supplied is not the one the
     /// order names. Measuring an order against another instrument's price is
