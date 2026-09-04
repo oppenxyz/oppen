@@ -163,6 +163,15 @@ pub enum LedgerError {
     /// that keeps the record ahead of the signer.
     #[error("append an order intent with record_intent, so the signer can require its receipt")]
     UseRecordIntent,
+    /// A fill was appended through a path that carries no idempotence key.
+    ///
+    /// Fills have one door for the same reason an intent does. The venue's own
+    /// trade id is what makes re-walking a window a no-op, `record_fill` is the
+    /// only writer that supplies it, and a fill row written without one is a
+    /// duplicate an append-only chain cannot give back. Every other kind is
+    /// still free to use the generic path.
+    #[error("append a fill with record_fill, so the venue's trade id keys the row")]
+    UseRecordFill,
     /// A [`EventKind::PayloadRedacted`] row was itself passed to
     /// [`Ledger::redact`]. Its payload is `{redacted_seq, reason}` — two
     /// operator-authored fields with no agent text in them, so there is no
@@ -367,6 +376,27 @@ pub struct NewIntent<'a> {
     pub payload: &'a Value,
     /// Decision-time book reference, if one was captured.
     pub snapshot: Option<SnapshotRef<'a>>,
+}
+
+/// A fill about to be recorded, with the venue identifiers that key it.
+///
+/// `account` and `tid` are not decoration: together they are the row's
+/// idempotence key, so offering the same fill twice writes once. They are a
+/// *pair* rather than the `tid` alone because a trade has two sides, and an
+/// operator running two containers can be both of them — the same venue trade
+/// id then legitimately appears once per container.
+#[derive(Debug, Clone)]
+pub(crate) struct NewFill<'a> {
+    /// Container address the fill landed on, lowercase and `0x`-prefixed.
+    pub account: &'a str,
+    /// The venue's own trade id.
+    pub tid: u64,
+    /// The **venue's** timestamp for the fill, in unix milliseconds.
+    pub ts_ms: i64,
+    /// The agent it is attributed to, if the join found one.
+    pub agent_id: Option<&'a str>,
+    /// The chained body.
+    pub payload: &'a Value,
 }
 
 /// What an append assigned.
@@ -710,20 +740,117 @@ impl Ledger {
     /// row or nothing. A half-written row would be indistinguishable from
     /// tampering on the next verification.
     ///
-    /// Two kinds are refused here on purpose, each because it has exactly one
+    /// Three kinds are refused here on purpose, each because it has exactly one
     /// door. [`EventKind::OrderIntent`] would be durable but would not produce
     /// an [`IntentReceipt`], which is the whole mechanism keeping the record
     /// ahead of the signer — use [`Ledger::record_intent`].
     /// [`EventKind::PayloadRedacted`] is the evidence [`Ledger::verify`] demands
     /// before it accepts a null payload, so it must never be writable without
-    /// the null it explains — use [`Ledger::redact`].
+    /// the null it explains — use [`Ledger::redact`]. [`EventKind::Fill`] would
+    /// be durable but unkeyed, so the next walk over the same window would chain
+    /// the trade a second time — use `record_fill`.
     pub fn append(&self, event: &NewEvent<'_>) -> Result<Appended> {
-        match event.kind {
-            EventKind::OrderIntent => return Err(LedgerError::UseRecordIntent),
-            EventKind::PayloadRedacted => return Err(LedgerError::UseRedact),
-            _ => {}
-        }
+        self.refuse_one_door_kind(event.kind)?;
         self.append_committed(event)
+    }
+
+    /// The kinds that may not go through a generic append.
+    ///
+    /// One list, so [`Ledger::append`] and [`Ledger::record_outcome`] cannot
+    /// drift apart on which kinds have their own door.
+    fn refuse_one_door_kind(&self, kind: EventKind) -> Result<()> {
+        match kind {
+            EventKind::OrderIntent => Err(LedgerError::UseRecordIntent),
+            EventKind::PayloadRedacted => Err(LedgerError::UseRedact),
+            EventKind::Fill => Err(LedgerError::UseRecordFill),
+            _ => Ok(()),
+        }
+    }
+
+    /// Record one fill, keyed on the venue's own identifiers.
+    ///
+    /// `Ok(None)` means this container already has that trade id in the chain.
+    /// That is the normal result of a correct re-run — the window is re-walked
+    /// on every reconnect, retry and restart, and the venue's `startTime` is
+    /// inclusive — not an error, and the caller counts it as a duplicate rather
+    /// than handling a failure.
+    ///
+    /// **There is no read before the write.** The uniqueness is the partial
+    /// index in `schema.rs`, evaluated by SQLite inside the same statement that
+    /// inserts the row, so there is no interval during which a second writer can
+    /// slip the same fill in. An in-memory index of what has already been
+    /// recorded cannot have that property however carefully it is refreshed: the
+    /// refresh closes the window before the walk and not during it.
+    pub(crate) fn record_fill(&self, fill: &NewFill<'_>) -> Result<Option<Appended>> {
+        let idem_key = fill_idem_key(fill.account, fill.tid);
+        let mut guard = self.lock()?;
+        let transaction = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let appended = append_keyed_in_tx(
+            &transaction,
+            &NewEvent {
+                kind: EventKind::Fill,
+                ts_ms: fill.ts_ms,
+                agent_id: fill.agent_id,
+                payload: fill.payload,
+                snapshot: None,
+            },
+            &idem_key,
+        )?;
+        transaction.commit()?;
+        if let Some(appended) = &appended {
+            self.note_head(appended)?;
+        }
+        Ok(appended)
+    }
+
+    /// The newest **venue** timestamp among the fills recorded for `account` at
+    /// a chain position before `before_seq`.
+    ///
+    /// This is the reconciler's only venue-clock reading, and `before_seq` is
+    /// what makes it trustworthy. A fill row's `ts_ms` is the instant the venue
+    /// stamped it, and a row written before the disconnect is proof oppen was
+    /// still being served then. Rows written *after* that chain position — by a
+    /// later backfill, or by the live feed once it resumed — say nothing about
+    /// the outage and would drag the answer forward past the fills it is meant
+    /// to defend, so they are excluded by position rather than by any clock.
+    ///
+    /// A stored timestamp below the epoch (only reachable by editing the file)
+    /// reads as "no anchor", which widens the caller's window instead of
+    /// narrowing it. A timestamp in the **future** is returned as it stands —
+    /// nothing here knows what "now" is — and it is the caller that must decide
+    /// whether to believe it, because an anchor past the disconnect starts a
+    /// walk after the fills the gap exists to recover. `reconcile::outage_window`
+    /// is where that is decided.
+    pub(crate) fn newest_fill_ts_ms(&self, account: &str, before_seq: u64) -> Result<Option<u64>> {
+        let before = i64::try_from(before_seq).map_err(|_| LedgerError::SeqOutOfRange)?;
+        let (low, high) = fill_key_range(account);
+        let guard = self.lock()?;
+        // The key range alone selects this account's fills: `fill_idem_key` is
+        // the only producer of a key, so no other kind of row can fall in it.
+        let newest: Option<i64> = guard.query_row(
+            "SELECT MAX(ts_ms) FROM events WHERE idem_key >= ?1 AND idem_key < ?2 AND seq < ?3",
+            params![low, high, before],
+            |row| row.get(0),
+        )?;
+        Ok(newest.and_then(|ts_ms| u64::try_from(ts_ms).ok()))
+    }
+
+    /// Every chained row of one kind, oldest first.
+    ///
+    /// Served by the `events_kind` index. The reconciler reads the intent and
+    /// operator rows through it at the moment it needs them, which is what lets
+    /// it hold no cursor of its own.
+    pub(crate) fn events_of_kind(&self, kind: EventKind) -> Result<Vec<Event>> {
+        let guard = self.lock()?;
+        let mut statement = guard.prepare(&format!(
+            "SELECT {SELECT_EVENT_COLUMNS} FROM events WHERE kind = ?1 ORDER BY seq ASC"
+        ))?;
+        let mut rows = statement.query(params![kind.as_str()])?;
+        let mut events = Vec::new();
+        while let Some(row) = rows.next()? {
+            events.push(event_from_row(row)?);
+        }
+        Ok(events)
     }
 
     /// Record an order intent and return proof it is on disk.
@@ -788,11 +915,7 @@ impl Ledger {
         ts_ms: i64,
         outcome: &Value,
     ) -> Result<Appended> {
-        match kind {
-            EventKind::OrderIntent => return Err(LedgerError::UseRecordIntent),
-            EventKind::PayloadRedacted => return Err(LedgerError::UseRedact),
-            _ => {}
-        }
+        self.refuse_one_door_kind(kind)?;
         if receipt.chain != self.genesis {
             return Err(LedgerError::ReceiptFromAnotherChain {
                 expected: self.genesis.clone(),
@@ -1483,23 +1606,73 @@ fn head(connection: &Connection) -> Result<(u64, String)> {
     ))
 }
 
-/// Append inside an existing transaction.
+/// The idempotence key of one fill.
 ///
-/// Shared by [`Ledger::append`] and by every operation that has to write a
-/// chained row and a side-table row atomically. Taking the seq from
-/// `chain_head` under the transaction's write lock, rather than from
-/// `MAX(seq)` or SQLite's rowid allocator, is what makes the seq strictly
-/// monotonic even after a row is deleted — and the cursor in `docs/spec.md` D6
-/// only works if it is.
-fn append_in_tx(transaction: &Transaction<'_>, event: &NewEvent<'_>) -> Result<Appended> {
+/// A storage format: it is what the partial unique index holds, so moving it
+/// orphans every fill already keyed and the next walk records them all again.
+/// The account comes first so that one container's fills are a contiguous range
+/// of the index, which is how [`Ledger::newest_fill_ts_ms`] reads them.
+fn fill_idem_key(account: &str, tid: u64) -> String {
+    format!("fill:{account}:{tid}")
+}
+
+/// The half-open key range covering every fill of one container.
+///
+/// The upper bound is the prefix with its final `:` (0x3A) raised to `;`
+/// (0x3B). Every key in the range is the prefix followed by decimal digits, all
+/// of which sort below `;`, and a different account diverges from the prefix
+/// before that byte — so the range is exactly this container's fills.
+fn fill_key_range(account: &str) -> (String, String) {
+    let low = format!("fill:{account}:");
+    let high = format!("fill:{account};");
+    (low, high)
+}
+
+/// A chained row, built from the head and ready to insert.
+///
+/// Split out so the keyed and unkeyed inserts share one definition of what a
+/// row *is* — the hash preimage above all. The two differ only in the statement
+/// that writes them.
+struct ChainedRow<'a> {
+    seq: u64,
+    seq_key: i64,
+    kind: &'static str,
+    ts_ms: i64,
+    agent_id: Option<&'a str>,
+    canonical: String,
+    payload_hash: String,
+    prev_hash: String,
+    row_hash: String,
+    snapshot_id: Option<&'a str>,
+    snapshot_hash: Option<&'a str>,
+}
+
+impl ChainedRow<'_> {
+    /// What the caller gets back once the row is in.
+    fn appended(self) -> Appended {
+        Appended {
+            seq: self.seq,
+            hash: self.row_hash,
+        }
+    }
+}
+
+/// Build the next row of the chain.
+///
+/// Taking the seq from `chain_head` under the transaction's write lock, rather
+/// than from `MAX(seq)` or SQLite's rowid allocator, is what makes the seq
+/// strictly monotonic even after a row is deleted — and the cursor in
+/// `docs/spec.md` D6 only works if it is.
+///
+/// The payload is canonicalised here rather than by `serde_json::to_string`, and
+/// here rather than in `append_committed`, so that every chained row — including
+/// the ones redact, open_gap and close_gap write directly — goes through the one
+/// encoder that sorts keys and refuses floats.
+fn chain_row<'a>(transaction: &Transaction<'_>, event: &NewEvent<'a>) -> Result<ChainedRow<'a>> {
     let (head_seq, prev_hash) = head(transaction)?;
     let seq = head_seq.checked_add(1).ok_or(LedgerError::SeqOutOfRange)?;
     let seq_key = i64::try_from(seq).map_err(|_| LedgerError::SeqOutOfRange)?;
 
-    // Canonicalised here rather than by `serde_json::to_string`, and here rather
-    // than in `append_committed`, so that every chained row — including the
-    // ones redact, open_gap and close_gap write directly — goes through the one
-    // encoder that sorts keys and refuses floats.
     let canonical = hash::canonical_json(event.payload)?;
     let payload_hash = hash::payload_hash(canonical.as_bytes());
     let kind = event.kind.as_str();
@@ -1515,31 +1688,95 @@ fn append_in_tx(transaction: &Transaction<'_>, event: &NewEvent<'_>) -> Result<A
         snapshot_id,
         snapshot_hash,
     });
+    Ok(ChainedRow {
+        seq,
+        seq_key,
+        kind,
+        ts_ms: event.ts_ms,
+        agent_id: event.agent_id,
+        canonical,
+        payload_hash,
+        prev_hash,
+        row_hash,
+        snapshot_id,
+        snapshot_hash,
+    })
+}
 
+/// Move the head to a row that has just been written.
+fn advance_head(transaction: &Transaction<'_>, row: &ChainedRow<'_>) -> Result<()> {
+    transaction.execute(
+        "UPDATE chain_head SET seq = ?1, hash = ?2 WHERE id = 0",
+        params![row.seq_key, row.row_hash],
+    )?;
+    Ok(())
+}
+
+/// Append inside an existing transaction.
+///
+/// Shared by [`Ledger::append`] and by every operation that has to write a
+/// chained row and a side-table row atomically. The row carries no idempotence
+/// key, so the insert either writes or raises — there is no third outcome to
+/// report.
+fn append_in_tx(transaction: &Transaction<'_>, event: &NewEvent<'_>) -> Result<Appended> {
+    let row = chain_row(transaction, event)?;
     transaction.execute(
         "INSERT INTO events (seq, ts_ms, kind, agent_id, payload, payload_hash, prev_hash, hash, \
          snapshot_id, snapshot_hash) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         params![
-            seq_key,
-            event.ts_ms,
-            kind,
-            event.agent_id,
-            canonical,
-            payload_hash,
-            prev_hash,
-            row_hash,
-            snapshot_id,
-            snapshot_hash,
+            row.seq_key,
+            row.ts_ms,
+            row.kind,
+            row.agent_id,
+            row.canonical,
+            row.payload_hash,
+            row.prev_hash,
+            row.row_hash,
+            row.snapshot_id,
+            row.snapshot_hash,
         ],
     )?;
-    transaction.execute(
-        "UPDATE chain_head SET seq = ?1, hash = ?2 WHERE id = 0",
-        params![seq_key, row_hash],
+    advance_head(transaction, &row)?;
+    Ok(row.appended())
+}
+
+/// Append inside an existing transaction, keyed for idempotence.
+///
+/// `Ok(None)` means the key is already in the chain and nothing was written.
+/// The conflict target names the partial index exactly, so this swallows a
+/// repeated `idem_key` and nothing else: a violation of any other constraint
+/// still raises. The head is advanced only when a row actually landed, so a
+/// duplicate leaves the chain — and its hash — untouched.
+fn append_keyed_in_tx(
+    transaction: &Transaction<'_>,
+    event: &NewEvent<'_>,
+    idem_key: &str,
+) -> Result<Option<Appended>> {
+    let row = chain_row(transaction, event)?;
+    let written = transaction.execute(
+        "INSERT INTO events (seq, ts_ms, kind, agent_id, payload, payload_hash, prev_hash, hash, \
+         snapshot_id, snapshot_hash, idem_key) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
+         ON CONFLICT (idem_key) WHERE idem_key IS NOT NULL DO NOTHING",
+        params![
+            row.seq_key,
+            row.ts_ms,
+            row.kind,
+            row.agent_id,
+            row.canonical,
+            row.payload_hash,
+            row.prev_hash,
+            row.row_hash,
+            row.snapshot_id,
+            row.snapshot_hash,
+            idem_key,
+        ],
     )?;
-    Ok(Appended {
-        seq,
-        hash: row_hash,
-    })
+    if written == 0 {
+        return Ok(None);
+    }
+    advance_head(transaction, &row)?;
+    Ok(Some(row.appended()))
 }
 
 /// Build an [`Event`] from a row selected with [`SELECT_EVENT_COLUMNS`].
