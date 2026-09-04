@@ -16,7 +16,7 @@ Status as of 2026-09-04: P0 and the P1 code are on `main`; the P1 gate is waitin
 
 - [x] Rust workspace: `oppen-hl`, `oppen-core`, `oppen-mcp`, Tauri 2 desktop app with the Vue 3 console shell [1]
 - [x] CI: fmt, clippy `-D warnings`, tests, `cargo deny`, web build; actions pinned by SHA, `--ignore-scripts` [1]
-- [x] Apache-2.0 + CLA gate, `NOTICE`, `AGENTS.md`, `skills/oppen` stub [23]
+- [x] Open core (Apache-2.0 `crates/*`, commercial `apps/desktop`) + CLA gate, `NOTICE`, `AGENTS.md`, `skills/oppen` stub [23, L1–L7]
 - [x] Testnet-default `Network` type, every network constant selected by it [13, D4]
 - [x] Design system in `docs/design/`, ASCII primitives and the shared 90 ms motion clock in the app shell [36]
 - [x] Ink ladder raised so labels and rules clear WCAG AA

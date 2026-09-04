@@ -1,0 +1,94 @@
+oppen Commercial Source License
+Version 1.0, 2026-09-04
+
+Copyright 2026 oppen contributors
+
+This licence governs `apps/desktop` — the Tauri shell and the Vue operator
+console, together with the quant layer and the workflow engine that ship inside
+them. It does not govern `crates/`, which is the open core and is licensed under
+Apache-2.0; see the LICENSE file at the root of this repository. Which code sits
+on which side of that line, and why the line is where it is, is recorded as
+decisions L1 and L2 in docs/decisions.md.
+
+The source in this directory is published so that it can be read. It is not
+open source, and the difference is deliberate: the safety claims oppen makes are
+claims about the core, the core is Apache-2.0 so that those claims can be
+checked, and nothing above the core carries a claim that requires the right to
+redistribute in order to verify.
+
+1. DEFINITIONS
+
+   "The Software" means the contents of this directory and any derivative work
+   of it. "You" means the individual or entity exercising the permissions below.
+   "Official Build" means a binary distributed by the oppen maintainers.
+
+2. WHAT YOU MAY DO
+
+   a. Read, copy and retain the source, for any purpose.
+
+   b. Build the Software and run your own builds.
+
+   c. Use the Software to trade, including for profit, on your own account or on
+      the account of an entity you control or are employed by. Trading with
+      oppen is what it is for; nothing in this licence restricts what you trade,
+      how much, or on whose behalf, and no separate commercial licence is
+      required to trade with your own build.
+
+   d. Modify the Software for your own use under 2(b) and 2(c), and submit those
+      modifications to the Project under the CLA.
+
+   e. Publish excerpts and analysis, including security research and adversarial
+      findings, without prior permission and without notice to the maintainers.
+
+3. WHAT YOU MAY NOT DO
+
+   a. Distribute the Software, modified or unmodified, in source or binary form,
+      to any third party.
+
+   b. Offer the Software to third parties as a hosted or managed service.
+
+   c. Sublicense, sell, rent or lease the Software.
+
+   d. Remove, disable or alter the builder code configured in an Official Build,
+      in any copy you distribute. This restriction does not apply to a build you
+      run yourself under 2(b) and 2(c). The fee is disclosed in README.md and is
+      bounded by a maximum rate you sign; decisions M1, M2 and L5 record the
+      rates and the reasoning.
+
+   e. Use the "oppen" name or mark to identify any build that is not an Official
+      Build. See NOTICE.
+
+4. RESERVED RIGHTS
+
+   All rights not expressly granted in section 2 are reserved. No patent licence
+   is granted by this licence. The maintainers may offer the Software to any
+   party under different terms, including terms permitting the activities in
+   section 3, by separate written agreement.
+
+5. NO WARRANTY
+
+   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+   IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+   FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+   AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+   LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+   OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+   SOFTWARE.
+
+   Trading carries risk of total loss. The safety properties oppen documents are
+   described in docs/threat-model.md, which states what they do and do not
+   defend against. Read it before trading real funds.
+
+6. TERMINATION
+
+   Your permissions under section 2 end automatically if you breach section 3
+   and do not cure the breach within 30 days of becoming aware of it. Permissions
+   granted to anyone who received the Software from the maintainers directly are
+   not affected by your breach.
+
+--------------------------------------------------------------------------
+
+This licence has not yet been reviewed by counsel for the Project; the
+maintainers intend to do so before the first stable release. The same note
+applies to CLA.md, and for the same reason: the terms are meant to be honest
+about intent now and precise later, in that order.

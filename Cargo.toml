@@ -10,6 +10,9 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
+# Apache-2.0 covers the open core — `crates/*`, the trusted computing base.
+# `apps/desktop` sits above that line and overrides this with `license-file`.
+# The split and its reasoning are decisions L1 and L2 in docs/decisions.md.
 license = "Apache-2.0"
 repository = "https://github.com/gkssxf/oppen"
 rust-version = "1.85"
