@@ -566,6 +566,47 @@ pub struct ClearinghouseState {
     pub time: u64,
 }
 
+/// One `[timestamp_ms, value]` sample from a `portfolio` series.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct PortfolioSample(pub u64, pub Decimal);
+
+/// One window's series from `portfolio`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PortfolioWindow {
+    /// Total account value over the window — the venue's own answer to what
+    /// [`MarginSummary::account_value`] does not answer.
+    pub account_value_history: Vec<PortfolioSample>,
+    pub pnl_history: Vec<PortfolioSample>,
+    pub vlm: Decimal,
+}
+
+impl PortfolioWindow {
+    /// The high-water mark over the window, for the drawdown budget.
+    pub fn peak_account_value(&self) -> Option<Decimal> {
+        self.account_value_history
+            .iter()
+            .map(|sample| sample.1)
+            .max()
+    }
+}
+
+/// `portfolio` response: `[["day", {...}], ["week", {...}], ...]`.
+///
+/// Deserialised as pairs rather than a struct because the venue may add
+/// windows, and an unknown one must not fail the whole read.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct Portfolio(pub Vec<(String, PortfolioWindow)>);
+
+impl Portfolio {
+    pub fn window(&self, name: &str) -> Option<&PortfolioWindow> {
+        self.0
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, window)| window)
+    }
+}
+
 /// One spot token balance from `spotClearinghouseState`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]

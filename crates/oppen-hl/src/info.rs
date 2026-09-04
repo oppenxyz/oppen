@@ -9,8 +9,8 @@ use serde::de::DeserializeOwned;
 
 use crate::types::{
     Candle, ClearinghouseState, Fill, FundingHistoryPage, FundingHistoryRow, L2Book, Meta,
-    MetaAndAssetCtxs, OpenOrder, OrderStatusResponse, PredictedFundings, SpotClearinghouseState,
-    SubAccount, UserRateLimit, ValidatorDexCoin,
+    MetaAndAssetCtxs, OpenOrder, OrderStatusResponse, Portfolio, PredictedFundings,
+    SpotClearinghouseState, SubAccount, UserRateLimit, ValidatorDexCoin,
 };
 use crate::wire::Cloid;
 use crate::{Address, Error, Network, Universe};
@@ -176,6 +176,15 @@ impl InfoClient {
 
     pub async fn clearinghouse_state(&self, user: Address) -> Result<ClearinghouseState, Error> {
         self.post(serde_json::json!({ "type": "clearinghouseState", "user": user }))
+            .await
+    }
+
+    /// Account value and PnL over the venue's own windows (`day`, `week`, …).
+    ///
+    /// The source for the drawdown high-water mark: nothing local can
+    /// reconstruct a peak that predates oppen's first run.
+    pub async fn portfolio(&self, user: Address) -> Result<Portfolio, Error> {
+        self.post(serde_json::json!({ "type": "portfolio", "user": user }))
             .await
     }
 
