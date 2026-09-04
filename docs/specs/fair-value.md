@@ -596,3 +596,193 @@ distribution all look like a well-behaved component to a variance solve.
 These four are the reason §10's validation order starts with mark-price
 replication and ends with replay determinism, and why weight recovery on
 synthetic streams with known noise is step 3 rather than an afterthought.
+
+---
+
+## 14. Live API audit, 2026-09-03
+
+Twenty-nine agents probed the live Hyperliquid API against every claim in this
+document, then adversarially re-verified every non-available finding. What
+follows is what the venue actually serves today. Where §1–§13 and the API
+disagree, **the API wins** and the correction is stated.
+
+### 14.1 The verdict on scope
+
+Build the carry, basis and micro components with the full combination engine and
+all five MCP tools. **Consume `markPx`; do not replicate it.**
+
+Mark replication is not deferred, it is unreachable. Granting two gifts no
+implementation can have — perfect clock alignment and a perfect `c1`/`c2`
+selector — the best-case residual is still 3.090 bp at p99 on HYPE and 1.858 bp
+on FARTCOIN, because the mark lands on neither `c1` nor `c2` more than 1% of the
+time. That is information-theoretic, not a tuning problem. BTC, ETH and SOL clear
+1 bp only with the perfect selector, and measured selector persistence is 33–70%,
+at or below a coin flip for BTC (37.1%) and SOL (33.3%).
+
+Three further facts close it:
+
+- The venue's sampling instants are unobservable. `activeAssetCtx` and
+  `fastAssetCtxs` carry **no timestamp**, while `l2Book`, `trades` and `bbo` all
+  do. A 250 ms misalignment alone injects 0.3–0.9 bp at p99.
+- 52 of 233 mainnet assets have a single `markPx` tick wider than 1 bp (HMSTR
+  56.18 bp). The gate is arithmetically unreachable there regardless of data.
+- Testnet's mark is pinned to its local book (HYPE `markPx` 12.733 equals the
+  best bid exactly while `midPx` is 31.8155), so a residual measured on oppen's
+  default network says nothing about mainnet.
+
+### 14.2 What replaces §10.1
+
+`median(c1, c2, c3) ≡ clamp(c3, min(c1,c2), max(c1,c2))` is an exact identity,
+and `c1` and `c2` are both Hyperliquid-only. That yields a real gate:
+
+> **Mark containment monitor.** Subscribe `activeAssetCtx` + `bbo` + `trades`.
+> Build `c1 = oraclePx + EMA₁₅₀ₛ(midPx − oraclePx)` and
+> `c2 = median(best bid, best ask, last trade)`. Assert
+> `markPx ∈ [min(c1,c2), max(c1,c2)]` whenever `c3` is not the median, and record
+> the implied-`c3` series on ticks where `markPx` equals neither. State the target
+> per asset as `max(1 bp, k ticks)`, on p50 and p90, with p99 reported but not
+> gated.
+
+Run steps 1 and 2 against **mainnet read-only info endpoints**. They need no key
+and no signing, so this does not conflict with the testnet-default trading
+decision, and the spec says so explicitly. Steps 3–6 are synthetic or structural
+and may run on testnet.
+
+Honest caveat: with `c2` from `bbo`, `markPx` fell inside the band only 61–63% of
+the time, so the containment check **will fail on first run**. That failure is
+the finding, and diagnosing it is worth more than a bit-exactness claim that can
+never be satisfied.
+
+### 14.3 What is verified and buildable today
+
+| Claim | Result |
+|---|---|
+| §3.1 premium formula | Reproduces the published `premium` to <1e-9 on **177/177** live mainnet and **156/156** testnet assets |
+| §3.2 constants and dead zone | Zero violations across **4,627** mainnet records; both edges exercised (921 unpinned below, 135 above) |
+| §3.2 censoring detection | `fundingRate == "0.0000125"` is an exact string match on the main dex; float-exact and string-exact agree 152/152 on BTC |
+| §5.2 1 s sampler | `activeAssetCtx` pushes the complete ctx at **1.02 s median**. 177 subscriptions on one connection sustained 10,142 msgs/min, 0 errors |
+| §4.2–§4.5, §7 | Pure local math over the three live components. No new data requirement |
+
+**The single most valuable finding:** `fundingHistory` publishes the
+**uncensored** hourly-average premium alongside the censored rate, and `g(premium)`
+reproduces `fundingRate` to 5e-11 over 4,627 records. So for all historical work
+the censored-interval machinery collapses to a point observation. This matters
+enormously — **77.2% of prints are pinned** in aggregate (BTC 90.5%, ETH 98.8%,
+WCT 168/168), so anything fitted on `fundingRate` is fitted on a constant.
+
+### 14.4 Corrections
+
+Each of these makes a statement elsewhere in this document false.
+
+1. **`ctx.funding` is not `g(ctx.premium)`.** `funding` is `g` applied to the
+   hour-to-date **running mean** premium; `ctx.premium` is the instantaneous 5 s
+   sample. Over 68 s of BTC, `funding` spanned 9.05e-7 while `premium` spanned
+   4.05e-4 — **448× larger**. §5.1 lists them in one sentence and §5.3 labels
+   `funding` as `_1h`, which invites feeding it into the §3.2 inverse. That is
+   wrong by construction. Newtype it (`HourToDateRate1h`) so it cannot be
+   substituted, and state that live carry reads `ctx.premium` directly.
+2. **`premium`, `midPx` and `impactPxs` are null**, not absent and not `"0.0"`,
+   on 56 of 233 mainnet assets and 197 of 511 once HIP-3 is counted. They are
+   perfectly co-null. Type all three as `Option` — a non-`Option` `f64` fails to
+   deserialize the **whole** 233-asset response, not one row. The invariant is
+   `openInterest == 0.0` (233/233 mainnet), **not** `isDelisted`: testnet PURR is
+   live-but-null. Never compact the universe array — the index **is** the
+   on-chain asset id.
+3. **Never fall back to `allMids` for a null `midPx`.** It returns a value for all
+   56 nulled assets, and that value is `markPx`: a frozen last print. FRIEND
+   reads 4.72 against an oracle of 0.47734, a 9.9× stale price.
+4. **`micro` must source from the `bbo` channel, not `l2Book`.** Default `l2Book`
+   WS pushes at a **5.4 s median gap**, failing §5.2's own 2 s threshold on every
+   sample. `bbo` delivers 0.10–0.13 s with `{px, sz, n}` per side, which is
+   exactly what a Stoikov microprice needs. The undocumented `fast: true` flag on
+   `l2Book` restores 0.53 s but silently truncates to 5 levels per side.
+5. **§5.1 is missing three sources.** Add `bbo` (for `micro`), add `trades`
+   (component (2)'s last-trade leg is currently unsourced anywhere), and record
+   that `fundingHistory` returns `premium` alongside `fundingRate`.
+6. **§13.4 divergence 25 reverses.** It says the spec wins and consuming `markPx`
+   makes the gate untestable. The gate as written is untestable regardless;
+   consuming `markPx` plus a containment residual is the testable version. The
+   reference implementation was right. New caveat: `markPx` contains `c2`, which
+   derives from the same book that produces the target mid and the `micro`
+   component, so `mark` and `micro` are **structurally correlated**. The §4.3
+   ridge is load-bearing, and a high `mark` weight is not evidence of skill.
+7. **Degradation is the common case, not the exception.** 24% of the main dex and
+   38.6% of the full mainnet universe has no book, so `micro` and `carry` are
+   unconstructible and β renormalizes over `mark` alone. Six HIP-3 dexes are 100%
+   null. §4.3's slice-and-renormalize path is day-one code.
+8. **The §3.2 inverse must take `i` as an argument** (HIP-3 deployers set it, and
+   it can be negative) and must **refuse** rather than return a point when `f*`
+   equals the pinned rate. 147 of 177 live mainnet assets sit on that plateau
+   right now.
+9. **The EMA recursion, verbatim:** `ema = numerator/denominator`, with
+   `numerator → numerator·exp(−t/2.5min) + sample·t` and
+   `denominator → denominator·exp(−t/2.5min) + t`. §13.1 row 3's `w = exp(−dt/τ)`
+   is correct — at constant spacing the gain converges to exactly `(1−w)` — but
+   add that the form is **self-seeding** (from `num = den = 0` the first update
+   returns the sample exactly) and that the **sample clock is undocumented and
+   matters 10–60× more than the recursion form.** Fix it to the oracle clock (~3 s).
+10. **§3.3's fallback arity is wrong.** The docs say the 30 s EMA is *added to*
+    the median inputs: two survivors plus one EMA is a median of **three**. "A
+    fourth input" implies a 4-element median, which is the mean of the middle
+    two — a different number.
+11. **§10.2's purpose changes** from "confirm the estimator treats them as
+    intervals" to "confirm the estimator never touches `fundingRate` at all",
+    given correction 14.3. Raise its expectation to 77.2% aggregate.
+12. **Backfill rules.** `fundingHistory` caps at 500 rows with forward pagination
+    (next `startTime` = last row's `time`); a too-wide window truncates silently
+    from the newest end with no cursor. Do not assert an exact 3600 s gap as a
+    health check — the real gap set is `{3599, 3600}` with ±142 ms jitter, and
+    2023 history contains 77 genuine 8-hour holes. A `null` body means an
+    **unlisted coin** (deterministic HTTP 500); genuine no-data is `[]` with HTTP
+    200. Never map `null` to an empty page and advance the cursor.
+13. **`activeAssetCtx` nests the payload** as `{coin, ctx:{…}}`, unlike the flat
+    REST array elements. §5.1's "verify shapes on first run" is now closed.
+14. **§5.2's breadth-versus-freshness tradeoff is false.** 177 per-coin
+    subscriptions on one connection sustained 10,142 msgs/min with zero errors,
+    inside the documented 1000-subscription cap; the 2000/min limit counts
+    messages **sent**, not received. `allDexsAssetCtxs` is a poor substitute:
+    15.1 s median gap, 113 KB per message, and its ctx objects carry **no coin
+    name**, being positionally aligned to a separately-fetched meta, so a
+    mid-session listing shift silently moves every index.
+15. **Scope fence: v1 is the validator-operated dex only.** HIP-3 uses a
+    different premium formula (midpoint, not impact-difference — `xyz:EUR` reads
+    0.00039570 one way and 0.00020645 the other), a clamp of 3e-4 not 5e-4 that
+    is published nowhere, deployer-set per-asset multipliers in [0,10] that are
+    **mutable with no change timestamp and no history**, and interest rates that
+    can be negative. It is 38.6% of the mainnet universe across 10 live dexes.
+    Emitting a `carry` component for a `<dex>:<coin>` asset under §3.1's formula
+    produces a wrong number silently.
+16. **§11 needs a `MarkModel` extension point**, not just `FundingModel`. HIP-3
+    mark is `median(deployer markPxs, local mark)` with no 150 s EMA and no CEX
+    weight set, clamped to 1% per update, falling back to `median(bid, ask, last)`
+    after 10 s. A completely different code path.
+17. **`collateral_apr` is a configured constant, not a measurement.** Hyperliquid
+    supplies neither leg of `f* = r − y`. Surface it in the `fair_value.carry`
+    response so an agent can see which half of the edge is assumed. Datapoint for
+    the default: HIP-3 dex `km` sets its own interest rate to ≈5% APR.
+
+### 14.5 Corrections this forces elsewhere
+
+- **`hl-signing.md` open questions 1 and 2 are CLOSED.** `expiresAfter` is
+  `0x00` followed by 8 big-endian bytes after the vault marker — only that
+  encoding recovers the actual signer under differential recovery. And the L1
+  accepts **any** `signatureChainId`, including `0xdeadbeef`, rebuilding the
+  EIP-712 domain from the declared value. So do not restrict the accepted set:
+  read the wallet's live chain id and write it verbatim, or reject a user whose
+  MetaMask happens to sit on Ethereum or Base.
+- **`charts.md` §5.2 — `next_funding_s` has no source.** No such field exists on
+  any ctx object on either transport or either network, and
+  `predictedFundings.HlPerp.nextFundingTime` names a boundary that **already
+  passed** (measured 1,064–1,898 s in the past, identical across all 233 coins,
+  while BinPerp and BybitPerp on the same payload point forward). A
+  `now >= nextFundingTime` refresh trigger fires forever. Derive it instead:
+  `next_funding_s = 3600 − (unix_epoch_s mod 3600)`.
+- **`charts.md` §5.2 — `depth_usd_25bps` is uncomputable** from a default
+  `l2Book` for 46 of the top 50 mainnet symbols. The 20-level book spans a median
+  of 13.18 bp, and only **2.40 bp on BTC** — $22 of an $81,183 price. The
+  `nSigFigs` ladder is coarse and does not land on 25 bp (BTC: `nSigFigs=4` gives
+  24.1 bp, `nSigFigs=3` gives 240.6 bp), and coarsening can zero the answer.
+  Either rename the column to the achieved window or publish the achieved
+  coverage next to the number. A header saying 25 bp over a book that reached
+  2.4 bp is exactly the failure §5.5 exists to prevent. **This defect is
+  invisible on testnet**, where the thin book does span 25 bp.

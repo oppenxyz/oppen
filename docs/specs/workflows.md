@@ -72,7 +72,17 @@ sub-account's guardrails. Every node inherits them. The execute node signs with
 that sub-account's agent wallet. Per-node attribution lives in the ledger, not in
 venue state.
 
-### 2.4 Paper execution is a prerequisite, not a later phase
+### 2.4 Paper execution: cut
+
+**Decided 2026-09-03: no paper broker. Testnet is the paper mode.** Testnet gives
+real fills, real rejections, real latency and real funding, and exercises the real
+signing path; a paper fill model is an assumption that would be optimistic in
+exactly the ways the assumptions are wrong. The execute node has one
+implementation, and §8 becomes "arm on testnet, promote to mainnet". See
+[decisions.md](../decisions.md) S5.
+
+The original argument, retained:
+
 
 The handoff is right that paper trading comes first, and oppen v1 has no paper
 mode. A workflow's execute node must be swappable between a paper broker and the
