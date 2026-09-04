@@ -11,6 +11,15 @@ decisions" section until then.
 
 ---
 
+## 2026-09-04 · Operator interview, second round
+
+| # | Decision | Choice | Why |
+|---|---|---|---|
+| A1 | Approval mode default | **Auto-approve inside the agent's caps; queue anything above them** | Revises spec item 28 and D-c, which set approval ON for every order. The guardrail caps already encode what the operator considers acceptable unattended; requiring a click *inside* those caps asks the same question twice and trains the operator to approve reflexively, which is worse than not asking. The boundary still fails closed: an order that would exceed any cap returns `pending_approval` with a TTL and is re-priced at approval time with drift shown. **What this gives up:** the operator no longer sees every order before it lands, so the caps become the whole of the policy and the activity stream becomes the only record — both must be right. Approval-for-everything stays available per agent. |
+| A2 | Mainnet timing | **Testnet only until v1 is complete** | Revises S2, which put mainnet after P3. The execution path is still being built: `place`, the guardrail wiring into the signer, and the console's fail-closed behaviour on a stale feed do not exist yet. Real money buys nothing a mock 999 USDC does not while those are in flight, and it can lose something. The operator's 29.70 USDC on mainnet stays untouched. **The cost, stated:** real fills exercise fee tiers, funding accrual and partial-fill behaviour that testnet does not, so those paths land unproven and must be gated deliberately at the v1 boundary rather than assumed. |
+| A3 | First visible milestone | **Both: the live read-only console and the full agent loop** | Not sequenced one after the other, because they share the expensive part. `get_state` (item 16) and the console's readouts (items 31-34) are the same assembled view of positions, orders, balances, feed health and guardrail utilisation, differing only in transport — Tauri command versus MCP tool. Building the assembler once in `oppen-core` serves both and keeps R1's headless rule intact; building them separately would produce two views that drift. |
+| A4 | First agent's guardrails | **D-c near-zero defaults, unchanged** | Empty symbol allowlist, $25 orders, $100 positions, $25 daily loss. The first order is refused by design with a reason naming the limit to raise. The refusal is the onboarding, and it is also the demonstration that the guardrail path is real rather than decorative. |
+
 ## 2026-09-04 · P4 gateway dependencies
 
 `AGENTS.md` leanness rule 9: a new crate gets a line saying what was rejected.
