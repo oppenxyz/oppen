@@ -15,6 +15,8 @@ serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 hex = "0.4"
+hmac = "0.13"
+keyring = "4.2"
 rusqlite = { version = "0.32", features = ["bundled"] }
 rust_decimal = { version = "1.43", default-features = false, features = ["std", "serde-with-str"] }
 sha3 = { version = "0.11", default-features = false }
@@ -22,3 +24,18 @@ tokio.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+
+# The keyring backend is chosen per platform: Keychain on macOS, Credential
+# Manager on Windows, Secret Service on Linux. `docs/threat-model.md` names all
+# three by name, so the feature set has to match what that document promises.
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "4.2", features = ["apple-native-keyring-store"] }
+
+[target.'cfg(target_os = "ios")'.dependencies]
+keyring = { version = "4.2", features = ["apple-native-keyring-store"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "4.2", features = ["windows-native-keyring-store"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "4.2", features = ["dbus-secret-service-keyring-store"] }

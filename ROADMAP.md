@@ -4,7 +4,9 @@ Everything mapped so far, from the v1 MVP through the versions after it. Numbers
 
 Legend: `[x]` shipped on `main` or in an open PR · `[ ]` not started · **gate** = what proves the phase.
 
-Status as of 2026-09-03: P0 and the P1 code are on `main`; the P1 gate is waiting on a funded testnet agent wallet. Six feature specs are written, and twenty-five product decisions are recorded in [docs/decisions.md](docs/decisions.md).
+Status as of 2026-09-04: P0 and the P1 code are on `main`; the P1 gate is waiting on a funded testnet agent wallet. Six feature specs are written, two more were commissioned by the 2026-09-04 venue audit ([onboarding.md](docs/specs/onboarding.md), [venue-containers.md](docs/specs/venue-containers.md)), and thirty-nine product decisions are recorded in [docs/decisions.md](docs/decisions.md).
+
+**D1 was revised on 2026-09-04.** The unit of isolation is one venue *account* per agent — a sub-account where the venue grants one, a top-level account where it does not. Hyperliquid gates sub-accounts behind $100,000 of protocol-enforced traded volume, on testnet as well as mainnet, so v1 provisions one top-level account per agent. Where this roadmap used "sub-account" to mean the unit of isolation, it now says **container**; where it names the venue's own `subAccounts` endpoint, it still means a sub-account. Reasoning: [decisions.md](docs/decisions.md) V1–V6.
 
 ---
 
@@ -43,7 +45,7 @@ Status as of 2026-09-03: P0 and the P1 code are on `main`; the P1 gate is waitin
 - [ ] Append-only, hash-chained SQLite ledger: the one source for `get_events`, the activity stream and the audit export [D6, 29]
 - [ ] Event taxonomy: fills, order transitions, rejections, guardrail trips, approvals, kill-switch changes, wallet expiry warnings, WS state, alerts [18]
 - [ ] Keys in the OS keychain, read only from `oppen-hl`; keychain hand-off zeroizes the hex string [2]
-- [ ] Sub-account registry: one per agent, `manual · external` bucket for outside fills [D1]
+- [ ] Container registry: one venue account per agent — a **top-level Hyperliquid account** in v1, keyed by venue, address and container kind so V5's sub-account upgrade needs no migration of ledger rows — plus the `manual · external` bucket for outside fills [D1 as revised, decisions.md V1–V2, V5] — [venue-containers.md](docs/specs/venue-containers.md)
 - **Gate:** zero fills lost across a 30 s disconnect
 
 ### P3 · Guardrails, kill switch, dead-man
@@ -52,14 +54,14 @@ Status as of 2026-09-03: P0 and the P1 code are on `main`; the P1 gate is waitin
 - [ ] Guardrail config HMAC-checked with a keychain key [3]
 - [ ] Loss circuit breaker: max daily loss / drawdown per agent and account-wide trips the kill switch [25]
 - [ ] Kill switch per agent and global: pauses new orders, cancels resting, persists across restart, typed `trading_paused` [26]
-- [ ] Dead-man's switch: `scheduleCancel` armed while any agent is active; quit dialog with cancel-all when positions are open [27]
+- [ ] Dead-man's switch: `scheduleCancel` armed while any agent is active; quit dialog with cancel-all when positions are open [27] — **it is a daily budget, not a standing net**: minimum 5 s ahead, maximum 10 triggers per day resetting 00:00 UTC, so the arming policy is deliberate and the remaining count is shown in the risk console [decisions.md O1]
 - [ ] Property test proving there is no signer path without a guardrail check [invariant 1]
 - **Gate:** no signer path without a guardrail check
 
 ### P4 · MCP gateway
 
 - [ ] Streamable HTTP on loopback only: `Origin`/`Host` validation, bearer on every request, constant-time compare, revocation closes live sessions, on/off toggle [14, D2]
-- [ ] Default-deny pairing: approve dialog names the agent, binds a sub-account, assigns guardrails; new agents start in approval mode with tiny caps [15]
+- [ ] Default-deny pairing: approve dialog names the agent, binds a container, assigns guardrails; new agents start in approval mode with tiny caps [15]
 - [ ] `get_state`: versioned deterministic envelope, staleness flags, time-since-last-action, positions with liq distance, orders, balances, funding, guardrail utilization, pending proposals, kill state, rate budget, network badge [16]
 - [ ] `get_meta` [17], `get_events(since_cursor)` with `resync_required` [18]
 - [ ] `place`, `cancel`, `cancel_all`, `close_position` with required `reason`; synchronous result contract; `get_order_status(cloid|oid)` [19]
@@ -107,11 +109,12 @@ a test, and an ungated judgement resolves as schedule drift.
 ### P7 · Approval mode, skill, release
 
 - [ ] Approval mode, built last: `pending_approval` with TTL, re-priced at approval time with drift shown, typed approved/rejected/expired events, visible in `get_state` [28]
-- [ ] First-run onboarding: testnet default → sub-account + agent wallet per agent → WalletConnect ceremony → pair first agent with the `claude mcp add` snippet and a connection test [4, D5]
+- [ ] First-run onboarding: testnet default → one container + agent wallet per agent (`usdSend` to fund it, `approveAgent` to authorise the agent wallet, `approveBuilderFee` for the builder code — every signature in the user's own wallet, never a container key in the app) → pair first agent with the `claude mcp add` snippet and a connection test [4, D5, decisions.md V2, O7] — [onboarding.md](docs/specs/onboarding.md)
+- [ ] Sub-account path offered as an attempt, never as a precondition: `userRateLimit` returns `cumVlm`, so oppen may show distance to the gate as a labelled estimate, but nothing documents that the gate reads that counter or whether it is lifetime or windowed — so oppen still tries `createSubAccount` and classifies the refusal, and `Required:` / `Traded:` are displayed, never branched on [decisions.md V5, O3]
 - [ ] `AGENTS.md` and the `skills/oppen` Claude Code skill written for real [23]
 - [ ] Threat model finalized against the shipped code [2]
 - [ ] Release builds: ad-hoc dmg + unsigned AppImage first; provenance attestations and checksums [1]
-- **Gate:** fresh machine to a testnet trade in 10 minutes
+- **Gate:** fresh machine to a testnet trade in 10 minutes — measured from a wallet that already holds testnet USDC. The faucet pays 1,000 mock USDC only to an address that has previously deposited on **mainnet**, which is outside oppen and outside the ten minutes [decisions.md O2]
 
 ### Cut from v1 — decided, do not re-add
 
@@ -121,12 +124,15 @@ a test, and an ungated judgement resolves as schedule drift.
 
 ## Specified but not scheduled
 
-These have written specs in [docs/specs/](docs/specs/) and slot into the versions
-below. A spec is not a commitment; each carries open decisions that need an
-answer before it starts.
+These have written specs in [docs/specs/](docs/specs/). Most slot into the
+versions below; the two written on 2026-09-04 are already scheduled inside v1 and
+are listed here so the index is complete. A spec is not a commitment; each carries
+open decisions that need an answer before it starts.
 
 | Spec | Feature | Target |
 |---|---|---|
+| [onboarding.md](docs/specs/onboarding.md) | First-run ceremony: container per agent, agent wallet, builder fee, pairing | v1 · P7 |
+| [venue-containers.md](docs/specs/venue-containers.md) | The container model and what Hyperliquid, Aster and Lighter each grant | v1 · P2 (model) / v2 (Aster, Lighter) |
 | [workflows.md](docs/specs/workflows.md) | Trading workflows, triggers, schedulers, agent profiles | v1.5 / v2 |
 | [history.md](docs/specs/history.md) | Durable trading history in the Portfolio tab | v1.1 |
 | [charts.md](docs/specs/charts.md) | ASCII candles with real axes, arbitrary intervals, line chart, Quantoppen | v1 / v1.1 |
@@ -156,17 +162,17 @@ answer before it starts.
 - [ ] `tape_intensity_z` as a `set_alert` wakeup
 - [ ] OI × price regime enum (`longs_opening`, `shorts_covering`, …) with raw deltas attached
 - [ ] `suggest_size`: stop-based, vol-target, quarter-Kelly with the agent-declared edge logged for calibration grading
-- [ ] Fleet crowding across sub-accounts and a `FLEET_CAP` guardrail
+- [ ] Fleet crowding across containers and a `FLEET_CAP` guardrail
 - [ ] Markout curves; implementation shortfall anchored on a `preflight` `snapshot_id`
 - [ ] BYO-model runtime: a model loop hosted in-app, still behind the same guardrail path
 - [ ] **Fair value engine**: mark replication, funding dead-zone censoring, min-variance component combination, `basis_bp` / `z` / `z_sigma`, and the five `fair_value.*` MCP tools — [fair-value.md](docs/specs/fair-value.md)
-- [ ] **Paper execution**: one trait, two brokers, real ledger events tagged `paper` — prerequisite for workflows — [workflows.md](docs/specs/workflows.md) §8
 - [ ] **Workflow engine, layer one**: triggers, cron scheduler, conditions, loops, approval gates, `await_agent` nodes for external agents, run state on the existing ledger — [workflows.md](docs/specs/workflows.md) §4.1
 - [ ] **Workflow templates**: `funding-carry`, `basis-dislocation`, `vol-regime`, `position-guardian`, `research-only`, `custom` — structure only, no alpha — [workflows.md](docs/specs/workflows.md) §10
 
 ## v2+ · Venues, strategies, scripts
 
-- [ ] Lighter and Aster venues; cross-venue aggregation and routing
+- [ ] **Aster and Lighter venues.** Both grant sub-accounts with no volume gate — Aster at "All VIP levels", Lighter tier-capped at 4 free / 16 / 64 — so the container model lands on them more cleanly than on Hyperliquid, which is the worst of the three for this architecture [decisions.md V4] — [venue-containers.md](docs/specs/venue-containers.md)
+- [ ] **Cross-venue aggregation and routing.** Positions on different venues never net: three venues is three margin pools and three liquidation prices, an economically flat book posts full margin on both legs, and one leg can liquidate while the other survives. Aggregate exposure is an oppen-enforced guardrail with no venue behind it, and is labelled as containment rather than a boundary [decisions.md V6]
 - [ ] TWAP and scale orders
 - [ ] Backtesting and strategy templates
 - [ ] Portfolio analytics

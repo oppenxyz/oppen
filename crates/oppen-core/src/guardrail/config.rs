@@ -7,13 +7,13 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
 /// `$25` order cap for a new agent (D-c).
-pub const DEFAULT_MAX_ORDER_USD: Decimal = Decimal::from_parts(25, 0, 0, false, 0);
+pub(super) const DEFAULT_MAX_ORDER_USD: Decimal = Decimal::from_parts(25, 0, 0, false, 0);
 /// `$100` position cap for a new agent (D-c).
-pub const DEFAULT_MAX_POSITION_USD: Decimal = Decimal::from_parts(100, 0, 0, false, 0);
+pub(super) const DEFAULT_MAX_POSITION_USD: Decimal = Decimal::from_parts(100, 0, 0, false, 0);
 /// `$25` daily loss budget for a new agent (D-c).
-pub const DEFAULT_DAILY_LOSS_USD: Decimal = Decimal::from_parts(25, 0, 0, false, 0);
+pub(super) const DEFAULT_DAILY_LOSS_USD: Decimal = Decimal::from_parts(25, 0, 0, false, 0);
 /// Five orders per five minutes for a new agent (D-c).
-pub const DEFAULT_ORDER_RATE: OrderRate = OrderRate {
+pub(super) const DEFAULT_ORDER_RATE: OrderRate = OrderRate {
     count: 5,
     per_ms: 300_000,
 };
@@ -21,27 +21,27 @@ pub const DEFAULT_ORDER_RATE: OrderRate = OrderRate {
 /// to the number D-c omits: tight enough that the first wide order is refused
 /// and the refusal names the limit to raise. Spec item 12 makes max-slippage
 /// mandatory on market orders, so there has to be a number here.
-pub const DEFAULT_MAX_SLIPPAGE_BPS: Decimal = Decimal::from_parts(10, 0, 0, false, 0);
+pub(super) const DEFAULT_MAX_SLIPPAGE_BPS: Decimal = Decimal::from_parts(10, 0, 0, false, 0);
 /// D-c does not name a leverage default either. `1` is "no leverage", which
 /// is what "default-deny all the way down" means for a multiplier.
-pub const DEFAULT_MAX_LEVERAGE: u32 = 1;
+pub(super) const DEFAULT_MAX_LEVERAGE: u32 = 1;
 /// `docs/specs/fair-value.md` §9: `mark_divergence_bp`.
-pub const DEFAULT_MARK_DIVERGENCE_BPS: Decimal = Decimal::from_parts(5, 0, 0, false, 0);
+pub(super) const DEFAULT_MARK_DIVERGENCE_BPS: Decimal = Decimal::from_parts(5, 0, 0, false, 0);
 /// `docs/specs/fair-value.md` §9: `mark_divergence_window_s`, in ms.
-pub const DEFAULT_MARK_DIVERGENCE_WINDOW_MS: u64 = 30_000;
+pub(super) const DEFAULT_MARK_DIVERGENCE_WINDOW_MS: u64 = 30_000;
 /// How long an approval proposal stays valid (spec item 28: proposals carry
 /// a TTL and auto-expire). Two minutes: long enough for an operator to look
 /// at a queued order, short enough that approving one is still a decision
 /// about roughly the current market rather than about a stale one. The order
 /// is re-evaluated in full against fresh data at approval time anyway, so an
 /// expiry is a convenience for the operator, not the safety property.
-pub const APPROVAL_TTL_MS: u64 = 120_000;
+pub(super) const APPROVAL_TTL_MS: u64 = 120_000;
 /// Longest agent `reason` string accepted, in bytes.
 ///
 /// Refusal rows are kept forever (D-e) and a refusal costs no rate token, so
 /// an unbounded reason is unlimited free writes into an append-only
 /// hash-chained store. 2 KiB is far more than a sentence explaining a trade.
-pub const MAX_REASON_BYTES: usize = 2_048;
+pub(super) const MAX_REASON_BYTES: usize = 2_048;
 
 /// Token-bucket shape for spec item 24's order-rate cap: `count` orders per
 /// `per_ms` milliseconds. `docs/specs/workflows.md` §7 writes it as
@@ -82,7 +82,7 @@ pub struct GlobalRateBudget {
 impl GlobalRateBudget {
     /// Rejects a budget that cannot be evaluated, in the same shape
     /// [`AgentGuardrails::validate`] uses.
-    pub fn validate(&self) -> Result<(), (&'static str, String)> {
+    pub(super) fn validate(&self) -> Result<(), (&'static str, String)> {
         if self.rate.per_ms == 0 {
             return Err(("global_rate.rate.per_ms", "must be positive".to_owned()));
         }
@@ -170,12 +170,12 @@ impl Default for LossLimits {
 impl LossLimits {
     /// The account-wide pair: unset until an operator sets it (see the type
     /// doc for why D-c does not supply one).
-    pub const UNSET: LossLimits = LossLimits {
+    pub(super) const UNSET: LossLimits = LossLimits {
         max_daily_loss_usd: None,
         max_drawdown_usd: None,
     };
 
-    pub fn is_unset(&self) -> bool {
+    pub(super) fn is_unset(&self) -> bool {
         self.max_daily_loss_usd.is_none() && self.max_drawdown_usd.is_none()
     }
 }
@@ -259,7 +259,7 @@ impl AgentGuardrails {
     /// Rejects a configuration that cannot be evaluated at all, so a bad
     /// value is caught when an operator types it rather than at the moment
     /// an order needs a verdict. Returns the offending field and why.
-    pub fn validate(&self) -> Result<(), (&'static str, String)> {
+    pub(super) fn validate(&self) -> Result<(), (&'static str, String)> {
         if self.max_order_usd.is_sign_negative() {
             return Err(("max_order_usd", "must not be negative".to_owned()));
         }

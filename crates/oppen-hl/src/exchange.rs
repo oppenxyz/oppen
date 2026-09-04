@@ -26,11 +26,19 @@ pub struct PreSign<'a> {
 /// `AGENTS.md` invariant 1 requires exactly one code path to the signer, and
 /// that it run the guardrail check. This trait is that path: the check is
 /// invoked *inside* [`ExchangeRequest::sign_checked`], so a caller cannot
-/// construct a signed request and skip it. `oppen-core`'s guardrail engine is
-/// the implementation oppen ships; the trait lives here because `oppen-hl`
-/// owns the signer and cannot depend on the crate above it.
+/// construct a signed request and skip it. The trait lives here because
+/// `oppen-hl` owns the signer and cannot depend on the crate above it.
 ///
-/// **What this does not prevent.** A caller can still write a type that
+/// The implementation oppen ships is **private to `oppen-core`**: a gate
+/// bound to one guardrail clearance, built by `GuardrailEngine::sign_cleared`
+/// and nameable nowhere else. The guardrail engine deliberately does not
+/// implement this trait itself. It did until 2026-09-04, and because both the
+/// engine and this constructor are public, that let any caller hand the real
+/// engine an [`Action`](crate::Action) it had never evaluated and collect a
+/// signature — the gate sees only the assembled request, so it had nothing to
+/// check the action against.
+///
+/// **What this does not prevent.** A caller can still write its own type that
 /// implements this trait and returns `Ok(())` unconditionally, and
 /// [`ExchangeRequest::sign_unchecked`] remains available for the operator's
 /// manual path and for tests. Both are deliberate, and both are *visible*: a
@@ -75,6 +83,15 @@ pub struct ExchangeRequest {
 impl ExchangeRequest {
     /// The guarded signing path. Runs `check` first and signs only if it
     /// passes. This is the constructor every agent-initiated order uses.
+    ///
+    /// The two statements in the body are in that order on purpose, and the
+    /// order is load-bearing rather than stylistic: swapping them still
+    /// returns `Err(SignError::Refused)` to the caller, so no test that
+    /// inspects the return value can tell the difference, while the private
+    /// key has in fact been used on an order the gate went on to refuse.
+    /// `seal_tests::the_gate_runs_before_the_key_is_touched` pins the order
+    /// against this file's own source because that is the only place the
+    /// difference is visible.
     pub fn sign_checked<C: PreSignCheck>(
         key: &AgentKey,
         action: Action,
@@ -109,7 +126,13 @@ impl ExchangeRequest {
     /// 33), the signing vectors, and the testnet CLI example. **Every new
     /// call site is a blocking review finding** — see `AGENTS.md` invariant 1.
     /// It is named to be greppable rather than hidden, because a bypass that
-    /// is invisible is worse than one that is obvious.
+    /// is invisible is worse than one that is obvious, and `oppen-core`'s
+    /// `no_call_site_in_oppen_core_reaches_the_signer_unchecked` test greps
+    /// for exactly this name so an accidental one fails the suite.
+    ///
+    /// There is deliberately no `sign` shorthand. An unqualified name would
+    /// be the one a new call site reaches for by habit, and habit is the
+    /// mechanism this whole module exists to defeat.
     pub fn sign_unchecked(
         key: &AgentKey,
         action: Action,
@@ -127,20 +150,6 @@ impl ExchangeRequest {
             vault_address,
             expires_after,
         })
-    }
-
-    /// Temporary alias for [`Self::sign_unchecked`], kept only so the
-    /// in-flight guardrail integration keeps compiling. Removed as soon as
-    /// `oppen-core` moves to `sign_checked`.
-    pub fn sign(
-        key: &AgentKey,
-        action: Action,
-        nonce: u64,
-        vault_address: Option<Address>,
-        expires_after: Option<u64>,
-        network: Network,
-    ) -> Result<Self, Error> {
-        Self::sign_unchecked(key, action, nonce, vault_address, expires_after, network)
     }
 
     pub fn action(&self) -> &Action {
@@ -381,9 +390,15 @@ mod tests {
         let key =
             AgentKey::from_hex("0123456789012345678901234567890123456789012345678901234567890123")
                 .unwrap();
-        let req =
-            ExchangeRequest::sign(&key, Action::ClaimRewards, 1, None, None, Network::Testnet)
-                .unwrap();
+        let req = ExchangeRequest::sign_unchecked(
+            &key,
+            Action::ClaimRewards,
+            1,
+            None,
+            None,
+            Network::Testnet,
+        )
+        .unwrap();
         let json = serde_json::to_value(&req).unwrap();
         assert_eq!(json["action"]["type"], "claimRewards");
         assert_eq!(json["nonce"], 1);
@@ -490,5 +505,144 @@ mod seal_tests {
             &Inspect,
         )
         .expect("inspector saw the real request");
+    }
+
+    /// The property `AGENTS.md` invariant 1 actually asks for, at this layer:
+    /// over generated inputs, **every** attempt is evaluated exactly once,
+    /// every refusal yields no `ExchangeRequest`, and every pass yields one.
+    ///
+    /// What it proves: `sign_checked` cannot be entered without the gate
+    /// running, cannot run it twice, and cannot produce a value on the
+    /// refusal branch. What it cannot prove: that some other code did not
+    /// call [`ExchangeRequest::sign_unchecked`] — that is a call-site
+    /// property, and `oppen-core` tests it by grepping its own sources.
+    #[test]
+    fn every_generated_input_is_evaluated_exactly_once_and_only_passes_sign() {
+        /// Refuses on an arbitrary but deterministic predicate, so both
+        /// branches are exercised by the same generator.
+        struct OddNoncesRefused(std::cell::Cell<u32>);
+        impl PreSignCheck for OddNoncesRefused {
+            type Refusal = u64;
+            fn check(&self, r: PreSign<'_>) -> Result<(), u64> {
+                self.0.set(self.0.get() + 1);
+                if r.nonce % 2 == 1 {
+                    Err(r.nonce)
+                } else {
+                    Ok(())
+                }
+            }
+        }
+
+        let key = key();
+        let check = OddNoncesRefused(std::cell::Cell::new(0));
+        let mut signed = 0u32;
+        let mut refused = 0u32;
+        // A tiny LCG rather than a dependency: the point is coverage of both
+        // branches over many shapes, and a fixed seed keeps the run
+        // reproducible after the fact.
+        let mut seed = 0x2026_0904_u64;
+        for i in 0..2_000u64 {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            let nonce = (seed >> 11) ^ i;
+            let network = if seed & 1 == 0 {
+                Network::Testnet
+            } else {
+                Network::Mainnet
+            };
+            let vault = if seed & 2 == 0 {
+                None
+            } else {
+                Some(Address::from_bytes([7u8; 20]))
+            };
+            let expires_after = if seed & 4 == 0 { None } else { Some(nonce) };
+            let action = if seed & 8 == 0 {
+                Action::ClaimRewards
+            } else {
+                Action::ScheduleCancel { time: Some(nonce) }
+            };
+            let before = check.0.get();
+            let out = ExchangeRequest::sign_checked(
+                &key,
+                action,
+                nonce,
+                vault,
+                expires_after,
+                network,
+                &check,
+            );
+            assert_eq!(
+                check.0.get(),
+                before + 1,
+                "case {i}: exactly one evaluation per attempt"
+            );
+            match out {
+                Err(SignError::Refused(n)) => {
+                    assert_eq!(n % 2, 1, "case {i}: refused a passing input");
+                    refused += 1;
+                }
+                Ok(request) => {
+                    assert_eq!(nonce % 2, 0, "case {i}: signed a refused input");
+                    assert_eq!(request.nonce(), nonce);
+                    assert_eq!(request.vault_address(), vault);
+                    assert_eq!(request.expires_after(), expires_after);
+                    signed += 1;
+                }
+                Err(SignError::Signing(e)) => panic!("case {i}: signing failed: {e}"),
+            }
+        }
+        assert_eq!(u64::from(signed + refused), 2_000);
+        assert_eq!(
+            check.0.get(),
+            signed + refused,
+            "one evaluation per attempt, refusals included"
+        );
+        assert!(
+            signed > 500 && refused > 500,
+            "both branches were exercised"
+        );
+    }
+
+    /// **The ordering, which no runtime test above can see.**
+    ///
+    /// Move the `check` call after the `sign_unchecked` call and every other
+    /// test in this module still passes: the caller still gets
+    /// `Err(SignError::Refused)` and still gets no [`ExchangeRequest`]. What
+    /// changed is invisible from outside — the agent key was used to sign an
+    /// order the gate then refused. `AGENTS.md` invariant 1 says the check
+    /// happens *before* signing, not merely that a refusal yields no value,
+    /// so the ordering is asserted where it is observable: this file's own
+    /// source.
+    ///
+    /// This is a grep, and it is exactly as strong as a grep. It cannot
+    /// follow the check into a helper, and it would not notice a signature
+    /// computed somewhere else entirely. It catches the one mistake that is
+    /// actually likely, which is someone reordering two statements while
+    /// refactoring and seeing a green suite.
+    #[test]
+    fn the_gate_runs_before_the_key_is_touched() {
+        let source = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("exchange.rs"),
+        )
+        .expect("this module's own source is readable");
+        let body = source
+            .split_once("pub fn sign_checked")
+            .expect("sign_checked exists")
+            .1;
+        // The end of the function: the next item at the same indentation.
+        let body = body
+            .split_once("\n    /// Signs with no gate.")
+            .expect("sign_unchecked follows sign_checked in this file")
+            .0;
+        let gate_at = body.find(".check(PreSign {").expect("the gate is called");
+        let sign_at = body
+            .find("Self::sign_unchecked(")
+            .expect("the signer is called");
+        assert!(
+            gate_at < sign_at,
+            "sign_checked calls the signer at byte {sign_at} before the gate at {gate_at}; \
+             a refused order would be signed and then discarded (AGENTS.md invariant 1)"
+        );
     }
 }

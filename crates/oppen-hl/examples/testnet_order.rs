@@ -13,6 +13,20 @@
 //! `OPPEN_TESTNET_USER` is the master (or sub-account) address the agent
 //! signs for; set `OPPEN_TESTNET_VAULT` to route through a sub-account.
 //! The key is read from the environment only; never paste it anywhere else.
+//!
+//! # Why this file signs unchecked
+//!
+//! `AGENTS.md` invariant 1 puts a guardrail evaluation immediately before
+//! every signature, and `oppen-core`'s `GuardrailEngine::sign_cleared` is the
+//! path that does it. This example is the other thing: spec item 33's manual
+//! operator escape hatch, driven from a CLI with no engine, no ledger and no
+//! agent registry to evaluate against. It therefore calls
+//! [`ExchangeRequest::sign_unchecked`] at every one of its three signing
+//! sites, by that name, so the bypass is a thing you can read and grep for
+//! rather than something that happens because nobody wired the gate up. A
+//! call to `sign_unchecked` anywhere in `oppen-core` is a blocking review
+//! finding and fails that crate's
+//! `no_call_site_in_oppen_core_reaches_the_signer_unchecked` test.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -65,7 +79,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mid = *mids.get("BTC").ok_or("no BTC mid")?;
     let state = info.clearinghouse_state(user).await?;
     println!("mid      {mid}");
-    println!("equity   {}", state.margin_summary.account_value);
+    println!(
+        "perps    accountValue={} withdrawable={} (0 is expected under unified \
+         margin; this is not the account balance)",
+        state.margin_summary.account_value, state.withdrawable
+    );
 
     let cloid = random_cloid();
     let spec = OrderSpec {
@@ -89,7 +107,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         grouping: Grouping::Na,
         builder: None,
     };
-    let request = ExchangeRequest::sign(&key, action, nonces.next(), vault, None, network)?;
+    // Spec item 33, the manual escape hatch: no engine exists here to clear
+    // the order, so the gate is skipped by name rather than by omission.
+    let request =
+        ExchangeRequest::sign_unchecked(&key, action, nonces.next(), vault, None, network)?;
     let response = exchange.post(&request).await?;
     println!("place    {:?}", response.statuses);
     let oid = match response.statuses.first() {
@@ -119,7 +140,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             cloid: cloid.clone(),
         }],
     };
-    let request = ExchangeRequest::sign(&key, cancel, nonces.next(), vault, None, network)?;
+    // Item 33 again. A cancel is risk-reducing, so even under an engine this
+    // one would clear; it is unchecked here for the same reason as above.
+    let request =
+        ExchangeRequest::sign_unchecked(&key, cancel, nonces.next(), vault, None, network)?;
     let response = exchange.post(&request).await?;
     println!("cancel   {:?}", response.statuses);
 
@@ -133,7 +157,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         builder: None,
     };
     let expires_after = now_ms() - 60_000;
-    let request = ExchangeRequest::sign(
+    // Item 33. This one is a deliberate probe of a venue rejection, which is
+    // precisely the shape a guardrail engine would refuse before it reached
+    // the wire, so it could not be written any other way.
+    let request = ExchangeRequest::sign_unchecked(
         &key,
         action,
         nonces.next(),

@@ -61,16 +61,38 @@ external agents, which pick work up through the existing event cursor.
 
 This is the difference that makes the feature shippable early. See §4.
 
-### 2.3 One sub-account per workflow, not per node
+### 2.3 One container per workflow, not per node
 
-D1 gives each agent its own sub-account. A workflow has six roles but only one of
-them trades. Binding a sub-account per node would fragment margin and make
-per-workflow PnL meaningless.
+D1 was revised on 2026-09-04: each agent gets one venue **account** — a
+sub-account where the venue grants one, a top-level account where it does not
+([../spec.md](../spec.md) D1, [../decisions.md](../decisions.md) V1). oppen calls
+that account a container. A workflow has six roles and only one of them trades.
 
-**A workflow instance owns exactly one sub-account.** Its guardrails are that
-sub-account's guardrails. Every node inherits them. The execute node signs with
-that sub-account's agent wallet. Per-node attribution lives in the ledger, not in
-venue state.
+**A workflow instance is bound to exactly one container.** Its guardrails are
+that container's guardrails. Every node inherits them. The execute node signs
+with that container's agent wallet. Per-node attribution lives in the ledger, not
+in venue state.
+
+The conclusion survived the revision; the argument for it changed. "Binding a
+sub-account per node would fragment margin" is still true — six containers are six
+margin pools that do not net, because Hyperliquid nets per address per coin and
+two containers are two addresses. What the revision adds is price. On Hyperliquid
+a container is a top-level account the user derives in their own wallet, and
+standing it up costs three wallet signatures — `approveAgent`,
+`approveBuilderFee`, `usdSend` ([onboarding.md](onboarding.md) §3.3), or two with
+the builder fee declined — plus one more withdrawal-capable key the operator
+holds and backs up ([../decisions.md](../decisions.md), "The container's own
+key"). A container per node charges that six times over for five roles that never
+sign. On Aster and Lighter containers are cheaper — two signatures and one
+API-key transaction respectively ([onboarding.md](onboarding.md) §4–§5) — and the
+margin argument alone still settles it.
+
+**Whose container it is, is not settled.** [../decisions.md](../decisions.md) R2
+records the schema — `owner_type ENUM('agent','workflow')` plus `owner_id` — and
+leaves the product rule open: a workflow may own a container of its own, or bind
+to the container of the agent that drives it. One container per instance holds
+either way. The branch decides whether two workflows can end up on one address,
+which is §11's netting row and open decision 4 in §13.
 
 ### 2.4 Paper execution: cut
 
@@ -81,13 +103,13 @@ exactly the ways the assumptions are wrong. The execute node has one
 implementation, and §8 becomes "arm on testnet, promote to mainnet". See
 [decisions.md](../decisions.md) S5.
 
-The original argument, retained:
+The original argument, retained as superseded — §8 no longer carries this
+dependency:
 
-
-The handoff is right that paper trading comes first, and oppen v1 has no paper
-mode. A workflow's execute node must be swappable between a paper broker and the
-live signer without the graph knowing which. This is added as a v1.5 dependency
-(§8).
+> The handoff is right that paper trading comes first, and oppen v1 has no paper
+> mode. A workflow's execute node must be swappable between a paper broker and
+> the live signer without the graph knowing which. This is added as a v1.5
+> dependency (§8).
 
 ### 2.5 Instruments and evidence
 
@@ -221,15 +243,16 @@ edge or a style.
 
 Declarative, versioned, stored in SQLite, exportable as a file so a workflow can
 be shared and diffed. Sharing a workflow file shares structure only; it never
-contains keys, tokens, or the operator's sub-account.
+contains keys, tokens, or the operator's container addresses.
 
 ```yaml
 workflow: funding-carry-watch
 version: 3
 network: testnet
-sub_account: auto            # provisioned on first arm
+container: alpha-c1          # an existing container, by registry name
+                             # `prompt` = arm behind the onboarding ceremony
 
-guardrails:                  # the sub-account's limits; nodes inherit
+guardrails:                  # the container's limits; nodes inherit
   symbols: [BTC, ETH]
   max_position_usd: 2000
   max_order_usd: 500
@@ -296,6 +319,18 @@ limits:
   max_orders_per_run: 4
 ```
 
+`container` names a container that already exists in the registry. **oppen cannot
+provision one on its own**, and the earlier `sub_account: auto  # provisioned on
+first arm` was false as soon as D1 was revised: on Hyperliquid a container is a
+top-level account the user derives in their own wallet, and it takes three
+signatures in that wallet to stand up (§2.3). `container: prompt` is therefore
+not auto-provisioning — it means arming blocks on the onboarding ceremony and the
+workflow does not leave `draft` until the ceremony completes and the registry has
+the address. On Aster and Lighter oppen can create the sub-account itself, so
+`prompt` is cheaper there; it still is not silent, because the operator signs on
+Aster and the key registration on Lighter needs the L1 key
+([onboarding.md](onboarding.md) §4–§5).
+
 Routing conditions are evaluated over structured fields only. There is no path
 in which a natural-language string decides an edge.
 
@@ -323,26 +358,27 @@ append that commits before the node's side effect begins. On restart, a run in
 
 ---
 
-## 8. Paper execution
+## 8. Arming: testnet, then mainnet
 
-Required before any workflow runs live.
+**There is no paper broker.** Testnet is the paper mode
+([../decisions.md](../decisions.md) S5, §2.4 above). The execute node has one
+implementation — the live signer — so there is no second fill model to maintain
+and no branch in the graph that behaves differently in rehearsal.
 
-```
-        execute node
-             │
-      ┌──────┴──────┐
-   PaperBroker   LiveSigner
-```
+Promotion is not a flag. A testnet container and a mainnet container are
+different accounts on different networks, recorded in different database files
+with different hash chains ([../decisions.md](../decisions.md) R4), so promoting
+a workflow means binding its definition to a mainnet container that has been
+through §2.3's ceremony. The arm dialog states the network in words and names the
+container it will sign with; mainnet requires a second confirmation. P2 gates
+unattended live execution on N clean testnet runs with no guardrail trips, and
+editing the definition resets that counter because a fork is a new definition.
 
-Both implement one trait. The paper broker fills against the live book with a
-configurable latency and a conservative fill model: marketable orders walk real
-depth from `l2Book` and pay the spread; resting orders fill only when the book
-trades through the level, never at it. Paper fills produce real ledger events
-tagged `paper`, real positions in a shadow portfolio, and real PnL arithmetic,
-so a workflow's audit trail is identical in shape whether it traded or not.
-
-A workflow's arm dialog states the mode in words, and mainnet + live requires a
-second confirmation.
+What this gives up, stated rather than smoothed over: a testnet book is thinner
+than a mainnet book, so a fill that walked testnet depth is not evidence about
+mainnet slippage. A paper broker would not have fixed that. It would have
+modelled it, which is worse — the model would be an assumption maintained by us,
+optimistic in exactly the ways the assumptions are wrong.
 
 ---
 
@@ -391,7 +427,8 @@ it cannot trade because it has no execute node, not because a flag is off.
 | Agent answers twice | Second `submit_result` for a completed task is rejected as `stale_task` |
 | Loop does not converge | `max_iterations` halts the run and records `limit_hit` |
 | Trigger storms | Per-workflow trigger rate limit; coalesce identical triggers within a window |
-| Two workflows, same symbol | Positions net at the venue only if they share a sub-account; they do not. Cross-workflow exposure is surfaced but not netted. A `FLEET_CAP` guardrail (v1.5 quant scope) bounds the aggregate |
+| Two workflows, same symbol, different containers | Nothing nets. Hyperliquid nets per address per coin and two containers are two addresses, so both legs post full margin and each carries its own liquidation price. Exposure is summed across containers and never netted (D1); `FLEET_CAP` (v1.5 quant scope) bounds the aggregate |
+| Two workflows, same symbol, one container | They **do** net, and every objection D1 raises to a shared address applies: no per-workflow margin, one liquidation price belonging to neither, and funding that cannot be split because at net zero no cash moved ([../decisions.md](../decisions.md) V3). D1's shared-address guards bind — a workflow may cancel or modify only order ids it opened, `close_position` and flatten are refused, equity and margin are shown once for the container and never mirrored per workflow. Whether oppen arms a second workflow onto an occupied container at all is **not decided** (§13.4) |
 | Machine sleeps mid-run | On wake: reconcile, then either resume or fail the run. Never resume a run whose `place` node has an unreconciled cloid |
 | Model cost runaway | `max_model_cost_usd` per run and per day; exceeded means halt, not truncate |
 | Approval expires | Proposal expires with a typed event; the run does not silently proceed |
@@ -406,9 +443,10 @@ guardrail node refuses an oversized proposal with a typed reason, and the full
 causal chain from trigger to refusal is reconstructable from the ledger with no
 gaps. No order is placed, because the template has no execute node.
 
-**Paper (v1.5).** The same workflow with an execute node, in paper mode, fills
-against the live testnet book, and its shadow PnL matches a hand computation over
-the recorded fills.
+**Execution (v1.5).** The same workflow with an execute node, armed on testnet
+against its own container, fills on the live testnet book, and its realized PnL
+matches the venue's `closedPnl` for those fills ([history.md](history.md) §5) —
+the venue's number, not a local recomputation used as its own proof.
 
 **Layer two (v2).** The same workflow runs unattended with in-app agent nodes,
 overnight, and every order it placed passes the same guardrail path as an
@@ -426,6 +464,11 @@ externally-driven one — proven by the type system, not by inspection.
    distinct in a fund; in a one-person deployment the same model answers both.
    Recommend keeping them separate in the graph and allowing the same agent
    identity to serve both roles.
-4. **Cross-workflow netting.** Deferred to the `FLEET_CAP` work; a real answer
-   needs portfolio-level guardrails spanning sub-accounts, which the whitepaper
-   already lists as post-v1.
+4. **Cross-workflow netting, and whether two workflows may share a container.**
+   Two questions, split by §11's two rows. *Across* containers there is nothing
+   to net and the answer is `FLEET_CAP`: portfolio-level guardrails spanning
+   containers, which the whitepaper already lists as post-v1. *Within* one
+   container the positions net at the venue, so the question is not aggregation
+   but whether oppen arms the second workflow at all. That branch is downstream
+   of R2 landing on `agent` or `workflow` ([../decisions.md](../decisions.md)),
+   which is itself open; nothing in v1.5 should assume either answer.

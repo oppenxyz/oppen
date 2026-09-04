@@ -38,7 +38,7 @@ impl fmt::Display for LossKind {
 
 /// An exhausted loss budget.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Breach {
+pub(super) struct Breach {
     pub scope: KillScope,
     pub kind: LossKind,
     /// The loss, as a positive number of dollars.
@@ -57,7 +57,7 @@ pub struct Breach {
 ///
 /// Returns the first breach found, daily before drawdown, because the daily
 /// budget is the tighter and more actionable of the two.
-pub fn check(scope: &KillScope, limits: &LossLimits, account: &AccountSnapshot) -> Option<Breach> {
+fn check(scope: &KillScope, limits: &LossLimits, account: &AccountSnapshot) -> Option<Breach> {
     if let Some(limit) = limits.max_daily_loss_usd {
         let loss = Decimal::ZERO.saturating_sub(account.day_pnl_usd());
         if loss >= limit {
@@ -91,7 +91,7 @@ pub fn check(scope: &KillScope, limits: &LossLimits, account: &AccountSnapshot) 
 /// Order matters for the refusal an agent sees: its own budget is the one it
 /// can reason about, so it is reported first. The account-wide breach carries
 /// [`KillScope::Global`] and therefore stops every agent, not just this one.
-pub fn check_all(
+pub(super) fn check_all(
     agent: &AgentId,
     agent_limits: &LossLimits,
     agent_account: &AccountSnapshot,

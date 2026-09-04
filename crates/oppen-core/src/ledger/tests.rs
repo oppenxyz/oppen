@@ -49,7 +49,7 @@ const KINDS: [EventKind; 8] = [
     EventKind::ApprovalDecision,
     EventKind::AgentDecision,
     EventKind::Refusal,
-    EventKind::Fill,
+    EventKind::KillSwitchChanged,
     EventKind::OrderStateChange,
     EventKind::OperatorAction,
     EventKind::GuardrailTrip,
@@ -629,7 +629,7 @@ fn an_append_that_fails_midway_leaves_no_half_row() {
     let body = payload(99);
     let error = ledger
         .append(&NewEvent {
-            kind: EventKind::Fill,
+            kind: EventKind::OrderStateChange,
             ts_ms: 1_756_300_000_000,
             agent_id: Some("agent-a"),
             payload: &body,
@@ -656,7 +656,7 @@ fn an_append_that_fails_midway_leaves_no_half_row() {
     // The seq the failed append would have taken is handed out again.
     let next = ledger
         .append(&NewEvent {
-            kind: EventKind::Fill,
+            kind: EventKind::OrderStateChange,
             ts_ms: 1_756_300_000_001,
             agent_id: Some("agent-a"),
             payload: &body,
@@ -739,7 +739,7 @@ fn an_intent_is_committed_before_the_receipt_exists() {
     let outcome = reopened
         .record_outcome(
             &receipt,
-            EventKind::Fill,
+            EventKind::OrderStateChange,
             1_756_500_000_500,
             &json!({ "oid": 42, "avg_px": "63000.5" }),
         )
@@ -1322,7 +1322,7 @@ fn a_receipt_from_another_chain_is_refused() {
     let error = mainnet
         .record_outcome(
             &receipt,
-            EventKind::Fill,
+            EventKind::OrderStateChange,
             2,
             &json!({ "oid": 1, "avg_px": "63000" }),
         )
@@ -1355,7 +1355,12 @@ fn a_receipt_whose_row_no_longer_matches_is_refused() {
             .expect("tamper");
     }
     assert!(matches!(
-        ledger.record_outcome(&receipt, EventKind::Fill, 2, &json!({ "oid": 1 })),
+        ledger.record_outcome(
+            &receipt,
+            EventKind::OrderStateChange,
+            2,
+            &json!({ "oid": 1 })
+        ),
         Err(LedgerError::ReceiptRowMismatch { seq: 1, .. })
     ));
 
@@ -1369,7 +1374,12 @@ fn a_receipt_whose_row_no_longer_matches_is_refused() {
             .expect("delete");
     }
     assert!(matches!(
-        ledger.record_outcome(&receipt, EventKind::Fill, 3, &json!({ "oid": 1 })),
+        ledger.record_outcome(
+            &receipt,
+            EventKind::OrderStateChange,
+            3,
+            &json!({ "oid": 1 })
+        ),
         Err(LedgerError::NoSuchEvent(1))
     ));
 }
@@ -1392,7 +1402,12 @@ fn an_outcome_is_attributed_to_the_agent_that_asked() {
     // The attribution comes from the receipt, so there is no parameter through
     // which a fill could be booked against an agent that never asked.
     let appended = ledger
-        .record_outcome(&receipt, EventKind::Fill, 2, &json!({ "oid": 7 }))
+        .record_outcome(
+            &receipt,
+            EventKind::OrderStateChange,
+            2,
+            &json!({ "oid": 7 }),
+        )
         .expect("outcome");
     let event = ledger.event(appended.seq).expect("event").expect("present");
     assert_eq!(event.agent_id.as_deref(), Some("agent-a"));
@@ -1540,7 +1555,7 @@ fn a_float_in_a_payload_is_refused() {
     let floaty = json!({ "px": 63000.1, "sz": "0.1" });
     let error = ledger
         .append(&NewEvent {
-            kind: EventKind::Fill,
+            kind: EventKind::OrderStateChange,
             ts_ms: 1,
             agent_id: Some("agent-a"),
             payload: &floaty,
@@ -1552,7 +1567,7 @@ fn a_float_in_a_payload_is_refused() {
     let nested = json!({ "fills": [{ "notional": 6300.010000000001 }] });
     let error = ledger
         .append(&NewEvent {
-            kind: EventKind::Fill,
+            kind: EventKind::OrderStateChange,
             ts_ms: 2,
             agent_id: Some("agent-a"),
             payload: &nested,
@@ -1572,7 +1587,7 @@ fn a_float_in_a_payload_is_refused() {
     // Decimal strings and integers are what belong here, and they still work.
     ledger
         .append(&NewEvent {
-            kind: EventKind::Fill,
+            kind: EventKind::OrderStateChange,
             ts_ms: 3,
             agent_id: Some("agent-a"),
             payload: &json!({ "px": "63000.1", "sz": "0.1", "oid": 42 }),
@@ -1595,7 +1610,7 @@ fn a_payload_that_nests_too_deeply_is_refused_rather_than_recursed_into() {
     }
     assert!(matches!(
         ledger.append(&NewEvent {
-            kind: EventKind::Fill,
+            kind: EventKind::OrderStateChange,
             ts_ms: 1,
             agent_id: None,
             payload: &deep,
@@ -1745,4 +1760,145 @@ fn deleting_the_sidecar_is_a_break_not_a_shrug() {
         Some(&BreakReason::AnchorMissing),
         "a removed anchor must be reported, not treated as unanchored: {report:?}"
     );
+}
+
+// --- fills have one door, and the database is what closes it ----------------
+
+/// A fill row is keyed on the venue's own identifiers, and the partial unique
+/// index — not a caller's memory — is what refuses the second write.
+#[test]
+fn a_fill_is_keyed_by_the_database_and_written_once() {
+    let dir = TempDir::new().expect("tempdir");
+    let ledger = open(&dir, Network::Testnet);
+    let account = "0x1111111111111111111111111111111111111111";
+    let body = json!({ "account": account, "tid": 77, "px": "63000.1" });
+    let fill = |tid: u64| NewFill {
+        account,
+        tid,
+        ts_ms: 1_756_000_000_000,
+        agent_id: Some("agent-a"),
+        payload: &body,
+    };
+
+    assert!(ledger.record_fill(&fill(77)).expect("record").is_some());
+    let head = ledger.chain_head().expect("head");
+    assert!(
+        ledger.record_fill(&fill(77)).expect("record").is_none(),
+        "the same trade landed twice"
+    );
+    assert_eq!(ledger.chain_head().expect("head"), head);
+    assert_eq!(ledger.get_events(0, 10).expect("page").events.len(), 1);
+
+    // A different trade on the same container is not the same row.
+    assert!(ledger.record_fill(&fill(78)).expect("record").is_some());
+    assert_eq!(ledger.get_events(0, 10).expect("page").events.len(), 2);
+    assert!(ledger.verify().expect("verify").is_intact());
+}
+
+/// The generic doors refuse a fill, so no path can write one unkeyed.
+#[test]
+fn the_generic_append_paths_refuse_a_fill() {
+    let dir = TempDir::new().expect("tempdir");
+    let ledger = open(&dir, Network::Testnet);
+    let body = json!({ "tid": 5, "px": "1.0" });
+
+    assert!(matches!(
+        ledger.append(&NewEvent {
+            kind: EventKind::Fill,
+            ts_ms: 1,
+            agent_id: None,
+            payload: &body,
+            snapshot: None,
+        }),
+        Err(LedgerError::UseRecordFill)
+    ));
+
+    let receipt = ledger
+        .record_intent(&NewIntent {
+            agent_id: "agent-a",
+            ts_ms: 1,
+            payload: &json!({ "coin": "BTC", "reason": "carry" }),
+            snapshot: None,
+        })
+        .expect("intent");
+    assert!(matches!(
+        ledger.record_outcome(&receipt, EventKind::Fill, 2, &body),
+        Err(LedgerError::UseRecordFill)
+    ));
+    assert_eq!(
+        ledger.get_events(0, 10).expect("page").events.len(),
+        1,
+        "only the intent is in the chain"
+    );
+}
+
+/// Upgrading a database written before `idem_key` existed keys the fills it
+/// already holds.
+///
+/// Without the backfill every stored fill is unkeyed, so the first reconcile
+/// after the upgrade records the whole recoverable window a second time into an
+/// append-only chain. The column and index are dropped here to put the file
+/// back in the shape an older build left it in, and `user_version` is rewound
+/// so reopening re-runs the migration.
+#[test]
+fn upgrading_keys_the_fills_already_in_the_chain() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = dir.path().join("testnet.db");
+    let account = "0x1111111111111111111111111111111111111111";
+    {
+        let ledger = Ledger::open_at(&path, Network::Testnet).expect("open");
+        for tid in [77u64, 78] {
+            ledger
+                .record_fill(&NewFill {
+                    account,
+                    tid,
+                    ts_ms: 1_756_000_000_000,
+                    agent_id: None,
+                    payload: &json!({ "account": account, "tid": tid }),
+                })
+                .expect("record")
+                .expect("written");
+        }
+        let guard = ledger.connection.lock().expect("lock");
+        guard
+            .execute_batch(
+                "DROP INDEX events_idem_key; \
+                 ALTER TABLE events DROP COLUMN idem_key; \
+                 PRAGMA user_version = 1;",
+            )
+            .expect("rewind to the pre-idem_key schema");
+    }
+
+    let upgraded = Ledger::open_at(&path, Network::Testnet).expect("reopen and migrate");
+    // The chain is untouched: idem_key is not in the row-hash preimage.
+    assert!(upgraded.verify().expect("verify").is_intact());
+    let keyed: i64 = upgraded
+        .connection
+        .lock()
+        .expect("lock")
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE idem_key IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count");
+    assert_eq!(keyed, 2, "the fills an older build wrote were not keyed");
+
+    // And the reconcile that follows the upgrade records neither of them again.
+    for tid in [77u64, 78] {
+        assert!(
+            upgraded
+                .record_fill(&NewFill {
+                    account,
+                    tid,
+                    ts_ms: 1_756_000_000_000,
+                    agent_id: None,
+                    payload: &json!({ "account": account, "tid": tid }),
+                })
+                .expect("record")
+                .is_none(),
+            "tid {tid} was chained a second time on upgrade"
+        );
+    }
+    assert_eq!(upgraded.get_events(0, 10).expect("page").events.len(), 2);
 }

@@ -51,7 +51,8 @@
 //! `activeAssetCtx` and `fastAssetCtxs` carry no venue timestamp while
 //! `l2Book`, `trades` and `bbo` all do (§14.1). Locally-stamped samples cannot
 //! be aligned against venue-stamped ones, so the distinction is carried in the
-//! event type: see [`EventTime`].
+//! field names: [`WsEvent::ActiveAssetCtx`] stamps its own `received_at_ms`,
+//! while [`WsEvent::Bbo`] carries the venue's `venue_time_ms`.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -68,12 +69,15 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 
 use crate::types::{AssetCtx, Candle, Fill, L2Book, Level, OrderStatusEntry, Side};
-use crate::{Address, Error, Network};
+use crate::{Address, Network};
 
 /// The venue's own keepalive. The server drops a connection that has been idle
 /// for roughly 60 s (`docs/spec.md` item 9), and it answers this frame with
 /// `{"channel":"pong"}` (verified live).
 const PING_FRAME: &str = r#"{"method":"ping"}"#;
+
+/// Depth of the consumer's event channel. Bounded on purpose: see [`WsEvent`].
+const EVENT_BUFFER: usize = 4096;
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -90,7 +94,7 @@ pub enum PoolError {
     /// another. Hyperliquid documents 1000 subscriptions and 100 connections
     /// per IP, so this is a real ceiling, not a self-imposed one. `cap` is the
     /// effective one, i.e. already clamped to
-    /// [`MAX_SUBSCRIPTIONS_PER_IP`].
+    /// `MAX_SUBSCRIPTIONS_PER_IP`.
     #[error(
         "subscription capacity exhausted: {used} of {cap} slots across {connections} connections"
     )]
@@ -101,7 +105,7 @@ pub enum PoolError {
     },
     /// There is room in the pool, but not for *this* subscription: every open
     /// connection already owns one of a kind that may not share a socket
-    /// (`orderUpdates`, see [`Subscription::exclusive_per_connection`]), and no
+    /// (`orderUpdates`, see `Subscription::exclusive_per_connection`), and no
     /// further connection may be opened. Distinct from
     /// [`PoolError::CapacityExhausted`] because the operator's fix is
     /// different: raise `max_connections`, not the per-connection cap. D1 gives
@@ -138,15 +142,9 @@ pub enum PoolError {
     Parse { channel: String, detail: String },
     /// `orderUpdates` payloads carry no `user` field, so a connection can only
     /// attribute them by owning exactly one such subscription. See
-    /// [`Subscription::exclusive_per_connection`].
+    /// `Subscription::exclusive_per_connection`.
     #[error("orderUpdates arrived on a connection that owns no orderUpdates subscription")]
     UnattributableOrderUpdates,
-}
-
-impl From<PoolError> for Error {
-    fn from(e: PoolError) -> Self {
-        Error::Ws(e.to_string())
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -218,7 +216,7 @@ impl Subscription {
 
     /// The venue's channel name, for error messages that have to name a kind
     /// rather than an instance.
-    pub fn kind(&self) -> &'static str {
+    fn kind(&self) -> &'static str {
         match self {
             Subscription::ActiveAssetCtx { .. } => "activeAssetCtx",
             Subscription::Bbo { .. } => "bbo",
@@ -239,7 +237,7 @@ impl Subscription {
     /// per connection makes the owning address recoverable from the socket that
     /// delivered the frame. `userFills` needs no such rule: its payload does
     /// carry `user` (verified live).
-    pub fn exclusive_per_connection(&self) -> bool {
+    fn exclusive_per_connection(&self) -> bool {
         matches!(self, Subscription::OrderUpdates { .. })
     }
 
@@ -249,9 +247,8 @@ impl Subscription {
     /// Thresholds are `docs/specs/fair-value.md` §5.2's: book 2 s, mark 5 s,
     /// oracle 10 s. `activeAssetCtx` carries both a mark leg and an oracle leg,
     /// so the tighter of the two binds it. `l2Book` gets
-    /// [`StalenessThresholds::depth`] instead of `book`: §5.2's 2 s is the
-    /// budget for the book *component*, and §14.4 correction 4 moved that
-    /// component to `bbo`.
+    /// [`StalenessThresholds::depth`] rather than `book`, for the measured
+    /// reason recorded there.
     ///
     /// `None` means silence is not a fault. Trades, candles, fills and order
     /// updates are event-driven: a quiet tape is information, not a broken
@@ -259,8 +256,8 @@ impl Subscription {
     /// the market is calm. Their age is still reported so a caller can judge.
     /// It does **not** mean such a feed is never stale: a down, unacked or
     /// quarantined socket is stale on every channel — see
-    /// [`SubscriptionRegistry::health`].
-    pub fn staleness_threshold(&self, thresholds: &StalenessThresholds) -> Option<Duration> {
+    /// `SubscriptionRegistry::health`.
+    fn staleness_threshold(&self, thresholds: &StalenessThresholds) -> Option<Duration> {
         match self {
             Subscription::Bbo { .. } => Some(thresholds.book),
             Subscription::L2Book { .. } => Some(thresholds.depth),
@@ -334,30 +331,12 @@ impl Default for StalenessThresholds {
 /// Identifies one socket in the pool. Present on every control event so the
 /// console can show which shard degraded (`docs/spec.md` item 34).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
-pub struct ConnectionId(pub usize);
+pub struct ConnectionId(usize);
 
 impl fmt::Display for ConnectionId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "ws{}", self.0)
     }
-}
-
-/// Whose clock stamped an event.
-///
-/// `activeAssetCtx` carries no timestamp while `bbo`, `trades` and `l2Book` all
-/// do (`docs/specs/fair-value.md` §14.1). A 250 ms misalignment alone injects
-/// 0.3–0.9 bp at p99, so the fair value sampler must never treat a local
-/// arrival stamp as a venue instant. Making the distinction a type rather than
-/// a convention is the only way that rule survives contact with a `u64`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EventTime {
-    /// The venue stamped it. Alignable against other venue-stamped feeds.
-    Venue(u64),
-    /// oppen stamped it on arrival. Carries this machine's clock plus an
-    /// unobservable network delay; not alignable.
-    LocalArrival(u64),
-    /// No meaningful sample instant (control events; candle bar boundaries).
-    None,
 }
 
 /// One public trade off the `trades` channel.
@@ -393,14 +372,6 @@ pub struct WsTrade {
 pub struct GapWindow {
     pub start_ms: u64,
     pub end_ms: u64,
-}
-
-impl GapWindow {
-    /// Width of the window. Saturating: a backwards clock yields zero rather
-    /// than a panic.
-    pub fn duration_ms(&self) -> u64 {
-        self.end_ms.saturating_sub(self.start_ms)
-    }
 }
 
 /// A connection lost its socket. Emitted once per outage, not once per retry.
@@ -462,8 +433,7 @@ pub enum WsEvent {
     },
     /// Public tape, never emitted empty.
     Trades { coin: String, trades: Vec<WsTrade> },
-    /// Live bar. `t`/`T` are bar boundaries, not a sample instant, so this
-    /// event's [`EventTime`] is `None`.
+    /// Live bar. `t`/`T` are bar boundaries, not a sample instant.
     Candle(Box<Candle>),
     /// Depth ladder for a `l2Book` subscription.
     L2Book(Box<L2Book>),
@@ -489,7 +459,7 @@ pub enum WsEvent {
     /// socket down instead of being acknowledged. The shard converges instead
     /// of reconnect-looping, at the cost of that feed; the operator has to fix
     /// the subscription. See
-    /// [`SubscriptionRegistry::record_failed_session`].
+    /// `SubscriptionRegistry::record_failed_session`.
     SubscriptionQuarantined {
         connection: ConnectionId,
         subscription: Subscription,
@@ -513,7 +483,7 @@ pub enum WsEvent {
 impl WsEvent {
     /// Which subscription this event belongs to, for staleness bookkeeping.
     /// `None` for control events, which belong to a connection, not a feed.
-    pub fn subscription_key(&self) -> Option<String> {
+    fn subscription_key(&self) -> Option<String> {
         let sub = match self {
             WsEvent::ActiveAssetCtx { coin, .. } => {
                 Subscription::ActiveAssetCtx { coin: coin.clone() }
@@ -537,47 +507,6 @@ impl WsEvent {
         };
         Some(sub.key())
     }
-
-    /// Whose clock stamped this event. See [`EventTime`] for why the caller is
-    /// not allowed to forget the difference.
-    ///
-    /// A frame carrying an array is stamped with its **newest** element, taken
-    /// by `max` rather than by position: the venue's array order is unverified
-    /// on all three of `trades`, `userFills` and `orderUpdates`, and
-    /// newest-first is the common shape for a subscribe snapshot. Taking the
-    /// last element would then stamp the frame with its oldest row and hand
-    /// [`EventTime::Venue`] — the type built so the sampler and the ledger
-    /// could trust a venue instant — the wrong end of the array.
-    pub fn event_time(&self) -> EventTime {
-        match self {
-            WsEvent::ActiveAssetCtx { received_at_ms, .. } => {
-                EventTime::LocalArrival(*received_at_ms)
-            }
-            WsEvent::Bbo { venue_time_ms, .. } => EventTime::Venue(*venue_time_ms),
-            WsEvent::Trades { trades, .. } => trades
-                .iter()
-                .map(|t| t.time)
-                .max()
-                .map_or(EventTime::None, EventTime::Venue),
-            WsEvent::L2Book(b) => EventTime::Venue(b.time),
-            WsEvent::UserFills { fills, .. } => fills
-                .iter()
-                .map(|f| f.time)
-                .max()
-                .map_or(EventTime::None, EventTime::Venue),
-            WsEvent::OrderUpdates { updates, .. } => updates
-                .iter()
-                .map(|u| u.status_timestamp)
-                .max()
-                .map_or(EventTime::None, EventTime::Venue),
-            WsEvent::Candle(_)
-            | WsEvent::Disconnected(_)
-            | WsEvent::Reconnected(_)
-            | WsEvent::SubscriptionQuarantined { .. }
-            | WsEvent::VenueError { .. }
-            | WsEvent::MessageDropped { .. } => EventTime::None,
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -586,7 +515,7 @@ impl WsEvent {
 
 /// What one inbound frame turned out to be.
 #[derive(Debug, Clone, PartialEq)]
-pub enum Incoming {
+enum Incoming {
     /// Data for a consumer.
     Event(WsEvent),
     /// `subscriptionResponse`. `subscribed` distinguishes subscribe from
@@ -606,13 +535,13 @@ pub enum Incoming {
 
 /// Everything [`parse_message`] needs that is not in the frame itself.
 #[derive(Debug, Clone, Copy)]
-pub struct ParseContext {
+struct ParseContext {
     /// Arrival clock, ms. Passed in rather than read inside so the parser is
     /// pure and its `activeAssetCtx` stamping is testable.
-    pub now_ms: u64,
+    now_ms: u64,
     /// The single address whose `orderUpdates` this connection owns, if any.
     /// Required because the payload carries no `user`.
-    pub order_updates_user: Option<Address>,
+    order_updates_user: Option<Address>,
 }
 
 #[derive(Deserialize)]
@@ -657,7 +586,7 @@ fn parse_field<T: serde::de::DeserializeOwned>(
 ///
 /// Pure, so the shapes below are pinned by fixtures captured from live mainnet
 /// rather than by a running socket (`AGENTS.md`: tests before "done").
-pub fn parse_message(raw: &str, ctx: &ParseContext) -> Result<Incoming, PoolError> {
+fn parse_message(raw: &str, ctx: &ParseContext) -> Result<Incoming, PoolError> {
     let envelope: Envelope = serde_json::from_str(raw).map_err(|e| PoolError::Parse {
         channel: "<envelope>".to_owned(),
         detail: e.to_string(),
@@ -782,20 +711,16 @@ impl Default for Backoff {
 impl Backoff {
     /// Un-jittered delay for `attempt`, doubling from `base` and capped at
     /// `max`. Saturating throughout: no attempt count can overflow it.
-    pub fn nominal(&self, attempt: u32) -> Duration {
+    fn nominal(&self, attempt: u32) -> Duration {
         let base_ms = u64::try_from(self.base.as_millis()).unwrap_or(u64::MAX);
-        let factor = 1u64.checked_shl(attempt.min(32)).unwrap_or(u64::MAX);
-        Duration::from_millis(base_ms.saturating_mul(factor)).min(self.max)
+        Duration::from_millis(base_ms.saturating_mul(1u64 << attempt.min(32))).min(self.max)
     }
 
-    /// [`Backoff::nominal`] spread uniformly over
-    /// `±jitter_pct%`, never negative.
-    pub fn delay(&self, attempt: u32, jitter: &mut Jitter) -> Duration {
+    /// `Backoff::nominal` spread uniformly over `±jitter_pct%`, never
+    /// negative. A zero band needs no special case: it draws from `0..1`.
+    fn delay(&self, attempt: u32, jitter: &mut Jitter) -> Duration {
         let nominal_ms = u64::try_from(self.nominal(attempt).as_millis()).unwrap_or(u64::MAX);
         let spread = nominal_ms.saturating_mul(u64::from(self.jitter_pct.min(100))) / 100;
-        if spread == 0 {
-            return Duration::from_millis(nominal_ms);
-        }
         let low = nominal_ms.saturating_sub(spread);
         Duration::from_millis(low.saturating_add(jitter.next_below(2 * spread + 1)))
     }
@@ -809,12 +734,12 @@ impl Backoff {
 /// Seedable so the backoff band is a deterministic test rather than a
 /// statistical one.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Jitter(u64);
+struct Jitter(u64);
 
 impl Jitter {
     /// Seeded explicitly. Only zero is replaced — xorshift cannot escape it —
     /// so distinct seeds stay distinct streams.
-    pub fn from_seed(seed: u64) -> Self {
+    fn from_seed(seed: u64) -> Self {
         Jitter(if seed == 0 {
             0x9E37_79B9_7F4A_7C15
         } else {
@@ -824,7 +749,7 @@ impl Jitter {
 
     /// Wall clock plus a per-connection salt, so sibling connections in one
     /// pool do not share a sequence.
-    pub fn from_entropy(salt: u64) -> Self {
+    fn from_entropy(salt: u64) -> Self {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
@@ -842,7 +767,7 @@ impl Jitter {
     }
 
     /// Uniform-ish draw in `0..n`; zero when `n` is zero.
-    pub fn next_below(&mut self, n: u64) -> u64 {
+    fn next_below(&mut self, n: u64) -> u64 {
         if n == 0 { 0 } else { self.next_u64() % n }
     }
 }
@@ -854,9 +779,9 @@ impl Jitter {
 /// The venue's documented subscription budget, which it counts **per IP**
 /// (`docs/spec.md` item 9). Every connection in the pool spends from the same
 /// one, so it caps the pool rather than a socket — and
-/// [`SubscriptionRegistry::capacity`] clamps to it rather than trusting
+/// `SubscriptionRegistry::capacity` clamps to it rather than trusting
 /// `max_connections × max_subs_per_connection`, which can multiply past it.
-pub const MAX_SUBSCRIPTIONS_PER_IP: usize = 1000;
+const MAX_SUBSCRIPTIONS_PER_IP: usize = 1000;
 
 /// Retry schedule for a quarantined subscription: a minute, doubling per
 /// quarantine served, capped at an hour.
@@ -870,9 +795,9 @@ const QUARANTINE_BACKOFF: Backoff = Backoff {
     jitter_pct: 0,
 };
 
-/// Where a [`SubscriptionRegistry::place`] call put a subscription.
+/// Where a `SubscriptionRegistry::place` call put a subscription.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Placement {
+enum Placement {
     /// Added to a connection that is already running.
     Existing(ConnectionId),
     /// Added to a connection the caller must now spawn.
@@ -894,7 +819,7 @@ pub struct FeedHealth {
     pub last_message_ms: Option<u64>,
     /// Silence so far, ms. `None` before the first message.
     pub age_ms: Option<u64>,
-    /// Budget from [`Subscription::staleness_threshold`]; `None` for
+    /// Budget from `Subscription::staleness_threshold`; `None` for
     /// event-driven feeds.
     pub threshold_ms: Option<u64>,
     /// Fails closed. True whenever this feed is not delivering, which is any
@@ -908,10 +833,8 @@ pub struct FeedHealth {
     pub stale: bool,
     /// The pool has stopped re-subscribing this one because the venue kept
     /// killing the socket rather than acknowledging it. Expires; see
-    /// [`SubscriptionRegistry::record_failed_session`].
+    /// `SubscriptionRegistry::record_failed_session`.
     pub quarantined: bool,
-    /// When the current quarantine lifts, ms. `None` when not quarantined.
-    pub quarantined_until_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -921,7 +844,7 @@ struct SubEntry {
     acked: bool,
     strikes: u32,
     /// When the current quarantine lifts, ms. `None` means never quarantined
-    /// or already lifted by [`SubscriptionRegistry::clear_quarantine`].
+    /// or already lifted by `SubscriptionRegistry::clear_quarantine`.
     quarantined_until_ms: Option<u64>,
     /// Quarantines served. Widens the next interval so a genuinely poisoned
     /// subscription converges instead of retrying on a fixed schedule.
@@ -960,16 +883,6 @@ pub enum FeedBlock {
     Stale(Box<FeedHealth>),
 }
 
-impl FeedBlock {
-    /// The feed this block is about.
-    pub fn subscription(&self) -> &Subscription {
-        match self {
-            FeedBlock::NotSubscribed(sub) => sub,
-            FeedBlock::Stale(h) => &h.subscription,
-        }
-    }
-}
-
 impl fmt::Display for FeedBlock {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -1000,7 +913,7 @@ struct ConnectionSlot {
 /// Pure bookkeeping with no I/O, so the placement rules, the per-connection cap
 /// and the staleness arithmetic are unit-testable without a socket.
 #[derive(Debug)]
-pub struct SubscriptionRegistry {
+struct SubscriptionRegistry {
     max_connections: usize,
     max_subs_per_connection: usize,
     slots: Vec<ConnectionSlot>,
@@ -1011,7 +924,7 @@ impl SubscriptionRegistry {
     /// (`docs/spec.md` item 9). Note the venue documents that ceiling **per
     /// IP**, so a pool of several connections shares one budget; size
     /// `max_connections` accordingly.
-    pub fn new(max_connections: usize, max_subs_per_connection: usize) -> Self {
+    fn new(max_connections: usize, max_subs_per_connection: usize) -> Self {
         SubscriptionRegistry {
             max_connections: max_connections.max(1),
             max_subs_per_connection: max_subs_per_connection.max(1),
@@ -1023,18 +936,14 @@ impl SubscriptionRegistry {
     ///
     /// First connection with room wins, so a pool stays as small as the load
     /// requires; `orderUpdates` is placed alone per
-    /// [`Subscription::exclusive_per_connection`].
-    pub fn place(&mut self, sub: Subscription) -> Result<Placement, PoolError> {
+    /// `Subscription::exclusive_per_connection`.
+    fn place(&mut self, sub: Subscription) -> Result<Placement, PoolError> {
         let key = sub.key();
         if let Some(slot) = self.slots.iter().find(|s| s.subs.contains_key(&key)) {
             return Ok(Placement::AlreadyPresent(slot.id));
         }
         if self.len() >= self.capacity() {
-            return Err(PoolError::CapacityExhausted {
-                used: self.len(),
-                cap: self.capacity(),
-                connections: self.slots.len(),
-            });
+            return Err(self.capacity_exhausted());
         }
         let cap = self.max_subs_per_connection;
         let exclusive = sub.exclusive_per_connection();
@@ -1057,11 +966,7 @@ impl SubscriptionRegistry {
                     connections: self.slots.len(),
                 });
             }
-            return Err(PoolError::CapacityExhausted {
-                used: self.len(),
-                cap: self.capacity(),
-                connections: self.slots.len(),
-            });
+            return Err(self.capacity_exhausted());
         }
         let id = ConnectionId(self.slots.len());
         let mut subs = BTreeMap::new();
@@ -1078,7 +983,7 @@ impl SubscriptionRegistry {
     /// Drop a subscription, returning the connection that must send the
     /// unsubscribe frame. The now-possibly-empty connection is kept open and
     /// reused: reconnecting costs a handshake, idling costs a ping every 30 s.
-    pub fn remove(&mut self, sub: &Subscription) -> Result<ConnectionId, PoolError> {
+    fn remove(&mut self, sub: &Subscription) -> Result<ConnectionId, PoolError> {
         let key = sub.key();
         for slot in self.slots.iter_mut() {
             if slot.subs.remove(&key).is_some() {
@@ -1088,35 +993,39 @@ impl SubscriptionRegistry {
         Err(PoolError::NotSubscribed(key))
     }
 
-    /// Everything one connection owns, in key order, quarantined included.
-    pub fn subscriptions(&self, id: ConnectionId) -> Vec<Subscription> {
-        self.slot(id)
-            .map(|s| s.subs.values().map(|e| e.sub.clone()).collect())
-            .unwrap_or_default()
-    }
-
-    /// What a reconnect should actually re-send, in key order: everything the
-    /// connection owns except what [`SubscriptionRegistry::record_failed_session`]
-    /// has quarantined *and whose quarantine has not yet lapsed*.
-    pub fn resubscribe_set(&self, id: ConnectionId, now_ms: u64) -> Vec<Subscription> {
+    /// One connection's subscriptions matching `keep`, in key order. Empty for
+    /// a connection that does not exist.
+    fn subs_where(&self, id: ConnectionId, keep: impl Fn(&SubEntry) -> bool) -> Vec<Subscription> {
         self.slot(id)
             .map(|s| {
                 s.subs
                     .values()
-                    .filter(|e| !e.quarantined_at(now_ms))
+                    .filter(|e| keep(e))
                     .map(|e| e.sub.clone())
                     .collect()
             })
             .unwrap_or_default()
     }
 
+    /// Everything one connection owns, in key order, quarantined included.
+    fn subscriptions(&self, id: ConnectionId) -> Vec<Subscription> {
+        self.subs_where(id, |_| true)
+    }
+
+    /// What a reconnect should actually re-send, in key order: everything the
+    /// connection owns except what `SubscriptionRegistry::record_failed_session`
+    /// has quarantined *and whose quarantine has not yet lapsed*.
+    fn resubscribe_set(&self, id: ConnectionId, now_ms: u64) -> Vec<Subscription> {
+        self.subs_where(id, |e| !e.quarantined_at(now_ms))
+    }
+
     /// Quarantines that have lapsed on a live connection: cleared here and
     /// returned in key order so the caller re-sends the subscribe frames.
     ///
     /// Without this the expiry would be unreachable on a healthy shard —
-    /// nothing else re-reads [`SubscriptionRegistry::resubscribe_set`] until
+    /// nothing else re-reads `SubscriptionRegistry::resubscribe_set` until
     /// the next reconnect, which a converged pool never performs.
-    pub fn take_expired_quarantines(&mut self, id: ConnectionId, now_ms: u64) -> Vec<Subscription> {
+    fn take_expired_quarantines(&mut self, id: ConnectionId, now_ms: u64) -> Vec<Subscription> {
         let Some(slot) = self.slot_mut(id) else {
             return Vec::new();
         };
@@ -1138,7 +1047,7 @@ impl SubscriptionRegistry {
     /// [`WsEvent::SubscriptionQuarantined`] event named.
     ///
     /// Returns the owning connection so the caller can re-send the subscribe.
-    pub fn clear_quarantine(&mut self, sub: &Subscription) -> Result<ConnectionId, PoolError> {
+    fn clear_quarantine(&mut self, sub: &Subscription) -> Result<ConnectionId, PoolError> {
         let key = sub.key();
         for slot in self.slots.iter_mut() {
             if let Some(entry) = slot.subs.get_mut(&key) {
@@ -1181,7 +1090,7 @@ impl SubscriptionRegistry {
     /// failure, at double the interval.
     ///
     /// Returns the subscription that just became quarantined, if any.
-    pub fn record_failed_session(
+    fn record_failed_session(
         &mut self,
         id: ConnectionId,
         quarantine_after: u32,
@@ -1204,21 +1113,13 @@ impl SubscriptionRegistry {
     }
 
     /// Subscriptions the venue has not acknowledged on the current socket.
-    pub fn unacked(&self, id: ConnectionId) -> Vec<Subscription> {
-        self.slot(id)
-            .map(|s| {
-                s.subs
-                    .values()
-                    .filter(|e| !e.acked)
-                    .map(|e| e.sub.clone())
-                    .collect()
-            })
-            .unwrap_or_default()
+    fn unacked(&self, id: ConnectionId) -> Vec<Subscription> {
+        self.subs_where(id, |e| !e.acked)
     }
 
     /// The address whose `orderUpdates` this connection owns, used to attribute
     /// a payload that carries no user.
-    pub fn order_updates_user(&self, id: ConnectionId) -> Option<Address> {
+    fn order_updates_user(&self, id: ConnectionId) -> Option<Address> {
         self.slot(id)?.subs.values().find_map(|e| match &e.sub {
             Subscription::OrderUpdates { user } => Some(*user),
             _ => None,
@@ -1227,20 +1128,20 @@ impl SubscriptionRegistry {
 
     /// Last message on the connection, whatever channel it came on. This is the
     /// gap-window anchor; see [`GapWindow`].
-    pub fn connection_last_message(&self, id: ConnectionId) -> Option<u64> {
+    fn connection_last_message(&self, id: ConnectionId) -> Option<u64> {
         self.slot(id)?.last_message_ms
     }
 
     /// Record traffic on the connection as a whole. Called for every frame,
     /// including pongs, because a pong proves the socket is alive.
-    pub fn touch_connection(&mut self, id: ConnectionId, now_ms: u64) {
+    fn touch_connection(&mut self, id: ConnectionId, now_ms: u64) {
         if let Some(slot) = self.slot_mut(id) {
             slot.last_message_ms = Some(now_ms);
         }
     }
 
     /// Record traffic on one feed.
-    pub fn touch(&mut self, id: ConnectionId, key: &str, now_ms: u64) {
+    fn touch(&mut self, id: ConnectionId, key: &str, now_ms: u64) {
         if let Some(entry) = self.slot_mut(id).and_then(|s| s.subs.get_mut(key)) {
             entry.last_message_ms = Some(now_ms);
         }
@@ -1248,7 +1149,7 @@ impl SubscriptionRegistry {
 
     /// Record the venue's `subscriptionResponse`. Clears the strike count: a
     /// subscription the venue has just accepted is not a suspect.
-    pub fn ack(&mut self, id: ConnectionId, key: &str) {
+    fn ack(&mut self, id: ConnectionId, key: &str) {
         if let Some(entry) = self.slot_mut(id).and_then(|s| s.subs.get_mut(key)) {
             entry.acked = true;
             entry.strikes = 0;
@@ -1259,14 +1160,14 @@ impl SubscriptionRegistry {
     ///
     /// Either transition clears every ack: a dead socket confirms nothing, and
     /// a fresh one has confirmed nothing yet. Callers that need the pre-drop
-    /// ack state — [`SubscriptionRegistry::unacked`], which names the likely
+    /// ack state — `SubscriptionRegistry::unacked`, which names the likely
     /// poison in a [`Disconnected`] — must read it before flipping.
     ///
     /// Coming up seeds the connection clock so the idle detector has a
     /// baseline. Neither transition touches per-feed timestamps, so each feed's
     /// age keeps growing through an outage, which is what makes them read
     /// stale.
-    pub fn set_connected(&mut self, id: ConnectionId, connected: bool, now_ms: u64) {
+    fn set_connected(&mut self, id: ConnectionId, connected: bool, now_ms: u64) {
         if let Some(slot) = self.slot_mut(id) {
             slot.connected = connected;
             for entry in slot.subs.values_mut() {
@@ -1279,7 +1180,7 @@ impl SubscriptionRegistry {
     }
 
     /// Health of every feed, ordered by connection then key.
-    pub fn health(&self, now_ms: u64, thresholds: &StalenessThresholds) -> Vec<FeedHealth> {
+    fn health(&self, now_ms: u64, thresholds: &StalenessThresholds) -> Vec<FeedHealth> {
         let mut out = Vec::with_capacity(self.len());
         for slot in &self.slots {
             for entry in slot.subs.values() {
@@ -1311,7 +1212,6 @@ impl SubscriptionRegistry {
                     threshold_ms,
                     stale,
                     quarantined,
-                    quarantined_until_ms: entry.quarantined_until_ms.filter(|_| quarantined),
                 });
             }
         }
@@ -1326,7 +1226,7 @@ impl SubscriptionRegistry {
     /// depended on, so an unrelated depth ladder does not block an order priced
     /// off `bbo`. A required feed that is not subscribed at all blocks — the
     /// pool cannot report an age for something it was never asked to watch.
-    pub fn stale_feeds(
+    fn stale_feeds(
         &self,
         now_ms: u64,
         thresholds: &StalenessThresholds,
@@ -1347,28 +1247,26 @@ impl SubscriptionRegistry {
     }
 
     /// Subscriptions held across the whole pool, for the item 9 cap.
-    pub fn len(&self) -> usize {
+    fn len(&self) -> usize {
         self.slots.iter().map(|s| s.subs.len()).sum()
-    }
-
-    /// True when nothing is subscribed.
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
     }
 
     /// Total slots this pool may ever hold, clamped to the venue's per-IP
     /// budget. `max_connections × max_subs_per_connection` can multiply past
-    /// [`MAX_SUBSCRIPTIONS_PER_IP`]; the venue's counter does not care how the
+    /// `MAX_SUBSCRIPTIONS_PER_IP`; the venue's counter does not care how the
     /// pool sharded them.
-    pub fn capacity(&self) -> usize {
+    fn capacity(&self) -> usize {
         self.max_connections
             .saturating_mul(self.max_subs_per_connection)
             .min(MAX_SUBSCRIPTIONS_PER_IP)
     }
 
-    /// Connections opened so far.
-    pub fn connection_count(&self) -> usize {
-        self.slots.len()
+    fn capacity_exhausted(&self) -> PoolError {
+        PoolError::CapacityExhausted {
+            used: self.len(),
+            cap: self.capacity(),
+            connections: self.slots.len(),
+        }
     }
 
     fn slot(&self, id: ConnectionId) -> Option<&ConnectionSlot> {
@@ -1393,15 +1291,15 @@ pub struct WsPoolConfig {
     ///
     /// This is the ceiling on the agent roster, not just on sharding: D1 gives
     /// every agent its own sub-account, `orderUpdates` may not share a socket
-    /// ([`Subscription::exclusive_per_connection`]), so watching N agents needs
+    /// (`Subscription::exclusive_per_connection`), so watching N agents needs
     /// N connections. Sixteen against the venue's documented 100-per-IP
     /// connection ceiling. Raise it for a larger roster — the subscription
     /// budget stays safe either way, because
-    /// [`SubscriptionRegistry::capacity`] clamps to
-    /// [`MAX_SUBSCRIPTIONS_PER_IP`].
+    /// `SubscriptionRegistry::capacity` clamps to
+    /// `MAX_SUBSCRIPTIONS_PER_IP`.
     pub max_connections: usize,
     /// Per-socket subscription cap. The pool-wide ceiling is
-    /// [`MAX_SUBSCRIPTIONS_PER_IP`], which binds first whenever this one times
+    /// `MAX_SUBSCRIPTIONS_PER_IP`, which binds first whenever this one times
     /// `max_connections` exceeds it.
     pub max_subs_per_connection: usize,
     /// Client ping cadence. The server drops idle connections at roughly 60 s,
@@ -1415,7 +1313,7 @@ pub struct WsPoolConfig {
     pub thresholds: StalenessThresholds,
     /// Consecutive sessions that may die with the same subscription
     /// unacknowledged before the pool stops re-sending it
-    /// ([`SubscriptionRegistry::record_failed_session`]). Three, because one
+    /// (`SubscriptionRegistry::record_failed_session`). Three, because one
     /// drop inside a subscribe window is ordinary bad luck and three in a row
     /// is not.
     pub quarantine_after: u32,
@@ -1428,7 +1326,7 @@ pub struct WsPoolConfig {
     /// `bbo` produces a bare TCP close, code 1006, within a round trip). So:
     ///
     /// - shorter: the close is evidence about whatever was unacknowledged, and
-    ///   a strike is charged ([`SubscriptionRegistry::record_failed_session`]);
+    ///   a strike is charged (`SubscriptionRegistry::record_failed_session`);
     /// - shorter: the reconnect backoff does **not** reset, so a
     ///   connect-then-immediately-drop loop actually backs off instead of
     ///   hammering the venue's per-IP budget every `base` ms;
@@ -1436,8 +1334,6 @@ pub struct WsPoolConfig {
     ///
     /// Five seconds, an order of magnitude above the measured round trip.
     pub session_grace: Duration,
-    /// Event channel depth. Bounded on purpose: see [`WsEvent`].
-    pub event_buffer: usize,
 }
 
 impl Default for WsPoolConfig {
@@ -1452,17 +1348,6 @@ impl Default for WsPoolConfig {
             thresholds: StalenessThresholds::default(),
             quarantine_after: 3,
             session_grace: Duration::from_secs(5),
-            event_buffer: 4096,
-        }
-    }
-}
-
-impl WsPoolConfig {
-    /// Defaults on an explicit network.
-    pub fn new(network: Network) -> Self {
-        WsPoolConfig {
-            network,
-            ..Default::default()
         }
     }
 }
@@ -1474,6 +1359,7 @@ enum ConnCommand {
     Shutdown,
 }
 
+#[derive(Debug)]
 struct PoolInner {
     registry: SubscriptionRegistry,
     conns: Vec<mpsc::UnboundedSender<ConnCommand>>,
@@ -1489,6 +1375,7 @@ struct PoolInner {
 ///
 /// Dropping the pool closes every command channel, which stops every connection
 /// task; [`WsPool::shutdown`] does the same explicitly.
+#[derive(Debug)]
 pub struct WsPool {
     cfg: WsPoolConfig,
     inner: Arc<Mutex<PoolInner>>,
@@ -1525,7 +1412,7 @@ impl WsPool {
     /// outside a runtime.
     pub fn new(cfg: WsPoolConfig) -> Result<(Self, mpsc::Receiver<WsEvent>), PoolError> {
         let handle = tokio::runtime::Handle::try_current().map_err(|_| PoolError::NoRuntime)?;
-        let (tx, rx) = mpsc::channel(cfg.event_buffer.max(1));
+        let (tx, rx) = mpsc::channel(EVENT_BUFFER);
         let inner = PoolInner {
             registry: SubscriptionRegistry::new(cfg.max_connections, cfg.max_subs_per_connection),
             conns: Vec::new(),
@@ -1642,22 +1529,6 @@ impl WsPool {
         Ok(())
     }
 
-    /// Subscriptions held, against [`WsPool::capacity`] (`docs/spec.md`
-    /// item 9's 1000-per-connection cap).
-    pub fn subscription_count(&self) -> usize {
-        lock(&self.inner).registry.len()
-    }
-
-    /// Total subscription slots this pool may ever hold.
-    pub fn capacity(&self) -> usize {
-        lock(&self.inner).registry.capacity()
-    }
-
-    /// Connections opened so far.
-    pub fn connection_count(&self) -> usize {
-        lock(&self.inner).registry.connection_count()
-    }
-
     /// Stop every connection. Idempotent; further subscribes return
     /// [`PoolError::Shutdown`].
     pub fn shutdown(&self) {
@@ -1667,16 +1538,6 @@ impl WsPool {
             let _ = tx.send(ConnCommand::Shutdown);
         }
         guard.conns.clear();
-    }
-}
-
-impl fmt::Debug for WsPool {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("WsPool")
-            .field("network", &self.cfg.network)
-            .field("subscriptions", &self.subscription_count())
-            .field("connections", &self.connection_count())
-            .finish()
     }
 }
 
@@ -1881,21 +1742,17 @@ async fn run_connection(
                     }
                 }
                 if let Some(reason) = resubscribe_error {
-                    let last_seen_ms = lock(&inner).registry.connection_last_message(id);
-                    let step = next_step(
-                        &mut state,
-                        Turn::ResubscribeFailed {
-                            at_ms: now_ms(),
-                            last_seen_ms,
-                            reason,
-                        },
-                    );
-                    if !apply(step, id, &cfg, &inner, &events, &subs).await {
+                    let turn = Turn::ResubscribeFailed {
+                        at_ms: now_ms(),
+                        last_seen_ms: lock(&inner).registry.connection_last_message(id),
+                        reason,
+                    };
+                    if !apply(&mut state, turn, id, &cfg, &inner, &events, &subs).await {
                         return;
                     }
                 } else {
-                    let step = next_step(&mut state, Turn::Subscribed { at_ms: now_ms() });
-                    if !apply(step, id, &cfg, &inner, &events, &subs).await {
+                    let turn = Turn::Subscribed { at_ms: now_ms() };
+                    if !apply(&mut state, turn, id, &cfg, &inner, &events, &subs).await {
                         return;
                     }
                     let started = tokio::time::Instant::now();
@@ -1906,18 +1763,14 @@ async fn run_connection(
                             return;
                         }
                         SessionEnd::Dropped(reason) => {
-                            let last_seen_ms = lock(&inner).registry.connection_last_message(id);
-                            let step = next_step(
-                                &mut state,
-                                Turn::SessionDropped {
-                                    at_ms: now_ms(),
-                                    last_seen_ms,
-                                    reason,
-                                    lived: started.elapsed(),
-                                    grace: cfg.session_grace,
-                                },
-                            );
-                            if !apply(step, id, &cfg, &inner, &events, &subs).await {
+                            let turn = Turn::SessionDropped {
+                                at_ms: now_ms(),
+                                last_seen_ms: lock(&inner).registry.connection_last_message(id),
+                                reason,
+                                lived: started.elapsed(),
+                                grace: cfg.session_grace,
+                            };
+                            if !apply(&mut state, turn, id, &cfg, &inner, &events, &subs).await {
                                 return;
                             }
                         }
@@ -1925,14 +1778,11 @@ async fn run_connection(
                 }
             }
             Err(e) => {
-                let step = next_step(
-                    &mut state,
-                    Turn::ConnectFailed {
-                        at_ms: now_ms(),
-                        reason: format!("connect failed: {e}"),
-                    },
-                );
-                if !apply(step, id, &cfg, &inner, &events, &[]).await {
+                let turn = Turn::ConnectFailed {
+                    at_ms: now_ms(),
+                    reason: format!("connect failed: {e}"),
+                };
+                if !apply(&mut state, turn, id, &cfg, &inner, &events, &[]).await {
                     return;
                 }
             }
@@ -1954,17 +1804,18 @@ async fn run_connection(
     }
 }
 
-/// Carry out a [`Step`]. Returns false when the consumer's receiver is gone,
-/// which ends the connection task.
+/// Decide what a [`Turn`] means ([`next_step`]) and carry it out. Returns false
+/// when the consumer's receiver is gone, which ends the connection task.
 async fn apply(
-    step: Step,
+    state: &mut ConnState,
+    turn: Turn,
     id: ConnectionId,
     cfg: &WsPoolConfig,
     inner: &Arc<Mutex<PoolInner>>,
     events: &mpsc::Sender<WsEvent>,
     resubscribed: &[Subscription],
 ) -> bool {
-    match step {
+    match next_step(state, turn) {
         Step::Idle => true,
         Step::ReportDown { reason, strike } => {
             report_disconnect(id, cfg, inner, events, reason, strike).await
@@ -2216,15 +2067,6 @@ mod tests {
         /// `[bid, null]`; this frame exists so `parse_message` is pinned
         /// against the same shape `crate::types::Bbo`'s own tests cover.
         pub const BBO_BID_ONLY: &str = r#"{"channel":"bbo","data":{"coin":"FRIEND","time":1788490146994,"bbo":[{"px":"1.0","sz":"2.0","n":1},null]}}"#;
-        /// Two rows, **newest first**. Synthetic: the venue's array order is
-        /// unverified on every array-carrying channel, and newest-first is the
-        /// common shape for a subscribe snapshot. The live fixtures cannot
-        /// discriminate — `TRADES`'s two rows share a `time` and the other two
-        /// carry one row each — so these exist to keep
-        /// [`WsEvent::event_time`] from silently taking the oldest element.
-        pub const TRADES_DESCENDING: &str = r#"{"channel":"trades","data":[{"coin":"BTC","side":"A","px":"80639.0","sz":"0.00022","time":1788490042999,"hash":"0x00","tid":2,"users":[]},{"coin":"BTC","side":"B","px":"80640.0","sz":"0.00404","time":1788490042052,"hash":"0x00","tid":1,"users":[]}]}"#;
-        pub const USER_FILLS_DESCENDING: &str = r#"{"channel":"userFills","data":{"isSnapshot":true,"user":"0x31ca8395cf837de08b24da3f660e77761dfb974b","fills":[{"coin":"USUAL","px":"0.01152","sz":"1052.9","side":"A","time":1788490193999,"startPosition":"0.0","dir":"Open Short","closedPnl":"0.0","hash":"0x00","oid":2,"crossed":true,"fee":"0.0","tid":2,"feeToken":"USDC","twapId":null},{"coin":"USUAL","px":"0.01152","sz":"1052.9","side":"A","time":1788490193264,"startPosition":"0.0","dir":"Open Short","closedPnl":"0.0","hash":"0x00","oid":1,"crossed":true,"fee":"0.0","tid":1,"feeToken":"USDC","twapId":null}]}}"#;
-        pub const ORDER_UPDATES_DESCENDING: &str = r#"{"channel":"orderUpdates","data":[{"order":{"coin":"BTC","side":"B","limitPx":"80000.0","sz":"0.001","oid":2,"timestamp":1788490065008,"origSz":"0.001","cloid":null},"status":"filled","statusTimestamp":1788490065999},{"order":{"coin":"BTC","side":"B","limitPx":"80000.0","sz":"0.001","oid":1,"timestamp":1788490065008,"origSz":"0.001","cloid":null},"status":"open","statusTimestamp":1788490065010}]}"#;
         pub const ACK_BBO: &str = r#"{"channel":"subscriptionResponse","data":{"method":"subscribe","subscription":{"type":"bbo","coin":"BTC"}}}"#;
         /// The venue echoes `userFills` with its own default filled in.
         pub const ACK_USER_FILLS: &str = r#"{"channel":"subscriptionResponse","data":{"method":"subscribe","subscription":{"type":"userFills","user":"0x31ca8395cf837de08b24da3f660e77761dfb974b","aggregateByTime":false}}}"#;
@@ -2441,7 +2283,6 @@ mod tests {
             Ok(Placement::NewConnection(ConnectionId(1)))
         );
         assert_eq!(r.len(), 3);
-        assert_eq!(r.connection_count(), 2);
         assert_eq!(r.capacity(), 6);
     }
 
@@ -2582,7 +2423,6 @@ mod tests {
         );
         assert_eq!(r.len(), 1);
         // The emptied connection is kept and reused.
-        assert_eq!(r.connection_count(), 2);
         assert_eq!(
             r.place(Subscription::Bbo { coin: "SOL".into() }),
             Ok(Placement::Existing(ConnectionId(1)))
@@ -2882,26 +2722,6 @@ mod tests {
         assert_eq!(r.resubscribe_set(ConnectionId(0), 10_000), vec![sub]);
     }
 
-    #[test]
-    fn gap_window_saturates_on_a_backwards_clock() {
-        assert_eq!(
-            GapWindow {
-                start_ms: 100,
-                end_ms: 400
-            }
-            .duration_ms(),
-            300
-        );
-        assert_eq!(
-            GapWindow {
-                start_ms: 400,
-                end_ms: 100
-            }
-            .duration_ms(),
-            0
-        );
-    }
-
     // -- parsing --------------------------------------------------------------
 
     #[test]
@@ -2927,11 +2747,6 @@ mod tests {
         assert_eq!(ask.n, 46);
         assert!(bid.px < ask.px);
         assert_eq!(event.subscription_key().as_deref(), Some("bbo:BTC"));
-        assert_eq!(
-            event.event_time(),
-            EventTime::Venue(1_788_490_065_008),
-            "bbo is venue-stamped"
-        );
     }
 
     #[test]
@@ -2961,13 +2776,9 @@ mod tests {
         assert_eq!(asset_ctx.mark_px, dec("80640.0"));
         assert_eq!(asset_ctx.oracle_px, dec("80684.7"));
         assert_eq!(asset_ctx.premium, Some(dec("-0.0005540084")));
-        assert_eq!(*received_at_ms, 1_700_000_000_000);
         // The venue sends no timestamp on this channel (fair-value.md §14.1),
-        // and the event type has to say so.
-        assert_eq!(
-            event.event_time(),
-            EventTime::LocalArrival(1_700_000_000_000)
-        );
+        // so the event carries oppen's own arrival stamp instead.
+        assert_eq!(*received_at_ms, 1_700_000_000_000);
     }
 
     #[test]
@@ -2996,7 +2807,6 @@ mod tests {
         assert_eq!(trades[1].px, dec("80640.0"));
         assert_eq!(trades[0].users.len(), 2);
         assert_eq!(event.subscription_key().as_deref(), Some("trades:BTC"));
-        assert_eq!(event.event_time(), EventTime::Venue(1_788_490_042_052));
     }
 
     #[test]
@@ -3021,8 +2831,6 @@ mod tests {
         assert_eq!(c.i, "1m");
         assert_eq!(c.h, dec("80641.0"));
         assert_eq!(event.subscription_key().as_deref(), Some("candle:BTC:1m"));
-        // `t`/`T` are bar boundaries, not a sample instant.
-        assert_eq!(event.event_time(), EventTime::None);
     }
 
     #[test]
@@ -3191,39 +2999,6 @@ mod tests {
         assert!(bid.is_none() && ask.is_none());
     }
 
-    /// A frame carrying an array is stamped with its newest row. The venue's
-    /// array order is unverified, and newest-first is the common shape for a
-    /// subscribe snapshot, so taking the last element stamps
-    /// [`EventTime::Venue`] — the type built precisely so the sampler and the
-    /// ledger could trust a venue instant — with the oldest row.
-    #[test]
-    fn an_array_frame_is_stamped_with_its_newest_element() {
-        let user = addr("0x0000000000000000000000000000000000000009");
-        let with_user = ParseContext {
-            order_updates_user: Some(user),
-            ..ctx()
-        };
-        let cases = [
-            (fixtures::TRADES_DESCENDING, 1_788_490_042_999, ctx()),
-            (fixtures::USER_FILLS_DESCENDING, 1_788_490_193_999, ctx()),
-            (
-                fixtures::ORDER_UPDATES_DESCENDING,
-                1_788_490_065_999,
-                with_user,
-            ),
-        ];
-        for (raw, newest, parse_ctx) in cases {
-            let Ok(Incoming::Event(event)) = parse_message(raw, &parse_ctx) else {
-                panic!("expected an event from {raw}");
-            };
-            assert_eq!(
-                event.event_time(),
-                EventTime::Venue(newest),
-                "newest-first array must not be stamped with its last row"
-            );
-        }
-    }
-
     // -- the pre-sign gate ----------------------------------------------------
 
     /// `l2Book` pushes at a 5.4 s median (§14.4 correction 4), so §5.2's 2 s
@@ -3290,7 +3065,10 @@ mod tests {
         );
         let blocked = r.stale_feeds(late, &t, &[micro.clone(), depth.clone()]);
         assert_eq!(blocked.len(), 1);
-        assert_eq!(blocked[0].subscription(), &depth);
+        let FeedBlock::Stale(depth_block) = &blocked[0] else {
+            panic!("a subscribed feed past its budget is Stale, not NotSubscribed");
+        };
+        assert_eq!(depth_block.subscription, depth);
         assert_eq!(
             blocked[0].to_string(),
             "l2Book:BTC: silent 20000 ms of 15000 ms"
@@ -3314,7 +3092,10 @@ mod tests {
         r.set_connected(ConnectionId(0), false, late);
         let down = r.stale_feeds(late, &t, &[fills.clone(), micro.clone()]);
         assert_eq!(down.len(), 2);
-        assert_eq!(down[0].subscription(), &micro, "blocks are in key order");
+        let FeedBlock::Stale(first) = &down[0] else {
+            panic!("a subscribed feed on a dead socket is Stale, not NotSubscribed");
+        };
+        assert_eq!(first.subscription, micro, "blocks are in key order");
         assert_eq!(down[1].to_string(), format!("{fills}: socket down"));
     }
 
@@ -3488,16 +3269,15 @@ mod tests {
             // these coins never reach one: the placement decision is local.
             max_connections: 1,
             max_subs_per_connection: 2,
-            ..WsPoolConfig::new(Network::Testnet)
+            ..WsPoolConfig::default()
         };
         let (pool, _rx) = WsPool::new(cfg).expect("inside a runtime");
-        assert_eq!(pool.capacity(), 2);
-        assert_eq!(pool.subscription_count(), 0);
         pool.subscribe(Subscription::Bbo { coin: "BTC".into() })
             .expect("first");
         pool.subscribe(Subscription::Bbo { coin: "BTC".into() })
             .expect("repeat is a no-op");
-        assert_eq!(pool.subscription_count(), 1);
+        // The repeat took no slot: a second distinct feed still fits the cap
+        // of two, and a third does not.
         pool.subscribe(Subscription::Trades { coin: "BTC".into() })
             .expect("second");
         assert_eq!(
@@ -3517,7 +3297,7 @@ mod tests {
 
     #[tokio::test]
     async fn unsubscribing_something_absent_is_typed() {
-        let (pool, _rx) = WsPool::new(WsPoolConfig::new(Network::Testnet)).expect("runtime");
+        let (pool, _rx) = WsPool::new(WsPoolConfig::default()).expect("runtime");
         assert_eq!(
             pool.unsubscribe(&Subscription::Bbo { coin: "BTC".into() }),
             Err(PoolError::NotSubscribed("bbo:BTC".to_owned()))
@@ -3538,7 +3318,7 @@ mod tests {
     #[test]
     fn a_pool_built_outside_a_runtime_is_refused_not_a_panic() {
         assert!(tokio::runtime::Handle::try_current().is_err());
-        let refused = WsPool::new(WsPoolConfig::new(Network::Testnet))
+        let refused = WsPool::new(WsPoolConfig::default())
             .map(|_| ())
             .expect_err("no runtime here");
         assert_eq!(refused, PoolError::NoRuntime);
@@ -3552,7 +3332,7 @@ mod tests {
     /// console summary, so it reads degraded rather than green.
     #[tokio::test]
     async fn an_empty_pool_reads_degraded() {
-        let (pool, _rx) = WsPool::new(WsPoolConfig::new(Network::Testnet)).expect("runtime");
+        let (pool, _rx) = WsPool::new(WsPoolConfig::default()).expect("runtime");
         assert!(pool.health().is_empty());
         assert!(pool.any_stale(), "a pool watching nothing is not healthy");
         // And the pre-sign gate blocks on anything it is asked about.
@@ -3599,7 +3379,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(8);
         let cfg = WsPoolConfig {
             quarantine_after: 1,
-            ..WsPoolConfig::new(Network::Testnet)
+            ..WsPoolConfig::default()
         };
 
         assert!(
@@ -3653,7 +3433,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(8);
         let cfg = WsPoolConfig {
             quarantine_after: 1,
-            ..WsPoolConfig::new(Network::Testnet)
+            ..WsPoolConfig::default()
         };
 
         assert!(
@@ -3796,7 +3576,7 @@ mod tests {
         let inner = connected_registry(&bbo);
         let (tx, mut rx) = mpsc::channel(8);
         let (_cmd_tx, mut cmds) = mpsc::unbounded_channel();
-        let cfg = WsPoolConfig::new(Network::Testnet);
+        let cfg = WsPoolConfig::default();
 
         let end = session(ConnectionId(0), &mut stream, &mut cmds, &tx, &inner, &cfg).await;
         let SessionEnd::Dropped(reason) = end else {
@@ -3831,7 +3611,7 @@ mod tests {
         let cfg = WsPoolConfig {
             ping_interval: Duration::from_millis(40),
             idle_timeout: Duration::from_millis(100),
-            ..WsPoolConfig::new(Network::Testnet)
+            ..WsPoolConfig::default()
         };
 
         let end = session(ConnectionId(0), &mut stream, &mut cmds, &tx, &inner, &cfg).await;
@@ -3873,7 +3653,7 @@ mod tests {
         let cfg = WsPoolConfig {
             ping_interval: Duration::from_millis(40),
             idle_timeout: Duration::from_secs(60),
-            ..WsPoolConfig::new(Network::Testnet)
+            ..WsPoolConfig::default()
         };
         let stop = cmd_tx.clone();
         tokio::spawn(async move {
@@ -3907,7 +3687,10 @@ mod tests {
     #[tokio::test]
     #[ignore = "hits the public mainnet websocket"]
     async fn live_mainnet_bbo_trades_and_ctx() {
-        let cfg = WsPoolConfig::new(Network::Mainnet);
+        let cfg = WsPoolConfig {
+            network: Network::Mainnet,
+            ..Default::default()
+        };
         let (pool, mut rx) = WsPool::new(cfg).expect("runtime");
         for sub in [
             Subscription::Bbo { coin: "BTC".into() },
@@ -3941,10 +3724,6 @@ mod tests {
                 }
                 WsEvent::ActiveAssetCtx { ctx, .. } => {
                     assert!(ctx.mark_px > Decimal::ZERO && ctx.oracle_px > Decimal::ZERO);
-                    assert!(
-                        matches!(event.event_time(), EventTime::LocalArrival(_)),
-                        "activeAssetCtx carries no venue timestamp and must be stamped locally"
-                    );
                 }
                 WsEvent::L2Book(book) => {
                     assert!(!book.bids().is_empty() && !book.asks().is_empty());
@@ -3989,8 +3768,6 @@ mod tests {
             .expect("bbo health");
         assert!(!bbo.stale, "bbo should sit well inside the 2 s book budget");
         assert!(bbo.acked);
-        assert_eq!(pool.connection_count(), 1);
-        assert_eq!(pool.subscription_count(), 4);
 
         pool.shutdown();
     }
@@ -4009,7 +3786,8 @@ mod tests {
                 max: Duration::from_secs(2),
                 jitter_pct: 20,
             },
-            ..WsPoolConfig::new(Network::Mainnet)
+            network: Network::Mainnet,
+            ..WsPoolConfig::default()
         };
         let (pool, mut rx) = WsPool::new(cfg).expect("runtime");
         pool.subscribe(Subscription::Bbo { coin: "BTC".into() })
@@ -4056,7 +3834,7 @@ mod tests {
                         "reconnected {} after {} attempts, gap {} ms, resubscribed {:?}",
                         r.connection,
                         r.attempts,
-                        r.gap.duration_ms(),
+                        r.gap.end_ms.saturating_sub(r.gap.start_ms),
                         r.resubscribed.iter().map(|s| s.key()).collect::<Vec<_>>()
                     );
                     saw_reconnect.get_or_insert(r);
@@ -4083,9 +3861,8 @@ mod tests {
             "the unacked list should name the poison"
         );
         let reconnect = saw_reconnect.expect("a reconnect");
-        assert!(reconnect.gap.end_ms >= reconnect.gap.start_ms);
         assert!(
-            reconnect.gap.duration_ms() > 0,
+            reconnect.gap.end_ms > reconnect.gap.start_ms,
             "a real outage has a non-zero gap window"
         );
         assert!(

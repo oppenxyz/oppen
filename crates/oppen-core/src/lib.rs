@@ -12,9 +12,12 @@
 //! `docs/decisions.md` R1 keeps it able to run headless with the console as a
 //! client.
 
+pub mod accounts;
 pub mod candles;
 pub mod guardrail;
+pub mod keys;
 pub mod ledger;
+pub mod reconcile;
 
 pub use oppen_hl::Network;
 

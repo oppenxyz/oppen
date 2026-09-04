@@ -25,6 +25,16 @@ use oppen_hl::types::AssetInfo;
 use oppen_hl::wire::{CancelByCloidWire, CancelWire, Cloid, Grouping, OrderWire, Tif, Tpsl};
 use oppen_hl::{Action, Network};
 
+use crate::keys::KeyStore;
+
+use super::config::{
+    APPROVAL_TTL_MS, DEFAULT_DAILY_LOSS_USD, DEFAULT_MARK_DIVERGENCE_BPS,
+    DEFAULT_MARK_DIVERGENCE_WINDOW_MS, DEFAULT_MAX_ORDER_USD, DEFAULT_MAX_POSITION_USD,
+    DEFAULT_ORDER_RATE, MAX_REASON_BYTES,
+};
+use super::deadman::DEAD_MAN_MIN_LEAD_MS;
+use super::engine::NullAuditSink;
+use super::store::MemoryStore;
 use super::*;
 
 // ---- fixtures -----------------------------------------------------------
@@ -41,6 +51,37 @@ fn d(s: &str) -> Decimal {
 /// The sub-account D1 pairs `alpha` with.
 fn vault() -> oppen_hl::Address {
     oppen_hl::Address::parse("0x0d1d9635d0640821d15e323ac8adadfa9c111414").expect("address")
+}
+
+/// A key store holding one agent wallet per named agent.
+///
+/// The hex is derived from the agent's position in the list, so no two agents
+/// share a signer — which is the whole point of the container model, and the
+/// property [`a_clearance_is_signed_by_the_key_of_the_agent_it_names`] leans
+/// on. Testnet, because `AGENTS.md` invariant 5 makes that the default and
+/// [`GuardrailEngine::new`] refuses a store bound to the other network.
+fn key_store(agents: &[&str]) -> Arc<crate::keys::MemoryKeyStore> {
+    let store = Arc::new(crate::keys::MemoryKeyStore::new(Network::Testnet));
+    for (n, agent) in agents.iter().enumerate() {
+        store
+            .create_agent_key(
+                &AgentId::new(*agent),
+                crate::keys::SecretText::new(format!("{:064x}", n + 1)),
+                NOW_MS + 90 * 86_400_000,
+                NOW_MS,
+            )
+            .expect("a wallet for the agent");
+    }
+    store
+}
+
+/// The signer bound to `agent` in `store`, for tests that assert which key
+/// actually signed.
+fn signer_of(store: &crate::keys::MemoryKeyStore, agent: &str) -> oppen_hl::Address {
+    store
+        .load_agent_key(&AgentId::new(agent))
+        .expect("wallet")
+        .address()
 }
 
 fn cloid() -> Cloid {
@@ -174,7 +215,9 @@ struct FailingSink;
 
 impl AuditSink for FailingSink {
     fn record(&self, _entry: &AuditEntry<'_>) -> Result<(), AuditError> {
-        Err(AuditError::new("the ledger disk is full"))
+        Err(AuditError {
+            detail: "the ledger disk is full".to_owned(),
+        })
     }
 }
 
@@ -220,10 +263,37 @@ impl Fixture {
         store: Arc<dyn GuardrailStore>,
         sink: Arc<dyn AuditSink>,
     ) -> Self {
-        let engine = GuardrailEngine::new(store, sink, Network::Testnet).expect("engine");
+        let engine = GuardrailEngine::new(
+            store,
+            sink,
+            key_store(&["alpha"]) as Arc<dyn KeyStore>,
+            Network::Testnet,
+        )
+        .expect("engine");
         let agent = AgentId::new("alpha");
         engine
             .register_agent(&agent, Some(vault()), NOW_MS)
+            .expect("register");
+        engine
+            .operator_set_guardrails(&agent, config, NOW_MS)
+            .expect("set guardrails");
+        Fixture { engine, agent }
+    }
+
+    /// The same fixture in either shape of D1 container: a sub-account, or
+    /// the **top-level** account the revised D1 (V2) makes the Hyperliquid
+    /// default, which carries no `vaultAddress` on the wire at all.
+    fn in_container(config: AgentGuardrails, vault_address: Option<oppen_hl::Address>) -> Self {
+        let engine = GuardrailEngine::new(
+            Arc::new(MemoryStore::new()),
+            Arc::new(NullAuditSink),
+            key_store(&["alpha"]) as Arc<dyn KeyStore>,
+            Network::Testnet,
+        )
+        .expect("engine");
+        let agent = AgentId::new("alpha");
+        engine
+            .register_agent(&agent, vault_address, NOW_MS)
             .expect("register");
         engine
             .operator_set_guardrails(&agent, config, NOW_MS)
@@ -267,8 +337,13 @@ fn wire_sz(wire: &OrderWire) -> Decimal {
 #[test]
 fn a_freshly_paired_agent_is_refused_and_told_which_limit_to_raise() {
     let store: Arc<dyn GuardrailStore> = Arc::new(MemoryStore::new());
-    let engine =
-        GuardrailEngine::new(store, Arc::new(NullAuditSink), Network::Testnet).expect("engine");
+    let engine = GuardrailEngine::new(
+        store,
+        Arc::new(NullAuditSink),
+        key_store(&["alpha"]) as Arc<dyn KeyStore>,
+        Network::Testnet,
+    )
+    .expect("engine");
     let agent = AgentId::new("alpha");
     let config = engine
         .register_agent(&agent, Some(vault()), NOW_MS)
@@ -398,13 +473,9 @@ fn the_position_cap_is_measured_after_the_fill() {
 
     // An existing position counts, and a sell against a long reduces it.
     let mut long = exposure(d("100000"));
-    long.agent.positions.insert(
-        "BTC".to_owned(),
-        PositionSnapshot {
-            szi: d("1"),
-            entry_px: Some(d("100")),
-        },
-    );
+    long.agent
+        .positions
+        .insert("BTC".to_owned(), PositionSnapshot { szi: d("1") });
     long.agent.total_position_notional_usd = d("100");
     assert!(
         matches!(
@@ -603,13 +674,9 @@ fn reduce_only_mode_requires_the_flag_and_an_actual_reduction() {
     let market = MarketRef::fresh("BTC", d("100"), NOW_MS);
 
     let mut long = exposure(d("100000"));
-    long.agent.positions.insert(
-        "BTC".to_owned(),
-        PositionSnapshot {
-            szi: d("2"),
-            entry_px: Some(d("100")),
-        },
-    );
+    long.agent
+        .positions
+        .insert("BTC".to_owned(), PositionSnapshot { szi: d("2") });
     long.agent.total_position_notional_usd = d("200");
 
     let reduce = |sz: &str, is_buy: bool, flagged: bool| {
@@ -922,8 +989,13 @@ fn the_kill_switch_survives_a_restart() {
     {
         let store: Arc<dyn GuardrailStore> =
             Arc::new(SqliteGuardrailStore::open(&path).expect("open"));
-        let engine =
-            GuardrailEngine::new(store, Arc::new(NullAuditSink), Network::Testnet).expect("engine");
+        let engine = GuardrailEngine::new(
+            store,
+            Arc::new(NullAuditSink),
+            key_store(&["alpha"]) as Arc<dyn KeyStore>,
+            Network::Testnet,
+        )
+        .expect("engine");
         engine
             .register_agent(&agent, Some(vault()), NOW_MS)
             .expect("register");
@@ -940,8 +1012,13 @@ fn the_kill_switch_survives_a_restart() {
     // A whole new process would see exactly this.
     let store: Arc<dyn GuardrailStore> =
         Arc::new(SqliteGuardrailStore::open(&path).expect("reopen"));
-    let engine =
-        GuardrailEngine::new(store, Arc::new(NullAuditSink), Network::Testnet).expect("engine");
+    let engine = GuardrailEngine::new(
+        store,
+        Arc::new(NullAuditSink),
+        key_store(&["alpha"]) as Arc<dyn KeyStore>,
+        Network::Testnet,
+    )
+    .expect("engine");
     assert!(
         engine
             .kill_switch()
@@ -1152,17 +1229,20 @@ fn a_trip_whose_state_write_fails_still_queues_the_cancels() {
 #[test]
 fn the_dead_man_switch_arms_while_an_agent_is_active() {
     let f = Fixture::new(permissive(&["BTC"]));
-    assert_eq!(f.engine.dead_man_intent(NOW_MS, None), DeadManIntent::Hold);
+    assert_eq!(
+        f.engine.dead_man_intent(&f.agent, NOW_MS, None),
+        DeadManIntent::Hold
+    );
 
     f.engine.set_agent_active(&f.agent, true);
     assert_eq!(f.engine.active_agents(), 1);
-    let intent = f.engine.dead_man_intent(NOW_MS, None);
+    let intent = f.engine.dead_man_intent(&f.agent, NOW_MS, None);
     let DeadManIntent::Arm { cancel_at_ms } = intent else {
         panic!("expected an arm, got {intent:?}");
     };
     let cleared = f
         .engine
-        .clear_dead_man(intent, NOW_MS)
+        .clear_dead_man(&f.agent, intent, NOW_MS)
         .expect("arming clears")
         .expect("an arm produces an action");
     assert_eq!(
@@ -1174,18 +1254,19 @@ fn the_dead_man_switch_arms_while_an_agent_is_active() {
 
     f.engine.set_agent_active(&f.agent, false);
     assert_eq!(
-        f.engine.dead_man_intent(NOW_MS, Some(cancel_at_ms)),
+        f.engine
+            .dead_man_intent(&f.agent, NOW_MS, Some(cancel_at_ms)),
         DeadManIntent::Disarm
     );
     let disarm = f
         .engine
-        .clear_dead_man(DeadManIntent::Disarm, NOW_MS)
+        .clear_dead_man(&f.agent, DeadManIntent::Disarm, NOW_MS)
         .expect("disarming clears")
         .expect("a disarm produces an action");
     assert_eq!(disarm.action(), &Action::ScheduleCancel { time: None });
     assert!(
         f.engine
-            .clear_dead_man(DeadManIntent::Hold, NOW_MS)
+            .clear_dead_man(&f.agent, DeadManIntent::Hold, NOW_MS)
             .expect("hold clears")
             .is_none()
     );
@@ -1196,12 +1277,12 @@ fn a_schedule_cancel_inside_the_venue_minimum_is_refused() {
     let f = Fixture::new(permissive(&["BTC"]));
     assert!(matches!(
         f.engine
-            .clear_schedule_cancel(Some(NOW_MS + DEAD_MAN_MIN_LEAD_MS - 1), NOW_MS),
+            .clear_schedule_cancel(&f.agent, Some(NOW_MS + DEAD_MAN_MIN_LEAD_MS - 1), NOW_MS),
         Err(Refusal::VenueRule(VenueRule::ScheduleCancelTooSoon { .. }))
     ));
     assert!(
         f.engine
-            .clear_schedule_cancel(Some(NOW_MS + DEAD_MAN_MIN_LEAD_MS), NOW_MS)
+            .clear_schedule_cancel(&f.agent, Some(NOW_MS + DEAD_MAN_MIN_LEAD_MS), NOW_MS)
             .is_ok()
     );
 }
@@ -1411,13 +1492,9 @@ fn an_order_whose_arithmetic_overflows_is_refused_not_fatal() {
 
     // And a position snapshot large enough to overflow the post-fill maths.
     let mut vast = exposure(d("100"));
-    vast.agent.positions.insert(
-        "BTC".to_owned(),
-        PositionSnapshot {
-            szi: huge,
-            entry_px: Some(d("1")),
-        },
-    );
+    vast.agent
+        .positions
+        .insert("BTC".to_owned(), PositionSnapshot { szi: huge });
     vast.agent.total_position_notional_usd = huge;
     let refusal = f
         .evaluate(
@@ -1489,13 +1566,13 @@ fn a_ledger_write_failure_never_blocks_a_cancel_or_the_dead_man_switch() {
 
     let disarm = f
         .engine
-        .clear_dead_man(DeadManIntent::Disarm, NOW_MS)
+        .clear_dead_man(&f.agent, DeadManIntent::Disarm, NOW_MS)
         .expect("disarming clears")
         .expect("a disarm produces an action");
     assert_eq!(disarm.action(), &Action::ScheduleCancel { time: None });
 
     f.engine
-        .clear_schedule_cancel(Some(NOW_MS + DEAD_MAN_MIN_LEAD_MS), NOW_MS)
+        .clear_schedule_cancel(&f.agent, Some(NOW_MS + DEAD_MAN_MIN_LEAD_MS), NOW_MS)
         .expect("re-arming clears");
 
     // The order path is unchanged: an unexplainable *order* still does not
@@ -1953,13 +2030,10 @@ fn an_approved_proposal_is_still_refused_if_the_world_moved() {
 
     // By the time the operator looks, the agent already holds the cap.
     let mut loaded = exposure(d("100000"));
-    loaded.agent.positions.insert(
-        "BTC".to_owned(),
-        PositionSnapshot {
-            szi: d("2"),
-            entry_px: Some(d("100")),
-        },
-    );
+    loaded
+        .agent
+        .positions
+        .insert("BTC".to_owned(), PositionSnapshot { szi: d("2") });
     loaded.agent.total_position_notional_usd = d("200");
     assert!(matches!(
         f.engine
@@ -2113,28 +2187,6 @@ fn a_venue_rule_breach_is_a_typed_subtype_not_a_string() {
     }
 }
 
-#[test]
-fn a_clearance_signs_exactly_one_request() {
-    let f = Fixture::new(permissive(&["BTC"]));
-    let cleared = f
-        .evaluate(
-            &intent("BTC", true, d("100"), d("1")),
-            &asset("BTC", 2, 40),
-            &MarketRef::fresh("BTC", d("100"), NOW_MS),
-            &exposure(d("100000")),
-        )
-        .expect("clears");
-    let key = oppen_hl::AgentKey::from_hex(
-        "0123456789012345678901234567890123456789012345678901234567890123",
-    )
-    .expect("key");
-    let (request, clearance) = sign_cleared(&key, cleared, 1, None).expect("signs");
-    assert_eq!(clearance.agent, Some(AgentId::new("alpha")));
-    assert!(matches!(request.action(), Action::Order { .. }));
-    // `cleared` was consumed by the signature, so there is no second use of
-    // it here and the compiler enforces that.
-}
-
 /// R4 calls a mainnet number that is actually a testnet number the worst bug
 /// this product can ship, and D1 makes each agent's sub-account the unit of
 /// capital segregation. Neither may be a signing parameter: the clearance
@@ -2154,18 +2206,27 @@ fn a_clearance_is_signed_for_the_network_and_sub_account_it_was_evaluated_for() 
     assert_eq!(cleared.clearance().network, Network::Testnet);
     assert_eq!(cleared.clearance().vault_address, Some(vault()));
 
-    let key = oppen_hl::AgentKey::from_hex(
-        "0123456789012345678901234567890123456789012345678901234567890123",
-    )
-    .expect("key");
-    let (request, _) = sign_cleared(&key, cleared, 1, None).expect("signs");
+    let (request, _) = f
+        .engine
+        .sign_cleared(cleared, 1, None, NOW_MS)
+        .expect("signs");
     assert_eq!(request.vault_address(), Some(vault()));
 
     // The same order under a mainnet engine signs for mainnet — the network
     // travels with the engine, not with the call.
+    let mainnet_keys = Arc::new(crate::keys::MemoryKeyStore::new(Network::Mainnet));
+    mainnet_keys
+        .create_agent_key(
+            &AgentId::new("beta"),
+            crate::keys::SecretText::new(format!("{:064x}", 9)),
+            NOW_MS + 90 * 86_400_000,
+            NOW_MS,
+        )
+        .expect("wallet");
     let mainnet = GuardrailEngine::new(
         Arc::new(MemoryStore::new()),
         Arc::new(NullAuditSink),
+        mainnet_keys as Arc<dyn KeyStore>,
         Network::Mainnet,
     )
     .expect("engine");
@@ -2202,8 +2263,13 @@ fn the_sub_account_binding_survives_a_restart() {
     {
         let store: Arc<dyn GuardrailStore> =
             Arc::new(SqliteGuardrailStore::open(&path).expect("open"));
-        let engine =
-            GuardrailEngine::new(store, Arc::new(NullAuditSink), Network::Testnet).expect("engine");
+        let engine = GuardrailEngine::new(
+            store,
+            Arc::new(NullAuditSink),
+            key_store(&["alpha"]) as Arc<dyn KeyStore>,
+            Network::Testnet,
+        )
+        .expect("engine");
         engine
             .register_agent(&agent, Some(vault()), NOW_MS)
             .expect("register");
@@ -2213,8 +2279,13 @@ fn the_sub_account_binding_survives_a_restart() {
     }
     let store: Arc<dyn GuardrailStore> =
         Arc::new(SqliteGuardrailStore::open(&path).expect("reopen"));
-    let engine =
-        GuardrailEngine::new(store, Arc::new(NullAuditSink), Network::Testnet).expect("engine");
+    let engine = GuardrailEngine::new(
+        store,
+        Arc::new(NullAuditSink),
+        key_store(&["alpha"]) as Arc<dyn KeyStore>,
+        Network::Testnet,
+    )
+    .expect("engine");
     assert_eq!(engine.vault_address(&agent), Some(vault()));
     let cleared = engine
         .evaluate(
@@ -2300,11 +2371,6 @@ fn every_refusal_shape_serializes_deterministically() {
         Refusal::Unevaluable(Unevaluable::MissingRestingOrders),
         Refusal::Unevaluable(Unevaluable::UnknownProposal {
             approval_id: "alpha-1-1".to_owned(),
-        }),
-        Refusal::Unevaluable(Unevaluable::ProposalExpired {
-            approval_id: "alpha-1-1".to_owned(),
-            expires_at_ms: 1,
-            now_ms: 2,
         }),
     ];
     for refusal in &cases {
@@ -2468,7 +2534,6 @@ fn no_input_produces_a_signable_value_without_passing_every_predicate() {
                 symbol.to_owned(),
                 PositionSnapshot {
                     szi: d(rng.pick(&["-2", "-0.5", "0.5", "2"])),
-                    entry_px: Some(d("100")),
                 },
             );
         }
@@ -2718,11 +2783,7 @@ fn verify_every_predicate(
         }
         other => panic!("{ctx}: expected an order clearance, got {other:?}"),
     }
-    assert_eq!(
-        cleared.clearance().agent.as_ref(),
-        Some(&AgentId::new("alpha")),
-        "{ctx}"
-    );
+    assert_eq!(cleared.clearance().agent, AgentId::new("alpha"), "{ctx}");
 }
 
 /// The second property, and the one the first is structurally blind to.
@@ -2736,7 +2797,7 @@ fn verify_every_predicate(
 /// monotonically advancing clock.
 ///
 /// The bucket is re-derived here from the carry arithmetic directly, not by
-/// asking the engine, so an error in [`TokenBucket`] cannot hide by being
+/// asking the engine, so an error in the token bucket cannot hide by being
 /// made twice. Item 25's breaker and item 26's pause are re-derived the same
 /// way: once anything has stopped this agent, nothing may clear again.
 #[test]
@@ -2899,3 +2960,1273 @@ fn a_sequence_against_one_engine_never_outruns_the_rate_cap_or_the_pause() {
         "{trips} trips and {releases} releases; item 25 is barely exercised"
     );
 }
+
+// ---- the P3 gate: no signer path without a guardrail check ---------------
+
+fn account_at(equity: Decimal, now_ms: u64) -> AccountSnapshot {
+    AccountSnapshot {
+        as_of_ms: now_ms,
+        ..account(equity)
+    }
+}
+
+/// Spec item 7 puts a submit queue between the decision and the wire, so
+/// "the switch was clear when we evaluated" is not the same statement as
+/// "the switch is clear now". The gate re-reads the switch inside the signer,
+/// so this order dies there.
+#[test]
+fn a_kill_switch_engaged_after_the_clearance_still_stops_the_signature() {
+    let f = Fixture::new(permissive(&["BTC"]));
+    let cleared = f
+        .evaluate(
+            &intent("BTC", true, d("100"), d("1")),
+            &asset("BTC", 2, 40),
+            &MarketRef::fresh("BTC", d("100"), NOW_MS),
+            &exposure(d("100000")),
+        )
+        .expect("clears while the switch is open");
+
+    f.engine
+        .operator_engage_kill(
+            KillScope::agent(f.agent.clone()),
+            KillReason::Operator,
+            NOW_MS + 1,
+        )
+        .expect("engage");
+
+    match f.engine.sign_cleared(cleared, 1, None, NOW_MS + 2) {
+        Err(SignClearedError::Refused(Refusal::TradingPaused {
+            scope,
+            since_ms,
+            reason,
+        })) => {
+            assert_eq!(scope, KillScope::agent(f.agent.clone()));
+            assert_eq!(since_ms, NOW_MS + 1);
+            assert_eq!(reason, KillReason::Operator);
+        }
+        other => panic!("a paused agent must not get a signature, got {other:?}"),
+    }
+}
+
+/// D6 makes the chain the single record of why an order happened. A refusal
+/// at the signer arrives *after* `evaluate` already wrote the clearance row,
+/// so without its own row the export would show an order cleared and never
+/// say why no fill followed — and item 18 names guardrail trips as events.
+#[test]
+fn a_refusal_at_the_signer_reaches_the_ledger() {
+    let sink = Arc::new(CountingSink::default());
+    let f = Fixture::with(
+        permissive(&["BTC"]),
+        Arc::new(MemoryStore::new()),
+        sink.clone() as Arc<dyn AuditSink>,
+    );
+    let cleared = f
+        .evaluate(
+            &intent("BTC", true, d("100"), d("1")),
+            &asset("BTC", 2, 40),
+            &MarketRef::fresh("BTC", d("100"), NOW_MS),
+            &exposure(d("100000")),
+        )
+        .expect("clears");
+    assert_eq!(sink.cleared.load(Ordering::Relaxed), 1);
+    assert_eq!(sink.refused.load(Ordering::Relaxed), 0);
+
+    f.engine
+        .operator_engage_kill(KillScope::Global, KillReason::Operator, NOW_MS + 1)
+        .expect("engage");
+    let err = f
+        .engine
+        .sign_cleared(cleared, 1, None, NOW_MS + 2)
+        .expect_err("the signer refuses");
+    assert!(matches!(
+        err,
+        SignClearedError::Refused(Refusal::TradingPaused { .. })
+    ));
+
+    // The clearance row still stands — it was true when it was written — and
+    // the refusal that overtook it is now beside it.
+    assert_eq!(sink.cleared.load(Ordering::Relaxed), 1);
+    assert_eq!(sink.refused.load(Ordering::Relaxed), 1);
+}
+
+/// A ledger that cannot be written must not turn a refusal into a signature.
+/// Same reading as the refusal branch of `record`: losing the row is bad, the
+/// safe outcome already happened.
+#[test]
+fn a_failed_ledger_write_never_turns_a_signer_refusal_into_a_signature() {
+    let f = Fixture::with(
+        permissive(&["BTC"]),
+        Arc::new(MemoryStore::new()),
+        Arc::new(NullAuditSink),
+    );
+    let cleared = f
+        .evaluate(
+            &intent("BTC", true, d("100"), d("1")),
+            &asset("BTC", 2, 40),
+            &MarketRef::fresh("BTC", d("100"), NOW_MS),
+            &exposure(d("100000")),
+        )
+        .expect("clears");
+
+    // A second engine over the same store, whose sink fails every write, and
+    // which has never paired this agent.
+    let broken = GuardrailEngine::new(
+        Arc::new(MemoryStore::new()),
+        Arc::new(FailingSink),
+        key_store(&["alpha"]) as Arc<dyn KeyStore>,
+        Network::Testnet,
+    )
+    .expect("engine");
+    let err = broken
+        .sign_cleared(cleared, 1, None, NOW_MS)
+        .expect_err("still refuses with the ledger down");
+    assert!(matches!(
+        err,
+        SignClearedError::Refused(Refusal::Unevaluable(Unevaluable::UnknownAgent { .. }))
+    ));
+}
+
+/// The exemption, and only the exemption. Item 26 makes cancelling resting
+/// orders part of what engaging the switch *does*, so a cancel that clears
+/// while paused must also *sign* while paused — otherwise the switch stops
+/// the cure along with the disease.
+#[test]
+fn a_cancel_still_signs_while_the_kill_switch_is_engaged() {
+    let f = Fixture::new(permissive(&["BTC"]));
+    f.engine
+        .operator_engage_kill(KillScope::Global, KillReason::Operator, NOW_MS)
+        .expect("engage");
+
+    let cleared = f
+        .engine
+        .clear_cancel(
+            &f.agent,
+            vec![CancelWire { a: 7, o: 991 }],
+            "stopping",
+            NOW_MS,
+        )
+        .expect("a cancel clears while paused");
+    let (request, _) = f
+        .engine
+        .sign_cleared(cleared, 1, None, NOW_MS)
+        .expect("and it signs while paused");
+    assert!(matches!(request.action(), Action::Cancel { .. }));
+
+    // The dead-man's switch is the other risk-reducing action. It is per
+    // container (item 27), so it goes to the address it is protecting rather
+    // than to a fleet-wide account that does not exist under D1.
+    let cleared = f
+        .engine
+        .clear_schedule_cancel(&f.agent, Some(NOW_MS + 60_000), NOW_MS)
+        .expect("the dead-man's switch clears while paused");
+    let (request, _) = f
+        .engine
+        .sign_cleared(cleared, 2, None, NOW_MS)
+        .expect("and it signs");
+    assert!(matches!(request.action(), Action::ScheduleCancel { .. }));
+    assert_eq!(request.vault_address(), Some(vault()));
+}
+
+/// R4: one engine, one network, one database file. A clearance is a verdict
+/// about testnet limits measured against testnet positions; signing it for
+/// mainnet is the bug R4 calls the worst this product can ship. The gate is
+/// the engine itself, so the wrong engine cannot sign it even though the
+/// value type is the same.
+#[test]
+fn a_clearance_cannot_be_signed_through_another_networks_engine() {
+    let f = Fixture::new(permissive(&["BTC"]));
+    let cleared = f
+        .evaluate(
+            &intent("BTC", true, d("100"), d("1")),
+            &asset("BTC", 2, 40),
+            &MarketRef::fresh("BTC", d("100"), NOW_MS),
+            &exposure(d("100000")),
+        )
+        .expect("clears on testnet");
+
+    let mainnet_keys = Arc::new(crate::keys::MemoryKeyStore::new(Network::Mainnet));
+    mainnet_keys
+        .create_agent_key(
+            &AgentId::new("alpha"),
+            crate::keys::SecretText::new(format!("{:064x}", 1)),
+            NOW_MS + 90 * 86_400_000,
+            NOW_MS,
+        )
+        .expect("wallet");
+    let mainnet = GuardrailEngine::new(
+        Arc::new(MemoryStore::new()),
+        Arc::new(NullAuditSink),
+        mainnet_keys as Arc<dyn KeyStore>,
+        Network::Mainnet,
+    )
+    .expect("engine");
+    // Same agent, same sub-account: only the network differs.
+    mainnet
+        .register_agent(&AgentId::new("alpha"), Some(vault()), NOW_MS)
+        .expect("register");
+
+    match mainnet.sign_cleared(cleared, 1, None, NOW_MS) {
+        Err(SignClearedError::Refused(Refusal::Unevaluable(Unevaluable::WrongNetwork {
+            expected,
+            supplied,
+        }))) => {
+            assert_eq!(expected, Network::Mainnet);
+            assert_eq!(supplied, Network::Testnet);
+        }
+        other => panic!("a testnet clearance must not sign for mainnet, got {other:?}"),
+    }
+}
+
+/// D1 maps the agent roster 1:1 onto containers. An engine that has never
+/// paired this agent has never measured a limit against its capital, so it
+/// refuses rather than signing on someone else's behalf.
+///
+/// The identity checked is the clearance's own [`Clearance::agent`], not the
+/// `vaultAddress` on the wire — which is why the same refusal is asserted for
+/// a **top-level** container, where there is no `vaultAddress` at all (D1 V2)
+/// and the address-derived version of this check saw nothing to reject.
+#[test]
+fn a_clearance_cannot_be_signed_through_an_engine_that_does_not_know_its_agent() {
+    let stranger = || {
+        GuardrailEngine::new(
+            Arc::new(MemoryStore::new()),
+            Arc::new(NullAuditSink),
+            key_store(&["alpha"]) as Arc<dyn KeyStore>,
+            Network::Testnet,
+        )
+        .expect("engine")
+    };
+
+    for container in [Some(vault()), None] {
+        let f = Fixture::in_container(permissive(&["BTC"]), container);
+        let cleared = f
+            .evaluate(
+                &intent("BTC", true, d("100"), d("1")),
+                &asset("BTC", 2, 40),
+                &MarketRef::fresh("BTC", d("100"), NOW_MS),
+                &exposure(d("100000")),
+            )
+            .expect("clears");
+        assert_eq!(cleared.clearance().vault_address, container);
+
+        match stranger().sign_cleared(cleared, 1, None, NOW_MS) {
+            Err(SignClearedError::Refused(Refusal::Unevaluable(Unevaluable::UnknownAgent {
+                agent,
+            }))) => assert_eq!(agent, f.agent),
+            other => panic!("an unknown agent must not be signed for, got {other:?}"),
+        }
+    }
+}
+
+/// **The seal on `AGENTS.md` invariant 1, asserted on the type system.**
+///
+/// `GuardrailEngine` is public and `ExchangeRequest::sign_checked` is public.
+/// While the engine also implemented `PreSignCheck`, those three facts
+/// composed into a complete bypass: a caller wrote
+///
+/// ```text
+/// ExchangeRequest::sign_checked(&key, whatever_action, nonce, Some(vault), None, network, &engine)
+/// ```
+///
+/// and the real guardrail engine signed an action it had never evaluated. The
+/// gate is handed the assembled wire request and nothing else, so it had no
+/// way to tell that action from one of its own — the engine was its own
+/// rubber stamp.
+///
+/// The fix is that the shipped checker is a private type inside `engine.rs`,
+/// so that call no longer compiles. A compile error is not observable from a
+/// test that has to compile, so the property is asserted the only way it can
+/// be: **`GuardrailEngine` does not implement the trait.** The probe is the
+/// autoref-specialization shape `impls!` uses — the inherent method applies
+/// only when the bound holds, and the blanket trait method answers otherwise.
+///
+/// The second assertion is the one that keeps this honest. A probe that
+/// always answered `false` would pass whatever the engine does, so a type
+/// that *does* implement the trait is put through the same probe.
+#[test]
+fn the_guardrail_engine_is_not_a_checker_a_caller_can_hand_to_the_signer() {
+    use oppen_hl::exchange::{PreSign, PreSignCheck};
+    use std::marker::PhantomData;
+
+    struct Probe<T>(PhantomData<T>);
+
+    trait NotAChecker {
+        fn implements_pre_sign_check(&self) -> bool {
+            false
+        }
+    }
+    impl<T> NotAChecker for Probe<T> {}
+    impl<T: PreSignCheck> Probe<T> {
+        fn implements_pre_sign_check(&self) -> bool {
+            true
+        }
+    }
+
+    /// The kind of no-op gate the module doc admits anyone may still write.
+    /// Here it is only the probe's positive control.
+    struct RubberStamp;
+    impl PreSignCheck for RubberStamp {
+        type Refusal = Refusal;
+        fn check(&self, _request: PreSign<'_>) -> Result<(), Refusal> {
+            Ok(())
+        }
+    }
+
+    assert!(
+        Probe::<RubberStamp>(PhantomData).implements_pre_sign_check(),
+        "the probe cannot see a PreSignCheck impl at all; the assertion below proves nothing"
+    );
+    assert!(
+        !Probe::<GuardrailEngine>(PhantomData).implements_pre_sign_check(),
+        "GuardrailEngine implements PreSignCheck, so a caller can pass it to \
+         ExchangeRequest::sign_checked with any Action it likes and be handed a signature \
+         for an order the engine never evaluated (AGENTS.md invariant 1)"
+    );
+}
+
+/// **The gate's identity comes off the clearance, never off `vaultAddress`.**
+///
+/// The revised D1 (V2) gives each agent its own *top-level* venue account on
+/// Hyperliquid, and a top-level account sends no `vaultAddress` at all. The
+/// gate used to re-derive the agent by scanning the registry for that field
+/// and read an absent one as "the master account", where only a *global*
+/// engagement speaks. So an operator stopping exactly this agent — the
+/// narrowest, most deliberate use of the switch there is — did not stop the
+/// only container the agent has, and the order was signed while it was
+/// paused.
+#[test]
+fn an_agent_scoped_kill_stops_a_top_level_containers_signature() {
+    let f = Fixture::in_container(permissive(&["BTC"]), None);
+    let cleared = f
+        .evaluate(
+            &intent("BTC", true, d("100"), d("1")),
+            &asset("BTC", 2, 40),
+            &MarketRef::fresh("BTC", d("100"), NOW_MS),
+            &exposure(d("100000")),
+        )
+        .expect("clears while the switch is open");
+    assert_eq!(
+        cleared.clearance().vault_address,
+        None,
+        "a top-level container carries no vaultAddress"
+    );
+    assert_eq!(cleared.clearance().agent, f.agent);
+
+    f.engine
+        .operator_engage_kill(
+            KillScope::agent(f.agent.clone()),
+            KillReason::Operator,
+            NOW_MS + 1,
+        )
+        .expect("engage");
+
+    match f.engine.sign_cleared(cleared, 1, None, NOW_MS + 2) {
+        Err(SignClearedError::Refused(Refusal::TradingPaused {
+            scope, since_ms, ..
+        })) => {
+            assert_eq!(scope, KillScope::agent(f.agent.clone()));
+            assert_eq!(since_ms, NOW_MS + 1);
+        }
+        other => panic!("a paused agent's top-level container must not sign, got {other:?}"),
+    }
+}
+
+/// **D1's 1:1 mapping, enforced where the binding is made.**
+///
+/// Nothing used to stop two agents being registered against one sub-account,
+/// and the signer then resolved that address by taking the *first* agent in
+/// the registry — so the second agent's kill switch, loss budget and caps
+/// were silently evaluated as the first agent's. One container is one
+/// position book, one margin pool and one loss budget; two agents on it is a
+/// segregation the roster displays and the venue does not enforce.
+#[test]
+fn one_container_binds_to_exactly_one_agent() {
+    let engine = GuardrailEngine::new(
+        Arc::new(MemoryStore::new()),
+        Arc::new(NullAuditSink),
+        key_store(&["alpha", "beta", "gamma", "delta"]) as Arc<dyn KeyStore>,
+        Network::Testnet,
+    )
+    .expect("engine");
+    let alpha = AgentId::new("alpha");
+    let beta = AgentId::new("beta");
+    engine
+        .register_agent(&alpha, Some(vault()), NOW_MS)
+        .expect("the first agent takes the container");
+
+    match engine.register_agent(&beta, Some(vault()), NOW_MS) {
+        Err(GuardrailError::ContainerAlreadyBound {
+            vault_address,
+            bound_to,
+        }) => {
+            assert_eq!(vault_address, vault());
+            assert_eq!(bound_to, alpha);
+        }
+        other => panic!("a second agent must not take an occupied container, got {other:?}"),
+    }
+
+    // The refusal changed nothing: the container is still alpha's and beta
+    // has none, so the roster cannot show a binding that was refused.
+    assert_eq!(engine.vault_address(&alpha), Some(vault()));
+    assert_eq!(engine.vault_address(&beta), None);
+
+    // Re-registering the same pair stays idempotent; pairing calls this every
+    // time an agent reconnects.
+    engine
+        .register_agent(&alpha, Some(vault()), NOW_MS)
+        .expect("the same agent may re-take its own container");
+    assert_eq!(engine.vault_address(&alpha), Some(vault()));
+
+    // Two top-level containers are not a collision: `None` is the absence of
+    // a vaultAddress on the wire, not a shared account (D1 V2).
+    engine
+        .register_agent(&AgentId::new("gamma"), None, NOW_MS)
+        .expect("a top-level container");
+    engine
+        .register_agent(&AgentId::new("delta"), None, NOW_MS)
+        .expect("another top-level container");
+}
+
+/// **A clearance is a verdict about the market it was measured against, and
+/// it expires.**
+///
+/// `sign_cleared` took `now_ms` and never compared it to
+/// `Clearance::evaluated_at_ms`, so a `Cleared` held across spec item 7's
+/// submit queue could be signed against caps evaluated on an arbitrarily old
+/// book — an hour later, a day later. The budget is the agent's own
+/// `freshness.max_market_age_ms`: the operator has already stated there how
+/// stale a view of the market may be before this agent must not act on it,
+/// and a decision taken on that view is no fresher than the view was.
+#[test]
+fn an_order_clearance_expires_between_the_evaluation_and_the_signature() {
+    let config = permissive(&["BTC"]);
+    let budget_ms = config.freshness.max_market_age_ms;
+    let f = Fixture::new(config);
+    let clear = || {
+        f.evaluate(
+            &intent("BTC", true, d("100"), d("1")),
+            &asset("BTC", 2, 40),
+            &MarketRef::fresh("BTC", d("100"), NOW_MS),
+            &exposure(d("100000")),
+        )
+        .expect("clears")
+    };
+
+    match f
+        .engine
+        .sign_cleared(clear(), 1, None, NOW_MS + budget_ms + 1)
+    {
+        Err(SignClearedError::Refused(Refusal::Unevaluable(Unevaluable::StaleClearance {
+            age_ms,
+            max_age_ms,
+        }))) => {
+            assert_eq!(age_ms, budget_ms + 1);
+            assert_eq!(max_age_ms, budget_ms);
+        }
+        other => panic!("a stale clearance must not be signed, got {other:?}"),
+    }
+
+    // The boundary is inclusive, so the refusal above is the age and not an
+    // off-by-one that would refuse every order at the limit.
+    f.engine
+        .sign_cleared(clear(), 2, None, NOW_MS + budget_ms)
+        .expect("a clearance exactly at the budget still signs");
+
+    // A clock that moved backwards is unevaluable, not "zero milliseconds
+    // old": saturating the age would make a rewound clock the one way to sign
+    // anything, however old.
+    match f.engine.sign_cleared(clear(), 3, None, NOW_MS - 1) {
+        Err(SignClearedError::Refused(Refusal::Unevaluable(Unevaluable::ClockWentBackwards {
+            now_ms,
+            last_ms,
+        }))) => {
+            assert_eq!(now_ms, NOW_MS - 1);
+            assert_eq!(last_ms, NOW_MS);
+        }
+        other => panic!("a rewound clock must not sign, got {other:?}"),
+    }
+
+    // The exemption, and the reason for it: a cancel was never priced off a
+    // market tick, and item 10 keeps risk-reducing actions unblockable. An
+    // hour-old cancel is still the right thing to send.
+    let cancel = f
+        .engine
+        .clear_cancel(
+            &f.agent,
+            vec![CancelWire { a: 7, o: 991 }],
+            "stopping",
+            NOW_MS,
+        )
+        .expect("a cancel clears");
+    f.engine
+        .sign_cleared(cancel, 4, None, NOW_MS + 3_600_000)
+        .expect("a cancel does not go stale");
+}
+
+/// **The signing key is not a parameter, so it cannot be the wrong one.**
+///
+/// Under the revised D1 (V2) a Hyperliquid container is a *top-level* account
+/// that sends no `vaultAddress`, so the venue reads the account off the
+/// signature: the agent key **is** the container. While `sign_cleared` took a
+/// key, the identity the engine went to such lengths to bind into the
+/// clearance — the sub-account, the network — was the one that is `None` on
+/// every v1 container, and the one that decides where the order actually
+/// lands was supplied by the caller. Agent X's clearance signed with agent
+/// Y's key executed on Y's capital under X's caps, X's equity and X's kill
+/// switch.
+///
+/// The exploit cannot be written any more: there is no parameter to pass. So
+/// the property is asserted from the other side — the signature is a function
+/// of the *agent named by the clearance*, and of the wallet that agent holds:
+///
+/// 1. two agents on one engine, given the identical order and nonce, get
+///    different signatures (with a caller-supplied key both were the caller's
+///    single key, and the two were byte-identical);
+/// 2. an engine whose store gives `alpha` `beta`'s wallet signs `alpha`'s
+///    clearance with `beta`'s signature — so the key is read from the named
+///    agent's record and not from anywhere else.
+#[test]
+fn a_clearance_is_signed_by_the_wallet_of_the_agent_it_names() {
+    let sign_for = |keys: Arc<crate::keys::MemoryKeyStore>, agent: &str| -> String {
+        let engine = GuardrailEngine::new(
+            Arc::new(MemoryStore::new()),
+            Arc::new(NullAuditSink),
+            keys as Arc<dyn KeyStore>,
+            Network::Testnet,
+        )
+        .expect("engine");
+        let agent = AgentId::new(agent);
+        // Top-level containers: no `vaultAddress`, so nothing but the key
+        // distinguishes where this order lands.
+        engine
+            .register_agent(&agent, None, NOW_MS)
+            .expect("register");
+        engine
+            .operator_set_guardrails(&agent, permissive(&["BTC"]), NOW_MS)
+            .expect("rails");
+        let cleared = engine
+            .evaluate(
+                &agent,
+                &intent("BTC", true, d("100"), d("1")),
+                &asset("BTC", 2, 40),
+                &MarketRef::fresh("BTC", d("100"), NOW_MS),
+                &exposure(d("100000")),
+                NOW_MS,
+            )
+            .expect("clears");
+        assert_eq!(cleared.clearance().agent, agent);
+        assert_eq!(cleared.clearance().vault_address, None);
+        let (request, _) = engine
+            .sign_cleared(cleared, 1, None, NOW_MS)
+            .expect("signs");
+        request.signature().to_hex()
+    };
+
+    let pair = key_store(&["alpha", "beta"]);
+    assert_ne!(
+        signer_of(&pair, "alpha"),
+        signer_of(&pair, "beta"),
+        "the fixture must give the two agents different wallets"
+    );
+    let alpha = sign_for(pair.clone(), "alpha");
+    let beta = sign_for(pair.clone(), "beta");
+    assert_ne!(
+        alpha, beta,
+        "the same order and nonce for two agents produced one signature, so the key \
+         did not follow the clearance's agent"
+    );
+
+    // Give `alpha` the wallet `beta` had. If the key is read from the named
+    // agent's record, alpha's signature becomes beta's.
+    let swapped = Arc::new(crate::keys::MemoryKeyStore::new(Network::Testnet));
+    swapped
+        .create_agent_key(
+            &AgentId::new("alpha"),
+            crate::keys::SecretText::new(format!("{:064x}", 2)),
+            NOW_MS + 90 * 86_400_000,
+            NOW_MS,
+        )
+        .expect("wallet");
+    assert_eq!(signer_of(&swapped, "alpha"), signer_of(&pair, "beta"));
+    assert_eq!(
+        sign_for(swapped, "alpha"),
+        beta,
+        "the signature did not follow the wallet in the named agent's record"
+    );
+}
+
+/// Fail closed on a missing wallet: no key, no signature, and a typed error
+/// the operator can act on rather than a refusal an agent would retry against.
+#[test]
+fn a_clearance_whose_agent_has_no_wallet_is_not_signed() {
+    let engine = GuardrailEngine::new(
+        Arc::new(MemoryStore::new()),
+        Arc::new(NullAuditSink),
+        // The store knows a different agent entirely.
+        key_store(&["stranger"]) as Arc<dyn KeyStore>,
+        Network::Testnet,
+    )
+    .expect("engine");
+    let agent = AgentId::new("alpha");
+    engine
+        .register_agent(&agent, None, NOW_MS)
+        .expect("register");
+    engine
+        .operator_set_guardrails(&agent, permissive(&["BTC"]), NOW_MS)
+        .expect("rails");
+    let cleared = engine
+        .evaluate(
+            &agent,
+            &intent("BTC", true, d("100"), d("1")),
+            &asset("BTC", 2, 40),
+            &MarketRef::fresh("BTC", d("100"), NOW_MS),
+            &exposure(d("100000")),
+            NOW_MS,
+        )
+        .expect("clears");
+    assert!(matches!(
+        engine.sign_cleared(cleared, 1, None, NOW_MS),
+        Err(SignClearedError::Key(_))
+    ));
+}
+
+/// **The 1:1 container rule holds on every door, not just the front one.**
+///
+/// [`GuardrailStore`] is a `pub` trait and `save_vault` is a `pub` method, so
+/// any holder of the store writes bindings directly; and a restart reads back
+/// whatever is on disk. Guarding only [`GuardrailEngine::register_agent`] left
+/// the exact state it refuses reachable in one line plus a relaunch — two
+/// agents' caps, loss budgets and kill switches measured against one pool of
+/// capital, with a roster showing a segregation the venue does not enforce.
+#[test]
+fn a_store_holding_one_container_for_two_agents_refuses_to_start() {
+    let store = Arc::new(MemoryStore::new());
+    let alpha = AgentId::new("alpha");
+    let beta = AgentId::new("beta");
+    store.save_vault(&alpha, &vault()).expect("bind alpha");
+    store.save_vault(&beta, &vault()).expect("bind beta");
+
+    match GuardrailEngine::new(
+        store as Arc<dyn GuardrailStore>,
+        Arc::new(NullAuditSink),
+        key_store(&["alpha", "beta"]) as Arc<dyn KeyStore>,
+        Network::Testnet,
+    ) {
+        Err(GuardrailError::ContainerAlreadyBound {
+            vault_address,
+            bound_to,
+        }) => {
+            assert_eq!(vault_address, vault());
+            // Deterministic: `vaults` is a `BTreeMap`, so the holder named is
+            // the same one on every run.
+            assert_eq!(bound_to, alpha);
+        }
+        other => panic!("an ambiguous registry must not start an engine, got {other:?}"),
+    }
+}
+
+/// **A container binds once — and `None` is a container.**
+///
+/// Pairing calls [`GuardrailEngine::register_agent`] on every reconnect, so an
+/// address that disagreed with the stored one silently moved which capital the
+/// agent's caps, loss budget and ledger history describe — and, because the
+/// early return for an already-configured agent happens first, without a
+/// ledger row. `docs/decisions.md` V5 makes the container migration an
+/// explicit operator gesture that does not exist yet.
+///
+/// The guard read the binding out of `vaults`, where a **top-level** container
+/// has no row at all — so it fired only for a sub-account, and under the
+/// revised D1 (V2) a sub-account is the shape v1 never provisions. The second
+/// half of this test is that case: a top-level agent, a reconnect supplying an
+/// address, and the same refusal.
+#[test]
+fn an_agents_container_is_bound_once_and_never_re_pointed() {
+    let sink = Arc::new(CountingSink::default());
+    let engine = GuardrailEngine::new(
+        Arc::new(MemoryStore::new()),
+        sink.clone() as Arc<dyn AuditSink>,
+        key_store(&["alpha", "beta"]) as Arc<dyn KeyStore>,
+        Network::Testnet,
+    )
+    .expect("engine");
+    let alpha = AgentId::new("alpha");
+    let elsewhere =
+        oppen_hl::Address::parse("0x00000000000000000000000000000000000000ff").expect("address");
+    engine
+        .register_agent(&alpha, Some(vault()), NOW_MS)
+        .expect("the first binding");
+    let rows = sink.operator_actions().len();
+
+    match engine.register_agent(&alpha, Some(elsewhere), NOW_MS) {
+        Err(GuardrailError::ContainerChanged {
+            agent,
+            bound_to,
+            supplied,
+        }) => {
+            assert_eq!(agent, alpha);
+            assert_eq!(bound_to, Some(vault()));
+            assert_eq!(supplied, Some(elsewhere));
+        }
+        other => panic!("a re-point must be refused, got {other:?}"),
+    }
+    // Dropping the container is the same move in the other direction: it would
+    // send the next order to a top-level account nobody funded.
+    assert!(matches!(
+        engine.register_agent(&alpha, None, NOW_MS),
+        Err(GuardrailError::ContainerChanged { .. })
+    ));
+    assert_eq!(engine.vault_address(&alpha), Some(vault()));
+    assert_eq!(
+        sink.operator_actions().len(),
+        rows,
+        "a refused registration must not have written anything"
+    );
+
+    // The reconnect case still works: same agent, same container, no-op.
+    engine
+        .register_agent(&alpha, Some(vault()), NOW_MS)
+        .expect("re-pairing with the same container");
+
+    // **The top-level container, which is the only shape v1 provisions.** It
+    // has no row in `vaults`, so a guard that reads the binding out of that
+    // map alone sees "never bound" and lets the reconnect path move it.
+    let beta = AgentId::new("beta");
+    engine.register_agent(&beta, None, NOW_MS).expect("beta");
+    engine
+        .register_agent(&beta, None, NOW_MS)
+        .expect("beta again");
+    let rows = sink.operator_actions().len();
+    match engine.register_agent(&beta, Some(elsewhere), NOW_MS) {
+        Err(GuardrailError::ContainerChanged {
+            agent,
+            bound_to,
+            supplied,
+        }) => {
+            assert_eq!(agent, beta);
+            assert_eq!(bound_to, None, "a top-level container is bound to None");
+            assert_eq!(supplied, Some(elsewhere));
+        }
+        other => {
+            panic!("a top-level container must not be re-pointed onto a sub-account, got {other:?}")
+        }
+    }
+    assert_eq!(engine.vault_address(&beta), None);
+    assert_eq!(
+        sink.operator_actions().len(),
+        rows,
+        "the refused re-point must not have written anything"
+    );
+}
+
+/// **One proposal is one approval.**
+///
+/// [`GuardrailEngine::operator_approve_proposal`] read the proposal under one
+/// lock and removed it under another, with a full evaluation and a ledger
+/// write in between. Two callers approving one id both walked out with a
+/// [`Cleared`] — and `Mode::Approved` charges neither an order-rate token, so
+/// a cap of one order per hour signed two.
+///
+/// The window is held open deliberately rather than raced for: the sink stops
+/// the first clearance row until the second approval has been attempted, so
+/// the interleaving is certain on every run.
+#[test]
+fn one_proposal_authorises_exactly_one_approval() {
+    /// Parks the first *clearance* row until the test releases it. Two
+    /// barriers rather than one so the test can wait for the parking to have
+    /// happened before it acts, which is what makes the interleaving certain
+    /// rather than a race the spawn order decides.
+    struct HoldFirstClearance {
+        parked: std::sync::Barrier,
+        release: std::sync::Barrier,
+        held: std::sync::atomic::AtomicBool,
+    }
+    impl AuditSink for HoldFirstClearance {
+        fn record(&self, entry: &AuditEntry<'_>) -> Result<(), AuditError> {
+            if matches!(entry.outcome, AuditOutcome::Cleared(_))
+                && !self.held.swap(true, Ordering::SeqCst)
+            {
+                self.parked.wait();
+                self.release.wait();
+            }
+            Ok(())
+        }
+    }
+
+    let sink = Arc::new(HoldFirstClearance {
+        parked: std::sync::Barrier::new(2),
+        release: std::sync::Barrier::new(2),
+        held: std::sync::atomic::AtomicBool::new(false),
+    });
+    let mut config = permissive(&["BTC"]);
+    config.approval_required = true;
+    config.order_rate = OrderRate {
+        count: 1,
+        per_ms: 3_600_000,
+    };
+    let engine = Arc::new(
+        GuardrailEngine::new(
+            Arc::new(MemoryStore::new()),
+            sink.clone() as Arc<dyn AuditSink>,
+            key_store(&["alpha"]) as Arc<dyn KeyStore>,
+            Network::Testnet,
+        )
+        .expect("engine"),
+    );
+    let alpha = AgentId::new("alpha");
+    engine
+        .register_agent(&alpha, None, NOW_MS)
+        .expect("register");
+    engine
+        .operator_set_guardrails(&alpha, config, NOW_MS)
+        .expect("rails");
+
+    let Err(Refusal::ApprovalRequired { approval_id, .. }) = engine.evaluate(
+        &alpha,
+        &intent("BTC", true, d("100"), d("1")),
+        &asset("BTC", 2, 40),
+        &MarketRef::fresh("BTC", d("100"), NOW_MS),
+        &exposure(d("100000")),
+        NOW_MS,
+    ) else {
+        panic!("expected a queued proposal");
+    };
+
+    let approve = |engine: &GuardrailEngine| {
+        engine.operator_approve_proposal(
+            &approval_id,
+            &asset("BTC", 2, 40),
+            &MarketRef::fresh("BTC", d("100"), NOW_MS),
+            &exposure(d("100000")),
+            NOW_MS,
+        )
+    };
+    let first = std::thread::spawn({
+        let engine = engine.clone();
+        let id = approval_id.clone();
+        move || {
+            engine.operator_approve_proposal(
+                &id,
+                &asset("BTC", 2, 40),
+                &MarketRef::fresh("BTC", d("100"), NOW_MS),
+                &exposure(d("100000")),
+                NOW_MS,
+            )
+        }
+    });
+    // Wait until that approval is parked inside its ledger write, which is
+    // after it has taken (or read) the proposal and before it has recorded
+    // anything. That is the widest this window ever is.
+    sink.parked.wait();
+    let second = approve(&engine);
+    sink.release.wait();
+    let first = first.join().expect("the first approval thread");
+
+    assert!(first.is_ok(), "the first approval must succeed");
+    assert!(
+        matches!(
+            second,
+            Err(Refusal::Unevaluable(Unevaluable::UnknownProposal { .. }))
+        ),
+        "a second approval of one proposal minted a second clearance past a cap of \
+         one order per hour, got {second:?}"
+    );
+    assert!(engine.pending_proposals(NOW_MS).is_empty());
+}
+
+/// **The dead-man's switch is armed per container.**
+///
+/// Item 27: "armed per container, N times, not once… no container is covered
+/// by another's arming". The intent was computed from the count of active
+/// agents fleet-wide and the clearance named no agent at all, so one active
+/// agent armed on behalf of a roster and every other container's resting
+/// orders were left unwatched while the console reported them covered.
+#[test]
+fn the_dead_man_switch_is_armed_per_container() {
+    let engine = GuardrailEngine::new(
+        Arc::new(MemoryStore::new()),
+        Arc::new(NullAuditSink),
+        key_store(&["alpha", "beta"]) as Arc<dyn KeyStore>,
+        Network::Testnet,
+    )
+    .expect("engine");
+    let alpha = AgentId::new("alpha");
+    let beta = AgentId::new("beta");
+    engine
+        .register_agent(&alpha, Some(vault()), NOW_MS)
+        .expect("alpha");
+    engine.register_agent(&beta, None, NOW_MS).expect("beta");
+    engine.set_agent_active(&alpha, true);
+
+    assert!(matches!(
+        engine.dead_man_intent(&alpha, NOW_MS, None),
+        DeadManIntent::Arm { .. }
+    ));
+    assert_eq!(
+        engine.dead_man_intent(&beta, NOW_MS, None),
+        DeadManIntent::Hold,
+        "beta's container is not covered by alpha's arming"
+    );
+
+    // The arm carries alpha's container, so the request goes to the address it
+    // is meant to protect.
+    let cleared = engine
+        .clear_schedule_cancel(&alpha, Some(NOW_MS + 60_000), NOW_MS)
+        .expect("arms");
+    assert_eq!(cleared.clearance().agent, alpha);
+    assert_eq!(cleared.clearance().vault_address, Some(vault()));
+
+    // And an agent the engine has never paired cannot arm anything.
+    assert!(matches!(
+        engine.clear_schedule_cancel(&AgentId::new("ghost"), Some(NOW_MS + 60_000), NOW_MS),
+        Err(Refusal::Unevaluable(Unevaluable::UnknownAgent { .. }))
+    ));
+}
+
+/// **The other clearance that goes stale, and the one that does not.**
+///
+/// The freshness check was scoped to [`ClearedKind::Order`], on the reasoning
+/// that only an order is priced off a market tick. An *arm* of the dead-man's
+/// switch is not priced off a tick but it is priced off the clock: it clears
+/// against the venue's five-second minimum lead measured at evaluation, and
+/// item 7's submit queue eats into that lead. Held long enough the arm is one
+/// the venue rejects — and `deadman.rs` says silently failing to arm is the
+/// worst outcome there, so it is refused loudly and re-armed with a fresh
+/// lead. A *disarm* carries no time and never goes stale.
+#[test]
+fn an_arm_whose_lead_has_run_out_is_refused_at_the_signer() {
+    let f = Fixture::new(permissive(&["BTC"]));
+    let arm = || {
+        f.engine
+            .clear_schedule_cancel(&f.agent, Some(NOW_MS + 60_000), NOW_MS)
+            .expect("arms")
+    };
+
+    // 56 s later the lead is 4 s, inside the venue's 5 s minimum.
+    match f.engine.sign_cleared(arm(), 1, None, NOW_MS + 56_000) {
+        Err(SignClearedError::Refused(Refusal::VenueRule(VenueRule::ScheduleCancelTooSoon {
+            cancel_at_ms,
+            earliest_ms,
+        }))) => {
+            assert_eq!(cancel_at_ms, NOW_MS + 60_000);
+            assert_eq!(earliest_ms, NOW_MS + 56_000 + DEAD_MAN_MIN_LEAD_MS);
+        }
+        other => panic!("an arm the venue would reject must not be signed, got {other:?}"),
+    }
+    // Exactly at the minimum still signs, so the refusal above is the lead and
+    // not an off-by-one.
+    f.engine
+        .sign_cleared(arm(), 2, None, NOW_MS + 55_000)
+        .expect("an arm still clear of the minimum signs");
+
+    let disarm = f
+        .engine
+        .clear_schedule_cancel(&f.agent, None, NOW_MS)
+        .expect("disarms");
+    f.engine
+        .sign_cleared(disarm, 3, None, NOW_MS + 3_600_000)
+        .expect("a disarm carries no deadline and never goes stale");
+}
+
+/// **The residual the caps carry, and the obligation that closes it.**
+///
+/// A cleared order is exposure the agent has committed to, and it is not in
+/// [`RestingExposure`] until the venue acknowledges it. Nothing in this engine
+/// can know when that happened, so five clearances taken against the same flat
+/// book each pass the position cap on their own and sign to $125 against a
+/// $100 cap — inside the freshness window and inside the order-rate cap, so
+/// neither of those bounds it either. Only the component that sent them knows
+/// what is outstanding: spec item 7's submit queue.
+///
+/// So the cap is exactly as good as the working book the caller reports, and
+/// this pins that it *is* good when the obligation is met — the caller folds
+/// what it has sent and not yet seen acknowledged into
+/// [`AccountSnapshot::resting`], and the order that would breach is refused
+/// naming the resting notional it counted. Inventing an in-engine substitute
+/// was rejected: every approximation either double-counts an order once the
+/// venue's snapshot catches up — spurious refusals, and a cap the caller
+/// cannot predict — or leaks entries for clearances that were never signed.
+#[test]
+fn the_position_cap_holds_when_the_caller_reports_what_it_has_in_flight() {
+    let mut config = permissive(&["BTC"]);
+    config.max_order_usd = d("25");
+    config.max_position_usd = d("100");
+    let f = Fixture::new(config);
+    let btc = asset("BTC", 2, 40);
+
+    // Four orders of $25 fill the $100 cap exactly, each one reported into the
+    // working book before the next is asked for.
+    let mut in_flight = Decimal::ZERO;
+    for n in 1..=4 {
+        let exp = with_resting(exposure(d("100000")), "BTC", in_flight, d("100"));
+        f.engine
+            .evaluate(
+                &f.agent,
+                &intent("BTC", true, d("100"), d("0.25")),
+                &btc,
+                &MarketRef::fresh("BTC", d("100"), NOW_MS),
+                &exp,
+                NOW_MS,
+            )
+            .unwrap_or_else(|e| panic!("order {n} of $25 is inside a $100 cap, got {e:?}"));
+        in_flight += d("0.25");
+    }
+
+    let exp = with_resting(exposure(d("100000")), "BTC", in_flight, d("100"));
+    match f.engine.evaluate(
+        &f.agent,
+        &intent("BTC", true, d("100"), d("0.25")),
+        &btc,
+        &MarketRef::fresh("BTC", d("100"), NOW_MS),
+        &exp,
+        NOW_MS,
+    ) {
+        Err(Refusal::PositionNotional {
+            observed_usd,
+            resting_usd,
+            limit_usd,
+            ..
+        }) => {
+            assert_eq!(observed_usd, d("125.00"));
+            assert_eq!(resting_usd, d("100.00"));
+            assert_eq!(limit_usd, d("100"));
+        }
+        other => panic!("the fifth $25 order breaches a $100 cap, got {other:?}"),
+    }
+}
+
+/// **The P3 gate stated as a property.**
+///
+/// Thousands of generated intents driven at one engine with an advancing
+/// clock, with the kill switch pressed and released *between* each
+/// evaluation and its signature so the two do not always see the same world.
+/// Three things are asserted on every case:
+///
+/// 1. A refusal produces no [`Cleared`], so `sign_cleared` cannot be called.
+///    That half is enforced by the compiler, not by this loop — the `Err`
+///    arm below has no signing call in it because none can be written.
+/// 2. A signature is produced only when the gate passed, and a pause between
+///    the evaluation and the signature refuses at the signer.
+/// 3. Signatures never outnumber the clearances the ledger recorded.
+///
+/// **What this proves.** No input in the generated space reaches the signer
+/// through `oppen-core` without exactly one evaluation, and a signature
+/// always has a ledger row behind it.
+///
+/// **What it cannot prove.** That nothing else signs. `sign_unchecked` is
+/// `pub` for spec item 33's manual path and a foreign crate can implement a
+/// no-op [`PreSignCheck`]; see
+/// [`no_call_site_in_oppen_core_reaches_the_signer_unchecked`] for the
+/// grep-shaped half of the argument, and the module doc for the honest
+/// statement of the residual.
+#[test]
+fn no_generated_intent_reaches_the_signer_without_an_evaluation() {
+    const CASES: u64 = 3_000;
+    let sink = Arc::new(CountingSink::default());
+    let mut config = permissive(&["BTC", "ETH"]);
+    config.max_order_usd = d("5000");
+    config.max_position_usd = d("50000");
+    config.max_slippage_bps = d("500");
+    // Loose enough that most cases clear, tight enough that the cap still
+    // bites: one token per 750 ms against a case every 900 ms.
+    config.order_rate = OrderRate {
+        count: 4,
+        per_ms: 3_000,
+    };
+    let f = Fixture::with(
+        config,
+        Arc::new(MemoryStore::new()),
+        sink.clone() as Arc<dyn AuditSink>,
+    );
+
+    let mut rng = Rng(0x0000_0000_5161_1ED0);
+    let mut signed = 0u64;
+    let mut refused_at_signer = 0u64;
+    let mut refused_before_signer = 0u64;
+    let mut nonce = 1u64;
+
+    for case in 0..CASES {
+        // 45 minutes in total, so `MIDNIGHT_MS` stays the correct UTC day
+        // start and the loss window never mismatches.
+        let now_ms = NOW_MS + case * 900;
+        if rng.chance(3) {
+            f.engine
+                .operator_release_kill(&KillScope::Global, now_ms)
+                .expect("release");
+        }
+
+        // "DOGE" is off the allowlist and the wide sizes and prices push
+        // past the notional and slippage caps, so both branches are fed.
+        let symbol = *rng.pick(&["BTC", "BTC", "ETH", "DOGE"]);
+        let px = d(rng.pick(&["95", "100", "101", "180"]));
+        let sz = d(rng.pick(&["0.1", "1", "9", "900"]));
+        let mut order = intent(symbol, rng.chance(2), px, sz);
+        order.reason = format!("case {case}");
+        let market = MarketRef::fresh(symbol, d("100"), now_ms);
+        let instrument = asset(symbol, 2, 40);
+        let exposure = Exposure {
+            agent: account_at(d("1000000"), now_ms),
+            fleet: None,
+        };
+
+        let cleared =
+            match f
+                .engine
+                .evaluate(&f.agent, &order, &instrument, &market, &exposure, now_ms)
+            {
+                Ok(cleared) => cleared,
+                Err(_) => {
+                    // No `Cleared` exists, so there is nothing to sign. This arm
+                    // deliberately contains no signing call: `sign_cleared` takes
+                    // a `Cleared` by value and there is no public constructor,
+                    // so the bypass is not something this test has to police —
+                    // it is something the compiler refuses to compile.
+                    refused_before_signer += 1;
+                    continue;
+                }
+            };
+
+        // The gap spec item 7's submit queue lives in.
+        if rng.chance(8) {
+            f.engine
+                .operator_engage_kill(KillScope::Global, KillReason::Operator, now_ms)
+                .expect("engage");
+        }
+        let paused = f.engine.kill_switch().blocking(&f.agent).is_some();
+
+        match f.engine.sign_cleared(cleared, nonce, None, now_ms) {
+            Ok((request, clearance)) => {
+                assert!(!paused, "case {case}: a paused agent got a signature");
+                assert_eq!(request.nonce(), nonce, "case {case}");
+                assert_eq!(request.vault_address(), Some(vault()), "case {case}");
+                assert_eq!(clearance.network, Network::Testnet, "case {case}");
+                assert!(
+                    matches!(clearance.kind, ClearedKind::Order { .. }),
+                    "case {case}"
+                );
+                signed += 1;
+            }
+            Err(SignClearedError::Refused(Refusal::TradingPaused { .. })) => {
+                assert!(
+                    paused,
+                    "case {case}: refused at the signer with the switch open"
+                );
+                refused_at_signer += 1;
+            }
+            Err(other) => panic!("case {case}: unexpected {other}"),
+        }
+        nonce += 1;
+    }
+
+    let recorded_clearances = sink.cleared.load(Ordering::Relaxed) as u64;
+    let recorded_refusals = sink.refused.load(Ordering::Relaxed) as u64;
+
+    // The invariant: a signature always has exactly one recorded evaluation
+    // behind it, and some evaluations end without one.
+    assert_eq!(
+        recorded_clearances,
+        signed + refused_at_signer,
+        "every clearance was either signed or refused at the signer"
+    );
+    // Item 18 and D6: a refusal at the signer lands in the ledger too, or an
+    // export would show a clearance with no fill and no explanation.
+    assert_eq!(
+        recorded_refusals,
+        refused_before_signer + refused_at_signer,
+        "every refusal, wherever it happened, has a row"
+    );
+    assert_eq!(signed + refused_at_signer + refused_before_signer, CASES);
+    assert!(
+        signed < recorded_clearances,
+        "the signer gate never refused anything; the property is untested"
+    );
+
+    // Both branches have to be genuinely populated or the assertions above
+    // are vacuous.
+    assert!(signed > 500, "only {signed} signatures");
+    assert!(
+        refused_before_signer > 500,
+        "only {refused_before_signer} refusals before the signer"
+    );
+    assert!(
+        refused_at_signer > 20,
+        "only {refused_at_signer} refusals at the signer"
+    );
+}
+
+/// The other half of `AGENTS.md` invariant 1, which no type can express:
+/// **`oppen-core` must not call the ungated signer at all.**
+///
+/// `oppen_hl::ExchangeRequest::sign_unchecked` and
+/// `AgentKey::sign_l1_action` stay `pub` because spec item 33's manual
+/// escape hatch needs them from `oppen-hl`'s own example. Nothing in this
+/// crate may use them: every signature here goes through
+/// [`GuardrailEngine::sign_cleared`], which passes the engine as the gate.
+///
+/// The needles are built at runtime so this file does not match itself, and
+/// comment lines are skipped so the doc comments that name the hazard are
+/// not mistaken for call sites. The check is a grep, and a grep is exactly
+/// as strong as the claim being made: a bypass cannot happen by accident,
+/// and a deliberate one is visible.
+#[test]
+fn no_call_site_in_oppen_core_reaches_the_signer_unchecked() {
+    fn rust_sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+            .expect("the crate's own src directory is readable")
+            .map(|e| e.expect("directory entry").path())
+            .collect();
+        paths.sort();
+        for path in paths {
+            if path.is_dir() {
+                rust_sources(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    let needles = [
+        format!("sign_{}", "unchecked"),
+        format!("sign_{}", "l1_action"),
+    ];
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut files = Vec::new();
+    rust_sources(&src, &mut files);
+    assert!(files.len() > 5, "the source walk found almost nothing");
+
+    let mut offenders = Vec::new();
+    for path in &files {
+        let text = std::fs::read_to_string(path).expect("source file is utf-8");
+        for (n, line) in text.lines().enumerate() {
+            let code = line.trim_start();
+            if code.starts_with("//") {
+                continue;
+            }
+            for needle in &needles {
+                if code.contains(needle.as_str()) {
+                    offenders.push(format!("{}:{}: {}", path.display(), n + 1, code));
+                }
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "oppen-core must reach the signer only through GuardrailEngine::sign_cleared \
+         (AGENTS.md invariant 1). Ungated call sites:\n{}",
+        offenders.join("\n")
+    );
+}
+
+// ======================= ADVERSARIAL ATTACK PROBES =======================
+
+// The literal bypass — `ExchangeRequest::sign_checked(.., &engine)` — is not a
+// test here because it DOES NOT COMPILE, which is the point. `rustc` reports:
+//
+//     error[E0277]: the trait bound `GuardrailEngine: PreSignCheck` is not
+//     satisfied --> the trait `PreSignCheck` is not implemented for
+//     `engine::GuardrailEngine`
+//
+// The seal is the absence of that impl: `PreSignGate` is private to engine.rs
+// and only `sign_cleared` constructs one, so a caller has no checker to hand
+// the signer. `the_guardrail_engine_is_not_a_checker_a_caller_can_hand_to_the_signer`
+// asserts that absence from inside the crate, where it can be checked without
+// a compile-fail harness.

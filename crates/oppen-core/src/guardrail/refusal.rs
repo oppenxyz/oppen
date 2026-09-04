@@ -14,6 +14,7 @@
 use rust_decimal::Decimal;
 use serde::Serialize;
 
+use oppen_hl::Network;
 use oppen_hl::meta::ValidationError;
 use oppen_hl::order::OrderError;
 use oppen_hl::wire::WireError;
@@ -195,9 +196,10 @@ pub enum Refusal {
 
 impl Refusal {
     /// True when the refusal is a fail-closed one rather than a breached
-    /// limit. The operator console shows these differently: a breached limit
-    /// is the system working, an unevaluable input is the system blind.
-    pub fn is_unevaluable(&self) -> bool {
+    /// limit. Test-only sugar over the public [`Refusal::Unevaluable`]
+    /// variant, which anything else matches on directly.
+    #[cfg(test)]
+    pub(super) fn is_unevaluable(&self) -> bool {
         matches!(self, Refusal::Unevaluable(_))
     }
 }
@@ -312,6 +314,31 @@ impl From<OrderError> for VenueRule {
 pub enum Unevaluable {
     #[error("{agent} is not a paired agent")]
     UnknownAgent { agent: AgentId },
+
+    /// The request arriving at the signer is for a different network than the
+    /// engine gating it. `docs/decisions.md` R4 calls a mainnet number that
+    /// is really a testnet number the worst bug this product can ship, and
+    /// gives each network its own engine and database file; this is that
+    /// boundary asserted at the last instant, in the pre-sign gate
+    /// `super::GuardrailEngine::sign_cleared` builds, rather than assumed
+    /// from how the caller was written.
+    #[error("this engine is bound to {expected:?} but the request is for {supplied:?}")]
+    WrongNetwork {
+        expected: Network,
+        supplied: Network,
+    },
+
+    /// Spec item 7 puts a submit queue between the decision and the wire, and
+    /// a clearance is a verdict about the market it was evaluated against.
+    /// Held past the agent's own market-data budget it describes a world that
+    /// has moved, so the signer refuses it.
+    ///
+    /// Distinct from [`Unevaluable::StaleMarketData`] in what the reader does
+    /// next: there the feed is down and the answer is to back off until it
+    /// recovers; here the feed is fine and the answer is to evaluate again
+    /// now.
+    #[error("this clearance was evaluated {age_ms}ms ago, past the {max_age_ms}ms limit")]
+    StaleClearance { age_ms: u64, max_age_ms: u64 },
 
     /// The asset or the market tick the caller supplied is not the one the
     /// order names. Measuring an order against another instrument's price is
@@ -429,20 +456,15 @@ pub enum Unevaluable {
     StateWriteFailed { detail: String },
 
     /// An approval was presented for a proposal the engine is not holding:
-    /// never issued, already consumed, already rejected, or swept as expired.
-    /// The engine mints every proposal itself, so an unknown id is a
-    /// clearance that was never authorised (spec item 28).
+    /// never issued, already consumed, already rejected, or swept as expired
+    /// (spec item 28's TTL). The engine mints every proposal itself, so an
+    /// unknown id is a clearance that was never authorised.
+    ///
+    /// Expiry is deliberately not a separate variant. Proposals are swept
+    /// before every lookup, so an expired one is simply no longer held, and
+    /// the caller's move — re-propose — is the same for all four causes.
     #[error("proposal {approval_id} is not pending")]
     UnknownProposal { approval_id: String },
-
-    /// Spec item 28: proposals carry a TTL and auto-expire. An expired one is
-    /// re-proposed, never approved on stale terms.
-    #[error("proposal {approval_id} expired at {expires_at_ms}; now is {now_ms}")]
-    ProposalExpired {
-        approval_id: String,
-        expires_at_ms: u64,
-        now_ms: u64,
-    },
 }
 
 impl From<Unevaluable> for Refusal {

@@ -109,9 +109,51 @@ CREATE TABLE sub_accounts (
 );
 "#;
 
+/// `events.idem_key` and the partial unique index that enforces it.
+///
+/// Idempotence for fills used to be an in-memory set of every `tid` in the
+/// chain, consulted before the append. That is check-then-write, and the window
+/// between the two is exactly when a resumed socket replays its subscribe
+/// snapshot. A duplicate that lands in an append-only chain cannot be taken back
+/// out, so the check and the write have to be one operation, and the database is
+/// the only place they can be. `feed_gaps_one_open_per_scope` above already
+/// makes the same move for gaps.
+///
+/// The index is **partial** because only a row with a venue identifier to key on
+/// carries a key. Everything else stores NULL, and NULLs never collide in a
+/// SQLite unique index, so nothing else in the chain is constrained by this.
+///
+/// `idem_key` is deliberately **not** in the row-hash preimage. It is a function
+/// of the payload the chain already commits to, so chaining it would add nothing
+/// and would invalidate every hash already written — including the ones this
+/// migration backfills.
+///
+/// The backfill keys the fill rows an older build wrote, so upgrading does not
+/// re-record history the chain already holds. It keys the **first** row per
+/// `(account, tid)` only: a chain that already carries a duplicate keeps it —
+/// append-only means it cannot be removed — and the index then stops a third. A
+/// fill row that carries neither field at its payload root gets no key; it
+/// predates `Ledger::record_fill` being the one door for fills.
+const V2: &str = r#"
+ALTER TABLE events ADD COLUMN idem_key TEXT;
+
+UPDATE events
+   SET idem_key = 'fill:' || json_extract(payload, '$.account')
+                          || ':' || json_extract(payload, '$.tid')
+ WHERE seq IN (
+     SELECT MIN(seq) FROM events
+      WHERE kind = 'fill'
+        AND json_extract(payload, '$.account') IS NOT NULL
+        AND json_extract(payload, '$.tid') IS NOT NULL
+      GROUP BY json_extract(payload, '$.account'), json_extract(payload, '$.tid')
+ );
+
+CREATE UNIQUE INDEX events_idem_key ON events (idem_key) WHERE idem_key IS NOT NULL;
+"#;
+
 /// Every migration in order. The index of a statement is the `user_version` it
 /// produces, so `MIGRATIONS.len()` is the version this build writes.
-const MIGRATIONS: &[&str] = &[V1];
+const MIGRATIONS: &[&str] = &[V1, V2];
 
 /// Bring the database up to the schema this build expects.
 ///
