@@ -19,6 +19,11 @@ Four related pieces of the market surface:
 
 ### 1.1 Why not lightweight-charts
 
+**Decided 2026-09-03: ASCII is primary and `lightweight-charts` is dropped entirely.**
+See [decisions.md](../decisions.md) U1 and U2. The rest of this section records the
+reasoning.
+
+
 `../spec.md` item 31 names `lightweight-charts` for the chart panel. The site's
 ASCII renderer is better aligned with the design system, which is built on a
 character grid with a five-glyph ramp and forbids gradients, shadows and easing.
@@ -222,12 +227,12 @@ or one of them is lying.
 | `change_pct` | % over the visible window | bars |
 | `mark` | price | `metaAndAssetCtxs` |
 | `funding_apr_pct` | % | `funding` compounded hourly |
-| `next_funding_s` | s | ctx |
+| `next_funding_s` | s | **derived** — `3600 − (epoch_s mod 3600)`. No such ctx field exists; see [fair-value.md](fair-value.md) §14.5 |
 | `basis_bp` | bp | fair value |
 | `z_sigma` | σ | fair value |
 | `carry_edge_apr` | % | fair value |
 | `spread_bps` | bp | book |
-| `depth_usd_25bps` | $ | book |
+| `depth_usd_{achieved}` | $ | book — **the header states the window actually reached**, which is 2.4 bp on BTC from a default `l2Book`; see [fair-value.md](fair-value.md) §14.5 |
 | `oi_usd` | $ | ctx |
 | `quality` | enum | fair value |
 
