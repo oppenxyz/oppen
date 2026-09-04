@@ -529,6 +529,19 @@ pub struct AssetPosition {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MarginSummary {
+    /// **Not the account's buying power.** Hyperliquid margin is unified: spot
+    /// USDC collateralises perps directly, and this field reports only what has
+    /// been committed to the perps clearinghouse. On an account with 999 USDC of
+    /// spot and no position it reads `0.0` while the venue's own order ticket
+    /// reads `Available to Trade 999.00 USDC`. Verified live on both networks
+    /// 2026-09-04 (`docs/runbooks/testnet-provisioning.md` §0).
+    ///
+    /// Do not wire this into `oppen-core`'s `AccountSnapshot::equity_usd` or
+    /// any guardrail denominator. A leverage cap divided by this value treats a
+    /// funded account as empty, which fails closed today and would fail *open*
+    /// the moment a fallback is added. `webData2.cumLedger` and `portfolio`'s
+    /// `accountValueHistory` carry the unified figure; neither is modelled here
+    /// yet, and the wiring task owns choosing between them.
     pub account_value: Decimal,
     pub total_ntl_pos: Decimal,
     pub total_raw_usd: Decimal,

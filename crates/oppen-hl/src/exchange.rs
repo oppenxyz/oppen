@@ -26,11 +26,19 @@ pub struct PreSign<'a> {
 /// `AGENTS.md` invariant 1 requires exactly one code path to the signer, and
 /// that it run the guardrail check. This trait is that path: the check is
 /// invoked *inside* [`ExchangeRequest::sign_checked`], so a caller cannot
-/// construct a signed request and skip it. `oppen-core`'s guardrail engine is
-/// the implementation oppen ships; the trait lives here because `oppen-hl`
-/// owns the signer and cannot depend on the crate above it.
+/// construct a signed request and skip it. The trait lives here because
+/// `oppen-hl` owns the signer and cannot depend on the crate above it.
 ///
-/// **What this does not prevent.** A caller can still write a type that
+/// The implementation oppen ships is **private to `oppen-core`**: a gate
+/// bound to one guardrail clearance, built by `GuardrailEngine::sign_cleared`
+/// and nameable nowhere else. The guardrail engine deliberately does not
+/// implement this trait itself. It did until 2026-09-04, and because both the
+/// engine and this constructor are public, that let any caller hand the real
+/// engine an [`Action`](crate::Action) it had never evaluated and collect a
+/// signature — the gate sees only the assembled request, so it had nothing to
+/// check the action against.
+///
+/// **What this does not prevent.** A caller can still write its own type that
 /// implements this trait and returns `Ok(())` unconditionally, and
 /// [`ExchangeRequest::sign_unchecked`] remains available for the operator's
 /// manual path and for tests. Both are deliberate, and both are *visible*: a

@@ -79,7 +79,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mid = *mids.get("BTC").ok_or("no BTC mid")?;
     let state = info.clearinghouse_state(user).await?;
     println!("mid      {mid}");
-    println!("equity   {}", state.margin_summary.account_value);
+    println!(
+        "perps    accountValue={} withdrawable={} (0 is expected under unified \
+         margin; this is not the account balance)",
+        state.margin_summary.account_value, state.withdrawable
+    );
 
     let cloid = random_cloid();
     let spec = OrderSpec {
