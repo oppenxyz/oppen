@@ -13,7 +13,7 @@ oppen-core = { path = "../oppen-core" }
 oppen-hl = { path = "../oppen-hl" }
 axum = "0.8"
 getrandom = "0.2"
-rmcp = { version = "0.5", features = ["server", "transport-streamable-http-server", "transport-worker"] }
+rmcp = { version = "3", features = ["server", "transport-streamable-http-server"] }
 schemars = "1"
 serde.workspace = true
 serde_json.workspace = true

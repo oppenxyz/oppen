@@ -10,8 +10,8 @@ use std::sync::Arc;
 use oppen_hl::{InfoClient, Network, Universe, meta::MIN_NOTIONAL_USD};
 use rmcp::{
     ErrorData, ServerHandler,
-    handler::server::tool::Parameters,
-    model::{CallToolResult, Content},
+    handler::server::wrapper::Parameters,
+    model::{CallToolResult, ContentBlock},
     tool, tool_handler, tool_router,
 };
 use serde::{Deserialize, Serialize};
@@ -20,7 +20,6 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone)]
 pub struct Gateway {
     inner: Arc<GatewayInner>,
-    tool_router: rmcp::handler::server::router::tool::ToolRouter<Self>,
 }
 
 struct GatewayInner {
@@ -65,7 +64,6 @@ impl Gateway {
                 network,
                 info: InfoClient::new(network)?,
             }),
-            tool_router: Self::tool_router(),
         })
     }
 
@@ -110,7 +108,7 @@ impl Gateway {
 
         let json = serde_json::to_string(&out)
             .map_err(|e| ErrorData::internal_error(format!("serialise: {e}"), None))?;
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
     }
 }
 
@@ -131,25 +129,23 @@ fn describe(asset: &oppen_hl::meta::Asset) -> SymbolMeta {
 #[tool_handler]
 impl ServerHandler for Gateway {
     fn get_info(&self) -> rmcp::model::ServerInfo {
-        rmcp::model::ServerInfo {
-            // Without this the handshake advertises no capabilities and an
-            // agent never learns the tools exist. `#[tool_handler]` generates
-            // the routes; it does not announce them.
-            capabilities: rmcp::model::ServerCapabilities::builder()
-                .enable_tools()
-                .build(),
-            server_info: rmcp::model::Implementation {
-                name: "oppen".into(),
-                version: env!("CARGO_PKG_VERSION").into(),
-            },
-            instructions: Some(
-                "oppen — a local-first Hyperliquid terminal. You are one agent among several; \
-                 the human supervises. Every action you take is guardrail-checked before it is \
-                 signed and is recorded in an append-only ledger. Read AGENTS.md in the oppen \
-                 repository before trading."
-                    .into(),
-            ),
-            ..Default::default()
-        }
+        // `ServerInfo` is `#[non_exhaustive]`, so it is built from the default
+        // and adjusted rather than written as a struct expression.
+        let mut info = rmcp::model::ServerInfo::default();
+        // Without this the handshake advertises no capabilities and an agent
+        // never learns the tools exist. `#[tool_handler]` generates the routes;
+        // it does not announce them.
+        info.capabilities = rmcp::model::ServerCapabilities::builder()
+            .enable_tools()
+            .build();
+        info.server_info = rmcp::model::Implementation::new("oppen", env!("CARGO_PKG_VERSION"));
+        info.instructions = Some(
+            "oppen — a local-first Hyperliquid terminal. You are one agent among several; \
+             the human supervises. Every action you take is guardrail-checked before it is \
+             signed and is recorded in an append-only ledger. Read AGENTS.md in the oppen \
+             repository before trading."
+                .into(),
+        );
+        info
     }
 }
