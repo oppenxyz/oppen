@@ -33,7 +33,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  --header \"Authorization: Bearer {}\"", issued.reveal());
     println!();
 
-    let gateway = Gateway::new(Network::Testnet)?;
+    let account = std::env::var("OPPEN_TESTNET_USER")
+        .map_err(|_| "set OPPEN_TESTNET_USER (source ~/.oppen/testnet.env)")?
+        .parse()?;
+    let gateway = Gateway::new(Network::Testnet, account)?;
     serve(
         port,
         gateway,

@@ -5,6 +5,7 @@
  */
 
 import { reactive, readonly } from "vue";
+import { fetchAccountState, inTauri, isConsoleError, type AccountState } from "../lib/bridge";
 
 export type View = "trade" | "agents" | "builder" | "portfolio" | "settings" | "onboarding";
 export type Network = "testnet" | "mainnet";
@@ -32,6 +33,10 @@ interface ShellState {
   lastDecision: Decision | null;
   decisionsToday: number;
   refusedToday: number;
+  /** Last good reading. Kept across a failed refresh so a position stays visible. */
+  account: AccountState | null;
+  /** Why the last refresh failed, shown beside the stale reading. */
+  accountError: string | null;
 }
 
 const state = reactive<ShellState>({
@@ -43,6 +48,8 @@ const state = reactive<ShellState>({
   lastDecision: null,
   decisionsToday: 0,
   refusedToday: 0,
+  account: null,
+  accountError: null,
 });
 
 export const shell = readonly(state);
@@ -93,4 +100,56 @@ export function formatUsd(value: number | null): string {
 
 export function formatLatency(ms: number | null): string {
   return ms === null ? "—" : `${ms}MS`;
+}
+
+// ---------------------------------------------------------------------------
+// Live account state (spec items 16, 31-34).
+// ---------------------------------------------------------------------------
+
+/**
+ * Refresh the account readouts from Rust.
+ *
+ * Failure is recorded rather than thrown: the console must keep rendering with
+ * an explicit problem shown, because a blank panel and a stale panel look the
+ * same to an operator and only one of them is safe.
+ */
+export async function refreshAccount(): Promise<void> {
+  if (!inTauri()) {
+    state.accountError = "Not running in the desktop app — start it with `bun run tauri dev`.";
+    return;
+  }
+  try {
+    const next = await fetchAccountState(state.network);
+    state.account = next;
+    state.accountError = null;
+    state.equityUsd = Number(next.balances.equity_usd);
+    state.feeds = {
+      wsMarket: next.feed === "live" ? "ok" : next.feed === "stale" ? "stale" : "unknown",
+      wsUser: next.feed === "live" ? "ok" : next.feed === "stale" ? "stale" : "unknown",
+      rest: "ok",
+    };
+  } catch (error) {
+    state.accountError = isConsoleError(error)
+      ? error.detail
+      : error instanceof Error
+        ? error.message
+        : String(error);
+    // The previous reading is deliberately left in place and the error shown
+    // beside it. Clearing it would hide that a position is open.
+  }
+}
+
+let poll: ReturnType<typeof setInterval> | null = null;
+
+/** Start polling. Idempotent, so a remount does not stack timers. */
+export function startAccountPolling(everyMs = 5000): void {
+  if (poll !== null) return;
+  void refreshAccount();
+  poll = setInterval(() => void refreshAccount(), everyMs);
+}
+
+export function stopAccountPolling(): void {
+  if (poll === null) return;
+  clearInterval(poll);
+  poll = null;
 }

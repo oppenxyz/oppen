@@ -36,7 +36,8 @@ Verified against the live venue on 2026-09-04, on both networks.
 |---|---|---|
 | Spot USDC | 999.0 mock | 29.699177 |
 | `clearinghouseState.marginSummary.accountValue` | 0.0 | 0.0 |
-| `webData2.cumLedger` | 999.0 | 29.69 |
+| `portfolio.accountValue` | 999.0 | 29.699177 |
+| `webData2.cumLedger` — net deposits, **not** equity | 999.0 | 29.69 |
 | Available to Trade, perps ticket | 999.00 USDC | 29.70 USDC |
 | `userRole` | `user` | `user` |
 | Sub-accounts | 0 | 0 |
@@ -51,9 +52,12 @@ version of this file told you to do.
   `accountValue` of 0.0. The spot USDC *is* the perps collateral.
 - **`accountValue` is therefore not the balance.** It reads 0.0 on an account
   with 999 USDC of buying power, on both networks. Anything that gates on it —
-  ours included — reports a funded account as empty. `webData2.cumLedger` and
-  `portfolio`'s `accountValueHistory` both return the real figure; the perps
-  ticket agrees with them. This is tracked as a bug against oppen's equity read,
+  ours included — reports a funded account as empty. The real figure is
+  `perps accountValue + spot at mark`, and `portfolio`'s `accountValueHistory`
+  is the venue's own answer to it; the perps ticket agrees with both.
+  **`webData2.cumLedger` is not the figure** — it is cumulative net deposits,
+  and equals equity only while PnL is zero
+  (mainnet: `29.699177 = 29.69 + 0.009177`). This is tracked as a bug against oppen's equity read,
   not a venue problem.
 - **The faucet is already claimed.** It pays 1,000 mock USDC and only pays an
   address that has previously deposited on mainnet; the 29.699177 USDC mainnet
@@ -180,7 +184,7 @@ Expected, line by line:
   was pasted wrong.
 - `equity …` — **expect 0 today, and that is not a failure.** It is read from
   `clearinghouseState.marginSummary.accountValue`, which reports 0.0 on a funded
-  unified account (§0). Judge funding by `webData2.cumLedger` or the perps
+  unified account (§0). Judge funding by `portfolio.accountValue` or the perps
   ticket, not by this line. Once oppen's equity read is fixed this line becomes
   meaningful again.
 - `place [Resting { oid: … }]`
@@ -435,7 +439,7 @@ stated it. If it is windowed, an interrupted run can decay.
 | A `manual` sub-account so no operator key sits on the master | The manual ticket signs from the account it is intervening in | An API wallet cannot sign for an unrelated top-level account, so a single operator signer no longer exists |
 | A `spare` sub-account as a rotation target | A second named agent wallet on the same account | Rotation is a new wallet, not a new account. Three named slots is enough for an overlap |
 | Step 1: move the spot balance to perps with `usdClassTransfer` | Nothing to move | Hyperliquid margin is unified. The perps ticket shows `Available to Trade 999.00 USDC` against a spot 999 and a perps `accountValue` of 0.0 |
-| "`equity` is non-zero; if it reads 0, step 1 did not land" | Expect 0; judge funding by `webData2.cumLedger` | `accountValue` reads 0.0 on a funded unified account, on both networks |
+| "`equity` is non-zero; if it reads 0, step 1 did not land" | Expect 0; judge funding by `portfolio.accountValue` | `accountValue` reads 0.0 on a funded unified account, on both networks |
 | Step 2 was three sentences, with the `valid_until` name suffix flagged unconfirmed | Six numbered steps, including the required **Days Valid** field | The authorize modal has its own expiry field, so the suffix is moot in the UI |
 
 ### Corrected later the same day

@@ -1,8 +1,8 @@
 <script setup lang="ts">
-import { computed, type Component } from "vue";
+import { computed, onMounted, onUnmounted, type Component } from "vue";
 import AppHeader from "./components/shell/AppHeader.vue";
 import AppStatusBar from "./components/shell/AppStatusBar.vue";
-import { shell, type View } from "./stores/shell";
+import { shell, startAccountPolling, stopAccountPolling, type View } from "./stores/shell";
 import AgentsView from "./views/AgentsView.vue";
 import BuilderView from "./views/BuilderView.vue";
 import OnboardingView from "./views/OnboardingView.vue";
@@ -20,6 +20,9 @@ const VIEWS: Record<View, Component> = {
 };
 
 const current = computed(() => VIEWS[shell.view]);
+
+onMounted(() => startAccountPolling());
+onUnmounted(() => stopAccountPolling());
 </script>
 
 <template>
