@@ -539,9 +539,15 @@ pub struct MarginSummary {
     /// Do not wire this into `oppen-core`'s `AccountSnapshot::equity_usd` or
     /// any guardrail denominator. A leverage cap divided by this value treats a
     /// funded account as empty, which fails closed today and would fail *open*
-    /// the moment a fallback is added. `webData2.cumLedger` and `portfolio`'s
-    /// `accountValueHistory` carry the unified figure; neither is modelled here
-    /// yet, and the wiring task owns choosing between them.
+    /// the moment a fallback is added.
+    ///
+    /// The unified figure is `perps accountValue + spot holdings at mark`, and
+    /// `portfolio`'s `accountValueHistory` is the venue's own answer to the
+    /// same question. **`webData2.cumLedger` is not it** — it is cumulative net
+    /// deposits. Verified on mainnet 2026-09-04:
+    /// `accountValue 29.699177 = cumLedger 29.69 + pnl 0.009177`. It equals
+    /// equity only while PnL is exactly zero, which is why it looked correct on
+    /// a fresh testnet account and would have drifted from the first fill.
     pub account_value: Decimal,
     pub total_ntl_pos: Decimal,
     pub total_raw_usd: Decimal,
@@ -558,6 +564,43 @@ pub struct ClearinghouseState {
     pub withdrawable: Decimal,
     pub asset_positions: Vec<AssetPosition>,
     pub time: u64,
+}
+
+/// One spot token balance from `spotClearinghouseState`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SpotBalance {
+    pub coin: String,
+    pub token: u32,
+    /// Everything held, including the part reserved by resting spot orders.
+    pub total: Decimal,
+    /// The part reserved by resting spot orders and therefore not free.
+    pub hold: Decimal,
+}
+
+/// `spotClearinghouseState` response.
+///
+/// Needed because Hyperliquid margin is unified: spot USDC collateralises
+/// perps, so an account's equity is not visible from [`ClearinghouseState`]
+/// alone (see [`MarginSummary::account_value`]).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SpotClearinghouseState {
+    pub balances: Vec<SpotBalance>,
+}
+
+impl SpotClearinghouseState {
+    /// The USDC balance, or zero when the account holds none.
+    ///
+    /// Absent and zero are the same answer here: an account that has never
+    /// held USDC and one that spent it all have the same buying power.
+    pub fn usdc_total(&self) -> Decimal {
+        self.balances
+            .iter()
+            .find(|balance| balance.coin == "USDC")
+            .map(|balance| balance.total)
+            .unwrap_or_default()
+    }
 }
 
 /// `A` ask (sell), `B` bid (buy).

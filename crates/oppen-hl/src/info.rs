@@ -9,8 +9,8 @@ use serde::de::DeserializeOwned;
 
 use crate::types::{
     Candle, ClearinghouseState, Fill, FundingHistoryPage, FundingHistoryRow, L2Book, Meta,
-    MetaAndAssetCtxs, OpenOrder, OrderStatusResponse, PredictedFundings, SubAccount, UserRateLimit,
-    ValidatorDexCoin,
+    MetaAndAssetCtxs, OpenOrder, OrderStatusResponse, PredictedFundings, SpotClearinghouseState,
+    SubAccount, UserRateLimit, ValidatorDexCoin,
 };
 use crate::wire::Cloid;
 use crate::{Address, Error, Network, Universe};
@@ -176,6 +176,16 @@ impl InfoClient {
 
     pub async fn clearinghouse_state(&self, user: Address) -> Result<ClearinghouseState, Error> {
         self.post(serde_json::json!({ "type": "clearinghouseState", "user": user }))
+            .await
+    }
+
+    /// Spot balances. Required for equity under unified margin — see
+    /// [`crate::types::MarginSummary::account_value`].
+    pub async fn spot_clearinghouse_state(
+        &self,
+        user: Address,
+    ) -> Result<SpotClearinghouseState, Error> {
+        self.post(serde_json::json!({ "type": "spotClearinghouseState", "user": user }))
             .await
     }
 
