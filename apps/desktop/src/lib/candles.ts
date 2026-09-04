@@ -75,6 +75,16 @@ export interface InkRun {
 }
 
 /**
+ * Why a frame looks the way it does. Three distinct failures — no bars, nothing finite
+ * among them, and a grid too small to carry an axis — all paint the same blank grid, and
+ * a caller that cannot tell them apart cannot say anything true about it. A blank panel
+ * reads as downtime, which `specs/charts.md` §3.2 names as the failure to avoid. This is
+ * AGENTS.md invariant 8 ("every rejection is typed") applied to the view: the renderer
+ * reports which one it was and stays free of the copy that explains it.
+ */
+export type FrameStatus = "ok" | "no_bars" | "no_finite_bars" | "grid_too_small";
+
+/**
  * A rendered frame. `text[y]` and `ink[y]` are the same length as each other and as
  * every other row, which is what lets a caller diff two frames row by row.
  */
@@ -83,6 +93,8 @@ export interface CandleFrame {
   height: number;
   text: readonly string[];
   ink: readonly string[];
+  /** `"ok"` when the frame carries candles; otherwise which failure produced the blank. */
+  status: FrameStatus;
 }
 
 /** Everything the renderer needs. No market state, no clock, no venue handle. */
@@ -114,6 +126,15 @@ const PITCH = 4;
 const AXIS_ROWS = 3;
 const MIN_ROWS = AXIS_ROWS + 2;
 const MIN_COLS = 2;
+/**
+ * A hard ceiling on the grid. `cols` and `rows` come from a layout measurement, and the
+ * classic measurement failure — a panel measured while hidden, or before the mono font
+ * has loaded, so the character width reads 0 — yields `Infinity`. Unbounded, that either
+ * throws inside `new Array` or allocates tens of millions of cells on the 90 ms clock.
+ * Both ceilings are far past any real terminal, so no caller can notice the clamp.
+ */
+const MAX_COLS = 500;
+const MAX_ROWS = 500;
 
 const GLYPH_UP = "+";
 const GLYPH_DOWN = ":";
@@ -216,6 +237,16 @@ export function priceTicks(min: number, max: number, step: number): number[] {
   return out;
 }
 
+/**
+ * A grid dimension, whatever arrives: a non-negative integer inside `[0, limit]`. NaN and
+ * both infinities collapse to 0, which renders blank with a `"grid_too_small"` status
+ * rather than throwing — this runs on every clock tick and must survive any input.
+ */
+function clampGrid(value: number, limit: number): number {
+  if (!Number.isFinite(value)) return 0;
+  return Math.min(limit, Math.max(0, Math.trunc(value)));
+}
+
 /** Keep a caller's `max_price_decimals` inside what `toFixed` accepts, whatever arrives. */
 function clampDecimals(value: number): number {
   return Number.isFinite(value) ? Math.max(0, Math.min(12, Math.trunc(value))) : 0;
@@ -300,6 +331,45 @@ class Grid {
     for (let i = 0; i < text.length; i += 1) this.put(x + i, y, text[i], ink);
   }
 
+  /**
+   * Right-align `text` in the `width`-wide field starting at `x`, blanking the whole
+   * field first. Every gutter write goes through here on purpose. A right-aligned write
+   * that covers only part of its field leaves the previous label's leading characters in
+   * place and splices them onto the front of the new one: a 5-character last price under
+   * a 6-character tick label renders `100000` + `99990` as `199990`, a price that does
+   * not exist, in the most prominent ink on the surface. Blanking the field first makes
+   * that unrepresentable rather than merely absent from this one call site.
+   */
+  writeRight(x: number, y: number, width: number, text: string, ink: string): void {
+    for (let i = 0; i < width; i += 1) this.put(x + i, y, " ", INK.none);
+    // A label wider than its own field would spill left over the plot and read as a
+    // different number. The gutter is sized from the widest label, so this cannot happen
+    // from `paint`; it is here so it cannot happen from the next call site either.
+    if (text.length > width) return;
+    this.write(x + (width - text.length), y, text, ink);
+  }
+
+  /** True when the grid holds exactly `chars` / `inks` at exactly `width` x `height`. */
+  sameCells(width: number, height: number, chars: readonly string[], inks: readonly string[]): boolean {
+    if (width !== this.width || height !== this.height) return false;
+    const cells = this.width * this.height;
+    for (let i = 0; i < cells; i += 1) {
+      if (chars[i] !== this.chars[i] || inks[i] !== this.inks[i]) return false;
+    }
+    return true;
+  }
+
+  /** Copy the cells into the caller's arrays, reusing their storage. */
+  copyCells(chars: string[], inks: string[]): void {
+    const cells = this.width * this.height;
+    chars.length = cells;
+    inks.length = cells;
+    for (let i = 0; i < cells; i += 1) {
+      chars[i] = this.chars[i];
+      inks[i] = this.inks[i];
+    }
+  }
+
   /** Fill `text` and `ink` with one string per row, reusing the caller's arrays. */
   emit(text: string[], ink: string[]): void {
     text.length = this.height;
@@ -338,24 +408,38 @@ function finiteBar(bar: Bar): boolean {
   );
 }
 
-function paint(grid: Grid, input: CandleInput): void {
-  const cols = Math.max(0, Math.trunc(input.cols));
-  const rows = Math.max(0, Math.trunc(input.rows));
+function paint(grid: Grid, input: CandleInput): FrameStatus {
+  const cols = clampGrid(input.cols, MAX_COLS);
+  const rows = clampGrid(input.rows, MAX_ROWS);
   const plotWidth = cols * PITCH;
   const offsetMs = Math.trunc(input.tzOffsetMinutes ?? 0) * MS_MINUTE;
 
-  const source: Bar[] = [];
-  for (const bar of input.closed) if (finiteBar(bar)) source.push(bar);
-  const forming = input.forming && finiteBar(input.forming) ? input.forming : null;
-  if (forming) source.push(forming);
-
-  const visible = source.slice(Math.max(0, source.length - cols));
-
-  // A grid too small to carry an axis, or with nothing to draw, renders blank rather
-  // than throwing: this runs on every clock tick and must survive any input.
-  if (cols < MIN_COLS || rows < MIN_ROWS || visible.length === 0) {
+  // A grid too small to carry an axis renders blank rather than throwing: this runs on
+  // every clock tick and must survive any input, including a layout measurement that
+  // came back as 0 or Infinity.
+  if (cols < MIN_COLS || rows < MIN_ROWS) {
     grid.reset(Math.max(1, plotWidth), Math.max(1, rows));
-    return;
+    return "grid_too_small";
+  }
+
+  const forming = input.forming && finiteBar(input.forming) ? input.forming : null;
+
+  // Walk the closed bars backwards and stop as soon as the window is full. Identical to
+  // filtering the whole array and slicing its tail, but the cost tracks what is drawn
+  // rather than what is backfilled: `decisions.md` D-d puts 30 days in the foreground,
+  // which at 1m is 43,200 bars behind a 120-column plot, on the 90 ms clock (§2.5).
+  const want = forming ? cols - 1 : cols;
+  const visible: Bar[] = [];
+  for (let i = input.closed.length - 1; i >= 0 && visible.length < want; i -= 1) {
+    const bar = input.closed[i];
+    if (finiteBar(bar)) visible.push(bar);
+  }
+  visible.reverse();
+  if (forming) visible.push(forming);
+
+  if (visible.length === 0) {
+    grid.reset(Math.max(1, plotWidth), Math.max(1, rows));
+    return input.closed.length === 0 && !input.forming ? "no_bars" : "no_finite_bars";
   }
 
   let min = Number.POSITIVE_INFINITY;
@@ -367,7 +451,19 @@ function paint(grid: Grid, input: CandleInput): void {
     const volume = Number.isFinite(bar.volume) ? Math.abs(bar.volume) : 0;
     if (volume > maxVolume) maxVolume = volume;
   }
-  const span = max - min || 1;
+  // A flat window — every visible bar at one price — has a zero span. Substituting 1
+  // collapses every price onto the bottom plot row and leaves at most one tick, so the Y
+  // axis vanishes; §2.2 requires four to eight gridlines in the visible range. Pad
+  // symmetrically instead, so the flat line sits centred under a real axis. An illiquid
+  // alt on a 1m chart, or a locally-aggregated interval (§3.2) in a quiet stretch,
+  // produces exactly this.
+  let span = max - min;
+  if (!(span > 0)) {
+    const pad = Math.max(Math.abs(max) * 0.0005, Math.pow(10, -clampDecimals(input.priceDecimals)));
+    min -= pad;
+    max += pad;
+    span = max - min;
+  }
 
   const plotRows = rows - AXIS_ROWS;
   const ruleRow = plotRows;
@@ -456,15 +552,16 @@ function paint(grid: Grid, input: CandleInput): void {
   });
 
   for (let i = 0; i < ticks.length; i += 1) {
-    const label = tickLabels[i];
-    grid.write(gutterX + (gutterText - label.length), rowOf(ticks[i]), label, INK.label);
+    grid.writeRight(gutterX, rowOf(ticks[i]), gutterText, tickLabels[i], INK.label);
   }
 
   // The last price is the one live element on the surface, so it takes uranium and
-  // overwrites whatever tick label shares its row.
+  // replaces — not overlays — whatever tick label shares its row.
   const lastRow = rowOf(lastBar.close);
   grid.put(slots[slots.length - 1].x + 3, lastRow, GLYPH_LAST, INK.last);
-  grid.write(gutterX + (gutterText - lastLabel.length), lastRow, lastLabel, INK.last);
+  grid.writeRight(gutterX, lastRow, gutterText, lastLabel, INK.last);
+
+  return "ok";
 }
 
 interface TimeAxis {
@@ -532,14 +629,18 @@ function paintTimeAxis(grid: Grid, slots: readonly Slot[], axis: TimeAxis): void
  */
 export function renderCandles(input: CandleInput): CandleFrame {
   const grid = new Grid();
-  paint(grid, input);
+  const status = paint(grid, input);
   const text: string[] = [];
   const ink: string[] = [];
   grid.emit(text, ink);
-  return { width: grid.width, height: grid.height, text, ink };
+  return { width: grid.width, height: grid.height, text, ink, status };
 }
 
-/** A renderer that owns its buffers so the live surface allocates nothing per frame. */
+/**
+ * A renderer that owns its buffers. An unchanged frame costs a pass over the character
+ * cells and nothing else: no row strings are rebuilt and no DOM write follows. Only a
+ * changed frame pays for the one string per row that `text` and `ink` are made of.
+ */
 export interface CandleRenderer {
   /**
    * Paint `input` and report whether the frame differs from the previous one. The
@@ -558,34 +659,28 @@ export function createCandleRenderer(): CandleRenderer {
   const grid = new Grid();
   const text: string[] = [];
   const ink: string[] = [];
-  const previousText: string[] = [];
-  const previousInk: string[] = [];
-  let painted = false;
+  const previousChars: string[] = [];
+  const previousInks: string[] = [];
+  let previousStatus: FrameStatus | null = null;
+  let previousWidth = -1;
+  let previousHeight = -1;
 
   return {
     render(input: CandleInput) {
-      paint(grid, input);
-      grid.emit(text, ink);
-
-      let changed = !painted || previousText.length !== text.length;
-      if (!changed) {
-        for (let y = 0; y < text.length; y += 1) {
-          if (previousText[y] !== text[y] || previousInk[y] !== ink[y]) {
-            changed = true;
-            break;
-          }
-        }
-      }
+      const status = paint(grid, input);
+      // Diff the cells, not the rows. The old order rebuilt every row string before
+      // asking whether anything had changed, which is exactly the "allocates a string per
+      // row per frame" that §2.5 exists to remove.
+      const changed =
+        status !== previousStatus || !grid.sameCells(previousWidth, previousHeight, previousChars, previousInks);
       if (changed) {
-        previousText.length = text.length;
-        previousInk.length = ink.length;
-        for (let y = 0; y < text.length; y += 1) {
-          previousText[y] = text[y];
-          previousInk[y] = ink[y];
-        }
+        grid.copyCells(previousChars, previousInks);
+        previousWidth = grid.width;
+        previousHeight = grid.height;
+        previousStatus = status;
+        grid.emit(text, ink);
       }
-      painted = true;
-      return { frame: { width: grid.width, height: grid.height, text, ink }, changed };
+      return { frame: { width: grid.width, height: grid.height, text, ink, status }, changed };
     },
   };
 }

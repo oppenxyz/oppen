@@ -74,6 +74,25 @@ pub struct MarketRef {
     /// `None` when no divergence is being tracked.
     pub mark_divergence_bps: Option<Decimal>,
     pub mark_divergent_since_ms: Option<u64>,
+    /// The book snapshot this decision was taken against (`docs/decisions.md`
+    /// R6). Nullable today because no capture policy is decided; the
+    /// plumbing exists first because the book at the moment an agent decided
+    /// is the one class of data that cannot be backfilled.
+    ///
+    /// It rides on the market tick rather than on [`super::OrderIntent`] on
+    /// purpose: the snapshot is a fact about the market the engine measured
+    /// against, so an agent must not be able to choose which one its order is
+    /// recorded against.
+    pub snapshot: Option<MarketSnapshotRef>,
+}
+
+/// A reference to a stored book snapshot, in the shape the ledger's own
+/// `SnapshotRef` chains (`docs/decisions.md` R6): the id is the primary key
+/// in the prunable `book_snapshots` table, the hash goes into the chained row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MarketSnapshotRef {
+    pub id: String,
+    pub hash: String,
 }
 
 impl MarketRef {
@@ -87,6 +106,7 @@ impl MarketRef {
             quality: FeedQuality::Ok,
             mark_divergence_bps: None,
             mark_divergent_since_ms: None,
+            snapshot: None,
         }
     }
 }
@@ -124,6 +144,53 @@ pub struct AccountSnapshot {
     /// a refusal, a ledger row — has one serialization (`AGENTS.md`
     /// invariant 6).
     pub positions: BTreeMap<String, PositionSnapshot>,
+    /// The account's working orders (spec item 24).
+    ///
+    /// `Option` so that "no working orders" and "nobody supplied the working
+    /// orders" are different values. The engine refuses the second with
+    /// [`super::Unevaluable::MissingRestingOrders`], the same fail-closed
+    /// treatment [`Exposure::fleet`] gets: a cap measured against a book the
+    /// engine cannot see is a cap that is not enforced. Unused on the fleet
+    /// aggregate, which is only read for PnL and equity.
+    pub resting: Option<RestingExposure>,
+}
+
+/// What the agent's working orders would add to its position if they all
+/// filled (spec item 24).
+///
+/// Without this the notional and leverage caps measure only filled positions,
+/// and both are bypassable by splitting: at D-c's $100 position cap and 5
+/// orders per 5 minutes an agent rests five $100 orders, each of which clears
+/// because each is evaluated against a flat book, and holds $500 if they fill.
+/// Item 9 already fetches `frontendOpenOrders` on reconcile, so the numbers
+/// exist; they simply were not reaching the engine.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RestingExposure {
+    /// Signed resting size per coin — positive for working buys, negative for
+    /// working sells, summed per coin. This is the "everything fills"
+    /// reading, which is the one a cap has to be measured against.
+    ///
+    /// `BTreeMap` for the same reason as `positions`: one serialization
+    /// (`AGENTS.md` invariant 6).
+    pub szi: BTreeMap<String, Decimal>,
+    /// Sum of `|szi| × mark` across every working order in the account,
+    /// including symbols the current order does not touch, for the leverage
+    /// cap.
+    pub notional_usd: Decimal,
+}
+
+impl RestingExposure {
+    /// An account with nothing working. Named rather than `default()` at call
+    /// sites so "the book really is empty" is distinguishable from "nobody
+    /// filled this in" — the latter is [`None`], which refuses.
+    pub fn none() -> Self {
+        RestingExposure::default()
+    }
+
+    /// Signed resting size for one coin, zero when nothing is working.
+    pub fn szi_of(&self, symbol: &str) -> Decimal {
+        self.szi.get(symbol).copied().unwrap_or(Decimal::ZERO)
+    }
 }
 
 /// Milliseconds in a day, for the UTC day-boundary check.
@@ -140,7 +207,8 @@ impl AccountSnapshot {
             .saturating_add(self.unrealized_pnl_usd)
     }
 
-    /// Signed size of one position, zero when flat.
+    /// Signed size of one position, zero when flat. Filled size only — the
+    /// working book is [`AccountSnapshot::resting`].
     pub fn position_szi(&self, symbol: &str) -> Decimal {
         self.positions
             .get(symbol)
@@ -187,6 +255,7 @@ mod tests {
             day_start_ms,
             total_position_notional_usd: Decimal::ZERO,
             positions: BTreeMap::new(),
+            resting: Some(RestingExposure::none()),
         }
     }
 

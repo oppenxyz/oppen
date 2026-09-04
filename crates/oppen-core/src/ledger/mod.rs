@@ -24,12 +24,33 @@
 //!   commits under `synchronous = FULL` and hands back an [`IntentReceipt`] that
 //!   cannot be constructed anywhere else. A signing path that demands one by
 //!   reference cannot be reached with an unrecorded intent, so a power cut
-//!   cannot produce an order with no record of why.
+//!   cannot produce an order with no record of why. The receipt names its own
+//!   chain, so a testnet receipt cannot authorise a mainnet outcome (R4).
 //!
 //! Every call blocks on SQLite. Async callers run them on a blocking pool; the
 //! ledger deliberately holds no runtime dependency of its own
 //! (`docs/decisions.md` R1).
+//!
+//! # What tamper evidence here does and does not mean
+//!
+//! `docs/spec.md` item 29 says tamper-evident, not tamper-proof, and the exact
+//! shape of that matters:
+//!
+//! * A rewritten row, a deleted row from the middle, a payload that no longer
+//!   matches the chain, and a payload silently nulled without a chained
+//!   [`EventKind::PayloadRedacted`] row covering it are all caught by
+//!   [`Ledger::verify`] against the file alone.
+//! * Erasing the *end* of the chain, or rewriting a row and recomputing every
+//!   hash after it, cannot be caught from inside the file: `chain_head` is in
+//!   the same file the attacker is editing. That is what [`anchor`] is for, and
+//!   the default [`FileAnchor`] is an ordinary sidecar file, **not** a security
+//!   boundary. Read that module before relying on it; the keychain-backed
+//!   implementation is a later phase.
+//! * An agent must not be able to reach any of this. [`Ledger::agent_view`]
+//!   hands out the read-only surface (`AGENTS.md` invariant 3); `&Ledger`
+//!   itself is operator-only.
 
+mod anchor;
 mod export;
 mod hash;
 mod schema;
@@ -46,6 +67,7 @@ use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehav
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+pub use anchor::{Anchor, FileAnchor, HeadAnchor};
 pub use verify::{BreakReason, ChainBreak, ChainReport};
 
 use crate::Network;
@@ -130,11 +152,73 @@ pub enum LedgerError {
     /// of what it was deleting.
     #[error("event {0} is already redacted")]
     AlreadyRedacted(u64),
+    /// A redaction row was appended through the generic path. Redaction has one
+    /// door for the same reason an intent does: [`Ledger::redact`] nulls the
+    /// payload and appends the row that explains it in one transaction, so a
+    /// chained redaction always corresponds to a real one.
+    #[error("redact a payload with redact, so the tombstone and its explanation are one write")]
+    UseRedact,
     /// An order intent was appended through the generic path, which would give
     /// a durable row but no [`IntentReceipt`] — and the receipt is the thing
     /// that keeps the record ahead of the signer.
     #[error("append an order intent with record_intent, so the signer can require its receipt")]
     UseRecordIntent,
+    /// A [`EventKind::PayloadRedacted`] row was itself passed to
+    /// [`Ledger::redact`]. Its payload is `{redacted_seq, reason}` — two
+    /// operator-authored fields with no agent text in them, so there is no
+    /// retention argument for nulling it, and doing so erases the record of
+    /// which row was redacted and why.
+    #[error("event {0} is a redaction and its own explanation cannot be redacted")]
+    RedactionIsNotRedactable(u64),
+    /// The receipt was issued by a different chain. `docs/decisions.md` R4: a
+    /// mainnet number that is actually a testnet number is the worst bug this
+    /// product can ship, and the receipt is the type handed to the signer.
+    #[error("receipt belongs to chain {found}, this ledger is chain {expected}")]
+    ReceiptFromAnotherChain {
+        /// Genesis hash of this ledger's chain.
+        expected: String,
+        /// Genesis hash recorded in the receipt.
+        found: String,
+    },
+    /// The receipt names a row of this chain that no longer hashes to what the
+    /// receipt says. The intent it refers to is not the intent that is there.
+    #[error("receipt for event {seq} expects hash {expected}, the row hashes to {found}")]
+    ReceiptRowMismatch {
+        /// The seq the receipt names.
+        seq: u64,
+        /// The hash the receipt carries.
+        expected: String,
+        /// The hash the row actually has.
+        found: String,
+    },
+    /// A snapshot body was written, or read back, under an id that is already
+    /// committed to a different body. `docs/decisions.md` R6: the book at the
+    /// moment an agent decided is the one class of data that cannot be
+    /// backfilled, so a replaced book must never be served as the
+    /// decision-time book.
+    #[error("snapshot {snapshot_id} is committed to {expected}, this body hashes to {found}")]
+    SnapshotBodyConflict {
+        /// The snapshot id.
+        snapshot_id: String,
+        /// The hash already committed to.
+        expected: String,
+        /// The hash of the body offered or found.
+        found: String,
+    },
+    /// A payload carried a JSON float. `AGENTS.md` conventions: money and prices
+    /// are `Decimal`, never `f64`, and this is the table kept forever.
+    #[error("payload field {pointer} is a float; money and prices belong here as decimal strings")]
+    FloatInPayload {
+        /// RFC 6901 pointer to the offending field; empty for the root.
+        pointer: String,
+    },
+    /// A payload nested deeper than the ledger will walk. Refused rather than
+    /// recursed into, because a stack overflow is a panic on an input path.
+    #[error("payload nests too deeply at {pointer}")]
+    PayloadTooDeep {
+        /// RFC 6901 pointer to where the limit was hit.
+        pointer: String,
+    },
     /// No feed gap with that id.
     #[error("no feed gap {0}")]
     NoSuchGap(i64),
@@ -303,13 +387,31 @@ pub struct Appended {
 /// unrecorded intent: the ordering is enforced by the type system rather than
 /// by everyone remembering it. `AGENTS.md` invariant 1 puts the guardrail check
 /// in the same place — between holding this receipt and calling the signer.
+///
+/// The receipt also names the chain that issued it and the agent that asked.
+/// `docs/decisions.md` R4 makes one chain per network, and this is the one type
+/// that crosses from the ledger into the signer: without the chain field a
+/// testnet receipt was accepted by the mainnet ledger, which is precisely the
+/// confusion R4 calls the worst bug this product can ship. Without the agent
+/// field the outcome could be attributed to an agent that never asked.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IntentReceipt {
+    chain: String,
     seq: u64,
     hash: String,
+    agent_id: String,
 }
 
 impl IntentReceipt {
+    /// Genesis hash of the chain that issued this receipt.
+    ///
+    /// The genesis rather than the network name, because it binds the file's
+    /// actual chain: two testnet files are two chains only if their genesis
+    /// differs, and [`hash::genesis_hash`] makes the network part of it.
+    pub fn chain(&self) -> &str {
+        &self.chain
+    }
+
     /// The chain position of the intent row.
     pub fn seq(&self) -> u64 {
         self.seq
@@ -319,6 +421,13 @@ impl IntentReceipt {
     /// even if seqs are renumbered by someone editing the file.
     pub fn hash(&self) -> &str {
         &self.hash
+    }
+
+    /// The agent whose intent this is. Outcomes are attributed to it rather
+    /// than to a separately supplied id, so an outcome cannot be booked against
+    /// an agent that did not ask.
+    pub fn agent_id(&self) -> &str {
+        &self.agent_id
     }
 }
 
@@ -344,8 +453,14 @@ pub struct Event {
     /// This row's chain hash.
     pub hash: String,
     /// When the payload was redacted, in unix milliseconds.
+    ///
+    /// Convenience for display only. It is not in the row-hash preimage, so it
+    /// proves nothing: the chained [`EventKind::PayloadRedacted`] row is the
+    /// evidence, and [`Ledger::verify`] reads that and never this.
     pub redacted_at: Option<i64>,
-    /// Why it was redacted. Also recorded as its own chained event.
+    /// Why it was redacted. Display only, for the same reason as
+    /// [`Event::redacted_at`]; the chained redaction row carries the reason the
+    /// chain actually commits to.
     pub redaction_reason: Option<String>,
     /// Decision-time book snapshot id (`docs/decisions.md` R6).
     pub snapshot_id: Option<String>,
@@ -502,6 +617,7 @@ pub struct Ledger {
     connection: Mutex<Connection>,
     network: Network,
     genesis: String,
+    anchor: Option<Box<dyn HeadAnchor>>,
 }
 
 impl Ledger {
@@ -514,27 +630,77 @@ impl Ledger {
         Self::open_at(&dir.join(crate::db_file_name(network)), network)
     }
 
-    /// Open a ledger at an explicit path.
+    /// Open a ledger at an explicit path, anchored by the default sidecar.
     ///
     /// For tooling that is handed a file — a backup, an export to verify — and
     /// for tests. Product code should use [`Ledger::open`] so the naming rule
     /// stays in one place.
     pub fn open_at(path: &Path, network: Network) -> Result<Self> {
+        Self::open_anchored(path, network, Some(Box::new(FileAnchor::beside(path))))
+    }
+
+    /// Open a ledger with a chosen head anchor, or with none.
+    ///
+    /// `None` means the last row of the chain is whatever the database file
+    /// says it is, and suffix truncation is undetectable — use it only for a
+    /// file that is being inspected rather than kept, such as an export handed
+    /// over for a one-off check.
+    ///
+    /// When an anchor is supplied and holds nothing yet, the current head is
+    /// adopted into it. Adoption trusts the file at that first open; every
+    /// rewind after it is caught. See [`anchor`] for what the default sidecar
+    /// does and does not stop.
+    pub fn open_anchored(
+        path: &Path,
+        network: Network,
+        anchor: Option<Box<dyn HeadAnchor>>,
+    ) -> Result<Self> {
         let mut connection = Connection::open(path)?;
         configure(&connection)?;
         schema::migrate(&connection)?;
         let genesis = hash::genesis_hash(network);
         bind_network(&mut connection, network, &genesis)?;
-        Ok(Self {
+        let ledger = Self {
             connection: Mutex::new(connection),
             network,
             genesis,
-        })
+            anchor,
+        };
+        if let Some(anchor) = &ledger.anchor
+            && anchor.load()?.is_none()
+        {
+            anchor.store(&ledger.chain_head()?)?;
+        }
+        Ok(ledger)
     }
 
     /// Which network this file's chain belongs to.
     pub fn network(&self) -> Network {
         self.network
+    }
+
+    /// The chain head as it stands: the last seq and its row hash.
+    ///
+    /// Exposed so a caller that keeps its own record of the head — a backup
+    /// job, an operator writing it down, a future keychain anchor — can read it
+    /// without a private field. Pair it with [`Ledger::verify_against`].
+    pub fn chain_head(&self) -> Result<Anchor> {
+        let guard = self.lock()?;
+        let (seq, hash) = head(&guard)?;
+        Ok(Anchor { seq, hash })
+    }
+
+    /// The read-only surface an agent may hold.
+    ///
+    /// `AGENTS.md` invariant 3: no agent-reachable path modifies guardrails, the
+    /// approval setting, the kill switch or the agent registry. `docs/spec.md`
+    /// D6 makes `get_events` an agent-facing call served from this same
+    /// `Ledger`, so an MCP tool handed a `&Ledger` would be one line away from
+    /// [`Ledger::redact`] or [`Ledger::upsert_sub_account`]. Hand `oppen-mcp` an
+    /// [`AgentView`] instead and the invariant is a type error rather than a
+    /// review finding.
+    pub fn agent_view(&self) -> AgentView<'_> {
+        AgentView(self)
     }
 
     /// Append one event and return the seq it was assigned.
@@ -544,13 +710,18 @@ impl Ledger {
     /// row or nothing. A half-written row would be indistinguishable from
     /// tampering on the next verification.
     ///
-    /// [`EventKind::OrderIntent`] is refused here on purpose: an intent that
-    /// reached the ledger through this method would be durable but would not
-    /// have produced an [`IntentReceipt`], which is the whole mechanism keeping
-    /// the record ahead of the signer. Use [`Ledger::record_intent`].
+    /// Two kinds are refused here on purpose, each because it has exactly one
+    /// door. [`EventKind::OrderIntent`] would be durable but would not produce
+    /// an [`IntentReceipt`], which is the whole mechanism keeping the record
+    /// ahead of the signer — use [`Ledger::record_intent`].
+    /// [`EventKind::PayloadRedacted`] is the evidence [`Ledger::verify`] demands
+    /// before it accepts a null payload, so it must never be writable without
+    /// the null it explains — use [`Ledger::redact`].
     pub fn append(&self, event: &NewEvent<'_>) -> Result<Appended> {
-        if event.kind == EventKind::OrderIntent {
-            return Err(LedgerError::UseRecordIntent);
+        match event.kind {
+            EventKind::OrderIntent => return Err(LedgerError::UseRecordIntent),
+            EventKind::PayloadRedacted => return Err(LedgerError::UseRedact),
+            _ => {}
         }
         self.append_committed(event)
     }
@@ -572,19 +743,23 @@ impl Ledger {
             snapshot: intent.snapshot,
         })?;
         Ok(IntentReceipt {
+            chain: self.genesis.clone(),
             seq: appended.seq,
             hash: appended.hash,
+            agent_id: intent.agent_id.to_owned(),
         })
     }
 
     /// Append and commit, with no check on the kind.
     ///
-    /// Private so that [`EventKind::OrderIntent`] has exactly one public door.
+    /// Private so that [`EventKind::OrderIntent`] and
+    /// [`EventKind::PayloadRedacted`] each have exactly one public door.
     fn append_committed(&self, event: &NewEvent<'_>) -> Result<Appended> {
         let mut guard = self.lock()?;
         let transaction = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let appended = append_in_tx(&transaction, event)?;
         transaction.commit()?;
+        self.note_head(&appended)?;
         Ok(appended)
     }
 
@@ -594,26 +769,78 @@ impl Ledger {
     /// structural rather than a naming convention, which is what
     /// `docs/specs/history.md` 2 needs to join "why it happened" to "what
     /// actually filled".
+    ///
+    /// The receipt is checked against this chain before anything is written:
+    /// it must have been issued by this genesis, and the row it names must
+    /// still hash to what the receipt says. Without that a receipt from the
+    /// testnet ledger produced a mainnet fill citing an intent hash no mainnet
+    /// row has — a mainnet number that is actually a testnet number, which
+    /// `docs/decisions.md` R4 calls the worst bug this product can ship. The
+    /// check and the append share one transaction so the row cannot change
+    /// between them.
+    ///
+    /// Attribution comes from the receipt rather than from a parameter, so an
+    /// outcome cannot be booked against an agent that never asked.
     pub fn record_outcome(
         &self,
         receipt: &IntentReceipt,
         kind: EventKind,
         ts_ms: i64,
-        agent_id: Option<&str>,
         outcome: &Value,
     ) -> Result<Appended> {
+        match kind {
+            EventKind::OrderIntent => return Err(LedgerError::UseRecordIntent),
+            EventKind::PayloadRedacted => return Err(LedgerError::UseRedact),
+            _ => {}
+        }
+        if receipt.chain != self.genesis {
+            return Err(LedgerError::ReceiptFromAnotherChain {
+                expected: self.genesis.clone(),
+                found: receipt.chain.clone(),
+            });
+        }
+        let seq_key = i64::try_from(receipt.seq).map_err(|_| LedgerError::SeqOutOfRange)?;
         let payload = serde_json::json!({
             "intent_seq": receipt.seq,
             "intent_hash": receipt.hash,
             "outcome": outcome,
         });
-        self.append(&NewEvent {
-            kind,
-            ts_ms,
-            agent_id,
-            payload: &payload,
-            snapshot: None,
-        })
+
+        let mut guard = self.lock()?;
+        let transaction = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let found: Option<String> = transaction
+            .query_row(
+                "SELECT hash FROM events WHERE seq = ?1",
+                params![seq_key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match found {
+            None => return Err(LedgerError::NoSuchEvent(receipt.seq)),
+            // The row hash commits to the kind, so a matching hash is also
+            // proof the row is the order intent the receipt was issued for.
+            Some(found) if found != receipt.hash => {
+                return Err(LedgerError::ReceiptRowMismatch {
+                    seq: receipt.seq,
+                    expected: receipt.hash.clone(),
+                    found,
+                });
+            }
+            Some(_) => {}
+        }
+        let appended = append_in_tx(
+            &transaction,
+            &NewEvent {
+                kind,
+                ts_ms,
+                agent_id: Some(&receipt.agent_id),
+                payload: &payload,
+                snapshot: None,
+            },
+        )?;
+        transaction.commit()?;
+        self.note_head(&appended)?;
+        Ok(appended)
     }
 
     /// Read a page of events after `since_seq`.
@@ -687,9 +914,76 @@ impl Ledger {
     ///
     /// `docs/spec.md` item 29. Run on export and behind the "chain broken"
     /// banner.
+    ///
+    /// Includes the anchored-head check when this ledger has an anchor, which
+    /// is what makes erasing the end of the chain evident. See [`anchor`] for
+    /// the limits of the default sidecar.
     pub fn verify(&self) -> Result<ChainReport> {
+        let anchor = match &self.anchor {
+            Some(anchor) => {
+                match anchor.load()? {
+                    Some(witnessed) => Some(witnessed),
+                    // `open_anchored` populates the anchor at open, adopting
+                    // the head when the sidecar is empty. Reading `None` here
+                    // therefore means the sidecar was REMOVED since. Folding
+                    // that into "unanchored" would be a fail-open on the one
+                    // file an attacker deletes first.
+                    None => {
+                        let guard = self.lock()?;
+                        let (head_seq, head_hash) = verify::head_of(&guard)?;
+                        return Ok(ChainReport {
+                            rows_checked: 0,
+                            head_seq,
+                            head_hash: head_hash.clone(),
+                            first_break: Some(ChainBreak {
+                                seq: head_seq,
+                                reason: BreakReason::AnchorMissing,
+                            }),
+                        });
+                    }
+                }
+            }
+            None => None,
+        };
         let guard = self.lock()?;
-        verify::walk(&guard, &self.genesis)
+        verify::walk(&guard, &self.genesis, anchor.as_ref())
+    }
+
+    /// Walk the chain against a head the caller kept elsewhere.
+    ///
+    /// For an operator checking a file against a head they wrote down, a backup
+    /// verified against the anchor of the machine that made it, or the
+    /// keychain-backed anchor of a later phase.
+    pub fn verify_against(&self, anchor: &Anchor) -> Result<ChainReport> {
+        let guard = self.lock()?;
+        verify::walk(&guard, &self.genesis, Some(anchor))
+    }
+
+    /// Record a committed head in the anchor, if there is one.
+    ///
+    /// Called after the commit, never before: an anchor that is behind the
+    /// chain only costs detection of the rows appended since, whereas an anchor
+    /// ahead of the chain is the exact signature of truncation and would report
+    /// a break every time a machine lost power mid-append.
+    ///
+    /// Every caller holds the connection lock across this call. The lock is
+    /// already the ledger's write serialiser, and letting it go first would let
+    /// two appends commit in one order and anchor in the other, leaving the
+    /// anchor pointing at the earlier of the two.
+    ///
+    /// A failure here is returned even though the row is already committed. The
+    /// alternative is a ledger that quietly stops being able to prove its own
+    /// tail, which is worse than a caller that learns its append is only
+    /// half-protected: `record_intent` failing closed means the signer is never
+    /// reached.
+    fn note_head(&self, appended: &Appended) -> Result<()> {
+        match &self.anchor {
+            Some(anchor) => anchor.store(&Anchor {
+                seq: appended.seq,
+                hash: appended.hash.clone(),
+            }),
+            None => Ok(()),
+        }
     }
 
     /// Null a payload while leaving the chain intact.
@@ -697,25 +991,35 @@ impl Ledger {
     /// `docs/decisions.md` R5 chains `hash(payload)`, so removing the payload
     /// does not touch any hash and the chain still verifies. D-e keeps the
     /// record itself forever: a gap in a hash chain is indistinguishable from
-    /// tampering, so retention deletes content, never rows. The redaction is
-    /// itself appended as a chained [`EventKind::PayloadRedacted`] event, and
-    /// verification treats an unexplained null payload as a break.
+    /// tampering, so retention deletes content, never rows. The null and the
+    /// chained [`EventKind::PayloadRedacted`] row that explains it are written
+    /// in one transaction, and [`Ledger::verify`] treats a null payload with no
+    /// chained redaction covering it as a break.
+    ///
+    /// A redaction row cannot itself be redacted. Its payload is
+    /// `{redacted_seq, reason}` — operator-authored, no agent text — so there
+    /// is no retention argument for nulling it, and nulling it would erase the
+    /// very evidence verification looks for.
     pub fn redact(&self, seq: u64, reason: &str, ts_ms: i64) -> Result<Appended> {
         let seq_key = i64::try_from(seq).map_err(|_| LedgerError::SeqOutOfRange)?;
         let mut guard = self.lock()?;
         let transaction = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
-        let already: Option<bool> = transaction
+        let existing: Option<(bool, String)> = transaction
             .query_row(
-                "SELECT payload IS NULL FROM events WHERE seq = ?1",
+                "SELECT payload IS NULL, kind FROM events WHERE seq = ?1",
                 params![seq_key],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
-        match already {
+        match existing {
             None => return Err(LedgerError::NoSuchEvent(seq)),
-            Some(true) => return Err(LedgerError::AlreadyRedacted(seq)),
-            Some(false) => {}
+            Some((true, _)) => return Err(LedgerError::AlreadyRedacted(seq)),
+            Some((false, kind)) => {
+                if kind == EventKind::PayloadRedacted.as_str() {
+                    return Err(LedgerError::RedactionIsNotRedactable(seq));
+                }
+            }
         }
 
         transaction.execute(
@@ -734,6 +1038,7 @@ impl Ledger {
             },
         )?;
         transaction.commit()?;
+        self.note_head(&appended)?;
         Ok(appended)
     }
 
@@ -742,9 +1047,41 @@ impl Ledger {
     /// Writes the chained [`EventKind::WsDisconnected`] row and the gap row in
     /// one transaction, so there is never a disconnect event without a window
     /// to reconcile.
+    ///
+    /// Idempotent per scope: a scope that already has an open gap gets that gap
+    /// back, with no second window and no second event. A flapping socket
+    /// otherwise orphaned every gap but the last — nothing closes a gap but its
+    /// own id, so the first stayed on [`Ledger::unreconciled_gaps`] and under
+    /// the staleness overlay (`docs/spec.md` item 34) permanently, while the
+    /// reconciler retried a window with no end.
     pub fn open_gap(&self, scope: &str, ts_ms: i64, note: Option<&str>) -> Result<Gap> {
         let mut guard = self.lock()?;
         let transaction = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        let open: Option<(i64, i64, i64, Option<String>)> = transaction
+            .query_row(
+                "SELECT gap_id, opened_ts_ms, open_seq, note FROM feed_gaps \
+                 WHERE scope = ?1 AND closed_ts_ms IS NULL ORDER BY gap_id ASC",
+                params![scope],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        if let Some((gap_id, opened_ts_ms, open_seq, note)) = open {
+            drop(transaction);
+            return Ok(Gap {
+                gap_id,
+                scope: scope.to_owned(),
+                opened_ts_ms,
+                closed_ts_ms: None,
+                // An open gap cannot be reconciled: mark_gap_reconciled refuses
+                // one that has no close.
+                reconciled_ts_ms: None,
+                open_seq: u64::try_from(open_seq).map_err(|_| LedgerError::SeqOutOfRange)?,
+                close_seq: None,
+                note,
+            });
+        }
+
         let payload = serde_json::json!({ "scope": scope, "note": note });
         let appended = append_in_tx(
             &transaction,
@@ -763,6 +1100,7 @@ impl Ledger {
         )?;
         let gap_id = transaction.last_insert_rowid();
         transaction.commit()?;
+        self.note_head(&appended)?;
         Ok(Gap {
             gap_id,
             scope: scope.to_owned(),
@@ -817,6 +1155,7 @@ impl Ledger {
             params![gap_id, ts_ms, close_seq],
         )?;
         transaction.commit()?;
+        self.note_head(&appended)?;
         Ok(appended)
     }
 
@@ -882,6 +1221,14 @@ impl Ledger {
     /// `docs/decisions.md` R6 is plumbing only at this phase: this writes a body
     /// and hands back `(id, hash)` for [`NewEvent::snapshot`]. What to capture,
     /// and when, is not decided here.
+    ///
+    /// An id is bound to one body for good. Re-capturing the same body is
+    /// idempotent and returns the same hash; offering a *different* body under
+    /// an id that a chained row already points at is
+    /// [`LedgerError::SnapshotBodyConflict`], not a silent replacement. R6
+    /// exists because the book at the moment an agent decided cannot be
+    /// backfilled, and an `INSERT OR REPLACE` made the chained hash decorative:
+    /// the row still named a book, and the book it named had been swapped.
     pub fn put_snapshot(
         &self,
         snapshot_id: &str,
@@ -889,19 +1236,39 @@ impl Ledger {
         coin: &str,
         body: &Value,
     ) -> Result<String> {
-        let canonical = serde_json::to_string(body)?;
+        let canonical = hash::canonical_json(body)?;
         let snapshot_hash = hash::payload_hash(canonical.as_bytes());
         let guard = self.lock()?;
         guard.execute(
-            "INSERT OR REPLACE INTO book_snapshots (snapshot_id, snapshot_hash, ts_ms, coin, body) \
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO book_snapshots (snapshot_id, snapshot_hash, ts_ms, coin, body) \
+             VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT (snapshot_id) DO NOTHING",
             params![snapshot_id, &snapshot_hash, ts_ms, coin, canonical],
         )?;
+        let stored: String = guard.query_row(
+            "SELECT snapshot_hash FROM book_snapshots WHERE snapshot_id = ?1",
+            params![snapshot_id],
+            |row| row.get(0),
+        )?;
+        if stored != snapshot_hash {
+            return Err(LedgerError::SnapshotBodyConflict {
+                snapshot_id: snapshot_id.to_owned(),
+                expected: stored,
+                found: snapshot_hash,
+            });
+        }
         Ok(snapshot_hash)
     }
 
     /// Read a snapshot body back, if it has not been pruned.
-    pub fn snapshot_body(&self, snapshot_id: &str) -> Result<Option<Value>> {
+    ///
+    /// `expected_hash` is the `snapshot_hash` from the chained row that refers
+    /// to this snapshot. The stored body is rehashed and checked against it, so
+    /// a body that was replaced after the row was chained is
+    /// [`LedgerError::SnapshotBodyConflict`] rather than an answer. Reading it
+    /// without the chained hash was the whole weakness: the hash was stored and
+    /// then never used, so a pruned-and-replaced book was served as the
+    /// decision-time book.
+    pub fn snapshot_body(&self, snapshot_id: &str, expected_hash: &str) -> Result<Option<Value>> {
         let guard = self.lock()?;
         let body: Option<String> = guard
             .query_row(
@@ -910,10 +1277,21 @@ impl Ledger {
                 |row| row.get(0),
             )
             .optional()?;
-        match body {
-            Some(text) => Ok(Some(serde_json::from_str(&text)?)),
-            None => Ok(None),
+        let Some(text) = body else {
+            return Ok(None);
+        };
+        // Rehashed from the body, never read from the `snapshot_hash` column:
+        // that column is in the same unchained table as the body and is edited
+        // by the same hand.
+        let found = hash::payload_hash(text.as_bytes());
+        if found != expected_hash {
+            return Err(LedgerError::SnapshotBodyConflict {
+                snapshot_id: snapshot_id.to_owned(),
+                expected: expected_hash.to_owned(),
+                found,
+            });
         }
+        Ok(Some(serde_json::from_str(&text)?))
     }
 
     /// Drop snapshot bodies older than `ts_ms`, returning how many went.
@@ -1015,6 +1393,30 @@ impl Ledger {
     }
 }
 
+/// The slice of the ledger an agent may hold.
+///
+/// `docs/spec.md` D6 makes `get_events` an agent-facing call served from the
+/// same `Ledger` that owns [`Ledger::redact`], [`Ledger::upsert_sub_account`]
+/// and the gap and snapshot tables. `AGENTS.md` invariant 3 says no
+/// agent-reachable path modifies the agent registry, so `oppen-mcp` is handed
+/// one of these and never a `&Ledger`: reading events is all this type can
+/// express, and the invariant becomes a compile error instead of a thing to
+/// remember in review. Operator-only Tauri commands keep the `&Ledger`.
+#[derive(Debug, Clone, Copy)]
+pub struct AgentView<'a>(&'a Ledger);
+
+impl AgentView<'_> {
+    /// Read a page of events after `since_seq`. See [`Ledger::get_events`].
+    pub fn get_events(&self, since_seq: u64, limit: usize) -> Result<EventPage> {
+        self.0.get_events(since_seq, limit)
+    }
+
+    /// Fetch one event by seq. See [`Ledger::event`].
+    pub fn event(&self, seq: u64) -> Result<Option<Event>> {
+        self.0.event(seq)
+    }
+}
+
 /// Set the pragmas the durability guarantee depends on.
 ///
 /// WAL so a reader never blocks the writer that is recording a fill, and
@@ -1094,7 +1496,11 @@ fn append_in_tx(transaction: &Transaction<'_>, event: &NewEvent<'_>) -> Result<A
     let seq = head_seq.checked_add(1).ok_or(LedgerError::SeqOutOfRange)?;
     let seq_key = i64::try_from(seq).map_err(|_| LedgerError::SeqOutOfRange)?;
 
-    let canonical = serde_json::to_string(event.payload)?;
+    // Canonicalised here rather than by `serde_json::to_string`, and here rather
+    // than in `append_committed`, so that every chained row — including the
+    // ones redact, open_gap and close_gap write directly — goes through the one
+    // encoder that sorts keys and refuses floats.
+    let canonical = hash::canonical_json(event.payload)?;
     let payload_hash = hash::payload_hash(canonical.as_bytes());
     let kind = event.kind.as_str();
     let snapshot_id = event.snapshot.map(|snapshot| snapshot.id);

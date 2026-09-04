@@ -8,8 +8,8 @@
  *
  * There is no test runner in `apps/desktop/package.json` yet. The file is written
  * against the standard `describe` / `it` / `expect` globals so it runs unchanged under
- * vitest with `globals: true`; the declarations below are what keep
- * `vue-tsc --noEmit` green until that runner is installed.
+ * vitest with `globals: true` and under `bun test`; the declarations below are what
+ * keep `vue-tsc --noEmit` green until that runner is installed.
  */
 
 import {
@@ -21,6 +21,7 @@ import {
   renderCandles,
   type Bar,
   type CandleFrame,
+  type CandleInput,
 } from "./candles";
 
 interface Matchers {
@@ -83,6 +84,51 @@ const GOLDEN_TEXT = [
   "       21:00       00:00   02:00      ",
 ];
 
+/**
+ * A second snapshot at a second scale, and deliberately BTC-shaped: 16 x 16 at
+ * `max_price_decimals` 0 with the close straddling a power of ten, so the integer digit
+ * count changes inside the gutter. Row 4's gutter is `" 99990"` — one blank cell where a
+ * partial right-aligned write would have left the `1` of the `100000` tick label and
+ * printed `199990`. One golden at one size cannot see that; two at two can.
+ */
+const WIDE_TEXT = [
+  "· · · · · · · · · · · · · · · · · · · · · · · · · · +++ +++ :::  100500",
+  "                                                +++ +++     :::        ",
+  "· · · · · · · · · · · · · · · · · · · · · · +++ +++ · · · · :::  100250",
+  "                                        +++ +++             :::        ",
+  "· · · · · · · · · · · · · · · · ·│· +++ +++ · · · · · · · · :::◄  99990",
+  "                             │  +╥+ +++                                ",
+  "· · · · · · · · · · · · +++ +╨+ +++ · · · · · · · · · · · · · ·   99750",
+  "                    +++ +╨+  │                                         ",
+  "                +++ +++  │                                             ",
+  "· · · · · · +++ +++ · · · · · · · · · · · · · · · · · · · · · ·   99500",
+  "        +++ +++                                                        ",
+  "· · +++ +++ · · · · · · · · · · · · · · · · · · · · · · · · · ·   99250",
+  "    +++                                                                ",
+  "─────┴───────────┴───────┴───────┴───────┴───────┴───────────┴──       ",
+  "    ▁▁▁ ▁▁▁ ▂▂▂ ▂▂▂ ▂▂▂ ▂▂▂ ▂▂▂ ▂▂▂ ▂▂▂ ▂▂▂ ▂▂▂ ▂▂▂ ▂▂▂ ▂▂▂ ▁▁▁        ",
+  "   09:00       12:00   14:00   16:00   18:00   20:00       23:00       ",
+];
+
+const WIDE_INK = [
+  "r r r r r r r r r r r r r r r r r r r r r r r r r r uuu uuu ddd  llllll",
+  "                                                uuu uuu     ddd        ",
+  "r r r r r r r r r r r r r r r r r r r r r r uuu uuu r r r r ddd  llllll",
+  "                                        uuu uuu             ddd        ",
+  "r r r r r r r r r r r r r r r r rur uuu uuu r r r r r r r r dddk  kkkkk",
+  "                             u  uuu uuu                                ",
+  "r r r r r r r r r r r r uuu uuu uuu r r r r r r r r r r r r r r   lllll",
+  "                    uuu uuu  u                                         ",
+  "                uuu uuu  u                                             ",
+  "r r r r r r uuu uuu r r r r r r r r r r r r r r r r r r r r r r   lllll",
+  "        uuu uuu                                                        ",
+  "r r uuu uuu r r r r r r r r r r r r r r r r r r r r r r r r r r   lllll",
+  "    uuu                                                                ",
+  "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr       ",
+  "    vvv vvv vvv vvv vvv vvv vvv vvv vvv vvv vvv vvv vvv vvv vvv        ",
+  "   lllll       lllll   lllll   lllll   lllll   lllll       lllll       ",
+];
+
 const GOLDEN_INK = [
   "r r r r r r r r rurrrdr r r r r    lll",
   "r r r r r r rdr uuurddd r r r r    lll",
@@ -97,6 +143,47 @@ const GOLDEN_INK = [
   "        vvv vvv vvv vvv vvv vvv       ",
   "       lllll       lllll   lllll      ",
 ];
+
+/** The price gutter: every column right of the plot and its one blank separator. */
+function gutter(frame: CandleFrame, y: number, cols: number): { text: string; ink: string } {
+  const start = cols * 4 + 1;
+  return { text: frame.text[y].slice(start), ink: frame.ink[y].slice(start) };
+}
+
+/** A rising ladder of bars between `from` and `to`, one per hour. */
+function ladder(from: number, to: number, count: number): Bar[] {
+  const out: Bar[] = [];
+  const stepUp = (to - from) / Math.max(1, count - 1);
+  for (let i = 0; i < count; i += 1) {
+    const open = from + stepUp * i;
+    const close = i === count - 1 ? to : from + stepUp * (i + 1);
+    out.push({
+      time: Date.UTC(2026, 8, 2, 9, 0, 0) + i * HOUR,
+      open,
+      high: Math.max(open, close) + 20,
+      low: Math.min(open, close) - 20,
+      close,
+      volume: 10 + i,
+    });
+  }
+  return out;
+}
+
+/**
+ * `closed` wrapped so every index read is counted. `specs/charts.md` §2.5 requires the
+ * per-tick cost to track what is drawn, not what is backfilled, and `decisions.md` D-d
+ * puts 30 days in the foreground — 43,200 bars at 1m behind a 120-column plot.
+ */
+function countingBars(bars: readonly Bar[]): { closed: readonly Bar[]; reads: () => number } {
+  let reads = 0;
+  const proxy = new Proxy(bars as Bar[], {
+    get(target, key, receiver) {
+      if (typeof key === "string" && /^[0-9]+$/.test(key)) reads += 1;
+      return Reflect.get(target, key, receiver) as unknown;
+    },
+  });
+  return { closed: proxy as readonly Bar[], reads: () => reads };
+}
 
 /** Every cell whose ink is a candle's, i.e. a body, a wick or a cap. */
 function candleCells(frame: CandleFrame): Array<{ x: number; y: number; char: string }> {
@@ -124,6 +211,31 @@ describe("renderCandles", () => {
     expect(frame.height).toBe(12);
     expect(frame.text).toEqual(GOLDEN_TEXT);
     expect(frame.ink).toEqual(GOLDEN_INK);
+  });
+
+  it("matches the wide BTC-shaped golden frame", () => {
+    const bars = ladder(99100, 100500, 14);
+    bars.push({
+      time: Date.UTC(2026, 8, 2, 23, 0, 0),
+      open: 100500,
+      high: 100500,
+      low: 99990,
+      close: 99990,
+      volume: 5,
+    });
+    const frame = renderCandles({
+      closed: bars,
+      forming: null,
+      cols: 16,
+      rows: 16,
+      intervalMs: HOUR,
+      priceDecimals: 0,
+      tzOffsetMinutes: 0,
+    });
+    expect(frame.width).toBe(71);
+    expect(frame.height).toBe(16);
+    expect(frame.text).toEqual(WIDE_TEXT);
+    expect(frame.ink).toEqual(WIDE_INK);
   });
 
   it("keeps every row the same width so two frames diff row by row", () => {
@@ -276,6 +388,119 @@ describe("renderCandles", () => {
     expect(utc.text[utc.height - 1]).toContain("21:00");
     expect(shifted.text[shifted.height - 1]).toContain("22:00");
   });
+
+  /**
+   * The whole class, not one instance: a right-aligned gutter write that is shorter
+   * than what already sits in that field leaves the old leading characters in place and
+   * prints a price that does not exist. BTC at `max_price_decimals` 0 straddling a
+   * power of ten is where the digit count changes inside one row.
+   */
+  it("never splices a shorter gutter label onto a longer one", () => {
+    for (let last = 99940; last <= 100060; last += 1) {
+      const bars = ladder(99100, 100500, 7);
+      bars.push({
+        time: Date.UTC(2026, 8, 2, 16, 0, 0),
+        open: 100500,
+        high: 100500,
+        low: last,
+        close: last,
+        volume: 5,
+      });
+      const frame = renderCandles({
+        closed: bars,
+        forming: null,
+        cols: 8,
+        rows: 12,
+        intervalMs: HOUR,
+        priceDecimals: 0,
+        tzOffsetMinutes: 0,
+      });
+      for (let y = 0; y < frame.height; y += 1) {
+        const cell = gutter(frame, y, 8);
+        // No gutter row may carry two inks: one label per row, whole.
+        expect(cell.ink.indexOf(INK.label) >= 0 && cell.ink.indexOf(INK.last) >= 0).toBe(false);
+        // And whatever it carries must be exactly the number, with nothing spliced on.
+        if (cell.ink.indexOf(INK.last) >= 0) expect(cell.text.trim()).toBe(String(last));
+      }
+    }
+  });
+
+  it("never throws or loses row alignment on a hostile grid size", () => {
+    const hostile = [0, 1, -1, NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, 1e300, Number.MAX_SAFE_INTEGER];
+    for (const cols of hostile) {
+      for (const rows of hostile) {
+        const frame = renderCandles({ ...fixture(), cols, rows });
+        expect(Number.isFinite(frame.width) && frame.width >= 0).toBe(true);
+        expect(frame.text.length).toBe(frame.height);
+        expect(frame.ink.length).toBe(frame.height);
+        for (let y = 0; y < frame.height; y += 1) {
+          expect(frame.text[y].length).toBe(frame.width);
+          expect(frame.ink[y].length).toBe(frame.width);
+        }
+      }
+    }
+  });
+
+  it("holds row alignment at the specs/charts.md §2.5 reference size of 120 x 44", () => {
+    const frame = renderCandles({ ...fixture(), closed: ladder(98, 110, 300), forming: null, cols: 120, rows: 44 });
+    expect(frame.height).toBe(44);
+    for (let y = 0; y < frame.height; y += 1) {
+      expect(frame.text[y].length).toBe(frame.width);
+      expect(frame.ink[y].length).toBe(frame.width);
+    }
+  });
+
+  /** §2.2 wants four to eight gridlines in the visible range, flat window included. */
+  it("keeps a real price axis and a centred body when the window is flat", () => {
+    const flat: Bar[] = [];
+    for (let i = 0; i < 6; i += 1) {
+      flat.push({ time: Date.UTC(2026, 8, 2, 9, 0, 0) + i * HOUR, open: 100, high: 100, low: 100, close: 100, volume: 1 });
+    }
+    const frame = renderCandles({ ...fixture(), closed: flat, forming: null });
+    const labelled = frame.ink.filter((row) => row.indexOf(INK.label) >= 0).length;
+    expect(labelled).toBeGreaterThanOrEqual(4);
+    const bodyRows = frame.text.map((row, y) => ({ row, y })).filter((r) => r.row.indexOf("+") >= 0);
+    expect(bodyRows.length).toBe(1);
+    // Nine plot rows, so the centre is row 4, not the floor at row 8.
+    expect(bodyRows[0].y).toBe(4);
+  });
+
+  it("names why a frame is blank instead of returning indistinguishable blankness", () => {
+    expect(renderCandles(fixture()).status).toBe("ok");
+    expect(renderCandles({ ...fixture(), closed: [], forming: null }).status).toBe("no_bars");
+    const dirty = renderCandles({
+      ...fixture(),
+      closed: [{ time: START, open: NaN, high: NaN, low: NaN, close: NaN, volume: NaN }],
+      forming: null,
+    });
+    expect(dirty.status).toBe("no_finite_bars");
+    expect(renderCandles({ ...fixture(), rows: 3 }).status).toBe("grid_too_small");
+    expect(renderCandles({ ...fixture(), cols: 1 }).status).toBe("grid_too_small");
+  });
+
+  /**
+   * §2.5 again: 43,200 closed bars behind a 120-column plot must cost 120 bars of work,
+   * not 43,200, because this runs on the 90 ms clock.
+   */
+  it("reads only the bars it draws, not the whole backfill", () => {
+    const backfill = ladder(98, 110, 43_200);
+    const counted = countingBars(backfill);
+    const input: CandleInput = {
+      closed: counted.closed,
+      forming: null,
+      cols: 120,
+      rows: 44,
+      intervalMs: MINUTE,
+      priceDecimals: 2,
+      tzOffsetMinutes: 0,
+    };
+    const frame = renderCandles(input);
+    expect(counted.reads()).toBeLessThanOrEqual(600);
+    // And the frame is the one the whole-array walk would have produced.
+    const reference = renderCandles({ ...input, closed: backfill });
+    expect(frame.text).toEqual(reference.text);
+    expect(frame.ink).toEqual(reference.ink);
+  });
 });
 
 describe("niceTickStep", () => {
@@ -321,6 +546,52 @@ describe("createCandleRenderer", () => {
     const fresh = renderCandles(fixture());
     expect(reused.text).toEqual(fresh.text);
     expect(reused.ink).toEqual(fresh.ink);
+  });
+
+  /**
+   * §2.5's whole point: an unchanged frame is the common case between trades and must be
+   * cheaper than a changed one. Rebuilding every row string before asking whether
+   * anything moved makes the two cost the same. The bound is a ratio against this
+   * machine's own changed-tick cost, so it does not depend on how fast the machine is.
+   */
+  it("makes an unchanged tick cheaper than a changed one", () => {
+    const closed = ladder(98, 110, 400);
+    const base: CandleInput = {
+      closed,
+      forming: null,
+      cols: 120,
+      rows: 44,
+      intervalMs: MINUTE,
+      priceDecimals: 2,
+      tzOffsetMinutes: 0,
+    };
+    const renderer = createCandleRenderer();
+    renderer.render(base);
+
+    const bestOf = (body: () => void): number => {
+      let best = Number.POSITIVE_INFINITY;
+      for (let trial = 0; trial < 9; trial += 1) {
+        const started = performance.now();
+        for (let i = 0; i < 50; i += 1) body();
+        const each = (performance.now() - started) / 50;
+        if (each < best) best = each;
+      }
+      return best;
+    };
+
+    const unchanged = bestOf(() => {
+      renderer.render(base);
+    });
+    let n = 0;
+    const changed = bestOf(() => {
+      n += 1;
+      const close = 104 + (n % 17) * 0.01;
+      renderer.render({
+        ...base,
+        forming: { time: Date.UTC(2026, 8, 3, 0, 0, 0), open: 104, high: 105, low: 103, close, volume: 1 },
+      });
+    });
+    expect(unchanged).toBeLessThanOrEqual(changed * 0.8);
   });
 });
 

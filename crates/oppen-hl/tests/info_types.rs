@@ -13,7 +13,7 @@ fn meta_and_asset_ctxs() {
     assert_eq!(sol.funding.to_string(), "0.0000125");
     assert_eq!(sol.impact_pxs.as_ref().unwrap()[0].to_string(), "104.7452");
     assert_eq!(sol.mid_px.unwrap().to_string(), "104.985");
-    let u = Universe::from_meta(&meta);
+    let u = Universe::from_meta(&meta).expect("validator dex");
     assert_eq!(u.len(), 4);
 }
 
@@ -90,14 +90,61 @@ fn open_orders() {
     assert!(orders[0].cloid.is_none());
 }
 
+/// `docs/specs/fair-value.md` §14.5: `HlPerp.nextFundingTime` names a
+/// boundary that has **already passed**, identically for every coin, so
+/// `now >= next_funding_time` fires forever. `> 0` passed on that unusable
+/// value; this pins the defect instead.
+///
+/// The session clock is `fixtures/l2Book.json`'s `time`, captured alongside
+/// these rows, so nothing here depends on when the test runs.
 #[test]
 fn predicted_fundings_pick_hyperliquid() {
     let rows: Vec<PredictedFundings> =
         serde_json::from_str(include_str!("fixtures/predictedFundings.json")).unwrap();
+    let book: L2Book = serde_json::from_str(include_str!("fixtures/l2Book.json")).unwrap();
+    let captured_at_ms = book.time;
+
     let btc = rows.iter().find(|r| r.coin() == "BTC").unwrap();
     let hl = btc.hyperliquid().unwrap();
     assert_eq!(hl.funding_interval_hours, Some(1));
-    assert!(hl.next_funding_time > 0);
+
+    let boundary = hl
+        .next_funding_time
+        .venue_reported_boundary_ms_do_not_compare_to_now();
+    assert!(
+        boundary < captured_at_ms,
+        "the venue's 'next' hourly boundary {boundary} is not in the future at {captured_at_ms}"
+    );
+    let behind_s = (captured_at_ms - boundary) / 1_000;
+    assert_eq!(behind_s, 1_783, "1,783 s in the past, not a countdown");
+
+    // Identical across every coin, which a real per-coin boundary would not
+    // be — and the CEX rows on the same payload do point forward.
+    let hl_boundaries: Vec<u64> = rows
+        .iter()
+        .filter_map(|row| row.hyperliquid())
+        .map(|f| {
+            f.next_funding_time
+                .venue_reported_boundary_ms_do_not_compare_to_now()
+        })
+        .collect();
+    assert!(hl_boundaries.len() > 1);
+    assert!(hl_boundaries.iter().all(|b| *b == boundary));
+    let binance = btc
+        .1
+        .iter()
+        .find(|(venue, _)| venue == "BinPerp")
+        .and_then(|(_, f)| f.as_ref())
+        .unwrap()
+        .next_funding_time
+        .venue_reported_boundary_ms_do_not_compare_to_now();
+    assert!(binance > captured_at_ms, "BinPerp points forward");
+
+    // The countdown the UI shows is derived from the clock instead: the
+    // boundary the venue called "next" is the one 1,783 s behind us, so the
+    // real countdown at that instant is 3600 − 1783.
+    assert_eq!(next_funding_s_from_ms(captured_at_ms), 1_817);
+    assert_eq!(boundary / 1_000 % 3_600, 0, "it is a real hourly boundary");
 }
 
 #[test]

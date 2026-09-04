@@ -6,7 +6,7 @@ use std::collections::HashMap;
 
 use rust_decimal::Decimal;
 
-use crate::types::{AssetCtx, AssetInfo, Meta};
+use crate::types::{AssetInfo, Meta};
 
 /// Perp prices: 5 significant figures and at most `6 - szDecimals`
 /// decimals. Spot would be 8; v1 is perps only.
@@ -17,6 +17,14 @@ pub const MIN_NOTIONAL_USD: Decimal = Decimal::from_parts(10, 0, 0, false, 0);
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ValidationError {
+    /// A builder-deployed (HIP-3) universe was handed to the validator-dex
+    /// path, where the array position would be signed as the asset id. v1 is
+    /// the validator dex only — see [`Universe::from_meta`].
+    #[error(
+        "{0:?} is a builder-deployed (HIP-3) asset; v1 trades the validator dex only, and its \
+         asset ids are numbered differently (docs/hl-signing.md \u{a7}6)"
+    )]
+    BuilderDeployedDex(String),
     #[error("unknown asset {0:?}")]
     UnknownAsset(String),
     #[error("asset {0:?} is delisted")]
@@ -53,30 +61,6 @@ impl Asset {
 
     pub fn max_price_decimals(&self) -> u32 {
         PERP_MAX_DECIMALS.saturating_sub(self.info.sz_decimals)
-    }
-
-    /// Whether this asset can be traded right now, judged by the only
-    /// invariant the live API supports: it has a book.
-    ///
-    /// `docs/specs/fair-value.md` §14.4 correction 2 — the invariant is
-    /// `ctx.openInterest == 0` for "has no book", holding on 233/233 mainnet
-    /// assets on 2026-09-03. **It is not `isDelisted`.** Testnet PURR carries
-    /// no `isDelisted` flag, zero open interest and `premium`/`midPx`/
-    /// `impactPxs` all `null`; a caller gated on `isDelisted` would treat it
-    /// as live and build components from nothing. The two agree on mainnet
-    /// today (56 delisted, the same 56 nulled), which is exactly why a test
-    /// written against mainnet alone would not catch the difference.
-    ///
-    /// `isDelisted` remains a separate, stronger fact — the venue will refuse
-    /// the order outright — and [`Asset::validate_order`] still rejects on it.
-    /// This method answers a different question: whether a price can be
-    /// formed at all.
-    ///
-    /// The `ctx` must be the one at this asset's index; see
-    /// [`crate::types::MetaAndAssetCtxs::iter`], which pairs them and
-    /// preserves the on-chain asset id.
-    pub fn is_tradable(&self, ctx: &AssetCtx) -> bool {
-        ctx.has_book()
     }
 
     /// The SDK's market-order price: 5 significant figures, then at most
@@ -172,8 +156,29 @@ impl Universe {
     /// `docs/specs/fair-value.md` §14.4 correction 2). Dropping the 56
     /// bookless mainnet assets here would renumber every asset after the
     /// first one dropped and send orders to the wrong instrument. Filter at
-    /// the point of use with [`Asset::is_tradable`].
-    pub fn from_meta(meta: &Meta) -> Self {
+    /// the point of use on the paired ctx —
+    /// [`crate::types::AssetCtx::can_build_micro`],
+    /// [`crate::types::AssetCtx::can_build_carry`] or
+    /// [`crate::types::AssetCtx::has_book`] — which
+    /// [`crate::types::MetaAndAssetCtxs::iter`] hands you already paired, so
+    /// an asset can never be judged against another asset's context.
+    /// Builds a universe from a **validator-dex** `meta` response.
+    ///
+    /// Refuses a builder-deployed (HIP-3) response. On the validator dex the
+    /// array position is the on-chain asset id, but a HIP-3 asset's id is
+    /// `100000 + dex_index * 10000 + index` (`docs/hl-signing.md` §6), so
+    /// signing an order against the raw position would name a completely
+    /// different instrument — position 1 is ETH on the validator dex.
+    ///
+    /// The fence is total and free, because the venue prefixes every HIP-3
+    /// asset with its dex: a mainnet `{"type":"meta","dex":"xyz"}` names its
+    /// assets `xyz:TSLA`, `xyz:NVDA`. Anything carrying a colon is refused
+    /// rather than mis-numbered. v1 is the validator dex only
+    /// (`docs/specs/fair-value.md` §14.4 correction 15).
+    pub fn from_meta(meta: &Meta) -> Result<Self, ValidationError> {
+        if let Some(prefixed) = meta.universe.iter().find(|info| info.name.contains(':')) {
+            return Err(ValidationError::BuilderDeployedDex(prefixed.name.clone()));
+        }
         let by_name = meta
             .universe
             .iter()
@@ -188,7 +193,7 @@ impl Universe {
                 )
             })
             .collect();
-        Universe { by_name }
+        Ok(Universe { by_name })
     }
 
     pub fn get(&self, coin: &str) -> Result<&Asset, ValidationError> {
@@ -295,10 +300,30 @@ mod tests {
         ));
     }
 
+    /// The signed asset id, not merely a doc comment. A HIP-3 universe must
+    /// never reach `from_meta`, because position 1 there would be signed as
+    /// asset 1 — which is ETH on the validator dex. Names captured from the
+    /// live mainnet `{"type":"meta","dex":"xyz"}` on 2026-09-04.
+    #[test]
+    fn a_builder_dex_universe_is_refused_rather_than_misnumbered() {
+        let meta: Meta = serde_json::from_str(
+            r#"{"universe":[
+                {"name":"xyz:XYZ100","szDecimals":4,"maxLeverage":5,"marginTableId":5},
+                {"name":"xyz:TSLA","szDecimals":2,"maxLeverage":5,"marginTableId":5},
+                {"name":"xyz:NVDA","szDecimals":2,"maxLeverage":5,"marginTableId":5}
+            ]}"#,
+        )
+        .expect("hip-3 meta parses");
+        match Universe::from_meta(&meta) {
+            Err(ValidationError::BuilderDeployedDex(name)) => assert_eq!(name, "xyz:XYZ100"),
+            other => panic!("a HIP-3 universe must be refused, got {other:?}"),
+        }
+    }
+
     #[test]
     fn universe_assigns_indexes_in_meta_order() {
         let meta: Meta = serde_json::from_str(include_str!("../tests/fixtures/meta.json")).unwrap();
-        let u = Universe::from_meta(&meta);
+        let u = Universe::from_meta(&meta).expect("validator dex");
         assert_eq!(u.get("SOL").unwrap().index, 0);
         assert_eq!(u.get("BTC").unwrap().index, 1);
         assert_eq!(u.get("BTC").unwrap().sz_decimals(), 5);
@@ -335,29 +360,31 @@ mod tests {
     }
 
     /// The invariant is open interest, not `isDelisted`.
+    ///
+    /// The judgement is made on the ctx alone. `Asset::is_tradable(&self,
+    /// ctx)` used to forward here, and its `&self` bought nothing except the
+    /// ability to pass a mismatched pair — which this test itself used to do,
+    /// asking a fabricated `asset(2)` about PURR's context. There is no
+    /// `Asset` in this test now because there is nothing an `Asset` could
+    /// contribute to the answer.
     #[test]
-    fn tradability_is_open_interest_not_is_delisted() {
+    fn book_presence_is_open_interest_not_is_delisted() {
         let (purr, ctx) = pair(TESTNET_PURR);
         assert!(!purr.info.is_delisted, "PURR carries no isDelisted flag");
         assert!(
-            !purr.is_tradable(&ctx),
+            !ctx.has_book(),
             "zero open interest means no book, whatever isDelisted says"
         );
+        assert!(!ctx.can_build_micro() && !ctx.can_build_carry());
         assert_eq!(ctx.premium, None);
         assert_eq!(ctx.mid_px_no_fallback(), None);
 
-        // A delisted asset with the same zero open interest agrees.
-        let mut gone = asset(2);
-        gone.info.is_delisted = true;
-        assert!(!gone.is_tradable(&ctx));
-
-        // And a real book makes a live asset tradable.
-        let btc = asset(5);
+        // A real book, and both components constructible.
         let live: crate::types::AssetCtx = serde_json::from_str(
             r#"{"funding":"0.0000052764","openInterest":"36295.80812","prevDayPx":"77759.0","dayNtlVlm":"4490636711.43","premium":"-0.0005540084","oraclePx":"80684.7","markPx":"80639.0","midPx":"80639.5","impactPxs":["80635.5","80640.0"]}"#,
         )
         .unwrap();
-        assert!(btc.is_tradable(&live));
+        assert!(live.has_book() && live.can_build_micro() && live.can_build_carry());
     }
 
     /// The three nullable fields are not co-null in practice: SAGA has open
@@ -365,18 +392,20 @@ mod tests {
     /// not imply the §3.1 premium inputs exist.
     #[test]
     fn a_book_does_not_guarantee_impact_prices() {
-        let (saga, ctx) = pair(TESTNET_SAGA);
-        assert!(saga.is_tradable(&ctx), "SAGA has 1,146,084 open interest");
+        let (_saga, ctx) = pair(TESTNET_SAGA);
+        assert!(ctx.has_book(), "SAGA has 1,146,084 open interest");
+        assert!(ctx.can_build_micro());
+        assert!(!ctx.can_build_carry(), "carry is unconstructible here");
         assert!(ctx.mid_px_no_fallback().is_some());
         assert_eq!(ctx.premium, None);
-        assert_eq!(ctx.impact_pxs, None, "carry is unconstructible here");
+        assert_eq!(ctx.impact_pxs, None);
     }
 
     /// Filtering must never renumber: the asset id is the array position.
     #[test]
     fn bookless_assets_keep_their_asset_id() {
         let meta: Meta = serde_json::from_str(include_str!("../tests/fixtures/meta.json")).unwrap();
-        let u = Universe::from_meta(&meta);
+        let u = Universe::from_meta(&meta).expect("validator dex");
         assert_eq!(
             u.len(),
             meta.universe.len(),

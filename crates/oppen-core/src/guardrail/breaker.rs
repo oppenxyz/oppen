@@ -129,6 +129,7 @@ mod tests {
             day_start_ms: 0,
             total_position_notional_usd: Decimal::ZERO,
             positions: Default::default(),
+            resting: Some(crate::guardrail::RestingExposure::none()),
         }
     }
 

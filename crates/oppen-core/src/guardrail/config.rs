@@ -29,6 +29,19 @@ pub const DEFAULT_MAX_LEVERAGE: u32 = 1;
 pub const DEFAULT_MARK_DIVERGENCE_BPS: Decimal = Decimal::from_parts(5, 0, 0, false, 0);
 /// `docs/specs/fair-value.md` §9: `mark_divergence_window_s`, in ms.
 pub const DEFAULT_MARK_DIVERGENCE_WINDOW_MS: u64 = 30_000;
+/// How long an approval proposal stays valid (spec item 28: proposals carry
+/// a TTL and auto-expire). Two minutes: long enough for an operator to look
+/// at a queued order, short enough that approving one is still a decision
+/// about roughly the current market rather than about a stale one. The order
+/// is re-evaluated in full against fresh data at approval time anyway, so an
+/// expiry is a convenience for the operator, not the safety property.
+pub const APPROVAL_TTL_MS: u64 = 120_000;
+/// Longest agent `reason` string accepted, in bytes.
+///
+/// Refusal rows are kept forever (D-e) and a refusal costs no rate token, so
+/// an unbounded reason is unlimited free writes into an append-only
+/// hash-chained store. 2 KiB is far more than a sentence explaining a trade.
+pub const MAX_REASON_BYTES: usize = 2_048;
 
 /// Token-bucket shape for spec item 24's order-rate cap: `count` orders per
 /// `per_ms` milliseconds. `docs/specs/workflows.md` §7 writes it as
@@ -38,6 +51,61 @@ pub const DEFAULT_MARK_DIVERGENCE_WINDOW_MS: u64 = 30_000;
 pub struct OrderRate {
     pub count: u32,
     pub per_ms: u64,
+}
+
+/// Spec item 10's address-level request budget, which item 24 calls "the
+/// global budget" alongside the per-agent order-rate cap.
+///
+/// Hyperliquid meters requests per **address**, not per agent: a 10,000
+/// request initial buffer, then one request per 1 USDC traded, and otherwise
+/// one request per ten seconds. Every agent under the master shares it, so a
+/// per-agent cap cannot bound it and a budget this engine does not model is a
+/// budget nothing enforces before the venue rejects — and a venue rejection
+/// has already consumed a nonce.
+///
+/// Not persisted. The live figure comes from `userRateLimit` on every
+/// reconnect, so a stored copy would only ever be a stale one; the default
+/// below is item 10's documented shape, used until the first live reading.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GlobalRateBudget {
+    /// `count` requests per `per_ms`. The default is item 10 verbatim: a
+    /// 10,000 request buffer refilling at one per ten seconds.
+    pub rate: OrderRate,
+    /// Requests kept back for risk-reducing actions (item 10: "always reserve
+    /// headroom for risk-reducing actions"). An order is refused once the
+    /// remaining budget is at or below this; a cancel still goes through and
+    /// is charged, because a budget must never be the reason a cancel does
+    /// not happen.
+    pub reserve: u32,
+}
+
+impl GlobalRateBudget {
+    /// Rejects a budget that cannot be evaluated, in the same shape
+    /// [`AgentGuardrails::validate`] uses.
+    pub fn validate(&self) -> Result<(), (&'static str, String)> {
+        if self.rate.per_ms == 0 {
+            return Err(("global_rate.rate.per_ms", "must be positive".to_owned()));
+        }
+        if self.reserve >= self.rate.count {
+            return Err((
+                "global_rate.reserve",
+                "must be below the budget it reserves from".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Default for GlobalRateBudget {
+    fn default() -> Self {
+        GlobalRateBudget {
+            rate: OrderRate {
+                count: 10_000,
+                per_ms: 100_000_000,
+            },
+            reserve: 100,
+        }
+    }
 }
 
 /// Margin mode, operator-set per symbol (D3). Present so an agent can read

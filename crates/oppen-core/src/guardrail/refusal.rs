@@ -39,6 +39,18 @@ pub enum Refusal {
     #[error("the order carries no reason; spec item 19 requires one")]
     MissingReason,
 
+    /// The reason is kept forever (D-e) and costs no rate token, so an
+    /// unbounded one is unlimited free writes into the append-only chained
+    /// ledger. Bounded at ingestion; invariant 9 covers only rendering.
+    #[error("the reason is {len_bytes} bytes, past the {max_bytes}-byte limit")]
+    ReasonTooLong { len_bytes: usize, max_bytes: usize },
+
+    /// Item 30 renders the reason as inert plain text, but U1 and P4 put it
+    /// on a character grid where an ANSI escape or a C0 byte is not inert at
+    /// all. Newline and tab are the only control characters a sentence needs.
+    #[error("the reason contains control character U+{codepoint:04X} at byte {at_byte}")]
+    ReasonControlCharacter { at_byte: usize, codepoint: u32 },
+
     /// Spec item 24, symbol allowlist. `allowed` is empty for a freshly
     /// paired agent (D-c), which is the intended first refusal.
     #[error("{symbol} is not on this agent's allowlist ({})", fmt_list(.allowed))]
@@ -57,12 +69,17 @@ pub enum Refusal {
     },
 
     /// Spec item 24, max position size. `observed_usd` is the notional the
-    /// position would hold *after* this order fills, valued at the reference
-    /// price.
-    #[error("post-fill position ${observed_usd} on {symbol} exceeds the ${limit_usd} cap")]
+    /// position would hold *after* this order and every working order on the
+    /// symbol fills, valued at the reference price. `resting_usd` is how much
+    /// of it is working rather than filled, so an agent that is over the cap
+    /// because of its own book is told to cancel rather than left guessing.
+    #[error(
+        "post-fill position ${observed_usd} on {symbol} (${resting_usd} of it resting) exceeds the ${limit_usd} cap"
+    )]
     PositionNotional {
         symbol: String,
         observed_usd: Decimal,
+        resting_usd: Decimal,
         limit_usd: Decimal,
     },
 
@@ -73,6 +90,21 @@ pub enum Refusal {
         limit: u32,
         window_ms: u64,
         tokens_available: Decimal,
+        retry_after_ms: u64,
+    },
+
+    /// Spec item 10's address-wide request budget, which item 24 calls "the
+    /// global budget". Distinct from [`Refusal::OrderRate`] because the fix
+    /// is different: the agent's own cap is untouched and every agent under
+    /// the master is sharing one venue budget. `reserve` is the headroom held
+    /// back for risk-reducing actions, which is why an order is refused above
+    /// zero.
+    #[error(
+        "the account request budget is down to {tokens_available} against a {reserve} reserve, retry in {retry_after_ms}ms"
+    )]
+    GlobalRateBudget {
+        tokens_available: Decimal,
+        reserve: u32,
         retry_after_ms: u64,
     },
 
@@ -137,15 +169,22 @@ pub enum Refusal {
     #[error("venue rule: {0}")]
     VenueRule(VenueRule),
 
-    /// Spec item 28. Not a denial: every hard predicate has already passed
-    /// and the order-rate token has already been spent. `oppen-mcp` turns
-    /// this into `{status: pending_approval, approval_id, expires_at}` and
-    /// the operator's decision re-enters through the same
-    /// [`super::GuardrailEngine::evaluate`] with the approval attached.
-    #[error("approval required for a ${notional_usd} order on {symbol}")]
+    /// Spec item 28. Not a denial: every hard predicate has already passed,
+    /// the order-rate token has already been spent, and the engine has minted
+    /// and is holding a proposal. `oppen-mcp` renders this verbatim as
+    /// `{status: pending_approval, approval_id, expires_at}`.
+    ///
+    /// `approval_id` names a proposal the **engine** stores. It is a receipt,
+    /// not a credential: presenting it back only tells the engine which of
+    /// its own stored intents to re-evaluate, and only
+    /// [`super::GuardrailEngine::operator_approve_proposal`] — an
+    /// operator-only path, `AGENTS.md` invariant 3 — accepts it.
+    #[error("approval required for a ${notional_usd} order on {symbol} (proposal {approval_id})")]
     ApprovalRequired {
         symbol: String,
         notional_usd: Decimal,
+        approval_id: String,
+        expires_at_ms: u64,
     },
 
     /// Fail-closed. The engine could not establish whether a limit was
@@ -210,12 +249,19 @@ pub enum VenueRule {
     /// decimals, or a malformed cloid (`docs/hl-signing.md` §4).
     #[error("{detail}")]
     Unrepresentable { detail: String },
+    /// The asset belongs to a builder-deployed (HIP-3) dex. v1 trades the
+    /// validator dex only, and HIP-3 asset ids are numbered differently, so
+    /// signing against a HIP-3 universe would name the wrong instrument
+    /// (`docs/specs/fair-value.md` §14.4 correction 15).
+    #[error("{symbol} is on a builder-deployed dex; v1 trades the validator dex only")]
+    BuilderDeployedDex { symbol: String },
 }
 
 impl From<ValidationError> for VenueRule {
     fn from(e: ValidationError) -> Self {
         match e {
             ValidationError::UnknownAsset(symbol) => VenueRule::UnknownAsset { symbol },
+            ValidationError::BuilderDeployedDex(symbol) => VenueRule::BuilderDeployedDex { symbol },
             ValidationError::Delisted(symbol) => VenueRule::Delisted { symbol },
             ValidationError::NonPositivePrice(px) => VenueRule::NonPositivePrice { px },
             ValidationError::NonPositiveSize(sz) => VenueRule::NonPositiveSize { sz },
@@ -337,6 +383,14 @@ pub enum Unevaluable {
     #[error("account-wide loss limits are set but no fleet snapshot was supplied")]
     MissingFleetState,
 
+    /// No working-order book was supplied, so the position-notional and
+    /// leverage caps would be measuring filled size only — which is
+    /// bypassable by splitting one capped order into several resting ones.
+    /// Same fail-closed reading as [`Unevaluable::MissingFleetState`]: a cap
+    /// that cannot be measured is a cap that is not enforced.
+    #[error("no resting-order exposure was supplied; the position caps cannot be measured")]
+    MissingRestingOrders,
+
     #[error("account equity is ${equity_usd}; leverage is undefined")]
     NonPositiveEquity { equity_usd: Decimal },
 
@@ -373,6 +427,22 @@ pub enum Unevaluable {
     /// unevaluable rather than silently in-memory only.
     #[error("guardrail state write failed: {detail}")]
     StateWriteFailed { detail: String },
+
+    /// An approval was presented for a proposal the engine is not holding:
+    /// never issued, already consumed, already rejected, or swept as expired.
+    /// The engine mints every proposal itself, so an unknown id is a
+    /// clearance that was never authorised (spec item 28).
+    #[error("proposal {approval_id} is not pending")]
+    UnknownProposal { approval_id: String },
+
+    /// Spec item 28: proposals carry a TTL and auto-expire. An expired one is
+    /// re-proposed, never approved on stale terms.
+    #[error("proposal {approval_id} expired at {expires_at_ms}; now is {now_ms}")]
+    ProposalExpired {
+        approval_id: String,
+        expires_at_ms: u64,
+        now_ms: u64,
+    },
 }
 
 impl From<Unevaluable> for Refusal {

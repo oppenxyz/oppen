@@ -6,6 +6,12 @@
 //! that still verifies, two networks with independent cursors, and an
 //! interrupted append that leaves no half-row.
 //!
+//! The last section is adversarial: every test in it is an attack that this
+//! module verified clean before it was written. A test that only exercises the
+//! honest path is not evidence that the dishonest one is caught, which is how
+//! the forged-redaction hole survived a suite that looked like it covered
+//! redaction.
+//!
 //! The randomised tests use a fixed-seed splitmix64 rather than a proptest
 //! dependency the crate does not have. Seeds are constants, so a failure is
 //! reproducible by running the same test again.
@@ -735,7 +741,6 @@ fn an_intent_is_committed_before_the_receipt_exists() {
             &receipt,
             EventKind::Fill,
             1_756_500_000_500,
-            Some("agent-a"),
             &json!({ "oid": 42, "avg_px": "63000.5" }),
         )
         .expect("record outcome");
@@ -864,7 +869,12 @@ fn a_snapshot_reference_is_chained_and_its_body_is_prunable() {
         .expect("present");
     assert_eq!(event.snapshot_id.as_deref(), Some("snap-1"));
     assert_eq!(event.snapshot_hash.as_deref(), Some(snapshot_hash.as_str()));
-    assert_eq!(ledger.snapshot_body("snap-1").expect("body"), Some(book));
+    assert_eq!(
+        ledger
+            .snapshot_body("snap-1", &snapshot_hash)
+            .expect("body"),
+        Some(book)
+    );
 
     // Pruning the body leaves the chained reference, and the chain still holds.
     assert_eq!(
@@ -873,7 +883,12 @@ fn a_snapshot_reference_is_chained_and_its_body_is_prunable() {
             .expect("prune"),
         1
     );
-    assert_eq!(ledger.snapshot_body("snap-1").expect("body"), None);
+    assert_eq!(
+        ledger
+            .snapshot_body("snap-1", &snapshot_hash)
+            .expect("body"),
+        None
+    );
     assert!(ledger.verify().expect("verify").is_intact());
 
     // The reference is inside the preimage: editing it breaks this row.
@@ -1043,4 +1058,691 @@ fn every_event_kind_round_trips_through_its_stored_name() {
         EventKind::from_str("not_a_kind"),
         Err(LedgerError::UnknownKind(_))
     ));
+}
+
+// --- adversarial: redaction must be evidenced by the chain -------------------
+//
+// Every test from here down is an attack that verified clean before the fix.
+// `an_unrecorded_tombstone_is_a_break` above only covered a tamperer who forgot
+// to also set `redacted_at`; these cover the one who did not forget.
+
+#[test]
+fn a_forged_redacted_at_does_not_excuse_a_null_payload() {
+    let dir = TempDir::new().expect("tempdir");
+    let ledger = open(&dir, Network::Testnet);
+    fill(&ledger, 10, 19);
+    assert!(ledger.verify().expect("verify").is_intact());
+
+    {
+        let guard = ledger.connection.lock().expect("lock");
+        // `redacted_at` and `redaction_reason` are not in the row-hash preimage,
+        // so the same hand that nulls the payload writes them in the same
+        // statement. Evidence an attacker can author is not evidence.
+        guard
+            .execute(
+                "UPDATE events SET payload = NULL, redacted_at = 1, \
+                 redaction_reason = 'legal request' WHERE seq = 7",
+                [],
+            )
+            .expect("forge a redaction");
+    }
+
+    let report = ledger.verify().expect("verify");
+    let broken = report.first_break.expect("a break");
+    assert_eq!(broken.seq, 7);
+    assert_eq!(broken.reason, BreakReason::UnrecordedTombstone);
+    assert_eq!(report.rows_checked, 6);
+
+    // No chained redaction exists to explain it, which is the whole point.
+    assert!(
+        !ledger
+            .get_events(0, 100)
+            .expect("page")
+            .events
+            .iter()
+            .any(|event| event.kind == EventKind::PayloadRedacted)
+    );
+}
+
+#[test]
+fn a_redaction_row_cannot_be_appended_around_redact() {
+    let dir = TempDir::new().expect("tempdir");
+    let ledger = open(&dir, Network::Testnet);
+    fill(&ledger, 3, 26);
+
+    // The chained redaction is what verification accepts as an explanation, so
+    // it must never be writable without the null it explains.
+    let claim = json!({ "redacted_seq": 2, "reason": "legal request" });
+    assert!(matches!(
+        ledger.append(&NewEvent {
+            kind: EventKind::PayloadRedacted,
+            ts_ms: 1,
+            agent_id: None,
+            payload: &claim,
+            snapshot: None,
+        }),
+        Err(LedgerError::UseRedact)
+    ));
+    assert_eq!(ledger.get_events(0, 10).expect("page").events.len(), 3);
+}
+
+#[test]
+fn a_redaction_cannot_itself_be_redacted() {
+    let dir = TempDir::new().expect("tempdir");
+    let ledger = open(&dir, Network::Testnet);
+    fill(&ledger, 3, 27);
+    let tombstone = ledger.redact(2, "pii in reason", 10).expect("redact");
+
+    assert!(matches!(
+        ledger.redact(tombstone.seq, "housekeeping", 11),
+        Err(LedgerError::RedactionIsNotRedactable(_))
+    ));
+    let row = ledger
+        .event(tombstone.seq)
+        .expect("event")
+        .expect("present");
+    assert_eq!(row.kind, EventKind::PayloadRedacted);
+    assert_eq!(
+        row.payload,
+        Some(json!({ "redacted_seq": 2, "reason": "pii in reason" })),
+        "which seq it explained, and why, survives"
+    );
+    assert!(ledger.verify().expect("verify").is_intact());
+}
+
+#[test]
+fn erasing_a_tombstones_explanation_breaks_the_chain() {
+    let dir = TempDir::new().expect("tempdir");
+    let ledger = open(&dir, Network::Testnet);
+    fill(&ledger, 3, 28);
+    let tombstone = ledger.redact(2, "pii in reason", 10).expect("redact");
+    assert!(ledger.verify().expect("verify").is_intact());
+
+    {
+        let guard = ledger.connection.lock().expect("lock");
+        guard
+            .execute(
+                "UPDATE events SET payload = NULL, redacted_at = 1 WHERE seq = ?1",
+                params![tombstone.seq as i64],
+            )
+            .expect("erase the explanation");
+    }
+
+    // Both rows are now unexplained: the one that was legitimately redacted,
+    // because the record of why is gone, and the tombstone itself.
+    let report = ledger.verify().expect("verify");
+    let broken = report.first_break.expect("a break");
+    assert_eq!(broken.seq, 2);
+    assert_eq!(broken.reason, BreakReason::UnrecordedTombstone);
+}
+
+// --- adversarial: the end of the chain -------------------------------------
+
+#[test]
+fn a_truncated_tail_is_caught_by_the_anchored_head() {
+    let dir = TempDir::new().expect("tempdir");
+    let ledger = open(&dir, Network::Testnet);
+    fill(&ledger, 20, 88);
+    assert!(ledger.verify().expect("verify").is_intact());
+
+    {
+        let guard = ledger.connection.lock().expect("lock");
+        let keep: String = guard
+            .query_row("SELECT hash FROM events WHERE seq = 12", [], |row| {
+                row.get(0)
+            })
+            .expect("hash of the row to keep");
+        guard
+            .execute("DELETE FROM events WHERE seq > 12", [])
+            .expect("erase the tail");
+        guard
+            .execute(
+                "UPDATE chain_head SET seq = 12, hash = ?1 WHERE id = 0",
+                params![keep],
+            )
+            .expect("rewind the head to match");
+    }
+
+    // Every surviving row still verifies and the head agrees with the last of
+    // them. Nothing inside the file is wrong, which is why the reference has to
+    // come from outside it.
+    let report = ledger.verify().expect("verify");
+    let broken = report.first_break.expect("a break");
+    assert_eq!(broken.seq, 20);
+    assert!(matches!(
+        broken.reason,
+        BreakReason::HeadBehindAnchor {
+            anchor_seq: 20,
+            found_seq: 12,
+            ..
+        }
+    ));
+
+    // And the honest statement of the boundary: without an anchor this is
+    // undetectable, which is exactly why one is installed by default.
+    let unanchored = Ledger::open_anchored(&dir.path().join("testnet.db"), Network::Testnet, None)
+        .expect("open unanchored");
+    assert!(
+        unanchored.verify().expect("verify").is_intact(),
+        "the file alone cannot tell that eight rows are missing from the end"
+    );
+}
+
+#[test]
+fn a_rewritten_chain_is_caught_against_a_head_kept_elsewhere() {
+    let dir = TempDir::new().expect("tempdir");
+    let ledger = open(&dir, Network::Testnet);
+    fill(&ledger, 20, 91);
+    // What an operator, a backup job or a later keychain anchor wrote down.
+    let witnessed = ledger.chain_head().expect("head");
+    assert_eq!(witnessed.seq, 20);
+
+    {
+        let guard = ledger.connection.lock().expect("lock");
+        let keep: String = guard
+            .query_row("SELECT hash FROM events WHERE seq = 12", [], |row| {
+                row.get(0)
+            })
+            .expect("hash");
+        guard
+            .execute("DELETE FROM events WHERE seq > 12", [])
+            .expect("erase the tail");
+        guard
+            .execute(
+                "UPDATE chain_head SET seq = 12, hash = ?1 WHERE id = 0",
+                params![keep],
+            )
+            .expect("rewind the head");
+    }
+    // Rebuild the tail through the public API: every hash is valid, the head is
+    // correct, and the ledger's own anchor moved along with the forgery.
+    fill(&ledger, 8, 92);
+    let report = ledger.verify().expect("verify");
+    assert!(
+        report.is_intact(),
+        "the file is internally consistent again"
+    );
+    assert_eq!(report.head_seq, 20);
+
+    let report = ledger.verify_against(&witnessed).expect("verify");
+    let broken = report.first_break.expect("a break");
+    assert_eq!(broken.seq, 20);
+    assert!(matches!(
+        broken.reason,
+        BreakReason::HeadBehindAnchor { found_seq: 20, .. }
+    ));
+}
+
+#[test]
+fn the_anchor_is_adopted_on_first_open_and_moves_with_every_append() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = dir.path().join("testnet.db");
+    {
+        let ledger = Ledger::open_anchored(&path, Network::Testnet, None).expect("open unanchored");
+        fill(&ledger, 5, 71);
+    }
+    let sidecar = FileAnchor::beside(&path);
+    assert!(sidecar.load().expect("load").is_none());
+
+    // Adoption trusts the file once, at the first anchored open. Every rewind
+    // after that is caught.
+    let ledger = Ledger::open_at(&path, Network::Testnet).expect("open anchored");
+    assert_eq!(
+        sidecar.load().expect("load"),
+        Some(ledger.chain_head().expect("head"))
+    );
+
+    fill(&ledger, 2, 72);
+    let anchor = sidecar.load().expect("load").expect("anchor");
+    assert_eq!(anchor.seq, 7);
+    assert_eq!(anchor, ledger.chain_head().expect("head"));
+    assert!(ledger.verify().expect("verify").is_intact());
+}
+
+// --- adversarial: the receipt is the type handed to the signer ---------------
+
+#[test]
+fn a_receipt_from_another_chain_is_refused() {
+    let dir = TempDir::new().expect("tempdir");
+    let testnet = open(&dir, Network::Testnet);
+    let mainnet = open(&dir, Network::Mainnet);
+
+    let body = json!({ "coin": "BTC", "sz": "0.001", "reason": "testnet probe" });
+    let receipt = testnet
+        .record_intent(&NewIntent {
+            agent_id: "agent-a",
+            ts_ms: 1,
+            payload: &body,
+            snapshot: None,
+        })
+        .expect("testnet intent");
+    assert_eq!(receipt.chain(), testnet.genesis);
+
+    // docs/decisions.md R4: a mainnet number that is actually a testnet number.
+    let error = mainnet
+        .record_outcome(
+            &receipt,
+            EventKind::Fill,
+            2,
+            &json!({ "oid": 1, "avg_px": "63000" }),
+        )
+        .expect_err("the mainnet ledger must refuse a testnet receipt");
+    assert!(matches!(error, LedgerError::ReceiptFromAnotherChain { .. }));
+    assert_eq!(mainnet.get_events(0, 10).expect("page").events.len(), 0);
+}
+
+#[test]
+fn a_receipt_whose_row_no_longer_matches_is_refused() {
+    let dir = TempDir::new().expect("tempdir");
+    let ledger = open(&dir, Network::Testnet);
+    let body = json!({ "coin": "BTC", "sz": "0.001", "reason": "carry" });
+    let receipt = ledger
+        .record_intent(&NewIntent {
+            agent_id: "agent-a",
+            ts_ms: 1,
+            payload: &body,
+            snapshot: None,
+        })
+        .expect("intent");
+
+    {
+        let guard = ledger.connection.lock().expect("lock");
+        guard
+            .execute(
+                "UPDATE events SET hash = 'forged' WHERE seq = ?1",
+                params![receipt.seq() as i64],
+            )
+            .expect("tamper");
+    }
+    assert!(matches!(
+        ledger.record_outcome(&receipt, EventKind::Fill, 2, &json!({ "oid": 1 })),
+        Err(LedgerError::ReceiptRowMismatch { seq: 1, .. })
+    ));
+
+    {
+        let guard = ledger.connection.lock().expect("lock");
+        guard
+            .execute(
+                "DELETE FROM events WHERE seq = ?1",
+                params![receipt.seq() as i64],
+            )
+            .expect("delete");
+    }
+    assert!(matches!(
+        ledger.record_outcome(&receipt, EventKind::Fill, 3, &json!({ "oid": 1 })),
+        Err(LedgerError::NoSuchEvent(1))
+    ));
+}
+
+#[test]
+fn an_outcome_is_attributed_to_the_agent_that_asked() {
+    let dir = TempDir::new().expect("tempdir");
+    let ledger = open(&dir, Network::Testnet);
+    let body = json!({ "coin": "BTC", "sz": "0.001", "reason": "carry" });
+    let receipt = ledger
+        .record_intent(&NewIntent {
+            agent_id: "agent-a",
+            ts_ms: 1,
+            payload: &body,
+            snapshot: None,
+        })
+        .expect("intent");
+    assert_eq!(receipt.agent_id(), "agent-a");
+
+    // The attribution comes from the receipt, so there is no parameter through
+    // which a fill could be booked against an agent that never asked.
+    let appended = ledger
+        .record_outcome(&receipt, EventKind::Fill, 2, &json!({ "oid": 7 }))
+        .expect("outcome");
+    let event = ledger.event(appended.seq).expect("event").expect("present");
+    assert_eq!(event.agent_id.as_deref(), Some("agent-a"));
+    assert!(ledger.verify().expect("verify").is_intact());
+}
+
+// --- adversarial: the decision-time book ------------------------------------
+
+#[test]
+fn a_snapshot_body_cannot_be_swapped_under_a_chained_reference() {
+    let dir = TempDir::new().expect("tempdir");
+    let ledger = open(&dir, Network::Testnet);
+    let real = json!({ "bids": [["63000.0", "1.5"]], "asks": [["63001.0", "2.0"]] });
+    let chained = ledger
+        .put_snapshot("snap-1", 10, "BTC", &real)
+        .expect("put snapshot");
+
+    let body = json!({ "coin": "BTC", "reason": "thin book" });
+    let receipt = ledger
+        .record_intent(&NewIntent {
+            agent_id: "agent-a",
+            ts_ms: 11,
+            payload: &body,
+            snapshot: Some(SnapshotRef {
+                id: "snap-1",
+                hash: &chained,
+            }),
+        })
+        .expect("intent");
+    let row = ledger
+        .event(receipt.seq())
+        .expect("event")
+        .expect("present");
+    assert_eq!(row.snapshot_hash.as_deref(), Some(chained.as_str()));
+
+    // Re-capturing the identical book stays idempotent.
+    assert_eq!(
+        ledger
+            .put_snapshot("snap-1", 10, "BTC", &real)
+            .expect("recapture"),
+        chained
+    );
+
+    // A different book under the same id is refused, not silently substituted.
+    let forged = json!({ "bids": [["1.0", "9999"]], "asks": [["2.0", "9999"]] });
+    assert!(matches!(
+        ledger.put_snapshot("snap-1", 10, "BTC", &forged),
+        Err(LedgerError::SnapshotBodyConflict { .. })
+    ));
+    assert_eq!(
+        ledger.snapshot_body("snap-1", &chained).expect("body"),
+        Some(real)
+    );
+}
+
+#[test]
+fn a_replaced_snapshot_body_is_not_served_as_the_decision_time_book() {
+    let dir = TempDir::new().expect("tempdir");
+    let ledger = open(&dir, Network::Testnet);
+    let real = json!({ "bids": [["63000.0", "1.5"]] });
+    let chained = ledger
+        .put_snapshot("snap-1", 10, "BTC", &real)
+        .expect("put snapshot");
+
+    // `book_snapshots` is unchained by design (R5), so anyone editing the file
+    // can rewrite the body and the `snapshot_hash` column beside it. The read
+    // path rehashes the body and checks it against the hash from the chained
+    // row, which is the only copy an attacker would have to forge a chain to
+    // change.
+    {
+        let guard = ledger.connection.lock().expect("lock");
+        guard
+            .execute(
+                "UPDATE book_snapshots SET body = '{\"bids\":[[\"1.0\",\"9999\"]]}', \
+                 snapshot_hash = 'forged' WHERE snapshot_id = 'snap-1'",
+                [],
+            )
+            .expect("swap the book");
+    }
+    assert!(matches!(
+        ledger.snapshot_body("snap-1", &chained),
+        Err(LedgerError::SnapshotBodyConflict { .. })
+    ));
+}
+
+// --- adversarial: a flapping feed -------------------------------------------
+
+#[test]
+fn a_flapping_feed_reuses_the_open_gap_for_its_scope() {
+    let dir = TempDir::new().expect("tempdir");
+    let ledger = open(&dir, Network::Testnet);
+
+    let first = ledger
+        .open_gap("ws:user:0xabc", 100, None)
+        .expect("open gap");
+    let again = ledger
+        .open_gap("ws:user:0xabc", 200, Some("close 1006"))
+        .expect("open gap again");
+    assert_eq!(again.gap_id, first.gap_id, "a second gap orphans the first");
+    assert_eq!(
+        again.opened_ts_ms, 100,
+        "the window still starts when the feed actually dropped"
+    );
+    assert_eq!(
+        ledger.get_events(0, 100).expect("page").events.len(),
+        1,
+        "and no second disconnect event was chained"
+    );
+
+    // A different scope is still a different gap.
+    let other = ledger.open_gap("ws:trades", 150, None).expect("open gap");
+    assert_ne!(other.gap_id, first.gap_id);
+
+    ledger.close_gap(first.gap_id, 300).expect("close");
+    ledger
+        .mark_gap_reconciled(first.gap_id, 400)
+        .expect("reconcile");
+    let left = ledger.unreconciled_gaps().expect("gaps");
+    assert_eq!(left.len(), 1);
+    assert_eq!(left[0].scope, "ws:trades");
+
+    // Once closed, the same scope can open a fresh window.
+    let third = ledger
+        .open_gap("ws:user:0xabc", 500, None)
+        .expect("open gap");
+    assert_ne!(third.gap_id, first.gap_id);
+
+    // And the duplicate is unrepresentable in the schema, not merely avoided
+    // by the code path above.
+    let guard = ledger.connection.lock().expect("lock");
+    let duplicate = guard.execute(
+        "INSERT INTO feed_gaps (scope, opened_ts_ms, open_seq) VALUES ('ws:trades', 900, 2)",
+        [],
+    );
+    assert!(duplicate.is_err());
+}
+
+// --- adversarial: what may enter the record of record -----------------------
+
+#[test]
+fn a_float_in_a_payload_is_refused() {
+    let dir = TempDir::new().expect("tempdir");
+    let ledger = open(&dir, Network::Testnet);
+
+    let floaty = json!({ "px": 63000.1, "sz": "0.1" });
+    let error = ledger
+        .append(&NewEvent {
+            kind: EventKind::Fill,
+            ts_ms: 1,
+            agent_id: Some("agent-a"),
+            payload: &floaty,
+            snapshot: None,
+        })
+        .expect_err("a binary float must not enter the table kept forever");
+    assert!(matches!(&error, LedgerError::FloatInPayload { pointer } if pointer == "/px"));
+
+    let nested = json!({ "fills": [{ "notional": 6300.010000000001 }] });
+    let error = ledger
+        .append(&NewEvent {
+            kind: EventKind::Fill,
+            ts_ms: 2,
+            agent_id: Some("agent-a"),
+            payload: &nested,
+            snapshot: None,
+        })
+        .expect_err("must refuse");
+    assert!(
+        matches!(&error, LedgerError::FloatInPayload { pointer } if pointer == "/fills/0/notional")
+    );
+
+    // Snapshots go through the same encoder.
+    assert!(matches!(
+        ledger.put_snapshot("snap-1", 1, "BTC", &json!({ "bids": [[63000.0, 1.5]] })),
+        Err(LedgerError::FloatInPayload { .. })
+    ));
+
+    // Decimal strings and integers are what belong here, and they still work.
+    ledger
+        .append(&NewEvent {
+            kind: EventKind::Fill,
+            ts_ms: 3,
+            agent_id: Some("agent-a"),
+            payload: &json!({ "px": "63000.1", "sz": "0.1", "oid": 42 }),
+            snapshot: None,
+        })
+        .expect("decimal strings are the supported form");
+    assert_eq!(ledger.get_events(0, 10).expect("page").events.len(), 1);
+}
+
+#[test]
+fn a_payload_that_nests_too_deeply_is_refused_rather_than_recursed_into() {
+    let dir = TempDir::new().expect("tempdir");
+    let ledger = open(&dir, Network::Testnet);
+
+    // A payload arrives over the MCP wire. Recursing over it without a limit is
+    // a stack overflow, and a stack overflow is a panic on an input path.
+    let mut deep = json!(1);
+    for _ in 0..300 {
+        deep = Value::Array(vec![deep]);
+    }
+    assert!(matches!(
+        ledger.append(&NewEvent {
+            kind: EventKind::Fill,
+            ts_ms: 1,
+            agent_id: None,
+            payload: &deep,
+            snapshot: None,
+        }),
+        Err(LedgerError::PayloadTooDeep { .. })
+    ));
+    assert_eq!(ledger.get_events(0, 10).expect("page").events.len(), 0);
+}
+
+#[test]
+fn the_canonical_form_is_sorted_compact_and_integer_only() {
+    // The preimage is written in hash.rs, not by serde_json, whose map order is
+    // controlled by a Cargo feature any dependency in the workspace can switch
+    // on. These bytes are what every payload_hash in every database is taken
+    // over, so they are pinned here the way the chain vectors are.
+    assert_eq!(
+        hash::canonical_json(&json!({ "b": 1, "a": { "d": [1, 2], "c": "x" } }))
+            .expect("canonical"),
+        r#"{"a":{"c":"x","d":[1,2]},"b":1}"#
+    );
+    assert_eq!(
+        hash::canonical_json(&json!({ "s": "he said \"hi\"\n\u{1}" })).expect("canonical"),
+        "{\"s\":\"he said \\\"hi\\\"\\n\\u0001\"}"
+    );
+    assert_eq!(
+        hash::canonical_json(&json!({ "n": u64::MAX, "z": null, "t": true })).expect("canonical"),
+        r#"{"n":18446744073709551615,"t":true,"z":null}"#
+    );
+    assert!(matches!(
+        hash::canonical_json(&json!({ "px": 1.0 })),
+        Err(LedgerError::FloatInPayload { .. })
+    ));
+}
+
+// --- the surface an agent may hold ------------------------------------------
+
+#[test]
+fn the_agent_view_reads_events_and_exposes_nothing_else() {
+    let dir = TempDir::new().expect("tempdir");
+    let ledger = open(&dir, Network::Testnet);
+    fill(&ledger, 4, 66);
+
+    // AGENTS.md invariant 3. `oppen-mcp` is handed one of these, so redact,
+    // upsert_sub_account, put_snapshot, prune and the gap surface are not
+    // spellable from an agent tool — a compile error rather than a review note.
+    let view = ledger.agent_view();
+    assert_eq!(view.get_events(0, 10).expect("page").events.len(), 4);
+    assert_eq!(view.event(2).expect("event").expect("present").seq, 2);
+}
+
+/// The forged-tail attack the confirmation pass found still open.
+///
+/// An attacker with write access to the database can null a payload and then
+/// **append** a tombstone event it wrote itself, recomputing the row hash from
+/// the open-source preimage and moving `chain_head` along. Comparing only at
+/// the anchored seq accepted that, because the chain is still a valid prefix
+/// of itself. The anchor now bounds the head from above as well.
+///
+/// The rows appended here are entirely legitimate — correct hashes, correct
+/// head — so nothing but the ahead-of-anchor check can catch them. That is
+/// deliberate: an earlier version of this test forged the head hash instead,
+/// which tripped `HeadMismatch` and passed even with the new check disabled.
+#[test]
+fn a_chain_running_past_its_anchor_is_caught() {
+    let dir = TempDir::new().expect("tempdir");
+    let db = dir.path().join("testnet.db");
+    let sidecar = FileAnchor::beside(&db);
+
+    let ledger = Ledger::open_at(&db, Network::Testnet).expect("open anchored");
+    fill(&ledger, 10, 91);
+    let witnessed = ledger.chain_head().expect("head at 10");
+    assert!(ledger.verify().expect("verify").is_intact());
+
+    // Rows 11..=14, each perfectly valid. This is what a forged tail looks
+    // like once the attacker has done its arithmetic correctly.
+    fill(&ledger, 4, 92);
+    assert!(
+        ledger.verify().expect("verify").is_intact(),
+        "the ledger's own anchor moved with the appends, so this alone is fine"
+    );
+
+    // The witness an operator, a backup or a keychain kept did not move.
+    sidecar
+        .store(&witnessed)
+        .expect("restore the witnessed head");
+
+    let report = ledger.verify().expect("verify");
+    match report.first_break.as_ref().map(|b| &b.reason) {
+        Some(BreakReason::ChainAheadOfAnchor {
+            anchor_seq,
+            head_seq,
+            ahead,
+        }) => {
+            assert_eq!(*anchor_seq, 10);
+            assert_eq!(*head_seq, 14);
+            // Four unwitnessed rows, one of which a crash could explain.
+            assert_eq!(*ahead, 3);
+        }
+        other => panic!("a chain past its anchor must be reported, got {other:?}"),
+    }
+}
+
+/// A single unwitnessed row is the crash window, not an attack.
+///
+/// `note_head` writes the anchor after the row commits, so a crash in that
+/// window legitimately leaves the chain one row ahead. Reporting that as
+/// tampering would cry wolf on every unclean shutdown.
+#[test]
+fn one_row_ahead_of_the_anchor_is_the_crash_window() {
+    let dir = TempDir::new().expect("tempdir");
+    let db = dir.path().join("testnet.db");
+    let sidecar = FileAnchor::beside(&db);
+
+    let ledger = Ledger::open_at(&db, Network::Testnet).expect("open anchored");
+    fill(&ledger, 10, 93);
+    let witnessed = ledger.chain_head().expect("head at 10");
+    fill(&ledger, 1, 94);
+    sidecar.store(&witnessed).expect("anchor lags by one");
+
+    assert!(
+        ledger.verify().expect("verify").is_intact(),
+        "one row of lag is a crash between commit and anchor write"
+    );
+}
+
+/// Deleting the sidecar must not silently unanchor a live ledger.
+///
+/// `open_at` always installs a file anchor and populates it at open, so a
+/// later read of `None` is positive proof the sidecar was removed. Folding
+/// that into "this ledger has no anchor" was a fail-open on exactly the file
+/// an attacker deletes first.
+#[test]
+fn deleting_the_sidecar_is_a_break_not_a_shrug() {
+    let dir = TempDir::new().expect("tempdir");
+    let db = dir.path().join("testnet.db");
+    let ledger = Ledger::open_at(&db, Network::Testnet).expect("open anchored");
+    fill(&ledger, 6, 92);
+    assert!(ledger.verify().expect("verify").is_intact());
+
+    let sidecar = FileAnchor::beside(&db);
+    std::fs::remove_file(sidecar.path()).expect("remove the sidecar");
+
+    let report = ledger.verify().expect("verify");
+    assert_eq!(
+        report.first_break.as_ref().map(|b| &b.reason),
+        Some(&BreakReason::AnchorMissing),
+        "a removed anchor must be reported, not treated as unanchored: {report:?}"
+    );
 }

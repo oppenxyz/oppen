@@ -10,12 +10,31 @@
 //! concatenation is ambiguous: `("ab", "c")` and `("a", "bc")` would hash the
 //! same, which is a forgery primitive in a structure whose entire purpose is
 //! tamper evidence.
+//!
+//! The canonical form of a payload is written by [`canonical_json`] in this
+//! file rather than by `serde_json::to_string`. `serde_json`'s map ordering is
+//! controlled by its `preserve_order` Cargo feature, which any dependency
+//! anywhere in the workspace can switch on through feature unification. The
+//! preimage of every row in every existing database must not be a third-party
+//! crate's feature resolution, so the bytes are emitted here: keys in sorted
+//! byte order, no whitespace, integers only.
 
+use std::collections::BTreeMap;
+
+use serde_json::Value;
 use sha3::{Digest, Keccak256};
 
 use crate::Network;
 
-use super::network_key;
+use super::{LedgerError, Result, network_key};
+
+/// How deep a payload may nest before it is refused.
+///
+/// A recursive walk over an attacker-supplied value is a stack overflow, and a
+/// stack overflow is a panic on an input path (`AGENTS.md` conventions). The
+/// limit matches `serde_json`'s own parse recursion limit, so nothing that
+/// arrived over the MCP wire can hit it — only a value built in-process.
+const MAX_DEPTH: usize = 128;
 
 /// Domain tag for a chained row hash. Versioned because changing the preimage
 /// changes every hash in every existing database, so it has to be a visible,
@@ -70,6 +89,133 @@ pub(crate) fn payload_hash(canonical_json: &[u8]) -> String {
     h.update(PAYLOAD_DOMAIN);
     put(&mut h, b"payload", Some(canonical_json));
     hex::encode(h.finalize())
+}
+
+/// The canonical JSON text of a value: the bytes that get stored, hashed and
+/// exported.
+///
+/// Three rules, all of them load-bearing:
+///
+/// * **Object keys in sorted byte order.** Two callers that build the same
+///   logical payload in a different order must produce the same hash, and that
+///   must not depend on a Cargo feature.
+/// * **No whitespace.** There is one encoding of a value, not a family of them.
+/// * **Integers only.** `AGENTS.md` says money is `Decimal`, never `f64`, and
+///   this is the one table kept forever (`docs/decisions.md` D-e). A float in a
+///   chained audit row is a price that no longer means what it said, so it is
+///   refused rather than rounded. Prices and sizes belong here as decimal
+///   strings.
+pub(crate) fn canonical_json(value: &Value) -> Result<String> {
+    let mut out = String::new();
+    let mut pointer = String::new();
+    write_value(value, &mut out, &mut pointer, 0)?;
+    Ok(out)
+}
+
+/// Emit one value, tracking the RFC 6901 pointer so a rejection names the field.
+fn write_value(value: &Value, out: &mut String, pointer: &mut String, depth: usize) -> Result<()> {
+    if depth > MAX_DEPTH {
+        return Err(LedgerError::PayloadTooDeep {
+            pointer: pointer.clone(),
+        });
+    }
+    match value {
+        Value::Null => out.push_str("null"),
+        Value::Bool(true) => out.push_str("true"),
+        Value::Bool(false) => out.push_str("false"),
+        Value::Number(number) => {
+            if let Some(signed) = number.as_i64() {
+                out.push_str(&signed.to_string());
+            } else if let Some(unsigned) = number.as_u64() {
+                out.push_str(&unsigned.to_string());
+            } else {
+                return Err(LedgerError::FloatInPayload {
+                    pointer: pointer.clone(),
+                });
+            }
+        }
+        Value::String(text) => write_string(text, out),
+        Value::Array(items) => {
+            out.push('[');
+            let mark = pointer.len();
+            for (index, item) in items.iter().enumerate() {
+                if index > 0 {
+                    out.push(',');
+                }
+                pointer.push('/');
+                pointer.push_str(&index.to_string());
+                write_value(item, out, pointer, depth + 1)?;
+                pointer.truncate(mark);
+            }
+            out.push(']');
+        }
+        Value::Object(fields) => {
+            // Collected into a `BTreeMap` rather than iterated in place: with
+            // `serde_json`'s `preserve_order` feature on, `Map`'s own iteration
+            // order is insertion order, and the whole point here is that the
+            // preimage does not move when a dependency flips that feature.
+            let sorted: BTreeMap<&str, &Value> = fields
+                .iter()
+                .map(|(key, item)| (key.as_str(), item))
+                .collect();
+            out.push('{');
+            let mark = pointer.len();
+            for (index, (key, item)) in sorted.into_iter().enumerate() {
+                if index > 0 {
+                    out.push(',');
+                }
+                write_string(key, out);
+                out.push(':');
+                pointer.push('/');
+                push_pointer_token(key, pointer);
+                write_value(item, out, pointer, depth + 1)?;
+                pointer.truncate(mark);
+            }
+            out.push('}');
+        }
+    }
+    Ok(())
+}
+
+/// Write a JSON string literal.
+///
+/// The escaping matches `serde_json`'s exactly — `"`, `\`, the five short
+/// control escapes, `\u00xx` for the remaining C0 controls, and raw UTF-8 for
+/// everything else — so replacing the serialiser did not move a single hash in
+/// an existing database. The pinned vectors in `tests.rs` are the proof.
+fn write_string(value: &str, out: &mut String) {
+    out.push('"');
+    for character in value.chars() {
+        match character {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\u{08}' => out.push_str("\\b"),
+            '\u{09}' => out.push_str("\\t"),
+            '\u{0a}' => out.push_str("\\n"),
+            '\u{0c}' => out.push_str("\\f"),
+            '\u{0d}' => out.push_str("\\r"),
+            control if (control as u32) < 0x20 => {
+                let code = control as u32;
+                out.push_str("\\u00");
+                out.push(char::from_digit((code >> 4) & 0xF, 16).unwrap_or('0'));
+                out.push(char::from_digit(code & 0xF, 16).unwrap_or('0'));
+            }
+            other => out.push(other),
+        }
+    }
+    out.push('"');
+}
+
+/// Append one RFC 6901 pointer token, escaping `~` and `/` so a rejection names
+/// exactly one field even when a key contains a separator.
+fn push_pointer_token(key: &str, pointer: &mut String) {
+    for character in key.chars() {
+        match character {
+            '~' => pointer.push_str("~0"),
+            '/' => pointer.push_str("~1"),
+            other => pointer.push(other),
+        }
+    }
 }
 
 /// Everything a chained row commits to.

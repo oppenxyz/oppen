@@ -83,6 +83,13 @@ CREATE TABLE feed_gaps (
     note             TEXT
 );
 CREATE INDEX feed_gaps_unreconciled ON feed_gaps (reconciled_ts_ms, opened_ts_ms);
+-- A scope has at most one gap open at a time. A flapping socket that opened a
+-- second gap orphaned the first: nothing closes a gap but its own id, so it
+-- stayed on the reconciler's work list and under the staleness overlay
+-- (`docs/spec.md` item 34) forever. Reconnect handling has to be idempotent,
+-- and this makes a second open gap unrepresentable rather than merely
+-- discouraged.
+CREATE UNIQUE INDEX feed_gaps_one_open_per_scope ON feed_gaps (scope) WHERE closed_ts_ms IS NULL;
 
 -- docs/decisions.md R2: the owner discriminator exists before any row
 -- references a sub-account, because it is free today and impossible to add

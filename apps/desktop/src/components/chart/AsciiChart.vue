@@ -13,7 +13,14 @@
  * case between trades on a long interval.
  */
 import { computed, shallowRef, watchEffect } from "vue";
-import { createCandleRenderer, frameRuns, INK, type Bar, type InkRun } from "../../lib/candles";
+import {
+  createCandleRenderer,
+  frameRuns,
+  INK,
+  type Bar,
+  type FrameStatus,
+  type InkRun,
+} from "../../lib/candles";
 import { useClock } from "../../lib/clock";
 
 const props = withDefaults(
@@ -59,9 +66,29 @@ function inkClass(code: string): string {
   return INK_CLASS[code] ?? "ink-none";
 }
 
+/**
+ * Why the plot is empty, in words. `specs/charts.md` §3.2 is explicit that an empty
+ * region must say so and must never read as downtime, so a blank grid is not an option:
+ * the three blank causes are distinguishable in the frame's status and each one gets a
+ * sentence. The copy lives here and never in the renderer.
+ *
+ * §3.2's fuller wording is "no local history before HH:MM". The timestamp half needs the
+ * local aggregator's start instant, which this component is not given and must not
+ * invent — a prop for it belongs with the interval resolver. What is fixed here is the
+ * part that misleads: the panel now states its own emptiness instead of showing a box.
+ */
+const STATUS_TEXT: Readonly<Record<FrameStatus, string>> = {
+  ok: "",
+  no_bars: "no bars for this interval yet",
+  no_finite_bars: "no usable bars in this window",
+  grid_too_small: "panel too small to draw an axis",
+};
+
 const renderer = createCandleRenderer();
 const lines = shallowRef<InkRun[][]>([]);
+const status = shallowRef<FrameStatus>("no_bars");
 const tick = useClock();
+let painted = false;
 
 watchEffect(() => {
   // Resample on the shared clock. Reading the tick is the whole subscription; this
@@ -76,11 +103,14 @@ watchEffect(() => {
     priceDecimals: props.priceDecimals,
     tzOffsetMinutes: props.tzOffsetMinutes,
   });
-  if (!changed && lines.value.length > 0) return;
-  lines.value = frameRuns(frame);
+  if (!changed && painted) return;
+  painted = true;
+  status.value = frame.status;
+  lines.value = frame.status === "ok" ? frameRuns(frame) : [];
 });
 
 const description = computed(() => {
+  if (status.value !== "ok") return `${props.symbol || "candle"} chart, ${STATUS_TEXT[status.value]}`;
   const last = props.forming ?? props.closed[props.closed.length - 1];
   const price = last ? last.close.toFixed(props.priceDecimals) : "no data";
   return `${props.symbol || "candle"} chart, last ${price}`;
@@ -98,6 +128,7 @@ const description = computed(() => {
       :key="index"
       :class="inkClass(run.ink)"
     >{{ run.text }}</span></div>
+    <p v-if="status !== 'ok'" class="chart__empty">{{ STATUS_TEXT[status] }}</p>
   </div>
 </template>
 
@@ -147,5 +178,12 @@ const description = computed(() => {
 
 .ink-none {
   color: inherit;
+}
+
+/* An empty plot states why. Label ink, not hazard: nothing here is wrong, there is
+   simply nothing to draw, and hazard keeps its exclusive meaning. */
+.chart__empty {
+  margin: 0;
+  color: var(--bracket);
 }
 </style>

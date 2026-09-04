@@ -3,10 +3,17 @@
 //! [`Cleared`] is the whole point of the module. It has private fields, no
 //! `Clone`, no `Default`, and a constructor that is private to this file —
 //! reachable only from the success branch of [`GuardrailEngine::decide`].
-//! [`super::sign_cleared`] takes one by value. So inside `oppen-core` the
-//! statement "there is no code path to the signer without a guardrail
-//! evaluation" is a fact the compiler checks, not a rule a reviewer has to
-//! remember, and a clearance authorises exactly one signature.
+//! [`super::sign_cleared`] takes one by value.
+//!
+//! What that buys, exactly: **a `Cleared` cannot exist unless an evaluation
+//! produced it**, and it authorises one call to `sign_cleared`. That much the
+//! compiler checks. It is not the same claim as "there is no code path to the
+//! signer without a guardrail evaluation" — `oppen_hl::ExchangeRequest`
+//! exposes `sign_unchecked`, and `AgentKey::sign_l1_action` below it, so a
+//! module that wants to sign without a clearance can. Those are named to be
+//! greppable rather than hidden, and closing them is an `oppen-hl` change (a
+//! workspace `clippy.toml` `disallowed-methods` entry); see
+//! [`super::sign_cleared`].
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -14,49 +21,34 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use rust_decimal::Decimal;
 use serde::Serialize;
 
-use oppen_hl::Action;
 use oppen_hl::meta::Asset;
 use oppen_hl::order::{OrderKind, OrderSpec};
 use oppen_hl::wire::{BuilderInfo, CancelByCloidWire, CancelWire, Cloid, Grouping};
+use oppen_hl::{Action, Address, Network};
 
 use super::AgentId;
 use super::breaker;
 use super::bucket::{BucketError, TokenBucket};
-use super::config::{AgentGuardrails, LossLimits, OrderRate};
+use super::config::{
+    APPROVAL_TTL_MS, AgentGuardrails, GlobalRateBudget, LossLimits, MAX_REASON_BYTES, OrderRate,
+};
 use super::deadman::{DEAD_MAN_MIN_LEAD_MS, DeadManIntent, DeadManPolicy};
 use super::kill::{Engagement, KillEffect, KillReason, KillScope, KillSwitch};
 use super::refusal::{ReduceOnlyBreach, Refusal, Unevaluable, VenueRule};
-use super::snapshot::{AccountSnapshot, Exposure, MarketRef};
+use super::snapshot::{AccountSnapshot, Exposure, MarketRef, MarketSnapshotRef};
 use super::store::{GuardrailStore, StoreError};
 
 /// One basis point is a ten-thousandth.
 const BPS: Decimal = Decimal::from_parts(10_000, 0, 0, false, 0);
 const HUNDRED: Decimal = Decimal::from_parts(100, 0, 0, false, 0);
 
-/// Whether an operator has already approved this order (spec item 28).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Approval {
-    /// The agent placed the order directly. If the agent's guardrails have
-    /// approval mode on, the evaluation ends in
-    /// [`Refusal::ApprovalRequired`] after every hard predicate has passed.
-    NotSupplied,
-    /// An operator approved the proposal this order came from. The order is
-    /// re-evaluated in full — item 28 re-prices at approval time — but the
-    /// order-rate token is not charged twice, because it was already spent
-    /// when the proposal was accepted.
-    Granted { approval_id: String },
-}
-
-impl Approval {
-    fn is_granted(&self) -> bool {
-        matches!(self, Approval::Granted { .. })
-    }
-}
-
 /// What an agent is asking to do, in decimals, before anything is rounded.
 ///
 /// This is a request, not an order: nothing here reaches the wire until the
 /// engine has rounded it to the asset's rules and every predicate has passed.
+///
+/// There is deliberately **no approval field**. Approval is not something a
+/// request can assert about itself — see [`Proposal`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrderIntent {
     pub symbol: String,
@@ -76,9 +68,57 @@ pub struct OrderIntent {
     pub max_slippage_bps: Option<Decimal>,
     /// Spec item 19 requires a reason on every execution tool call. Item 30:
     /// this is an untrusted claim, rendered as inert plain text, never
-    /// interpreted here.
+    /// interpreted here. Bounded and control-character-checked on the way in:
+    /// see [`Refusal::ReasonTooLong`].
     pub reason: String,
-    pub approval: Approval,
+}
+
+/// A queued order waiting for an operator (spec item 28).
+///
+/// The engine mints these and holds them. A caller receives only the id, in
+/// [`Refusal::ApprovalRequired`], and hands it back to
+/// [`GuardrailEngine::operator_approve_proposal`], which looks up **its own
+/// stored intent** rather than trusting a re-supplied one. So there is no
+/// value a caller can construct that asserts "this was approved", and no way
+/// to approve one order and then sign a different one — which is what a
+/// caller-supplied approval field allowed, along with skipping the order-rate
+/// charge entirely.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Proposal {
+    id: String,
+    agent: AgentId,
+    intent: OrderIntent,
+    issued_at_ms: u64,
+    expires_at_ms: u64,
+}
+
+impl Proposal {
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    pub fn agent(&self) -> &AgentId {
+        &self.agent
+    }
+
+    /// What the agent asked for. Item 28 re-prices at approval time, so the
+    /// operator console shows this against the current market to display the
+    /// drift.
+    pub fn intent(&self) -> &OrderIntent {
+        &self.intent
+    }
+
+    pub fn issued_at_ms(&self) -> u64 {
+        self.issued_at_ms
+    }
+
+    pub fn expires_at_ms(&self) -> u64 {
+        self.expires_at_ms
+    }
+
+    fn is_expired(&self, now_ms: u64) -> bool {
+        now_ms >= self.expires_at_ms
+    }
 }
 
 /// How much of each guardrail this order consumes, for the utilization block
@@ -93,6 +133,12 @@ pub struct Utilization {
     pub daily_loss_pct: Option<Decimal>,
     pub leverage: Decimal,
     pub order_tokens_remaining: Decimal,
+    /// What is left of spec item 10's address-wide request budget, which
+    /// every agent under the master shares. Item 16 puts it in `get_state`
+    /// next to the per-agent number, because they throttle for different
+    /// reasons and an agent that only sees its own cap cannot tell why it is
+    /// being refused.
+    pub global_tokens_remaining: Decimal,
 }
 
 /// What was cleared, in the terms the guardrails evaluated it in.
@@ -114,6 +160,17 @@ pub enum ClearedKind {
         /// What the slippage was measured against: the market reference for
         /// a limit order, the order's own trigger for a stop.
         slippage_reference_px: Decimal,
+        /// Item 19 puts a cloid on everything and makes query-by-cloid the
+        /// only safe move after `timeout_unknown_outcome`; item 9 reconciles
+        /// `frontendOpenOrders` and `orderStatus` by it. Without it here the
+        /// ledger row saying why an order was allowed cannot be joined to the
+        /// fill it produced. `None` only when the caller supplied none.
+        cloid: Option<Cloid>,
+        /// The book snapshot the decision was taken against
+        /// (`docs/decisions.md` R6). Nullable until a capture policy exists;
+        /// the hash is what the chained ledger row commits to.
+        snapshot_id: Option<String>,
+        snapshot_hash: Option<String>,
     },
     /// Risk-reducing, so it clears while the kill switch is engaged.
     Cancel { count: usize },
@@ -133,6 +190,16 @@ pub struct Clearance {
     /// which belongs to no agent. Not a placeholder id: a fabricated agent
     /// name in the ledger would be indistinguishable from a real one.
     pub agent: Option<AgentId>,
+    /// The sub-account this was evaluated against (D1), taken from the
+    /// engine's own registry rather than from the caller. A clearance
+    /// measured against agent X's positions and caps must not be signable
+    /// with agent Y's `vaultAddress`, and the only way to guarantee that is
+    /// for the binding to travel with the clearance.
+    pub vault_address: Option<Address>,
+    /// The network the engine that produced this is bound to (R4). A testnet
+    /// clearance signed for mainnet is what R4 calls the worst bug this
+    /// product can ship, so the network is not a parameter of signing.
+    pub network: Network,
     pub evaluated_at_ms: u64,
     pub kind: ClearedKind,
     pub utilization: Utilization,
@@ -161,7 +228,14 @@ impl Cleared {
     /// rounded price and size the predicates ran against, never from
     /// caller-supplied bytes, so what was checked and what gets signed cannot
     /// drift apart.
-    pub fn action(&self) -> &Action {
+    ///
+    /// Test-only on purpose. `Action` is `Clone`, so a public accessor would
+    /// offer exactly the shape the by-value [`super::sign_cleared`] exists to
+    /// prevent: clone the action out of a clearance and sign it as many times
+    /// as you like. Nothing outside the tests needs it — a caller that wants
+    /// the action after signing reads it off the `ExchangeRequest`.
+    #[cfg(test)]
+    pub(crate) fn action(&self) -> &Action {
         &self.action
     }
 
@@ -191,9 +265,58 @@ impl AuditError {
 
 /// The verdict, for the audit record.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum AuditOutcome<'a> {
     Cleared(&'a Clearance),
     Refused(&'a Refusal),
+    /// An operator changed the rules rather than an agent trying to act
+    /// under them. Item 18's taxonomy names guardrail trips, approval
+    /// decisions and kill-switch changes as events; without this row an
+    /// export cannot answer why an order refused yesterday cleared today,
+    /// which is the question the ledger exists for.
+    Operator(&'a OperatorAction),
+}
+
+/// One operator mutation, with enough of the before and after state that the
+/// row explains the change rather than merely noting one happened.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "operator_action", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum OperatorAction {
+    /// A newly paired agent got D-c's near-zero defaults.
+    AgentRegistered {
+        config: Box<AgentGuardrails>,
+        vault_address: Option<Address>,
+    },
+    /// `before` is `None` when the agent had no stored configuration.
+    GuardrailsChanged {
+        before: Option<Box<AgentGuardrails>>,
+        after: Box<AgentGuardrails>,
+    },
+    AccountLimitsChanged {
+        before: LossLimits,
+        after: LossLimits,
+    },
+    GlobalRateBudgetChanged {
+        before: GlobalRateBudget,
+        after: GlobalRateBudget,
+    },
+    KillEngaged {
+        scope: KillScope,
+        reason: KillReason,
+        /// False when the scope was already engaged, so a repeated press is
+        /// still recorded but is distinguishable from the trip that stopped
+        /// trading.
+        newly_engaged: bool,
+        cancel_for: BTreeSet<AgentId>,
+    },
+    KillReleased {
+        scope: KillScope,
+        /// False when nothing was engaged in that scope.
+        was_engaged: bool,
+    },
+    /// Item 18: approval decisions are events.
+    ProposalRejected { approval_id: String },
 }
 
 /// One row for the append-only ledger.
@@ -243,13 +366,39 @@ pub enum GuardrailError {
     InvalidConfig { field: String, detail: String },
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct EngineState {
     guardrails: BTreeMap<AgentId, AgentGuardrails>,
+    /// D1: each agent's sub-account, bound into every clearance it produces.
+    vaults: BTreeMap<AgentId, Address>,
     account_limits: LossLimits,
     kill: KillSwitch,
     buckets: BTreeMap<AgentId, TokenBucket>,
     active: BTreeSet<AgentId>,
+    /// Spec item 28. `BTreeMap` so `pending_proposals` has one order
+    /// (`AGENTS.md` invariant 6).
+    proposals: BTreeMap<String, Proposal>,
+    /// Monotonic, so two proposals minted in the same millisecond still get
+    /// distinct ids.
+    proposal_seq: u64,
+    /// Spec item 10's address-wide budget, shared by every agent.
+    global_budget: GlobalRateBudget,
+    global_bucket: TokenBucket,
+    /// [`KillEffect`]s produced by a circuit-breaker trip, waiting for the
+    /// caller to drain them with
+    /// [`GuardrailEngine::take_pending_kill_effects`].
+    ///
+    /// Spec item 26 makes cancelling resting orders part of what engaging the
+    /// switch *does*, and item 25's whole point is that an agent grinding the
+    /// account down overnight has to be stopped — leaving its working orders
+    /// live is the failure mode. The breaker engages the switch from inside
+    /// an evaluation, which returns a [`Refusal`], and a refusal is the wrong
+    /// place to name a fleet-wide cancel set: it goes to one agent, and the
+    /// roster is not that agent's business. So the effect is queued instead.
+    ///
+    /// Bounded: the switch is idempotent and only a *newly* engaged scope
+    /// queues, so this holds at most one entry per scope.
+    pending_effects: Vec<KillEffect>,
 }
 
 impl EngineState {
@@ -267,6 +416,13 @@ impl EngineState {
         }
         bucket
     }
+
+    /// Drops proposals whose TTL has passed (spec item 28). Swept lazily on
+    /// every mint and lookup rather than on a timer, so `oppen-core` stays
+    /// free of a scheduler (R1).
+    fn sweep_proposals(&mut self, now_ms: u64) {
+        self.proposals.retain(|_, p| !p.is_expired(now_ms));
+    }
 }
 
 /// The guardrail engine: one per network, shared by every caller that can
@@ -279,45 +435,66 @@ pub struct GuardrailEngine {
     store: Arc<dyn GuardrailStore>,
     sink: Arc<dyn AuditSink>,
     dead_man: DeadManPolicy,
+    /// R4: one engine per network, and every clearance it produces carries
+    /// this. Fixed at construction because there is no operator gesture that
+    /// should move a running engine from testnet to mainnet — switching
+    /// networks means a different database file and a different engine.
+    network: Network,
     state: Mutex<EngineState>,
 }
 
 impl std::fmt::Debug for GuardrailEngine {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GuardrailEngine")
+            .field("network", &self.network)
             .field("dead_man", &self.dead_man)
             .finish_non_exhaustive()
     }
 }
 
 impl GuardrailEngine {
-    /// Loads persisted guardrails and kill-switch state (spec item 26: the
-    /// switch survives a restart).
+    /// Loads persisted guardrails, sub-account bindings and kill-switch state
+    /// (spec item 26: the switch survives a restart).
     pub fn new(
         store: Arc<dyn GuardrailStore>,
         sink: Arc<dyn AuditSink>,
+        network: Network,
     ) -> Result<Self, GuardrailError> {
-        Self::with_policy(store, sink, DeadManPolicy::default())
+        Self::with_policy(store, sink, network, DeadManPolicy::default())
     }
 
     pub fn with_policy(
         store: Arc<dyn GuardrailStore>,
         sink: Arc<dyn AuditSink>,
+        network: Network,
         dead_man: DeadManPolicy,
     ) -> Result<Self, GuardrailError> {
         let persisted = store.load()?;
+        let global_budget = GlobalRateBudget::default();
         Ok(GuardrailEngine {
             store,
             sink,
             dead_man,
+            network,
             state: Mutex::new(EngineState {
                 guardrails: persisted.guardrails,
+                vaults: persisted.vaults,
                 account_limits: persisted.account_limits,
                 kill: persisted.kill,
                 buckets: BTreeMap::new(),
                 active: BTreeSet::new(),
+                proposals: BTreeMap::new(),
+                proposal_seq: 0,
+                global_budget,
+                global_bucket: TokenBucket::new(global_budget.rate, 0),
+                pending_effects: Vec::new(),
             }),
         })
+    }
+
+    /// Which network every clearance from this engine is bound to (D4, R4).
+    pub fn network(&self) -> Network {
+        self.network
     }
 
     /// A poisoned lock is recovered rather than propagated: the state behind
@@ -338,17 +515,43 @@ impl GuardrailEngine {
     /// Registers a newly paired agent with D-c's near-zero defaults if it has
     /// no stored configuration, and returns the configuration in force.
     ///
+    /// `vault_address` is the sub-account D1 pairs the agent with. It is
+    /// recorded here and stamped onto every clearance the agent ever gets, so
+    /// no later caller can supply a different one. `None` means the agent
+    /// trades the master account directly, which is only the manual escape
+    /// hatch.
+    ///
     /// The defaults include an empty symbol allowlist, so the agent's first
     /// order is refused with [`Refusal::SymbolNotAllowed`] naming the limit
     /// to raise. That refusal is the onboarding.
-    pub fn register_agent(&self, agent: &AgentId) -> Result<AgentGuardrails, GuardrailError> {
+    pub fn register_agent(
+        &self,
+        agent: &AgentId,
+        vault_address: Option<Address>,
+        now_ms: u64,
+    ) -> Result<AgentGuardrails, GuardrailError> {
         let mut state = self.state();
+        if let Some(vault) = &vault_address
+            && state.vaults.get(agent) != Some(vault)
+        {
+            self.store.save_vault(agent, vault)?;
+            state.vaults.insert(agent.clone(), *vault);
+        }
         if let Some(existing) = state.guardrails.get(agent) {
             return Ok(existing.clone());
         }
         let config = AgentGuardrails::default();
         self.store.save_guardrails(agent, &config)?;
         state.guardrails.insert(agent.clone(), config.clone());
+        drop(state);
+        self.record_operator(
+            Some(agent),
+            now_ms,
+            &OperatorAction::AgentRegistered {
+                config: Box::new(config.clone()),
+                vault_address,
+            },
+        );
         Ok(config)
     }
 
@@ -359,6 +562,7 @@ impl GuardrailEngine {
         &self,
         agent: &AgentId,
         config: AgentGuardrails,
+        now_ms: u64,
     ) -> Result<(), GuardrailError> {
         if let Err((field, detail)) = config.validate() {
             return Err(GuardrailError::InvalidConfig {
@@ -367,14 +571,76 @@ impl GuardrailEngine {
             });
         }
         self.store.save_guardrails(agent, &config)?;
-        self.state().guardrails.insert(agent.clone(), config);
+        let before = self
+            .state()
+            .guardrails
+            .insert(agent.clone(), config.clone());
+        self.record_operator(
+            Some(agent),
+            now_ms,
+            &OperatorAction::GuardrailsChanged {
+                before: before.map(Box::new),
+                after: Box::new(config),
+            },
+        );
         Ok(())
     }
 
-    pub fn operator_set_account_limits(&self, limits: LossLimits) -> Result<(), GuardrailError> {
+    pub fn operator_set_account_limits(
+        &self,
+        limits: LossLimits,
+        now_ms: u64,
+    ) -> Result<(), GuardrailError> {
         self.store.save_account_limits(&limits)?;
-        self.state().account_limits = limits;
+        let before = std::mem::replace(&mut self.state().account_limits, limits);
+        self.record_operator(
+            None,
+            now_ms,
+            &OperatorAction::AccountLimitsChanged {
+                before,
+                after: limits,
+            },
+        );
         Ok(())
+    }
+
+    /// Sets spec item 10's address-wide request budget, normally from the
+    /// venue's own `userRateLimit` after a reconnect.
+    ///
+    /// Not persisted: the live figure is re-read from the venue, so a stored
+    /// copy would only ever be a stale one.
+    pub fn operator_set_global_rate_budget(
+        &self,
+        budget: GlobalRateBudget,
+        now_ms: u64,
+    ) -> Result<(), GuardrailError> {
+        if let Err((field, detail)) = budget.validate() {
+            return Err(GuardrailError::InvalidConfig {
+                field: field.to_owned(),
+                detail,
+            });
+        }
+        let before = {
+            let mut state = self.state();
+            let before = std::mem::replace(&mut state.global_budget, budget);
+            if state.global_bucket.rate() != budget.rate {
+                state.global_bucket = TokenBucket::new(budget.rate, now_ms);
+            }
+            before
+        };
+        self.record_operator(
+            None,
+            now_ms,
+            &OperatorAction::GlobalRateBudgetChanged {
+                before,
+                after: budget,
+            },
+        );
+        Ok(())
+    }
+
+    pub fn global_rate_budget(&self) -> GlobalRateBudget {
+        self.state().global_budget
     }
 
     /// Engages the kill switch and reports whose resting orders must now be
@@ -387,31 +653,79 @@ impl GuardrailEngine {
         reason: KillReason,
         now_ms: u64,
     ) -> Result<KillEffect, GuardrailError> {
-        let mut state = self.state();
-        let newly_engaged = state.kill.engage(
-            scope.clone(),
-            Engagement {
-                engaged_at_ms: now_ms,
+        let effect = {
+            let mut state = self.state();
+            let newly_engaged = state.kill.engage(
+                scope.clone(),
+                Engagement {
+                    engaged_at_ms: now_ms,
+                    reason: reason.clone(),
+                },
+            );
+            self.store.save_kill_switch(&state.kill)?;
+            KillEffect {
+                cancel_for: cancel_targets(&state, &scope),
+                scope,
+                newly_engaged,
+            }
+        };
+        self.record_operator(
+            None,
+            now_ms,
+            &OperatorAction::KillEngaged {
+                scope: effect.scope.clone(),
                 reason,
+                newly_engaged: effect.newly_engaged,
+                cancel_for: effect.cancel_for.clone(),
             },
         );
-        self.store.save_kill_switch(&state.kill)?;
-        Ok(KillEffect {
-            cancel_for: cancel_targets(&state, &scope),
-            scope,
-            newly_engaged,
-        })
+        Ok(effect)
     }
 
-    pub fn operator_release_kill(&self, scope: &KillScope) -> Result<bool, GuardrailError> {
-        let mut state = self.state();
-        let released = state.kill.release(scope);
-        self.store.save_kill_switch(&state.kill)?;
+    pub fn operator_release_kill(
+        &self,
+        scope: &KillScope,
+        now_ms: u64,
+    ) -> Result<bool, GuardrailError> {
+        let released = {
+            let mut state = self.state();
+            let released = state.kill.release(scope);
+            self.store.save_kill_switch(&state.kill)?;
+            released
+        };
+        self.record_operator(
+            None,
+            now_ms,
+            &OperatorAction::KillReleased {
+                scope: scope.clone(),
+                was_engaged: released,
+            },
+        );
         Ok(released)
+    }
+
+    /// Every agent the engine knows about, so a `Global` kill effect is
+    /// actionable without an id to look up (spec item 26).
+    pub fn agents(&self) -> BTreeSet<AgentId> {
+        self.state().guardrails.keys().cloned().collect()
+    }
+
+    /// Takes the cancel effects queued by circuit-breaker trips.
+    ///
+    /// The caller must drain this after every evaluation and issue the
+    /// cancels: item 26 makes cancelling resting orders part of what engaging
+    /// the switch does, and a breaker trip engages it.
+    pub fn take_pending_kill_effects(&self) -> Vec<KillEffect> {
+        std::mem::take(&mut self.state().pending_effects)
     }
 
     pub fn guardrails(&self, agent: &AgentId) -> Option<AgentGuardrails> {
         self.state().guardrails.get(agent).cloned()
+    }
+
+    /// The sub-account bound to an agent (D1).
+    pub fn vault_address(&self, agent: &AgentId) -> Option<Address> {
+        self.state().vaults.get(agent).copied()
     }
 
     pub fn account_limits(&self) -> LossLimits {
@@ -420,6 +734,82 @@ impl GuardrailEngine {
 
     pub fn kill_switch(&self) -> KillSwitch {
         self.state().kill.clone()
+    }
+
+    // ---- item 28: the approval queue -------------------------------------
+
+    /// Proposals still waiting on an operator, for item 16's `get_state`.
+    /// Expired ones are swept first, so nothing here is stale.
+    pub fn pending_proposals(&self, now_ms: u64) -> Vec<Proposal> {
+        let mut state = self.state();
+        state.sweep_proposals(now_ms);
+        state.proposals.values().cloned().collect()
+    }
+
+    /// Approves a proposal and re-evaluates it in full against fresh market
+    /// and account state (spec item 28 re-prices at approval time).
+    ///
+    /// Operator-only, like everything else in this section (`AGENTS.md`
+    /// invariant 3). The intent comes from the engine's own store, never from
+    /// the caller, so approving proposal *A* cannot sign order *B*; and the
+    /// proposal is consumed on success, so one approval authorises one
+    /// evaluation. Every hard predicate runs again — an order that has since
+    /// become a breach is refused rather than waved through because a human
+    /// looked at it a minute ago. Only two things are skipped: the order-rate
+    /// token, which was spent when the proposal was minted, and the approval
+    /// requirement itself.
+    pub fn operator_approve_proposal(
+        &self,
+        approval_id: &str,
+        asset: &Asset,
+        market: &MarketRef,
+        exposure: &Exposure,
+        now_ms: u64,
+    ) -> Result<Cleared, Refusal> {
+        let proposal = {
+            let mut state = self.state();
+            state.sweep_proposals(now_ms);
+            state.proposals.get(approval_id).cloned().ok_or_else(|| {
+                Unevaluable::UnknownProposal {
+                    approval_id: approval_id.to_owned(),
+                }
+            })?
+        };
+        let outcome = self.decide(
+            &proposal.agent,
+            &proposal.intent,
+            asset,
+            market,
+            exposure,
+            now_ms,
+            Mode::Approved,
+        );
+        self.record(
+            Some(&proposal.agent),
+            now_ms,
+            &proposal.intent.reason,
+            &outcome,
+        )?;
+        if outcome.is_ok() {
+            self.state().proposals.remove(approval_id);
+        }
+        outcome
+    }
+
+    /// Rejects a proposal. Item 18 makes approval decisions ledger events, so
+    /// this is recorded even though nothing is signed.
+    pub fn operator_reject_proposal(&self, approval_id: &str, now_ms: u64) -> bool {
+        let removed = self.state().proposals.remove(approval_id).is_some();
+        if removed {
+            self.record_operator(
+                None,
+                now_ms,
+                &OperatorAction::ProposalRejected {
+                    approval_id: approval_id.to_owned(),
+                },
+            );
+        }
+        removed
     }
 
     /// Marks an agent as connected or gone, which is what the dead-man's
@@ -473,18 +863,29 @@ impl GuardrailEngine {
         exposure: &Exposure,
         now_ms: u64,
     ) -> Result<Cleared, Refusal> {
-        let outcome = self.decide(agent, intent, asset, market, exposure, now_ms);
+        let outcome = self.decide(agent, intent, asset, market, exposure, now_ms, Mode::Fresh);
         self.record(Some(agent), now_ms, &intent.reason, &outcome)?;
         outcome
     }
 
     /// Writes the verdict to the ledger.
     ///
-    /// A clearance that cannot be recorded is downgraded to a refusal: D6
+    /// An **order** that cannot be recorded is downgraded to a refusal: D6
     /// makes the ledger the single record of why an order happened, and an
     /// order signed without one is unexplainable afterwards. A *refusal*
     /// that cannot be recorded is still a refusal — losing the row is bad,
     /// but the safe outcome already happened.
+    ///
+    /// A **risk-reducing** clearance — a cancel, or the dead-man's switch —
+    /// is never blocked by a failed write. Fail-closed exists to stop new
+    /// exposure; applying it to the actions that remove exposure inverts the
+    /// property. A full or locked ledger disk would otherwise take away the
+    /// operator's ability to stop trading while existing orders keep working,
+    /// take the kill switch's own cancels down with it (item 26 makes those
+    /// part of what engaging the switch does), and stop `scheduleCancel` from
+    /// being re-armed or disarmed (item 27) — all while item 10 says to
+    /// always reserve headroom for risk-reducing actions. So the row is
+    /// logged as lost and the action proceeds.
     ///
     /// The order-rate token spent by a clearance is not refunded when the
     /// write fails. Overcharging an agent is the conservative direction.
@@ -504,19 +905,44 @@ impl GuardrailEngine {
                 Err(refusal) => AuditOutcome::Refused(refusal),
             },
         };
-        match (self.sink.record(&entry), outcome) {
-            (Err(e), Ok(_)) => Err(Unevaluable::AuditWriteFailed {
+        let Err(e) = self.sink.record(&entry) else {
+            return Ok(());
+        };
+        let blocks = match outcome {
+            Ok(cleared) => matches!(cleared.clearance().kind, ClearedKind::Order { .. }),
+            Err(_) => false,
+        };
+        if blocks {
+            return Err(Unevaluable::AuditWriteFailed {
                 detail: e.to_string(),
             }
-            .into()),
-            (Err(e), Err(_)) => {
-                tracing::warn!(agent = ?agent, error = %e, "refusal not recorded in the ledger");
-                Ok(())
-            }
-            (Ok(()), _) => Ok(()),
+            .into());
+        }
+        tracing::warn!(
+            agent = ?agent,
+            error = %e,
+            "a guardrail outcome was not recorded in the ledger; \
+             it was a refusal or a risk-reducing action, so it still stands"
+        );
+        Ok(())
+    }
+
+    /// Records an operator mutation. Never refuses: the change has already
+    /// been made and persisted, so failing here would report an error for
+    /// something that happened. The lost row is logged instead.
+    fn record_operator(&self, agent: Option<&AgentId>, now_ms: u64, action: &OperatorAction) {
+        let entry = AuditEntry {
+            agent,
+            at_ms: now_ms,
+            reason: "operator",
+            outcome: AuditOutcome::Operator(action),
+        };
+        if let Err(e) = self.sink.record(&entry) {
+            tracing::warn!(agent = ?agent, error = %e, "operator action not recorded in the ledger");
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn decide(
         &self,
         agent: &AgentId,
@@ -525,10 +951,9 @@ impl GuardrailEngine {
         market: &MarketRef,
         exposure: &Exposure,
         now_ms: u64,
+        mode: Mode,
     ) -> Result<Cleared, Refusal> {
-        if intent.reason.trim().is_empty() {
-            return Err(Refusal::MissingReason);
-        }
+        check_reason(&intent.reason)?;
 
         let mut state = self.state();
 
@@ -585,7 +1010,7 @@ impl GuardrailEngine {
             &account_limits,
             exposure.fleet.as_ref(),
         ) {
-            state.kill.engage(
+            let newly_engaged = state.kill.engage(
                 breach.scope.clone(),
                 Engagement {
                     engaged_at_ms: now_ms,
@@ -596,6 +1021,19 @@ impl GuardrailEngine {
                     },
                 },
             );
+            // Item 26: engaging the switch cancels resting orders. Queued
+            // before the store write, and regardless of whether that write
+            // succeeds, because the cancels are the risk-reducing half of the
+            // trip and a failed write must never be the reason an agent's
+            // working orders stay live overnight.
+            if newly_engaged {
+                let effect = KillEffect {
+                    cancel_for: cancel_targets(&state, &breach.scope),
+                    scope: breach.scope.clone(),
+                    newly_engaged,
+                };
+                state.pending_effects.push(effect);
+            }
             // The in-memory engagement stands even if the write fails; the
             // conservative direction is to stay stopped.
             if let Err(e) = self.store.save_kill_switch(&state.kill) {
@@ -659,6 +1097,18 @@ impl GuardrailEngine {
 
         let signed_sz = if intent.is_buy { sz } else { -sz };
         let position_szi = account.position_szi(&intent.symbol);
+        // Spec item 24 measures a *position* cap, and an order that has not
+        // filled yet is still exposure the agent has committed to. Without
+        // the working book here, both this cap and the leverage cap below
+        // are bypassable by splitting one refused order into several resting
+        // ones. Fail closed when it is absent, exactly as with the fleet
+        // snapshot: a cap that cannot be measured is a cap that is not
+        // enforced.
+        let resting = account
+            .resting
+            .as_ref()
+            .ok_or(Unevaluable::MissingRestingOrders)?;
+        let resting_szi = resting.szi_of(&intent.symbol);
         if config.reduce_only {
             check_reduce_only(intent, position_szi, signed_sz, sz)?;
         }
@@ -672,30 +1122,54 @@ impl GuardrailEngine {
             });
         }
 
-        // Spec item 24, max position size, measured after this order fills.
-        let position_after = checked(position_szi.checked_add(signed_sz), "post-fill position")?;
+        // Spec item 24, max position size, measured after this order and
+        // every order already working on the symbol fills.
+        let position_after = checked(
+            position_szi
+                .checked_add(resting_szi)
+                .and_then(|n| n.checked_add(signed_sz)),
+            "post-fill position",
+        )?;
         let position_after_usd = checked(
             position_after.abs().checked_mul(reference_px),
             "post-fill position notional",
+        )?;
+        let resting_usd = checked(
+            resting_szi.abs().checked_mul(reference_px),
+            "resting notional",
         )?;
         if position_after_usd > config.max_position_usd {
             return Err(Refusal::PositionNotional {
                 symbol: intent.symbol.clone(),
                 observed_usd: position_after_usd,
+                resting_usd,
                 limit_usd: config.max_position_usd,
             });
         }
 
         // Spec item 24, leverage cap. D3: the operator sets it, and the
         // venue's own maximum for the asset is a hard bound below it.
-        let position_before_usd = checked(
-            position_szi.abs().checked_mul(reference_px),
-            "current position notional",
+        //
+        // This symbol's current contribution — filled plus working — is
+        // replaced by the post-fill number; every other symbol's positions
+        // and working orders stay in, which is why the account total and the
+        // resting total are added before the subtraction.
+        let symbol_before_usd = checked(
+            position_szi
+                .abs()
+                .checked_mul(reference_px)
+                .and_then(|n| n.checked_add(resting_usd)),
+            "current symbol notional",
         )?;
-        let total_after_usd = checked(
+        let account_before_usd = checked(
             account
                 .total_position_notional_usd
-                .checked_sub(position_before_usd)
+                .checked_add(resting.notional_usd),
+            "current account notional",
+        )?;
+        let total_after_usd = checked(
+            account_before_usd
+                .checked_sub(symbol_before_usd)
                 .and_then(|n| n.checked_add(position_after_usd)),
             "post-fill account notional",
         )?
@@ -734,24 +1208,38 @@ impl GuardrailEngine {
         }
 
         // Spec item 24, order rate. Spent last, so nothing refused above
-        // costs the agent budget. An already-approved proposal does not pay
-        // twice: the token was spent when the proposal was accepted.
+        // costs the agent budget. An approved proposal does not pay twice:
+        // the token was spent when the proposal was minted, below.
         let rate = config.order_rate;
         let bucket = state.bucket_mut(agent, rate, now_ms);
-        let spend = if intent.approval.is_granted() {
-            bucket.refill(now_ms)
-        } else {
-            bucket.try_take(now_ms)
+        let spend = match mode {
+            Mode::Approved => bucket.refill(now_ms),
+            Mode::Fresh => bucket.try_take(now_ms),
         };
         spend.map_err(|e| bucket_refusal(e, rate, now_ms))?;
         let tokens_remaining = bucket.tokens();
 
+        // Spec item 10 and item 24's "plus the global budget": the venue
+        // meters requests per address, so every agent under the master shares
+        // one budget that no per-agent cap can bound. An order may not draw
+        // it below the reserve; a cancel may, which is why this refusal is
+        // here and not in `decide_cancel`. Charged in the same pass as the
+        // per-agent token, and for the same reason last.
+        let global_budget = state.global_budget;
+        let global_tokens_remaining =
+            spend_global(&mut state.global_bucket, global_budget, mode, now_ms)?;
+
         // Spec item 28, checked last: a proposal that would have been refused
-        // is refused rather than queued for a human to approve.
-        if config.approval_required && !intent.approval.is_granted() {
+        // is refused rather than queued for a human to approve. The engine
+        // mints and holds it; the caller gets a receipt, not a credential.
+        if config.approval_required && mode == Mode::Fresh {
+            let approval_id = state.mint_proposal(agent, intent, now_ms);
+            let expires_at_ms = now_ms.saturating_add(APPROVAL_TTL_MS);
             return Err(Refusal::ApprovalRequired {
                 symbol: intent.symbol.clone(),
                 notional_usd,
+                approval_id,
+                expires_at_ms,
             });
         }
 
@@ -760,8 +1248,14 @@ impl GuardrailEngine {
             grouping: intent.grouping,
             builder: intent.builder.clone(),
         };
+        let (snapshot_id, snapshot_hash) = match &market.snapshot {
+            Some(MarketSnapshotRef { id, hash }) => (Some(id.clone()), Some(hash.clone())),
+            None => (None, None),
+        };
         let clearance = Clearance {
             agent: Some(agent.clone()),
+            vault_address: state.vaults.get(agent).copied(),
+            network: self.network,
             evaluated_at_ms: now_ms,
             kind: ClearedKind::Order {
                 symbol: intent.symbol.clone(),
@@ -773,6 +1267,9 @@ impl GuardrailEngine {
                 slippage_bps,
                 reference_px,
                 slippage_reference_px: slippage_reference,
+                cloid: intent.cloid.clone(),
+                snapshot_id,
+                snapshot_hash,
             },
             utilization: Utilization {
                 order_notional_pct: ratio_pct(notional_usd, config.max_order_usd),
@@ -787,6 +1284,7 @@ impl GuardrailEngine {
                 }),
                 leverage,
                 order_tokens_remaining: tokens_remaining,
+                global_tokens_remaining,
             },
         };
         Ok(Cleared::new(action, clearance))
@@ -795,9 +1293,14 @@ impl GuardrailEngine {
     /// Clears a cancel by order id.
     ///
     /// Risk-reducing, so it clears while the kill switch is engaged — item 26
-    /// makes cancelling resting orders part of what the switch *does*, and
-    /// item 10 says to reserve headroom for risk-reducing actions, so a
-    /// cancel spends no rate token either.
+    /// makes cancelling resting orders part of what the switch *does*.
+    ///
+    /// It costs no per-agent rate token, and the address-wide budget of item
+    /// 10 is charged but never allowed to refuse it: that budget exists to
+    /// throttle agents before the venue does, and refusing a cancel to save a
+    /// request is the one trade item 10 forbids ("always reserve headroom for
+    /// risk-reducing actions"). A failed ledger write does not block it
+    /// either — see [`GuardrailEngine::record`].
     pub fn clear_cancel(
         &self,
         agent: &AgentId,
@@ -849,9 +1352,7 @@ impl GuardrailEngine {
         now_ms: u64,
         action: Action,
     ) -> Result<Cleared, Refusal> {
-        if reason.trim().is_empty() {
-            return Err(Refusal::MissingReason);
-        }
+        check_reason(reason)?;
         if count == 0 {
             return Err(Unevaluable::InputMismatch {
                 field: "cancels".to_owned(),
@@ -860,19 +1361,26 @@ impl GuardrailEngine {
             }
             .into());
         }
-        if !self.state().guardrails.contains_key(agent) {
+        let mut state = self.state();
+        if !state.guardrails.contains_key(agent) {
             return Err(Unevaluable::UnknownAgent {
                 agent: agent.clone(),
             }
             .into());
         }
+        // Charged, never refused: the account budget has to stay honest about
+        // requests oppen actually sends, but a cancel is the one thing it may
+        // not stop. Saturates at zero rather than going negative.
+        let global_tokens_remaining = draw_global_reserve(&mut state.global_bucket, now_ms);
         Ok(Cleared::new(
             action,
             Clearance {
                 agent: Some(agent.clone()),
+                vault_address: state.vaults.get(agent).copied(),
+                network: self.network,
                 evaluated_at_ms: now_ms,
                 kind: ClearedKind::Cancel { count },
-                utilization: Utilization::none(),
+                utilization: Utilization::none_with_global(global_tokens_remaining),
             },
         ))
     }
@@ -923,28 +1431,146 @@ impl GuardrailEngine {
                 .into());
             }
         }
+        let global_tokens_remaining = draw_global_reserve(&mut self.state().global_bucket, now_ms);
         Ok(Cleared::new(
             Action::ScheduleCancel { time: cancel_at_ms },
             Clearance {
                 agent: None,
+                // Operator-scoped: the dead-man's switch belongs to the
+                // account, not to any one sub-account.
+                vault_address: None,
+                network: self.network,
                 evaluated_at_ms: now_ms,
                 kind: ClearedKind::ScheduleCancel { cancel_at_ms },
-                utilization: Utilization::none(),
+                utilization: Utilization::none_with_global(global_tokens_remaining),
             },
         ))
     }
 }
 
+/// Whether this evaluation is an agent's first attempt or an operator
+/// approving a proposal the engine minted (spec item 28).
+///
+/// The only two things `Approved` changes are the order-rate token, which was
+/// spent when the proposal was minted, and the approval requirement itself.
+/// Every other predicate runs again against fresh state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Fresh,
+    Approved,
+}
+
+impl EngineState {
+    /// Mints an approval proposal and returns its id.
+    ///
+    /// The id is a receipt for a value the engine holds, not a credential: it
+    /// only names which stored intent to re-evaluate, and only
+    /// [`GuardrailEngine::operator_approve_proposal`] accepts it. The
+    /// sequence number makes two proposals minted in the same millisecond
+    /// distinct.
+    fn mint_proposal(&mut self, agent: &AgentId, intent: &OrderIntent, now_ms: u64) -> String {
+        self.sweep_proposals(now_ms);
+        self.proposal_seq = self.proposal_seq.saturating_add(1);
+        let id = format!("{}-{now_ms}-{}", agent.as_str(), self.proposal_seq);
+        self.proposals.insert(
+            id.clone(),
+            Proposal {
+                id: id.clone(),
+                agent: agent.clone(),
+                intent: intent.clone(),
+                issued_at_ms: now_ms,
+                expires_at_ms: now_ms.saturating_add(APPROVAL_TTL_MS),
+            },
+        );
+        id
+    }
+}
+
 impl Utilization {
-    fn none() -> Self {
+    fn none_with_global(global_tokens_remaining: Decimal) -> Self {
         Utilization {
             order_notional_pct: None,
             position_notional_pct: None,
             daily_loss_pct: None,
             leverage: Decimal::ZERO,
             order_tokens_remaining: Decimal::ZERO,
+            global_tokens_remaining,
         }
     }
+}
+
+/// Spends one request from the address-wide budget for an order, refusing
+/// once the remainder would fall to or below the reserve item 10 keeps for
+/// risk-reducing actions. Returns what is left.
+fn spend_global(
+    bucket: &mut TokenBucket,
+    budget: GlobalRateBudget,
+    mode: Mode,
+    now_ms: u64,
+) -> Result<Decimal, Refusal> {
+    let reserve = Decimal::from(budget.reserve);
+    bucket.refill(now_ms).map_err(|e| match e {
+        BucketError::ClockWentBackwards { last_ms } => {
+            Unevaluable::ClockWentBackwards { now_ms, last_ms }.into()
+        }
+        _ => Refusal::from(Unevaluable::InvalidGuardrailConfig {
+            field: "global_rate.rate.per_ms".to_owned(),
+            detail: "must be positive".to_owned(),
+        }),
+    })?;
+    // An approved proposal already spent its request when it was minted.
+    if mode == Mode::Approved {
+        return Ok(bucket.tokens());
+    }
+    if bucket.tokens() <= reserve {
+        return Err(Refusal::GlobalRateBudget {
+            tokens_available: bucket.tokens(),
+            reserve: budget.reserve,
+            retry_after_ms: bucket.retry_after_ms(),
+        });
+    }
+    match bucket.try_take(now_ms) {
+        Ok(()) => Ok(bucket.tokens()),
+        Err(_) => Err(Refusal::GlobalRateBudget {
+            tokens_available: bucket.tokens(),
+            reserve: budget.reserve,
+            retry_after_ms: bucket.retry_after_ms(),
+        }),
+    }
+}
+
+/// Charges the address-wide budget for a risk-reducing request without ever
+/// refusing it (item 10). Saturates at zero.
+fn draw_global_reserve(bucket: &mut TokenBucket, now_ms: u64) -> Decimal {
+    // A backwards clock or a zero window means the budget cannot be metered.
+    // That is not a reason to stop a cancel, so the draw is simply skipped.
+    let _ = bucket.try_take(now_ms);
+    bucket.tokens()
+}
+
+/// Spec item 19 requires a reason; item 30 makes it untrusted text and D-e
+/// keeps it forever. Bounded and control-character-checked here, at
+/// ingestion — `AGENTS.md` invariant 9 covers only rendering, and on the
+/// character grid U1 chose, an ANSI escape in a stored string is not inert.
+fn check_reason(reason: &str) -> Result<(), Refusal> {
+    if reason.trim().is_empty() {
+        return Err(Refusal::MissingReason);
+    }
+    if reason.len() > MAX_REASON_BYTES {
+        return Err(Refusal::ReasonTooLong {
+            len_bytes: reason.len(),
+            max_bytes: MAX_REASON_BYTES,
+        });
+    }
+    for (at_byte, ch) in reason.char_indices() {
+        if ch.is_control() && ch != '\n' && ch != '\t' {
+            return Err(Refusal::ReasonControlCharacter {
+                at_byte,
+                codepoint: ch as u32,
+            });
+        }
+    }
+    Ok(())
 }
 
 fn cancel_targets(state: &EngineState, scope: &KillScope) -> BTreeSet<AgentId> {

@@ -14,15 +14,15 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use rust_decimal::Decimal;
 
 use oppen_hl::meta::Asset;
 use oppen_hl::order::OrderKind;
 use oppen_hl::types::AssetInfo;
-use oppen_hl::wire::{CancelWire, Grouping, OrderWire, Tif, Tpsl};
+use oppen_hl::wire::{CancelByCloidWire, CancelWire, Cloid, Grouping, OrderWire, Tif, Tpsl};
 use oppen_hl::{Action, Network};
 
 use super::*;
@@ -36,6 +36,15 @@ const NOW_MS: u64 = MIDNIGHT_MS + 12 * 3_600_000;
 
 fn d(s: &str) -> Decimal {
     Decimal::from_str(s).expect("decimal literal")
+}
+
+/// The sub-account D1 pairs `alpha` with.
+fn vault() -> oppen_hl::Address {
+    oppen_hl::Address::parse("0x0d1d9635d0640821d15e323ac8adadfa9c111414").expect("address")
+}
+
+fn cloid() -> Cloid {
+    Cloid::parse("0x00000000000000000000000000000001").expect("cloid")
 }
 
 fn asset(name: &str, sz_decimals: u32, max_leverage: u32) -> Asset {
@@ -63,7 +72,17 @@ fn account(equity: Decimal) -> AccountSnapshot {
         day_start_ms: MIDNIGHT_MS,
         total_position_notional_usd: Decimal::ZERO,
         positions: BTreeMap::new(),
+        resting: Some(RestingExposure::none()),
     }
+}
+
+/// An exposure whose working book holds `szi` of `symbol` at `px`.
+fn with_resting(mut exposure: Exposure, symbol: &str, szi: Decimal, px: Decimal) -> Exposure {
+    let mut book = RestingExposure::none();
+    book.szi.insert(symbol.to_owned(), szi);
+    book.notional_usd = szi.abs() * px;
+    exposure.agent.resting = Some(book);
+    exposure
 }
 
 fn exposure(equity: Decimal) -> Exposure {
@@ -86,7 +105,6 @@ fn intent(symbol: &str, is_buy: bool, px: Decimal, sz: Decimal) -> OrderIntent {
         builder: None,
         max_slippage_bps: None,
         reason: "test".to_owned(),
-        approval: Approval::NotSupplied,
     }
 }
 
@@ -120,15 +138,34 @@ fn permissive(symbols: &[&str]) -> AgentGuardrails {
 struct CountingSink {
     cleared: AtomicUsize,
     refused: AtomicUsize,
+    operator: Mutex<Vec<OperatorAction>>,
 }
 
 impl AuditSink for CountingSink {
     fn record(&self, entry: &AuditEntry<'_>) -> Result<(), AuditError> {
         match entry.outcome {
-            AuditOutcome::Cleared(_) => self.cleared.fetch_add(1, Ordering::Relaxed),
-            AuditOutcome::Refused(_) => self.refused.fetch_add(1, Ordering::Relaxed),
-        };
+            AuditOutcome::Cleared(_) => {
+                self.cleared.fetch_add(1, Ordering::Relaxed);
+            }
+            AuditOutcome::Refused(_) => {
+                self.refused.fetch_add(1, Ordering::Relaxed);
+            }
+            AuditOutcome::Operator(action) => self
+                .operator
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(action.clone()),
+        }
         Ok(())
+    }
+}
+
+impl CountingSink {
+    fn operator_actions(&self) -> Vec<OperatorAction> {
+        self.operator
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 }
 
@@ -159,6 +196,9 @@ impl GuardrailStore for FailingStore {
     fn save_account_limits(&self, _l: &LossLimits) -> Result<(), StoreError> {
         Ok(())
     }
+    fn save_vault(&self, _a: &AgentId, _v: &oppen_hl::Address) -> Result<(), StoreError> {
+        Ok(())
+    }
 }
 
 struct Fixture {
@@ -180,11 +220,13 @@ impl Fixture {
         store: Arc<dyn GuardrailStore>,
         sink: Arc<dyn AuditSink>,
     ) -> Self {
-        let engine = GuardrailEngine::new(store, sink).expect("engine");
+        let engine = GuardrailEngine::new(store, sink, Network::Testnet).expect("engine");
         let agent = AgentId::new("alpha");
-        engine.register_agent(&agent).expect("register");
         engine
-            .operator_set_guardrails(&agent, config)
+            .register_agent(&agent, Some(vault()), NOW_MS)
+            .expect("register");
+        engine
+            .operator_set_guardrails(&agent, config, NOW_MS)
             .expect("set guardrails");
         Fixture { engine, agent }
     }
@@ -225,9 +267,12 @@ fn wire_sz(wire: &OrderWire) -> Decimal {
 #[test]
 fn a_freshly_paired_agent_is_refused_and_told_which_limit_to_raise() {
     let store: Arc<dyn GuardrailStore> = Arc::new(MemoryStore::new());
-    let engine = GuardrailEngine::new(store, Arc::new(NullAuditSink)).expect("engine");
+    let engine =
+        GuardrailEngine::new(store, Arc::new(NullAuditSink), Network::Testnet).expect("engine");
     let agent = AgentId::new("alpha");
-    let config = engine.register_agent(&agent).expect("register");
+    let config = engine
+        .register_agent(&agent, Some(vault()), NOW_MS)
+        .expect("register");
 
     // D-c verbatim.
     assert!(config.symbols.is_empty());
@@ -764,10 +809,13 @@ fn the_daily_loss_breaker_trips_the_kill_switch_and_the_next_order_is_paused() {
 fn an_account_wide_breach_stops_every_agent() {
     let f = Fixture::new(permissive(&["BTC"]));
     f.engine
-        .operator_set_account_limits(LossLimits {
-            max_daily_loss_usd: Some(d("400")),
-            max_drawdown_usd: None,
-        })
+        .operator_set_account_limits(
+            LossLimits {
+                max_daily_loss_usd: Some(d("400")),
+                max_drawdown_usd: None,
+            },
+            NOW_MS,
+        )
         .expect("set account limits");
     let btc = asset("BTC", 2, 40);
     let market = MarketRef::fresh("BTC", d("100"), NOW_MS);
@@ -795,6 +843,74 @@ fn an_account_wide_breach_stops_every_agent() {
     assert!(f.engine.kill_switch().is_engaged(&KillScope::Global));
 }
 
+/// Item 24's position cap is a cap on exposure, and a working order is
+/// exposure. Five orders each landing exactly on the cap used to clear
+/// one after another, because each was measured against a flat book.
+#[test]
+fn the_position_cap_counts_working_orders_so_it_cannot_be_split() {
+    let mut config = permissive(&["BTC"]);
+    config.max_position_usd = d("100");
+    let f = Fixture::new(config);
+    let btc = asset("BTC", 2, 40);
+    let market = MarketRef::fresh("BTC", d("100"), NOW_MS);
+    let order = intent("BTC", true, d("100"), d("1"));
+
+    // The first order fills the cap on its own.
+    let flat = exposure(d("100000"));
+    assert!(f.evaluate(&order, &btc, &market, &flat).is_ok());
+
+    // Once it is resting, every further one is refused — including the four
+    // that the old engine admitted, which together held 5x the cap.
+    let mut book = flat.clone();
+    for n in 1..5 {
+        book = with_resting(book, "BTC", Decimal::from(n), d("100"));
+        match f
+            .evaluate(&order, &btc, &market, &book)
+            .expect_err("order {n} is past the cap once the book is counted")
+        {
+            Refusal::PositionNotional {
+                observed_usd,
+                resting_usd,
+                limit_usd,
+                ..
+            } => {
+                assert_eq!(observed_usd, Decimal::from(n + 1) * d("100"));
+                assert_eq!(resting_usd, Decimal::from(n) * d("100"));
+                assert_eq!(limit_usd, d("100"));
+            }
+            other => panic!("expected the position refusal, got {other}"),
+        }
+    }
+}
+
+/// Working orders on other symbols still consume the account's leverage.
+#[test]
+fn the_leverage_cap_counts_working_orders_on_other_symbols() {
+    let mut config = permissive(&["BTC"]);
+    config.risk.max_leverage = 2;
+    let f = Fixture::new(config);
+    let btc = asset("BTC", 2, 40);
+    let market = MarketRef::fresh("BTC", d("100"), NOW_MS);
+    let order = intent("BTC", true, d("100"), d("1"));
+
+    // $100 of new BTC exposure on $100 of equity is 1x on its own.
+    assert!(
+        f.evaluate(&order, &btc, &market, &exposure(d("100")))
+            .is_ok()
+    );
+
+    // With $150 of ETH already working, the same order is 2.5x.
+    let mut with_eth = exposure(d("100"));
+    with_eth.agent.resting = Some(RestingExposure {
+        szi: BTreeMap::from([("ETH".to_owned(), d("1.5"))]),
+        notional_usd: d("150"),
+    });
+    assert!(matches!(
+        f.evaluate(&order, &btc, &market, &with_eth),
+        Err(Refusal::Leverage { observed, .. }) if observed == d("2.5")
+    ));
+}
+
 // ---- item 26: the kill switch -------------------------------------------
 
 #[test]
@@ -806,10 +922,13 @@ fn the_kill_switch_survives_a_restart() {
     {
         let store: Arc<dyn GuardrailStore> =
             Arc::new(SqliteGuardrailStore::open(&path).expect("open"));
-        let engine = GuardrailEngine::new(store, Arc::new(NullAuditSink)).expect("engine");
-        engine.register_agent(&agent).expect("register");
+        let engine =
+            GuardrailEngine::new(store, Arc::new(NullAuditSink), Network::Testnet).expect("engine");
         engine
-            .operator_set_guardrails(&agent, permissive(&["BTC"]))
+            .register_agent(&agent, Some(vault()), NOW_MS)
+            .expect("register");
+        engine
+            .operator_set_guardrails(&agent, permissive(&["BTC"]), NOW_MS)
             .expect("set guardrails");
         let effect = engine
             .operator_engage_kill(KillScope::agent(agent.clone()), KillReason::Operator, 7)
@@ -821,7 +940,8 @@ fn the_kill_switch_survives_a_restart() {
     // A whole new process would see exactly this.
     let store: Arc<dyn GuardrailStore> =
         Arc::new(SqliteGuardrailStore::open(&path).expect("reopen"));
-    let engine = GuardrailEngine::new(store, Arc::new(NullAuditSink)).expect("engine");
+    let engine =
+        GuardrailEngine::new(store, Arc::new(NullAuditSink), Network::Testnet).expect("engine");
     assert!(
         engine
             .kill_switch()
@@ -872,7 +992,7 @@ fn a_global_engagement_pauses_an_agent_with_no_engagement_of_its_own() {
         })
     ));
     f.engine
-        .operator_release_kill(&KillScope::Global)
+        .operator_release_kill(&KillScope::Global, NOW_MS)
         .expect("release");
     assert!(
         f.evaluate(
@@ -905,6 +1025,126 @@ fn cancelling_still_clears_while_the_kill_switch_is_engaged() {
         Action::Cancel { cancels } if cancels.len() == 1
     ));
     assert_eq!(cleared.clearance().kind, ClearedKind::Cancel { count: 1 });
+}
+
+/// Item 26 makes cancelling resting orders part of what engaging the switch
+/// *does*, and item 25's whole point is stopping an agent that is grinding
+/// the account down overnight. A trip that pauses new orders but leaves the
+/// working ones live has not stopped anything.
+#[test]
+fn a_breaker_trip_queues_the_same_cancels_an_operator_engagement_would() {
+    let mut config = permissive(&["BTC"]);
+    config.loss = LossLimits {
+        max_daily_loss_usd: Some(d("25")),
+        max_drawdown_usd: None,
+    };
+    let f = Fixture::new(config);
+    assert!(f.engine.take_pending_kill_effects().is_empty());
+
+    let mut losing = exposure(d("975"));
+    losing.agent.realized_pnl_today_usd = d("-25");
+    assert!(matches!(
+        f.evaluate(
+            &intent("BTC", true, d("100"), d("1")),
+            &asset("BTC", 2, 40),
+            &MarketRef::fresh("BTC", d("100"), NOW_MS),
+            &losing,
+        ),
+        Err(Refusal::LossLimit { .. })
+    ));
+
+    let effects = f.engine.take_pending_kill_effects();
+    assert_eq!(
+        effects.len(),
+        1,
+        "the trip must name whose orders to cancel"
+    );
+    assert!(effects[0].newly_engaged);
+    assert_eq!(effects[0].scope, KillScope::agent("alpha"));
+    assert!(effects[0].cancel_for.contains(&f.agent));
+
+    // Identical to what the operator pressing the same scope would produce.
+    let manual = f
+        .engine
+        .operator_engage_kill(KillScope::agent("alpha"), KillReason::Operator, NOW_MS)
+        .expect("engage");
+    assert_eq!(effects[0].cancel_for, manual.cancel_for);
+
+    // Drained, so a caller cannot double-issue the cancels.
+    assert!(f.engine.take_pending_kill_effects().is_empty());
+}
+
+/// A `Global` trip has to be actionable without an agent id in hand.
+#[test]
+fn a_global_breaker_trip_names_every_agent() {
+    let f = Fixture::new(permissive(&["BTC"]));
+    let beta = AgentId::new("beta");
+    f.engine
+        .register_agent(&beta, None, NOW_MS)
+        .expect("register");
+    f.engine
+        .operator_set_account_limits(
+            LossLimits {
+                max_daily_loss_usd: Some(d("400")),
+                max_drawdown_usd: None,
+            },
+            NOW_MS,
+        )
+        .expect("set account limits");
+
+    let mut fleet = account(d("4600"));
+    fleet.realized_pnl_today_usd = d("-400");
+    let with_fleet = Exposure {
+        agent: account(d("1000")),
+        fleet: Some(fleet),
+    };
+    assert!(matches!(
+        f.evaluate(
+            &intent("BTC", true, d("100"), d("1")),
+            &asset("BTC", 2, 40),
+            &MarketRef::fresh("BTC", d("100"), NOW_MS),
+            &with_fleet,
+        ),
+        Err(Refusal::LossLimit {
+            scope: KillScope::Global,
+            ..
+        })
+    ));
+    let effects = f.engine.take_pending_kill_effects();
+    assert_eq!(effects.len(), 1);
+    assert_eq!(effects[0].scope, KillScope::Global);
+    assert_eq!(effects[0].cancel_for, f.engine.agents());
+    assert_eq!(
+        effects[0].cancel_for,
+        BTreeSet::from([f.agent.clone(), beta])
+    );
+}
+
+/// A kill-switch write failure refuses the order, but must still hand the
+/// caller the cancels: staying stopped and leaving the book live is the
+/// worst of both.
+#[test]
+fn a_trip_whose_state_write_fails_still_queues_the_cancels() {
+    let mut config = permissive(&["BTC"]);
+    config.loss = LossLimits {
+        max_daily_loss_usd: Some(d("25")),
+        max_drawdown_usd: None,
+    };
+    let f = Fixture::with(config, Arc::new(FailingStore), Arc::new(NullAuditSink));
+    let mut losing = exposure(d("975"));
+    losing.agent.realized_pnl_today_usd = d("-30");
+    assert!(matches!(
+        f.evaluate(
+            &intent("BTC", true, d("100"), d("1")),
+            &asset("BTC", 2, 40),
+            &MarketRef::fresh("BTC", d("100"), NOW_MS),
+            &losing,
+        ),
+        Err(Refusal::Unevaluable(Unevaluable::StateWriteFailed { .. }))
+    ));
+    let effects = f.engine.take_pending_kill_effects();
+    assert_eq!(effects.len(), 1);
+    assert!(effects[0].cancel_for.contains(&f.agent));
 }
 
 // ---- item 27: the dead-man's switch -------------------------------------
@@ -1075,6 +1315,13 @@ fn every_unevaluable_input_refuses() {
         ))
     ));
 
+    let mut no_book = good_exposure.clone();
+    no_book.agent.resting = None;
+    assert!(matches!(
+        f.evaluate(&order, &btc, &good_market, &no_book),
+        Err(Refusal::Unevaluable(Unevaluable::MissingRestingOrders))
+    ));
+
     let mut stale_account = good_exposure.clone();
     stale_account.agent.as_of_ms = NOW_MS - 5_001;
     assert!(matches!(
@@ -1125,10 +1372,13 @@ fn every_unevaluable_input_refuses() {
 fn account_wide_limits_with_no_fleet_snapshot_refuse() {
     let f = Fixture::new(permissive(&["BTC"]));
     f.engine
-        .operator_set_account_limits(LossLimits {
-            max_daily_loss_usd: Some(d("500")),
-            max_drawdown_usd: None,
-        })
+        .operator_set_account_limits(
+            LossLimits {
+                max_daily_loss_usd: Some(d("500")),
+                max_drawdown_usd: None,
+            },
+            NOW_MS,
+        )
         .expect("set");
     assert!(matches!(
         f.evaluate(
@@ -1203,6 +1453,295 @@ fn a_ledger_write_failure_refuses_the_order() {
     }
 }
 
+/// Fail-closed exists to stop new exposure. Applying it to the actions that
+/// *remove* exposure inverts the property: a full ledger disk would take away
+/// the operator's ability to stop trading, take the kill switch's own cancels
+/// down with it, and stop `scheduleCancel` from being disarmed — all while
+/// the orders it cannot cancel keep working.
+#[test]
+fn a_ledger_write_failure_never_blocks_a_cancel_or_the_dead_man_switch() {
+    let f = Fixture::with(
+        permissive(&["BTC"]),
+        Arc::new(MemoryStore::new()),
+        Arc::new(FailingSink),
+    );
+
+    f.engine
+        .clear_cancel(
+            &f.agent,
+            vec![CancelWire { a: 7, o: 42 }],
+            "the disk is full and the orders still have to go",
+            NOW_MS,
+        )
+        .expect("a cancel is risk-reducing and must clear");
+
+    f.engine
+        .clear_cancel_by_cloid(
+            &f.agent,
+            vec![CancelByCloidWire {
+                asset: 7,
+                cloid: cloid(),
+            }],
+            "cancel by cloid after a timeout",
+            NOW_MS,
+        )
+        .expect("cancel-by-cloid is the only safe move after a timeout");
+
+    let disarm = f
+        .engine
+        .clear_dead_man(DeadManIntent::Disarm, NOW_MS)
+        .expect("disarming clears")
+        .expect("a disarm produces an action");
+    assert_eq!(disarm.action(), &Action::ScheduleCancel { time: None });
+
+    f.engine
+        .clear_schedule_cancel(Some(NOW_MS + DEAD_MAN_MIN_LEAD_MS), NOW_MS)
+        .expect("re-arming clears");
+
+    // The order path is unchanged: an unexplainable *order* still does not
+    // happen.
+    assert!(matches!(
+        f.evaluate(
+            &intent("BTC", true, d("100"), d("1")),
+            &asset("BTC", 2, 40),
+            &MarketRef::fresh("BTC", d("100"), NOW_MS),
+            &exposure(d("100000")),
+        ),
+        Err(Refusal::Unevaluable(Unevaluable::AuditWriteFailed { .. }))
+    ));
+}
+
+/// Item 18 names guardrail trips, approval decisions and kill-switch changes
+/// as ledger events. Without these rows an export cannot say why an order
+/// refused yesterday cleared today.
+#[test]
+fn operator_actions_reach_the_ledger() {
+    let sink = Arc::new(CountingSink::default());
+    let f = Fixture::with(
+        permissive(&["BTC"]),
+        Arc::new(MemoryStore::new()),
+        sink.clone() as Arc<dyn AuditSink>,
+    );
+    f.engine
+        .operator_set_account_limits(LossLimits::UNSET, NOW_MS)
+        .expect("set");
+    f.engine
+        .operator_engage_kill(KillScope::Global, KillReason::Operator, NOW_MS)
+        .expect("engage");
+    f.engine
+        .operator_release_kill(&KillScope::Global, NOW_MS)
+        .expect("release");
+    f.engine
+        .operator_set_global_rate_budget(GlobalRateBudget::default(), NOW_MS)
+        .expect("set budget");
+
+    let actions = sink.operator_actions();
+    assert!(
+        actions
+            .iter()
+            .any(|a| matches!(a, OperatorAction::AgentRegistered { .. })),
+        "{actions:?}"
+    );
+    // The guardrail row carries both sides, so the change is readable.
+    let changed = actions
+        .iter()
+        .find_map(|a| match a {
+            OperatorAction::GuardrailsChanged { before, after } => Some((before, after)),
+            _ => None,
+        })
+        .expect("the fixture's own set_guardrails is recorded");
+    assert_eq!(
+        changed.0.as_deref().map(|c| c.max_order_usd),
+        Some(DEFAULT_MAX_ORDER_USD)
+    );
+    assert_eq!(changed.1.max_order_usd, d("1000000"));
+    assert!(actions.iter().any(|a| matches!(
+        a,
+        OperatorAction::KillEngaged {
+            newly_engaged: true,
+            ..
+        }
+    )));
+    assert!(actions.iter().any(|a| matches!(
+        a,
+        OperatorAction::KillReleased {
+            was_engaged: true,
+            ..
+        }
+    )));
+    assert!(
+        actions
+            .iter()
+            .any(|a| matches!(a, OperatorAction::AccountLimitsChanged { .. }))
+    );
+    assert!(
+        actions
+            .iter()
+            .any(|a| matches!(a, OperatorAction::GlobalRateBudgetChanged { .. }))
+    );
+}
+
+/// An operator action that has already happened must not be reported as
+/// failed because its row could not be written.
+#[test]
+fn an_operator_action_still_happens_when_its_ledger_row_fails() {
+    let f = Fixture::with(
+        permissive(&["BTC"]),
+        Arc::new(MemoryStore::new()),
+        Arc::new(FailingSink),
+    );
+    let effect = f
+        .engine
+        .operator_engage_kill(KillScope::Global, KillReason::Operator, NOW_MS)
+        .expect("the switch engages even when the ledger cannot record it");
+    assert!(effect.newly_engaged);
+    assert!(f.engine.kill_switch().is_engaged(&KillScope::Global));
+}
+
+// ---- item 10: the address-wide request budget ---------------------------
+
+/// Item 10's budget is metered per address, so no per-agent cap bounds it.
+/// An order may not draw it below the reserve; a cancel may, because item 10
+/// says to always reserve headroom for risk-reducing actions and a budget
+/// that refuses a cancel has spent that headroom on the wrong thing.
+#[test]
+fn the_global_budget_refuses_orders_at_the_reserve_but_never_a_cancel() {
+    let f = Fixture::new(permissive(&["BTC"]));
+    // Four requests, one of them reserved.
+    f.engine
+        .operator_set_global_rate_budget(
+            GlobalRateBudget {
+                rate: OrderRate {
+                    count: 4,
+                    per_ms: 4_000_000,
+                },
+                reserve: 1,
+            },
+            NOW_MS,
+        )
+        .expect("set budget");
+
+    let btc = asset("BTC", 2, 40);
+    let market = MarketRef::fresh("BTC", d("100"), NOW_MS);
+    let order = intent("BTC", true, d("100"), d("1"));
+    for i in 0..3 {
+        let cleared = f
+            .evaluate(&order, &btc, &market, &exposure(d("100000")))
+            .unwrap_or_else(|e| panic!("order {i} is inside the budget: {e}"));
+        assert_eq!(
+            cleared.clearance().utilization.global_tokens_remaining,
+            Decimal::from(3 - i)
+        );
+    }
+    match f
+        .evaluate(&order, &btc, &market, &exposure(d("100000")))
+        .expect_err("the fourth order would eat the reserve")
+    {
+        Refusal::GlobalRateBudget {
+            tokens_available,
+            reserve,
+            ..
+        } => {
+            assert_eq!(tokens_available, Decimal::ONE);
+            assert_eq!(reserve, 1);
+        }
+        other => panic!("expected the global budget refusal, got {other}"),
+    }
+
+    // The reserve is what the cancel path is for, and once it is gone the
+    // cancel still clears rather than being throttled.
+    for _ in 0..3 {
+        f.engine
+            .clear_cancel(
+                &f.agent,
+                vec![CancelWire { a: 7, o: 42 }],
+                "winding down",
+                NOW_MS,
+            )
+            .expect("a cancel is never refused by the request budget");
+    }
+}
+
+// ---- item 30: the reason is untrusted text ------------------------------
+
+#[test]
+fn an_unbounded_or_control_laden_reason_is_refused_at_both_boundaries() {
+    let f = Fixture::new(permissive(&["BTC"]));
+    let btc = asset("BTC", 2, 40);
+    let market = MarketRef::fresh("BTC", d("100"), NOW_MS);
+    let with_reason = |reason: String| {
+        let mut i = intent("BTC", true, d("100"), d("1"));
+        i.reason = reason;
+        i
+    };
+
+    assert!(
+        f.evaluate(
+            &with_reason("a".repeat(MAX_REASON_BYTES)),
+            &btc,
+            &market,
+            &exposure(d("100000")),
+        )
+        .is_ok(),
+        "exactly at the limit is allowed"
+    );
+    match f
+        .evaluate(
+            &with_reason("a".repeat(MAX_REASON_BYTES + 1)),
+            &btc,
+            &market,
+            &exposure(d("100000")),
+        )
+        .expect_err("one byte past the limit is refused")
+    {
+        Refusal::ReasonTooLong {
+            len_bytes,
+            max_bytes,
+        } => {
+            assert_eq!(len_bytes, MAX_REASON_BYTES + 1);
+            assert_eq!(max_bytes, MAX_REASON_BYTES);
+        }
+        other => panic!("expected the length refusal, got {other}"),
+    }
+
+    // Newline and tab are the only control characters a sentence needs.
+    assert!(
+        f.evaluate(
+            &with_reason("funding\nflipped\tnegative".to_owned()),
+            &btc,
+            &market,
+            &exposure(d("100000")),
+        )
+        .is_ok()
+    );
+    match f
+        .evaluate(
+            &with_reason("\u{1b}[2J fake price row".to_owned()),
+            &btc,
+            &market,
+            &exposure(d("100000")),
+        )
+        .expect_err("an ANSI escape is not inert on a character grid")
+    {
+        Refusal::ReasonControlCharacter { at_byte, codepoint } => {
+            assert_eq!(at_byte, 0);
+            assert_eq!(codepoint, 0x1b);
+        }
+        other => panic!("expected the control-character refusal, got {other}"),
+    }
+
+    // The cancel path takes the same reason and must check it identically.
+    assert!(matches!(
+        f.engine.clear_cancel(
+            &f.agent,
+            vec![CancelWire { a: 7, o: 42 }],
+            &"a".repeat(MAX_REASON_BYTES + 1),
+            NOW_MS,
+        ),
+        Err(Refusal::ReasonTooLong { .. })
+    ));
+}
+
 #[test]
 fn a_kill_switch_write_failure_refuses_rather_than_forgetting_the_trip() {
     let mut config = permissive(&["BTC"]);
@@ -1274,24 +1813,179 @@ fn approval_is_the_last_check_and_is_not_charged_twice() {
         ),
         Err(Refusal::OrderNotional { .. })
     ));
+    assert!(f.engine.pending_proposals(NOW_MS).is_empty());
 
     // A good order becomes a proposal, and spends the single rate token.
     let order = intent("BTC", true, d("25"), d("1"));
-    assert!(matches!(
-        f.evaluate(&order, &btc, &market, &exposure(d("100000"))),
-        Err(Refusal::ApprovalRequired { .. })
-    ));
+    let Err(Refusal::ApprovalRequired {
+        approval_id,
+        expires_at_ms,
+        ..
+    }) = f.evaluate(&order, &btc, &market, &exposure(d("100000")))
+    else {
+        panic!("a good order under approval mode becomes a proposal");
+    };
+    assert_eq!(expires_at_ms, NOW_MS + APPROVAL_TTL_MS);
+    let pending = f.engine.pending_proposals(NOW_MS);
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].id(), approval_id);
+    assert_eq!(pending[0].intent(), &order);
 
     // The operator approves; the re-evaluation must not need a second token.
-    let mut approved = order.clone();
-    approved.approval = Approval::Granted {
-        approval_id: "a-1".to_owned(),
-    };
     assert!(
-        f.evaluate(&approved, &btc, &market, &exposure(d("100000")))
+        f.engine
+            .operator_approve_proposal(&approval_id, &btc, &market, &exposure(d("100000")), NOW_MS)
             .is_ok(),
         "an approved proposal does not pay the rate token twice"
     );
+    // And it is spent: one approval, one evaluation.
+    assert!(f.engine.pending_proposals(NOW_MS).is_empty());
+    assert!(matches!(
+        f.engine.operator_approve_proposal(
+            &approval_id,
+            &btc,
+            &market,
+            &exposure(d("100000")),
+            NOW_MS
+        ),
+        Err(Refusal::Unevaluable(Unevaluable::UnknownProposal { .. }))
+    ));
+}
+
+/// The whole of finding 2: there must be no value a caller can build that
+/// asserts it was approved. `OrderIntent` has no approval field, so the only
+/// way to reach the approved path is an id the engine minted — and the engine
+/// re-evaluates *its own* stored intent, never one the caller re-supplies.
+#[test]
+fn an_approval_cannot_be_asserted_by_the_caller_and_cannot_be_swapped() {
+    let mut config = permissive(&["BTC"]);
+    config.approval_required = true;
+    config.order_rate = OrderRate {
+        count: 1,
+        per_ms: 300_000,
+    };
+    let f = Fixture::new(config);
+    let btc = asset("BTC", 2, 40);
+    let market = MarketRef::fresh("BTC", d("100"), NOW_MS);
+
+    // A made-up id is not an approval.
+    assert!(matches!(
+        f.engine
+            .operator_approve_proposal("a-1", &btc, &market, &exposure(d("100000")), NOW_MS),
+        Err(Refusal::Unevaluable(Unevaluable::UnknownProposal { .. }))
+    ));
+
+    // A small order is proposed; approving it signs the small order, and
+    // there is no parameter by which a larger one could be substituted.
+    let small = intent("BTC", true, d("100"), d("1"));
+    let Err(Refusal::ApprovalRequired { approval_id, .. }) =
+        f.evaluate(&small, &btc, &market, &exposure(d("100000")))
+    else {
+        panic!("expected a proposal");
+    };
+    let cleared = f
+        .engine
+        .operator_approve_proposal(&approval_id, &btc, &market, &exposure(d("100000")), NOW_MS)
+        .expect("the operator approves the proposal it was shown");
+    match &cleared.clearance().kind {
+        ClearedKind::Order { sz, .. } => assert_eq!(*sz, d("1")),
+        other => panic!("expected an order clearance, got {other:?}"),
+    }
+
+    // The rate token was spent when the proposal was minted, so a second
+    // fresh order is refused by the cap the old bypass skipped entirely.
+    assert!(matches!(
+        f.evaluate(&small, &btc, &market, &exposure(d("100000"))),
+        Err(Refusal::OrderRate { .. })
+    ));
+}
+
+/// Item 28: proposals carry a TTL and auto-expire.
+#[test]
+fn a_proposal_expires_and_cannot_be_approved_afterwards() {
+    let mut config = permissive(&["BTC"]);
+    config.approval_required = true;
+    let f = Fixture::new(config);
+    let btc = asset("BTC", 2, 40);
+    let market = MarketRef::fresh("BTC", d("100"), NOW_MS);
+    let Err(Refusal::ApprovalRequired { approval_id, .. }) = f.evaluate(
+        &intent("BTC", true, d("100"), d("1")),
+        &btc,
+        &market,
+        &exposure(d("100000")),
+    ) else {
+        panic!("expected a proposal");
+    };
+
+    let expiry = NOW_MS + APPROVAL_TTL_MS;
+    assert_eq!(f.engine.pending_proposals(expiry - 1).len(), 1);
+    assert!(f.engine.pending_proposals(expiry).is_empty());
+    let mut late_market = market.clone();
+    late_market.as_of_ms = expiry;
+    let mut late = exposure(d("100000"));
+    late.agent.as_of_ms = expiry;
+    assert!(matches!(
+        f.engine
+            .operator_approve_proposal(&approval_id, &btc, &late_market, &late, expiry),
+        Err(Refusal::Unevaluable(Unevaluable::UnknownProposal { .. }))
+    ));
+}
+
+/// An approval is not a waiver. Every hard predicate runs again against the
+/// state at approval time, which is what item 28's "re-priced at approval
+/// time" means for the guardrails.
+#[test]
+fn an_approved_proposal_is_still_refused_if_the_world_moved() {
+    let mut config = permissive(&["BTC"]);
+    config.approval_required = true;
+    config.max_position_usd = d("200");
+    let f = Fixture::new(config);
+    let btc = asset("BTC", 2, 40);
+    let market = MarketRef::fresh("BTC", d("100"), NOW_MS);
+    let Err(Refusal::ApprovalRequired { approval_id, .. }) = f.evaluate(
+        &intent("BTC", true, d("100"), d("1")),
+        &btc,
+        &market,
+        &exposure(d("100000")),
+    ) else {
+        panic!("expected a proposal");
+    };
+
+    // By the time the operator looks, the agent already holds the cap.
+    let mut loaded = exposure(d("100000"));
+    loaded.agent.positions.insert(
+        "BTC".to_owned(),
+        PositionSnapshot {
+            szi: d("2"),
+            entry_px: Some(d("100")),
+        },
+    );
+    loaded.agent.total_position_notional_usd = d("200");
+    assert!(matches!(
+        f.engine
+            .operator_approve_proposal(&approval_id, &btc, &market, &loaded, NOW_MS),
+        Err(Refusal::PositionNotional { .. })
+    ));
+}
+
+#[test]
+fn a_rejected_proposal_is_gone() {
+    let mut config = permissive(&["BTC"]);
+    config.approval_required = true;
+    let f = Fixture::new(config);
+    let btc = asset("BTC", 2, 40);
+    let market = MarketRef::fresh("BTC", d("100"), NOW_MS);
+    let Err(Refusal::ApprovalRequired { approval_id, .. }) = f.evaluate(
+        &intent("BTC", true, d("100"), d("1")),
+        &btc,
+        &market,
+        &exposure(d("100000")),
+    ) else {
+        panic!("expected a proposal");
+    };
+    assert!(f.engine.operator_reject_proposal(&approval_id, NOW_MS));
+    assert!(!f.engine.operator_reject_proposal(&approval_id, NOW_MS));
+    assert!(f.engine.pending_proposals(NOW_MS).is_empty());
 }
 
 // ---- what gets signed is what was checked -------------------------------
@@ -1323,6 +2017,71 @@ fn the_cleared_action_carries_the_rounded_values_that_were_checked() {
             assert_eq!(*px, d("41505"));
             assert_eq!(*sz, d("0.00123"));
             assert_eq!(*notional_usd, d("41505") * d("0.00123"));
+        }
+        other => panic!("expected an order clearance, got {other:?}"),
+    }
+}
+
+/// Item 19 makes query-by-cloid the only safe move after a
+/// `timeout_unknown_outcome` and item 9 reconciles by it, so the row that
+/// says why an order was allowed has to carry the same cloid the wire order
+/// does — otherwise the decision cannot be joined to the fill. R6 wants the
+/// same of the decision-time book snapshot.
+#[test]
+fn the_clearance_carries_the_cloid_and_the_snapshot_it_was_decided_against() {
+    let f = Fixture::new(permissive(&["BTC"]));
+    let btc = asset("BTC", 2, 40);
+    let mut market = MarketRef::fresh("BTC", d("100"), NOW_MS);
+    market.snapshot = Some(MarketSnapshotRef {
+        id: "snap-1".to_owned(),
+        hash: "0xfeed".to_owned(),
+    });
+    let mut order = intent("BTC", true, d("100"), d("1"));
+    order.cloid = Some(cloid());
+
+    let cleared = f
+        .evaluate(&order, &btc, &market, &exposure(d("100000")))
+        .expect("clears");
+    let wire = wire_of(&cleared);
+    match &cleared.clearance().kind {
+        ClearedKind::Order {
+            cloid: recorded,
+            snapshot_id,
+            snapshot_hash,
+            ..
+        } => {
+            assert_eq!(recorded.as_ref(), Some(&cloid()));
+            assert_eq!(
+                recorded.as_ref().map(|c| c.as_str()),
+                wire.c.as_ref().map(|c| c.as_str()),
+                "the ledger row and the wire order must name the same cloid"
+            );
+            assert_eq!(snapshot_id.as_deref(), Some("snap-1"));
+            assert_eq!(snapshot_hash.as_deref(), Some("0xfeed"));
+        }
+        other => panic!("expected an order clearance, got {other:?}"),
+    }
+
+    // Both are nullable today, and absence is absence rather than a
+    // placeholder that could be mistaken for a real id.
+    let bare = f
+        .evaluate(
+            &intent("BTC", true, d("100"), d("1")),
+            &btc,
+            &MarketRef::fresh("BTC", d("100"), NOW_MS),
+            &exposure(d("100000")),
+        )
+        .expect("clears");
+    match &bare.clearance().kind {
+        ClearedKind::Order {
+            cloid,
+            snapshot_id,
+            snapshot_hash,
+            ..
+        } => {
+            assert!(cloid.is_none());
+            assert!(snapshot_id.is_none());
+            assert!(snapshot_hash.is_none());
         }
         other => panic!("expected an order clearance, got {other:?}"),
     }
@@ -1369,12 +2128,105 @@ fn a_clearance_signs_exactly_one_request() {
         "0123456789012345678901234567890123456789012345678901234567890123",
     )
     .expect("key");
-    let (request, clearance) =
-        sign_cleared(&key, cleared, 1, None, None, Network::Testnet).expect("signs");
+    let (request, clearance) = sign_cleared(&key, cleared, 1, None).expect("signs");
     assert_eq!(clearance.agent, Some(AgentId::new("alpha")));
-    assert!(matches!(request.action, Action::Order { .. }));
+    assert!(matches!(request.action(), Action::Order { .. }));
     // `cleared` was consumed by the signature, so there is no second use of
     // it here and the compiler enforces that.
+}
+
+/// R4 calls a mainnet number that is actually a testnet number the worst bug
+/// this product can ship, and D1 makes each agent's sub-account the unit of
+/// capital segregation. Neither may be a signing parameter: the clearance
+/// carries what it was evaluated against, and `sign_cleared` has no argument
+/// by which a caller could change either.
+#[test]
+fn a_clearance_is_signed_for_the_network_and_sub_account_it_was_evaluated_for() {
+    let f = Fixture::new(permissive(&["BTC"]));
+    let cleared = f
+        .evaluate(
+            &intent("BTC", true, d("100"), d("1")),
+            &asset("BTC", 2, 40),
+            &MarketRef::fresh("BTC", d("100"), NOW_MS),
+            &exposure(d("100000")),
+        )
+        .expect("clears");
+    assert_eq!(cleared.clearance().network, Network::Testnet);
+    assert_eq!(cleared.clearance().vault_address, Some(vault()));
+
+    let key = oppen_hl::AgentKey::from_hex(
+        "0123456789012345678901234567890123456789012345678901234567890123",
+    )
+    .expect("key");
+    let (request, _) = sign_cleared(&key, cleared, 1, None).expect("signs");
+    assert_eq!(request.vault_address(), Some(vault()));
+
+    // The same order under a mainnet engine signs for mainnet — the network
+    // travels with the engine, not with the call.
+    let mainnet = GuardrailEngine::new(
+        Arc::new(MemoryStore::new()),
+        Arc::new(NullAuditSink),
+        Network::Mainnet,
+    )
+    .expect("engine");
+    let other = AgentId::new("beta");
+    let other_vault =
+        oppen_hl::Address::parse("0x000000000000000000000000000000000000beef").expect("address");
+    mainnet
+        .register_agent(&other, Some(other_vault), NOW_MS)
+        .expect("register");
+    mainnet
+        .operator_set_guardrails(&other, permissive(&["BTC"]), NOW_MS)
+        .expect("set guardrails");
+    let cleared = mainnet
+        .evaluate(
+            &other,
+            &intent("BTC", true, d("100"), d("1")),
+            &asset("BTC", 2, 40),
+            &MarketRef::fresh("BTC", d("100"), NOW_MS),
+            &exposure(d("100000")),
+            NOW_MS,
+        )
+        .expect("clears");
+    assert_eq!(cleared.clearance().network, Network::Mainnet);
+    assert_eq!(cleared.clearance().vault_address, Some(other_vault));
+}
+
+/// The binding has to survive a restart, or the second launch signs a
+/// sub-account's orders against the master account.
+#[test]
+fn the_sub_account_binding_survives_a_restart() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("testnet.db");
+    let agent = AgentId::new("alpha");
+    {
+        let store: Arc<dyn GuardrailStore> =
+            Arc::new(SqliteGuardrailStore::open(&path).expect("open"));
+        let engine =
+            GuardrailEngine::new(store, Arc::new(NullAuditSink), Network::Testnet).expect("engine");
+        engine
+            .register_agent(&agent, Some(vault()), NOW_MS)
+            .expect("register");
+        engine
+            .operator_set_guardrails(&agent, permissive(&["BTC"]), NOW_MS)
+            .expect("set guardrails");
+    }
+    let store: Arc<dyn GuardrailStore> =
+        Arc::new(SqliteGuardrailStore::open(&path).expect("reopen"));
+    let engine =
+        GuardrailEngine::new(store, Arc::new(NullAuditSink), Network::Testnet).expect("engine");
+    assert_eq!(engine.vault_address(&agent), Some(vault()));
+    let cleared = engine
+        .evaluate(
+            &agent,
+            &intent("BTC", true, d("100"), d("1")),
+            &asset("BTC", 2, 40),
+            &MarketRef::fresh("BTC", d("100"), NOW_MS),
+            &exposure(d("100000")),
+            NOW_MS,
+        )
+        .expect("clears");
+    assert_eq!(cleared.clearance().vault_address, Some(vault()));
 }
 
 /// Internally-tagged enums with newtype variants fail at *serialization*
@@ -1419,6 +2271,40 @@ fn every_refusal_shape_serializes_deterministically() {
             symbol: "BTC".to_owned(),
             age_ms: 3_000,
             max_age_ms: 2_000,
+        }),
+        Refusal::PositionNotional {
+            symbol: "BTC".to_owned(),
+            observed_usd: d("500"),
+            resting_usd: d("400"),
+            limit_usd: d("100"),
+        },
+        Refusal::GlobalRateBudget {
+            tokens_available: d("100"),
+            reserve: 100,
+            retry_after_ms: 10_000,
+        },
+        Refusal::ApprovalRequired {
+            symbol: "BTC".to_owned(),
+            notional_usd: d("25"),
+            approval_id: "alpha-1-1".to_owned(),
+            expires_at_ms: 120_000,
+        },
+        Refusal::ReasonTooLong {
+            len_bytes: 4_096,
+            max_bytes: MAX_REASON_BYTES,
+        },
+        Refusal::ReasonControlCharacter {
+            at_byte: 0,
+            codepoint: 0x1b,
+        },
+        Refusal::Unevaluable(Unevaluable::MissingRestingOrders),
+        Refusal::Unevaluable(Unevaluable::UnknownProposal {
+            approval_id: "alpha-1-1".to_owned(),
+        }),
+        Refusal::Unevaluable(Unevaluable::ProposalExpired {
+            approval_id: "alpha-1-1".to_owned(),
+            expires_at_ms: 1,
+            now_ms: 2,
         }),
     ];
     for refusal in &cases {
@@ -1573,6 +2459,7 @@ fn no_input_produces_a_signable_value_without_passing_every_predicate() {
             mark_divergent_since_ms: rng
                 .chance(2)
                 .then(|| now_ms.saturating_sub(rng.below(60_000))),
+            snapshot: None,
         };
 
         let mut positions = BTreeMap::new();
@@ -1604,6 +2491,17 @@ fn no_input_produces_a_signable_value_without_passing_every_predicate() {
             },
             total_position_notional_usd: d(rng.pick(&["0", "50", "500"])),
             positions,
+            resting: if rng.chance(16) {
+                None
+            } else {
+                let mut book = RestingExposure::none();
+                if rng.chance(2) {
+                    let szi = d(rng.pick(&["-2", "-0.5", "0.5", "2"]));
+                    book.notional_usd = szi.abs() * base_px;
+                    book.szi.insert(symbol.to_owned(), szi);
+                }
+                Some(book)
+            },
         };
         let exposure = Exposure {
             agent: agent_account,
@@ -1622,11 +2520,6 @@ fn no_input_produces_a_signable_value_without_passing_every_predicate() {
                 is_market: true,
                 trigger_px: base_px * d(rng.pick(&price_factors)),
                 tpsl: Tpsl::Sl,
-            };
-        }
-        if rng.chance(4) {
-            order.approval = Approval::Granted {
-                approval_id: "a".to_owned(),
             };
         }
         if rng.chance(25) {
@@ -1698,8 +2591,8 @@ fn verify_every_predicate(
     // Reason, agent, approval.
     assert!(!order.reason.trim().is_empty(), "{ctx}: no reason");
     assert!(
-        !config.approval_required || matches!(order.approval, Approval::Granted { .. }),
-        "{ctx}: approval mode bypassed"
+        !config.approval_required,
+        "{ctx}: approval mode bypassed — `evaluate` never clears under it"
     );
 
     // Inputs the engine must have established before measuring anything.
@@ -1751,13 +2644,19 @@ fn verify_every_predicate(
         "{ctx}: order notional past the cap"
     );
     let position_szi = account.position_szi(&order.symbol);
+    let resting = account
+        .resting
+        .as_ref()
+        .expect("a cleared order has a resting book");
+    let resting_szi = resting.szi_of(&order.symbol);
     let signed_sz = if order.is_buy { sz } else { -sz };
-    let after = position_szi + signed_sz;
+    let after = position_szi + resting_szi + signed_sz;
     assert!(
         after.abs() * reference_px <= config.max_position_usd,
         "{ctx}: position notional past the cap"
     );
-    let total_after = (account.total_position_notional_usd - position_szi.abs() * reference_px
+    let symbol_before = position_szi.abs() * reference_px + resting_szi.abs() * reference_px;
+    let total_after = (account.total_position_notional_usd + resting.notional_usd - symbol_before
         + after.abs() * reference_px)
         .max(Decimal::ZERO);
     assert!(
@@ -1823,5 +2722,180 @@ fn verify_every_predicate(
         cleared.clearance().agent.as_ref(),
         Some(&AgentId::new("alpha")),
         "{ctx}"
+    );
+}
+
+/// The second property, and the one the first is structurally blind to.
+///
+/// [`no_input_produces_a_signable_value_without_passing_every_predicate`]
+/// builds a fresh [`Fixture`] inside its loop, so every case starts with a
+/// full token bucket and a clear kill switch: the order-rate cap and item
+/// 26's pause are never exercised *across* cases, which is exactly where the
+/// bucket over-refill and the approval bypass lived. This run hoists one
+/// engine out of the loop and drives a sequence of intents against it on a
+/// monotonically advancing clock.
+///
+/// The bucket is re-derived here from the carry arithmetic directly, not by
+/// asking the engine, so an error in [`TokenBucket`] cannot hide by being
+/// made twice. Item 25's breaker and item 26's pause are re-derived the same
+/// way: once anything has stopped this agent, nothing may clear again.
+#[test]
+fn a_sequence_against_one_engine_never_outruns_the_rate_cap_or_the_pause() {
+    const STEPS: usize = 20_000;
+    /// 3 orders per 30s. Small enough that the cap binds constantly, and
+    /// `capacity_micro / per_ms` does not divide evenly — 3,000,000 / 30,000
+    /// is exact, so use a window that is not a multiple: 29,999 ms.
+    const RATE: OrderRate = OrderRate {
+        count: 3,
+        per_ms: 29_999,
+    };
+    const CAPACITY_MICRO: u128 = 3_000_000;
+
+    let mut config = permissive(&["BTC"]);
+    config.order_rate = RATE;
+    config.loss = LossLimits {
+        max_daily_loss_usd: Some(d("100")),
+        max_drawdown_usd: None,
+    };
+    let f = Fixture::new(config.clone());
+    // Item 10's budget must not be what refuses anything here.
+    f.engine
+        .operator_set_global_rate_budget(
+            GlobalRateBudget {
+                rate: OrderRate {
+                    count: 1_000_000,
+                    per_ms: 1,
+                },
+                reserve: 0,
+            },
+            NOW_MS,
+        )
+        .expect("set budget");
+
+    let btc = asset("BTC", 2, 40);
+    let mut rng = Rng(0x5EED_5EED_0BAD_F00D);
+
+    // An independent model of the bucket: exact numerator carry, no
+    // borrowing of the engine's arithmetic.
+    let mut tokens_micro: u128 = CAPACITY_MICRO;
+    let mut carry: u128 = 0;
+    let mut last_ms = NOW_MS;
+    let mut stopped_at_step: Option<usize> = None;
+    let mut trips = 0usize;
+    let mut releases = 0usize;
+
+    let mut now_ms = NOW_MS;
+    let mut cleared_count = 0usize;
+    let mut rate_refusals = 0usize;
+    let mut paused_refusals = 0usize;
+
+    for step in 0..STEPS {
+        now_ms += rng.below(3_000);
+        // The operator looks at the trip after a while and releases it, so
+        // the sequence keeps exercising the rate cap afterwards.
+        if let Some(at) = stopped_at_step
+            && step - at > 20
+        {
+            assert!(
+                f.engine
+                    .operator_release_kill(&KillScope::agent("alpha"), now_ms)
+                    .expect("release"),
+                "step {step}: the switch should still have been engaged"
+            );
+            stopped_at_step = None;
+            releases += 1;
+        }
+        // Stay inside the UTC day the snapshot's `day_start_ms` names.
+        if now_ms >= MIDNIGHT_MS + 86_400_000 {
+            break;
+        }
+        let losing = stopped_at_step.is_none() && rng.chance(400);
+        let mut exposure = exposure(d("100000"));
+        exposure.agent.as_of_ms = now_ms;
+        if losing {
+            exposure.agent.realized_pnl_today_usd = d("-100");
+        }
+        let market = MarketRef::fresh("BTC", d("100"), now_ms);
+        let order = intent("BTC", true, d("100"), d("1"));
+
+        let outcome = f
+            .engine
+            .evaluate(&f.agent, &order, &btc, &market, &exposure, now_ms);
+
+        // Advance the model's bucket to `now_ms` before judging the verdict.
+        let numerator = u128::from(now_ms - last_ms) * CAPACITY_MICRO + carry;
+        let per = u128::from(RATE.per_ms);
+        let gain = numerator / per;
+        carry = numerator % per;
+        last_ms = now_ms;
+        tokens_micro += gain;
+        if tokens_micro >= CAPACITY_MICRO {
+            tokens_micro = CAPACITY_MICRO;
+            carry = 0;
+        }
+
+        match outcome {
+            Ok(cleared) => {
+                assert!(
+                    stopped_at_step.is_none(),
+                    "step {step}: cleared after the agent was stopped at {now_ms}ms"
+                );
+                assert!(
+                    tokens_micro >= 1_000_000,
+                    "step {step}: cleared with {tokens_micro} micro-tokens at {now_ms}ms — \
+                     the rate cap was outrun"
+                );
+                tokens_micro -= 1_000_000;
+                assert_eq!(
+                    cleared.clearance().utilization.order_tokens_remaining,
+                    Decimal::from(tokens_micro) / Decimal::from(1_000_000u64),
+                    "step {step}: the engine and the model disagree about the budget"
+                );
+                cleared_count += 1;
+            }
+            Err(Refusal::OrderRate { .. }) => {
+                assert!(
+                    tokens_micro < 1_000_000,
+                    "step {step}: refused with {tokens_micro} micro-tokens — a token was lost"
+                );
+                rate_refusals += 1;
+            }
+            Err(Refusal::LossLimit { .. }) => {
+                assert!(losing, "step {step}: the breaker tripped on a healthy day");
+                // Item 25: the trip engages the switch, and item 26 says
+                // whose orders to cancel.
+                let effects = f.engine.take_pending_kill_effects();
+                assert_eq!(effects.len(), 1, "step {step}: no cancels queued");
+                assert!(effects[0].cancel_for.contains(&f.agent));
+                stopped_at_step = Some(step);
+                trips += 1;
+                // The refusal costs no token, so the model does not spend one.
+            }
+            Err(Refusal::TradingPaused { .. }) => {
+                assert!(
+                    stopped_at_step.is_some(),
+                    "step {step}: paused without ever being stopped"
+                );
+                paused_refusals += 1;
+            }
+            Err(other) => panic!("step {step}: unexpected refusal {other}"),
+        }
+    }
+
+    assert!(
+        cleared_count > 100,
+        "only {cleared_count} clearances; the sequence is not exercising the engine"
+    );
+    assert!(
+        rate_refusals > 100,
+        "only {rate_refusals} rate refusals; the cap is never binding"
+    );
+    assert!(
+        paused_refusals > 10,
+        "only {paused_refusals} paused refusals; item 26 is never exercised across cases"
+    );
+    assert!(
+        trips > 5 && releases > 5,
+        "{trips} trips and {releases} releases; item 25 is barely exercised"
     );
 }

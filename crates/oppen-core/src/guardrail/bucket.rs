@@ -46,6 +46,10 @@ pub struct TokenBucket {
     capacity_micro: u64,
     tokens_micro: u64,
     last_ms: u64,
+    /// Numerator left over from the last refill, in the same units as
+    /// `elapsed × capacity_micro`, always strictly below `rate.per_ms`. This
+    /// is what makes the refill exact: see [`TokenBucket::refill`].
+    carry: u64,
 }
 
 impl TokenBucket {
@@ -56,6 +60,7 @@ impl TokenBucket {
             capacity_micro,
             tokens_micro: capacity_micro,
             last_ms: now_ms,
+            carry: 0,
         }
     }
 
@@ -72,10 +77,21 @@ impl TokenBucket {
 
     /// Accrues tokens for the elapsed interval.
     ///
-    /// The clock is advanced only by the interval actually converted into
-    /// tokens, so the sub-token remainder of a short interval is kept rather
-    /// than discarded — otherwise a stream of fast calls would refill at
-    /// zero.
+    /// The clock always advances to `now_ms` and the sub-token remainder is
+    /// kept as an exact **numerator** rather than as un-advanced time. That
+    /// distinction is the whole correctness of this type. Converting the
+    /// granted tokens back into milliseconds and rewinding the clock by that
+    /// much floors twice — once granting the tokens, once charging for them —
+    /// and the residual milliseconds are then charged again on the next call.
+    /// At D-c's 5-per-300 s that leaks roughly a factor of two: a caller
+    /// polling every millisecond used to see its first refilled token at
+    /// 30,304 ms instead of 60,000 ms and fit 14 orders into a 300 s window
+    /// against a cap of 10.
+    ///
+    /// With the carry, `tokens(t)` depends only on `t`, never on how often it
+    /// was asked: `carry + Σ(elapsedᵢ × capacity)` telescopes to
+    /// `total_elapsed × capacity`, so polling accrues exactly what one call
+    /// at the same instant would.
     pub fn refill(&mut self, now_ms: u64) -> Result<(), BucketError> {
         if self.rate.per_ms == 0 {
             return Err(BucketError::InvalidRate);
@@ -86,24 +102,26 @@ impl TokenBucket {
             });
         }
         let elapsed = u128::from(now_ms - self.last_ms);
-        let gain =
-            elapsed.saturating_mul(u128::from(self.capacity_micro)) / u128::from(self.rate.per_ms);
-        if gain == 0 {
-            return Ok(());
+        // `elapsed ≤ u64::MAX` and `capacity_micro ≤ u32::MAX × 10⁶`, so the
+        // product is below 8e34 and cannot overflow a u128.
+        let numerator =
+            elapsed.saturating_mul(u128::from(self.capacity_micro)) + u128::from(self.carry);
+        let per = u128::from(self.rate.per_ms);
+        let gain = numerator / per;
+        // Strictly below `per_ms`, so it always fits a u64.
+        self.carry = u64::try_from(numerator % per).unwrap_or(0);
+        self.last_ms = now_ms;
+        if gain > 0 {
+            let gained = u64::try_from(gain).unwrap_or(u64::MAX);
+            self.tokens_micro = self.tokens_micro.saturating_add(gained);
+            if self.tokens_micro >= self.capacity_micro {
+                self.tokens_micro = self.capacity_micro;
+                // A full bucket has nothing to carry: keeping the remainder
+                // would hand out a free fraction of a token the moment one is
+                // spent.
+                self.carry = 0;
+            }
         }
-        let gained = u64::try_from(gain).unwrap_or(u64::MAX);
-        self.tokens_micro = self.tokens_micro.saturating_add(gained);
-        if self.tokens_micro >= self.capacity_micro {
-            self.tokens_micro = self.capacity_micro;
-            self.last_ms = now_ms;
-            return Ok(());
-        }
-        let consumed_ms = gain.saturating_mul(u128::from(self.rate.per_ms))
-            / u128::from(self.capacity_micro).max(1);
-        self.last_ms = self
-            .last_ms
-            .saturating_add(u64::try_from(consumed_ms).unwrap_or(0))
-            .min(now_ms);
         Ok(())
     }
 
@@ -123,7 +141,7 @@ impl TokenBucket {
 
     /// Milliseconds until one whole token exists, rounded up. `u64::MAX`
     /// when the capacity is zero, because no wait ever produces a token.
-    fn retry_after_ms(&self) -> u64 {
+    pub(super) fn retry_after_ms(&self) -> u64 {
         if self.capacity_micro == 0 {
             return u64::MAX;
         }
@@ -171,6 +189,56 @@ mod tests {
             assert!(b.try_take(ms).is_err(), "token granted early at {ms}ms");
         }
         assert!(b.try_take(1_000).is_ok());
+    }
+
+    /// The cap must bound orders, not calls. An agent that retries every
+    /// millisecond has to end the window with exactly the same budget as one
+    /// that waited and asked once, or the rate cap is defeated by polling.
+    ///
+    /// Before the carry fix this admitted 14 orders in the 300 s window and
+    /// handed out its first refilled token at 30,304 ms.
+    #[test]
+    fn polling_every_millisecond_does_not_farm_extra_tokens() {
+        let mut b = TokenBucket::new(rate(5, 300_000), 0);
+        let mut admitted = 0;
+        for _ in 0..5 {
+            assert!(b.try_take(0).is_ok());
+            admitted += 1;
+        }
+        let mut first_refill_ms = None;
+        for ms in 1..=300_000 {
+            if b.try_take(ms).is_ok() {
+                admitted += 1;
+                first_refill_ms.get_or_insert(ms);
+            }
+        }
+        assert_eq!(
+            first_refill_ms,
+            Some(60_000),
+            "one token per 60s at 5 per 300s, however often it is asked"
+        );
+        assert_eq!(
+            admitted, 10,
+            "5 initial + 5 refilled is the whole 300s budget"
+        );
+    }
+
+    /// The same property stated directly: the token count at an instant is a
+    /// function of the instant, not of the call pattern that reached it.
+    #[test]
+    fn accrual_is_independent_of_how_often_refill_is_called() {
+        let rate = rate(5, 300_000);
+        let mut polled = TokenBucket::new(rate, 0);
+        let mut quiet = TokenBucket::new(rate, 0);
+        for _ in 0..5 {
+            assert!(polled.try_take(0).is_ok());
+            assert!(quiet.try_take(0).is_ok());
+        }
+        for ms in 1..=59_999 {
+            polled.refill(ms).expect("refill");
+        }
+        quiet.refill(59_999).expect("refill");
+        assert_eq!(polled.tokens(), quiet.tokens());
     }
 
     #[test]

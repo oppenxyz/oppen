@@ -14,7 +14,7 @@
 use std::fmt;
 
 use rust_decimal::Decimal;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::wire::Cloid;
 
@@ -32,30 +32,147 @@ pub struct AssetInfo {
     pub only_isolated: bool,
 }
 
-/// `meta` response. `universe[i]` has asset id `i` on the first perp dex.
+/// `meta` response. `universe[i]` has asset id `i` on the validator-operated
+/// perp dex; see [`PerpDex`] for what the index means anywhere else.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Meta {
     pub universe: Vec<AssetInfo>,
 }
 
+/// A coin name that is **not** a HIP-3 builder-deployed asset.
+///
+/// `docs/specs/fair-value.md` §14.4 correction 15 fences v1 to the
+/// validator-operated dex. A `<dex>:<coin>` asset is a different market with
+/// a different funding mechanism: the premium is taken on the **midpoint**
+/// rather than §3.1's impact-price difference (`xyz:EUR` reads 0.00039570 one
+/// way and 0.00020645 the other), the clamp is 3e-4 rather than §3.2's 5e-4
+/// and is published nowhere, the per-asset multipliers are deployer-set,
+/// mutable, undated and unversioned, and the interest rate `i` may be
+/// negative. That is 38.6% of the mainnet universe across 10 live dexes, and
+/// every one of them answers the same endpoints with the same JSON shapes,
+/// so nothing about a HIP-3 response looks wrong on arrival.
+///
+/// The newtype is the fence. It is required to call
+/// [`crate::InfoClient::funding_history`] and it is the type of
+/// [`FundingHistoryRow::coin`], so §14.3's "`g(premium)` reproduces
+/// `fundingRate` to 5e-11" — which is a fact about the validator dex only —
+/// cannot be asserted over rows that came from somewhere else. Measured
+/// 2026-09-04 against the same reconstruction: BTC 0/200 mismatches,
+/// `xyz:TSLA` **200/200** with a worst error of 9.35e-5 (9.3 bp per hour),
+/// `hyna:BTC` 53/200 with a worst error of 2.50e-5.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ValidatorDexCoin(String);
+
+/// The v1 scope fence (`docs/specs/fair-value.md` §14.4 correction 15).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ScopeError {
+    #[error(
+        "{0:?} is a HIP-3 builder-deployed asset; v1 covers the validator-operated dex only (docs/specs/fair-value.md §14.4 correction 15)"
+    )]
+    OutOfScopeDex(String),
+}
+
+impl ValidatorDexCoin {
+    /// Accept a validator-dex coin, refuse a `<dex>:<coin>` one.
+    ///
+    /// `docs/hl-signing.md` §6: "builder-deployed perps always have name in
+    /// the format `{dex}:{coin}`", so the separator is the whole test.
+    pub fn new(coin: impl Into<String>) -> Result<Self, ScopeError> {
+        let coin = coin.into();
+        if coin.contains(':') {
+            return Err(ScopeError::OutOfScopeDex(coin));
+        }
+        Ok(ValidatorDexCoin(coin))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ValidatorDexCoin {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl PartialEq<str> for ValidatorDexCoin {
+    fn eq(&self, other: &str) -> bool {
+        self.0 == other
+    }
+}
+
+/// A HIP-3 row must not deserialize into a type whose documented invariants
+/// are validator-dex facts, so the check runs on the wire and not afterwards.
+impl<'de> Deserialize<'de> for ValidatorDexCoin {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let coin = String::deserialize(deserializer)?;
+        ValidatorDexCoin::new(coin).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Which perp dex a `metaAndAssetCtxs` response describes.
+///
+/// The array position in `meta.universe` is only the on-chain asset id on the
+/// validator dex. `docs/hl-signing.md` §6: a builder-deployed perp's id is
+/// `100000 + perp_dex_index * 10000 + index_in_meta` — `test:ABC` on testnet
+/// has `perp_dex_index = 1`, `index_in_meta = 0`, `asset = 110000`.
+///
+/// `{"type":"metaAndAssetCtxs","dex":"xyz"}` returns the byte-identical shape
+/// the validator dex returns, so a HIP-3 response deserializes into
+/// [`MetaAndAssetCtxs`] without complaint and its positions 0, 1, 2 are on
+/// chain BTC, ETH and ATOM. Naming the dex is therefore required to get an id
+/// at all: see [`MetaAndAssetCtxs::iter_on`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum PerpDex {
+    /// The validator-operated dex, where the asset id is the array position.
+    Validator,
+    /// A HIP-3 builder-deployed dex, by its `perpDexs` index.
+    Builder(u32),
+}
+
+impl PerpDex {
+    /// The on-chain asset id of the entry at `index_in_meta`
+    /// (`docs/hl-signing.md` §6).
+    ///
+    /// Saturating, because an out-of-range dex index is a caller bug and an
+    /// order path must never panic on one.
+    pub const fn asset_id(self, index_in_meta: u32) -> u32 {
+        match self {
+            PerpDex::Validator => index_in_meta,
+            PerpDex::Builder(dex_index) => 100_000u32
+                .saturating_add(dex_index.saturating_mul(10_000))
+                .saturating_add(index_in_meta),
+        }
+    }
+}
+
 /// Seconds in one Hyperliquid funding interval. Funding is charged hourly
 /// at `F₈ₕ / 8` (`docs/specs/fair-value.md` §3.1).
 pub const FUNDING_INTERVAL_S: u64 = 3600;
 
-/// Seconds remaining until the next hourly funding boundary.
+/// Seconds remaining until the next hourly funding boundary, from a
+/// **millisecond** epoch — the unit every other timestamp in this module
+/// carries ([`Bbo::time`], [`L2Book::time`], [`FundingHistoryRow::time`],
+/// [`Candle::t`], [`Fill::time`], [`ClearinghouseState::time`],
+/// [`OpenOrder::timestamp`]).
+///
+/// It takes ms rather than seconds because a seconds-taking version fails
+/// silently on the only values a caller has at hand: `1_788_490_137_025` ms
+/// read as seconds answers 575 where the true answer is 663.
 ///
 /// `docs/specs/fair-value.md` §14.5 (`charts.md` §5.2 correction): there is
 /// **no ctx field for this on either transport or either network**, and
 /// `predictedFundings.HlPerp.nextFundingTime` names a boundary that has
 /// already passed — measured 1,064–1,898 s in the past and identical across
 /// all 233 coins, so a `now >= nextFundingTime` refresh trigger built on it
-/// fires forever. Derive it from the clock instead.
+/// fires forever. Derive it from the clock instead. See [`StaleBoundaryMs`].
 ///
 /// Exactly on a boundary this returns [`FUNDING_INTERVAL_S`], never `0`, so
 /// a countdown built on it cannot latch at zero.
-pub const fn next_funding_s(unix_epoch_s: u64) -> u64 {
-    FUNDING_INTERVAL_S - (unix_epoch_s % FUNDING_INTERVAL_S)
+pub const fn next_funding_s_from_ms(unix_epoch_ms: u64) -> u64 {
+    FUNDING_INTERVAL_S - ((unix_epoch_ms / 1_000) % FUNDING_INTERVAL_S)
 }
 
 /// The `funding` field of [`AssetCtx`]: `g` applied to the **hour-to-date
@@ -134,20 +251,48 @@ pub struct AssetCtx {
 }
 
 impl AssetCtx {
-    /// Whether this asset has a book at all.
+    /// Whether the venue has nulled this asset's book-derived fields.
     ///
-    /// `docs/specs/fair-value.md` §14.4 correction 2: the invariant is
-    /// `openInterest == 0`, holding on 233/233 mainnet assets on
-    /// 2026-09-03. It is **not** `isDelisted` — testnet PURR is
-    /// live-but-null: `isDelisted` absent, open interest `0.0`, all three
-    /// nullable ctx fields `null`. An engine gated on `isDelisted` would
-    /// have tried to build `micro` and `carry` for it.
+    /// **This is not a trading permission and not a component gate.** It is
+    /// the one claim `docs/specs/fair-value.md` §14.4 correction 2 actually
+    /// makes: `openInterest == 0` identifies the nulled set, holding on
+    /// 233/233 mainnet assets on 2026-09-03. It is **not** `isDelisted` —
+    /// testnet PURR is live-but-null: `isDelisted` absent, open interest
+    /// `0.0`, all three nullable ctx fields `null`.
+    ///
+    /// Two reasons not to gate on it. Open interest measures **positions**,
+    /// not resting orders, so a perp listed today with a live book and no
+    /// fills yet reads `false` here. And the converse fails too: testnet SAGA
+    /// carries 1,146,084 open interest and a `midPx` of 0.01513 with `premium`
+    /// and `impactPxs` both `null`, so it reads `true` here while `carry` is
+    /// unconstructible. Ask [`AssetCtx::can_build_micro`] and
+    /// [`AssetCtx::can_build_carry`], which are the two questions §4.3's
+    /// slice-and-renormalize path actually asks.
     ///
     /// 24% of the main dex and 38.6% of the full mainnet universe has no
-    /// book, so this is the common case and the §4.3 slice-and-renormalize
-    /// degradation path is day-one code, not an edge case.
+    /// book, so degradation is the common case and §4.3 is day-one code.
     pub fn has_book(&self) -> bool {
         !self.open_interest.is_zero()
+    }
+
+    /// Whether the `micro` component of §4.2 can be built for this asset.
+    ///
+    /// §4.3: a missing component is dropped and `β` renormalized over the
+    /// survivors, never defaulted — so this is the question the sampler asks,
+    /// per asset, per sample.
+    pub fn can_build_micro(&self) -> bool {
+        self.mid_px.is_some()
+    }
+
+    /// Whether the `carry` component of §4.2 can be built for this asset.
+    ///
+    /// Needs both legs: the instantaneous [`AssetCtx::premium`] that §14.4
+    /// correction 1 says live carry reads, and the [`AssetCtx::impact_pxs`]
+    /// the §3.1 premium is defined on. The two are **not** co-null — testnet
+    /// SAGA has open interest, volume and a mid with `impactPxs: null` — so
+    /// neither [`AssetCtx::has_book`] nor a mid answers this.
+    pub fn can_build_carry(&self) -> bool {
+        self.premium.is_some() && self.impact_pxs.is_some()
     }
 
     /// The venue's mid, or `None`. **There is no fallback.**
@@ -168,6 +313,12 @@ impl AssetCtx {
 }
 
 /// `metaAndAssetCtxs` response: a two-element array.
+///
+/// The response does **not** say which dex it describes.
+/// `{"type":"metaAndAssetCtxs","dex":"xyz"}` returns the same two-element
+/// shape with the same keys, so this type deserializes a HIP-3 universe
+/// exactly as happily as the validator one. That is why the asset id is not
+/// available from a position alone — see [`Self::iter_on`] and [`PerpDex`].
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct MetaAndAssetCtxs(pub Meta, pub Vec<AssetCtx>);
 
@@ -187,26 +338,43 @@ impl MetaAndAssetCtxs {
         self.0.universe.len() == self.1.len()
     }
 
-    /// `(asset_id, info, ctx)` in universe order.
+    /// `(info, ctx)` pairs in universe order, **without** an asset id.
     ///
-    /// The position **is** the on-chain asset id (`docs/spec.md` item 8), so
-    /// the array is never compacted, sorted or filtered in place —
-    /// §14.4 correction 2. Filter with [`Self::tradable`], which preserves
-    /// the id it yields. Ordering is the response's own, which makes this
-    /// deterministic in a way iterating [`crate::Universe`] is not.
-    pub fn iter(&self) -> impl Iterator<Item = (u32, &AssetInfo, &AssetCtx)> {
-        self.0
-            .universe
-            .iter()
-            .zip(self.1.iter())
-            .enumerate()
-            .map(|(index, (info, ctx))| (index as u32, info, ctx))
+    /// The array is never compacted, sorted or filtered in place (§14.4
+    /// correction 2) and the ordering is the response's own, which makes this
+    /// deterministic in a way iterating [`crate::Universe`] is not. Getting
+    /// an id needs [`Self::iter_on`], because a position is only an id once
+    /// the dex is known.
+    pub fn iter(&self) -> impl Iterator<Item = (&AssetInfo, &AssetCtx)> {
+        self.0.universe.iter().zip(self.1.iter())
     }
 
-    /// Only the assets with a book, by the [`AssetCtx::has_book`] invariant,
-    /// each still carrying its true on-chain asset id.
-    pub fn tradable(&self) -> impl Iterator<Item = (u32, &AssetInfo, &AssetCtx)> {
-        self.iter().filter(|(_, _, ctx)| ctx.has_book())
+    /// `(asset_id, info, ctx)` in universe order, for a response known to
+    /// come from `dex`.
+    ///
+    /// The id is [`PerpDex::asset_id`] of the array position, which is the
+    /// position itself only on [`PerpDex::Validator`] (`docs/spec.md` item 8).
+    /// On a HIP-3 dex the same positions 0, 1, 2 are asset ids 110000, 110001
+    /// and 110002 while the bare positions name BTC, ETH and ATOM on the
+    /// validator dex — an order signed against the wrong one reaches a
+    /// different instrument, so the dex is an argument rather than an
+    /// assumption. `docs/specs/fair-value.md` §14.4 correction 15 fences v1
+    /// to [`PerpDex::Validator`]; the parameter exists so that fence is
+    /// visible at every call site instead of implied by a doc comment.
+    pub fn iter_on(&self, dex: PerpDex) -> impl Iterator<Item = (u32, &AssetInfo, &AssetCtx)> {
+        self.iter()
+            .enumerate()
+            .map(move |(index, (info, ctx))| (dex.asset_id(index as u32), info, ctx))
+    }
+
+    /// The assets whose book-derived fields the venue has not nulled, by
+    /// [`AssetCtx::has_book`].
+    ///
+    /// Named for what it measures. It is **not** a tradability filter and not
+    /// a component gate — see [`AssetCtx::can_build_micro`] and
+    /// [`AssetCtx::can_build_carry`].
+    pub fn with_book(&self) -> impl Iterator<Item = (&AssetInfo, &AssetCtx)> {
+        self.iter().filter(|(_, ctx)| ctx.has_book())
     }
 }
 
@@ -256,12 +424,37 @@ pub struct Bbo {
     pub coin: String,
     /// Venue timestamp, ms.
     pub time: u64,
-    /// `[bid, ask]`. A side is `None` when the book is empty on that side —
-    /// `l2Book` answers `[[],[]]` for a bookless asset such as FRIEND, so an
-    /// empty side is representable and must not fail the whole message the
-    /// way a null ctx field would (§14.4 correction 2).
-    #[serde(default)]
+    /// `[bid, ask]`, normalised from whatever the venue sends.
+    ///
+    /// The null-side shape is **unobserved**, not measured: subscribing `bbo`
+    /// and `l2Book` for MATIC, FRIEND, RNDR, FTM, MKR, HPOS and BTC on the
+    /// mainnet socket for 75 s produced `l2Book` frames with `levels: [[],[]]`
+    /// for every bookless coin and **zero `bbo` frames** for any of them; only
+    /// BTC emitted, always two-sided. `[Option<Level>; 2]` was a defensive
+    /// guess at a shape nobody has seen.
+    ///
+    /// A fixed-length array is the least forgiving representation of an
+    /// unknown shape, and §14.4 correction 2's lesson is that the cost of
+    /// getting this wrong is the **whole** frame: `"bbo":[]` against
+    /// `[Option<Level>; 2]` is `invalid length 0, expected an array of
+    /// length 2`, which loses the timestamp and both sides rather than one.
+    /// So lengths 0, 1 and 2, an absent key and an explicit `null` all
+    /// deserialize, a missing side reads as `None`, and anything past
+    /// position 1 is ignored.
+    #[serde(default, deserialize_with = "deserialize_bbo_sides")]
     pub bbo: [Option<Level>; 2],
+}
+
+/// Normalise the `bbo` array to two sides without ever failing on its length.
+fn deserialize_bbo_sides<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<[Option<Level>; 2], D::Error> {
+    let sides = Option::<Vec<Option<Level>>>::deserialize(deserializer)?.unwrap_or_default();
+    let mut normalised: [Option<Level>; 2] = [None, None];
+    for (slot, side) in normalised.iter_mut().zip(sides) {
+        *slot = side;
+    }
+    Ok(normalised)
 }
 
 impl Bbo {
@@ -449,11 +642,43 @@ pub struct UserRateLimit {
     pub n_requests_surplus: u64,
 }
 
+/// `predictedFundings.HlPerp.nextFundingTime`: a boundary that has already
+/// passed, so it is not a clock and carries no ordering.
+///
+/// `docs/specs/fair-value.md` §14.5, re-verified live 2026-09-04: all 233
+/// `HlPerp` entries report a boundary **in the past** — 1,749.97 s behind the
+/// capture clock, byte-identical across every coin — while `BinPerp` and
+/// `BybitPerp` on the same payload point forward. A `now >= next_funding_time`
+/// refresh trigger written against it fires on every tick, forever.
+///
+/// The type has no `PartialOrd` and no `From<StaleBoundaryMs> for u64` on
+/// purpose: the comparison the venue invites is the defect, and the only way
+/// out of the newtype is an accessor that names what it is at the call site.
+/// The real countdown is [`next_funding_s_from_ms`], derived from the clock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(transparent)]
+pub struct StaleBoundaryMs(u64);
+
+impl StaleBoundaryMs {
+    /// The raw venue value, ms. Fine to display or log; never a deadline.
+    pub const fn venue_reported_boundary_ms_do_not_compare_to_now(self) -> u64 {
+        self.0
+    }
+}
+
+impl fmt::Display for StaleBoundaryMs {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PredictedFunding {
     pub funding_rate: Decimal,
-    pub next_funding_time: u64,
+    /// See [`StaleBoundaryMs`]: on `HlPerp` this names a boundary that has
+    /// already passed, identically for every coin.
+    pub next_funding_time: StaleBoundaryMs,
     pub funding_interval_hours: Option<u32>,
 }
 
@@ -481,13 +706,25 @@ impl PredictedFundings {
 /// (`docs/specs/fair-value.md` §14.4 correction 12).
 pub const FUNDING_HISTORY_PAGE_LIMIT: usize = 500;
 
-/// One `fundingHistory` row: `{coin, fundingRate, premium, time}`.
+/// One `fundingHistory` row from the **validator-operated dex**:
+/// `{coin, fundingRate, premium, time}`.
 ///
 /// `docs/specs/fair-value.md` §14.3 calls [`Self::premium`] "the single most
 /// valuable finding" of the live audit: it is the **uncensored** hour-average
 /// premium published alongside the censored rate, and `g(premium)` reproduces
 /// `fundingRate` to 5e-11 over 4,627 records. That collapses the §3.2
 /// censored-interval machinery to a point observation for all historical work.
+///
+/// That reconstruction is a property of the validator dex, not of the
+/// endpoint. §14.4 correction 15: HIP-3 takes its premium on the midpoint,
+/// clamps at 3e-4, and lets the deployer move `i` and the multipliers with no
+/// change timestamp, so the same `g` reproduces nothing there — measured
+/// 2026-09-04, `xyz:TSLA` misses on 200/200 rows by up to 9.35e-5 (9.3 bp per
+/// hour) and `hyna:BTC` on 53/200 by up to 2.50e-5, while BTC misses 0/200.
+/// Those rows deserialize cleanly against every other field, which is why
+/// [`Self::coin`] is a [`ValidatorDexCoin`]: a `<dex>:<coin>` row fails here,
+/// on the wire, instead of being recorded as history whose stated invariant
+/// is false.
 ///
 /// It matters because [`Self::funding_rate`] is mostly a constant: 77.2% of
 /// prints are pinned to the `0.01%/8h` mechanism rate in aggregate (BTC 90.5%
@@ -498,7 +735,9 @@ pub const FUNDING_HISTORY_PAGE_LIMIT: usize = 500;
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FundingHistoryRow {
-    pub coin: String,
+    /// Refuses a `<dex>:<coin>` name at deserialization time; see
+    /// [`ValidatorDexCoin`].
+    pub coin: ValidatorDexCoin,
     /// The published rate, **censored**: pinned to the mechanism constant
     /// whenever the hour-average premium sits in the §3.2 dead zone.
     pub funding_rate: Decimal,
@@ -534,10 +773,21 @@ pub enum FundingHistoryPage {
 }
 
 impl FundingHistoryPage {
-    pub fn rows(&self) -> &[FundingHistoryRow] {
+    /// The rows, or `None` when the coin is not listed.
+    ///
+    /// It returns an [`Option`] rather than an empty slice because an empty
+    /// slice is exactly the `Vec` this enum exists to keep out of a `null`.
+    /// A backfill written the obvious way — `if page.rows().is_empty() {
+    /// mark_complete() }` — would otherwise reproduce §14.4 correction 12's
+    /// bug in full: a misspelled or unlisted coin reports "no more history",
+    /// the walk terminates reporting success, and under D-e the UI states a
+    /// completeness date that is wrong with no error raised anywhere.
+    /// [`Self::next_start_ms`] keeps the **cursor** safe; this keeps the
+    /// **completeness signal** safe, and they are different questions.
+    pub fn rows(&self) -> Option<&[FundingHistoryRow]> {
         match self {
-            FundingHistoryPage::Rows(rows) => rows,
-            FundingHistoryPage::UnlistedCoin => &[],
+            FundingHistoryPage::Rows(rows) => Some(rows),
+            FundingHistoryPage::UnlistedCoin => None,
         }
     }
 
@@ -624,20 +874,93 @@ mod tests {
     /// §14.4 correction 2: the invariant for "has no book" is
     /// `openInterest == 0`, and the universe is never compacted.
     #[test]
-    fn tradability_is_open_interest_and_ids_survive_filtering() {
+    fn book_presence_is_open_interest_and_ids_survive_filtering() {
         let response: MetaAndAssetCtxs = serde_json::from_str(MAINNET_PREFIX).expect("fixture");
 
-        let all: Vec<u32> = response.iter().map(|(id, _, _)| id).collect();
-        assert_eq!(all, vec![0, 1, 2, 3], "index is the on-chain asset id");
-
-        let tradable: Vec<(u32, &str)> = response
-            .tradable()
-            .map(|(id, info, _)| (id, info.name.as_str()))
+        let all: Vec<u32> = response
+            .iter_on(PerpDex::Validator)
+            .map(|(id, _, _)| id)
             .collect();
-        assert_eq!(tradable, vec![(0, "BTC"), (1, "ETH"), (2, "ATOM")]);
+        assert_eq!(all, vec![0, 1, 2, 3], "validator dex: index is the id");
+
+        let with_book: Vec<&str> = response
+            .with_book()
+            .map(|(info, _)| info.name.as_str())
+            .collect();
+        assert_eq!(with_book, vec!["BTC", "ETH", "ATOM"]);
 
         assert!(response.ctxs()[0].has_book());
         assert!(!response.ctxs()[3].has_book(), "openInterest 0.0 = no book");
+    }
+
+    /// §14.4 correction 15 and `docs/hl-signing.md` §6. The same
+    /// `metaAndAssetCtxs` shape comes back for `{"dex":"xyz"}`, where the
+    /// array positions are **not** the asset ids. Naming the dex is the only
+    /// way to get an id, so the HIP-3 arithmetic cannot be skipped by
+    /// accident. The regression is the old `iter()`, which handed out the
+    /// bare position as "the on-chain asset id" unconditionally: on this
+    /// fixture it would call `xyz:TSLA` asset 1, which is ETH.
+    #[test]
+    fn a_hip3_response_does_not_yield_validator_asset_ids() {
+        // Verbatim shape of `{"type":"metaAndAssetCtxs","dex":"xyz"}`,
+        // trimmed to three assets: same keys, same nesting, HIP-3 names.
+        const HIP3: &str = r#"[{"universe":[{"szDecimals":2,"name":"XYZ100","maxLeverage":5},{"szDecimals":2,"name":"TSLA","maxLeverage":5},{"szDecimals":2,"name":"NVDA","maxLeverage":5}]},[{"funding":"0.0","openInterest":"1.0","prevDayPx":"1.0","dayNtlVlm":"1.0","premium":"0.0001","oraclePx":"1.0","markPx":"1.0","midPx":"1.0","impactPxs":["1.0","1.0"]},{"funding":"0.0","openInterest":"1.0","prevDayPx":"1.0","dayNtlVlm":"1.0","premium":"0.0001","oraclePx":"1.0","markPx":"1.0","midPx":"1.0","impactPxs":["1.0","1.0"]},{"funding":"0.0","openInterest":"1.0","prevDayPx":"1.0","dayNtlVlm":"1.0","premium":"0.0001","oraclePx":"1.0","markPx":"1.0","midPx":"1.0","impactPxs":["1.0","1.0"]}]]"#;
+        let hip3: MetaAndAssetCtxs =
+            serde_json::from_str(HIP3).expect("a HIP-3 response has the same shape");
+        assert!(hip3.is_aligned());
+
+        // `xyz` is perp dex index 1 in this fixture's world.
+        let ids: Vec<(u32, &str)> = hip3
+            .iter_on(PerpDex::Builder(1))
+            .map(|(id, info, _)| (id, info.name.as_str()))
+            .collect();
+        assert_eq!(
+            ids,
+            vec![(110_000, "XYZ100"), (110_001, "TSLA"), (110_002, "NVDA")],
+            "hl-signing.md §6: 100000 + dex*10000 + index"
+        );
+        // The bare positions belong to entirely different instruments.
+        let validator: Vec<u32> = hip3
+            .iter_on(PerpDex::Validator)
+            .map(|(id, _, _)| id)
+            .collect();
+        assert_eq!(validator, vec![0, 1, 2]);
+        assert_ne!(ids[1].0, validator[1], "position 1 is ETH on the main dex");
+    }
+
+    /// `docs/hl-signing.md` §6, including its worked example, and no panic on
+    /// a dex index large enough to overflow the arithmetic.
+    #[test]
+    fn asset_ids_follow_the_dex_offset_and_saturate() {
+        assert_eq!(PerpDex::Validator.asset_id(0), 0);
+        assert_eq!(PerpDex::Validator.asset_id(233), 233);
+        // "test:ABC on testnet has perp_dex_index = 1, index_in_meta = 0,
+        // asset = 110000".
+        assert_eq!(PerpDex::Builder(1).asset_id(0), 110_000);
+        assert_eq!(PerpDex::Builder(9).asset_id(7), 190_007);
+        assert_eq!(PerpDex::Builder(u32::MAX).asset_id(u32::MAX), u32::MAX);
+    }
+
+    /// §4.3 asks two questions — can I build `micro`, can I build `carry` —
+    /// and `has_book` answers neither. Testnet SAGA, captured verbatim
+    /// 2026-09-03, is the counterexample: open interest and a mid with a null
+    /// premium and null impact prices.
+    #[test]
+    fn saga_has_a_book_but_no_carry() {
+        const TESTNET_SAGA: &str = r#"{"funding":"0.0","openInterest":"1146084.0","prevDayPx":"0.01518","dayNtlVlm":"38000.72228","premium":null,"oraclePx":"0.01482","markPx":"0.01483","midPx":"0.01513","impactPxs":null,"dayBaseVlm":"2496048.2999999998"}"#;
+        let saga: AssetCtx = serde_json::from_str(TESTNET_SAGA).expect("SAGA ctx");
+        assert!(saga.has_book(), "1,146,084 open interest");
+        assert!(saga.can_build_micro(), "midPx 0.01513");
+        assert!(
+            !saga.can_build_carry(),
+            "premium and impactPxs are both null: §3.1 is unconstructible"
+        );
+
+        let response: MetaAndAssetCtxs = serde_json::from_str(MAINNET_PREFIX).expect("fixture");
+        let btc = &response.ctxs()[0];
+        assert!(btc.can_build_micro() && btc.can_build_carry());
+        let matic = &response.ctxs()[3];
+        assert!(!matic.can_build_micro() && !matic.can_build_carry());
     }
 
     /// §14.4 correction 1: `funding` is typed apart from every other rate so
@@ -663,24 +986,80 @@ mod tests {
 
     /// §14.5: derived, because no ctx field carries it and
     /// `predictedFundings.nextFundingTime` points into the past.
+    ///
+    /// It takes **milliseconds**, the unit every timestamp in this module
+    /// carries. The regression is the seconds-taking version: fed the ms
+    /// value below it answered 575 instead of 663 — a plausible wrong number,
+    /// no panic, no type error.
     #[test]
-    fn next_funding_is_derived_from_the_clock() {
-        assert_eq!(next_funding_s(0), 3600, "on a boundary, never 0");
-        assert_eq!(next_funding_s(1), 3599);
-        assert_eq!(next_funding_s(3599), 1);
-        assert_eq!(next_funding_s(3600), 3600);
-        // Real captures, cross-checked against each other: the BTC bbo tick
-        // at 1788490137 s sits 2937 s past the funding boundary 1788487200,
-        // which is exactly the `time` of the newest live fundingHistory row.
-        assert_eq!(next_funding_s(1_788_490_137), 663);
+    fn next_funding_is_derived_from_the_clock_in_ms() {
+        assert_eq!(next_funding_s_from_ms(0), 3600, "on a boundary, never 0");
+        assert_eq!(next_funding_s_from_ms(1_000), 3599);
+        assert_eq!(
+            next_funding_s_from_ms(999),
+            3600,
+            "sub-second is the same s"
+        );
+        assert_eq!(next_funding_s_from_ms(3_599_000), 1);
+        assert_eq!(next_funding_s_from_ms(3_600_000), 3600);
+        // The real BTC bbo tick, verbatim in ms as the venue sent it: it sits
+        // 2937 s past the funding boundary 1788487200, which is exactly the
+        // `time` of the newest live fundingHistory row.
+        assert_eq!(next_funding_s_from_ms(1_788_490_137_025), 663);
         assert_eq!(1_788_490_137 + 663, 1_788_490_800);
         assert_eq!(1_788_490_800 % FUNDING_INTERVAL_S, 0, "lands on a boundary");
         assert_eq!(1_788_487_200 % FUNDING_INTERVAL_S, 0, "a real funding row");
         for s in 0..7200u64 {
-            let remaining = next_funding_s(s);
+            let ms = s * 1_000 + 500;
+            let remaining = next_funding_s_from_ms(ms);
             assert!((1..=FUNDING_INTERVAL_S).contains(&remaining));
             assert_eq!((s + remaining) % FUNDING_INTERVAL_S, 0);
         }
+    }
+
+    /// §14.5. `HlPerp` names a boundary already in the past, identically for
+    /// every coin, while the CEX rows on the same payload point forward. The
+    /// newtype is what stops `now >= next_funding_time` from compiling.
+    #[test]
+    fn hl_predicted_funding_boundary_is_in_the_past() {
+        // Two rows verbatim from `tests/fixtures/predictedFundings.json`,
+        // whose session clock is the `time` of `tests/fixtures/l2Book.json`.
+        const CAPTURED_AT_MS: u64 = 1_788_460_183_896;
+        let json = r#"[["BTC",[["BinPerp",{"fundingRate":"0.00009858","nextFundingTime":1788480000000,"fundingIntervalHours":8}],["HlPerp",{"fundingRate":"0.0012026746","nextFundingTime":1788458400000,"fundingIntervalHours":1}]]],["ETH",[["HlPerp",{"fundingRate":"-0.0010026023","nextFundingTime":1788458400000,"fundingIntervalHours":1}]]]]"#;
+        let rows: Vec<PredictedFundings> = serde_json::from_str(json).expect("live rows");
+
+        let boundaries: Vec<u64> = rows
+            .iter()
+            .map(|row| {
+                row.hyperliquid()
+                    .expect("HlPerp row")
+                    .next_funding_time
+                    .venue_reported_boundary_ms_do_not_compare_to_now()
+            })
+            .collect();
+        assert_eq!(
+            boundaries[0], boundaries[1],
+            "identical across coins, which a real per-coin boundary would not be"
+        );
+        assert!(
+            boundaries[0] < CAPTURED_AT_MS,
+            "the venue's next boundary is already past"
+        );
+        let behind_s = (CAPTURED_AT_MS - boundaries[0]) / 1_000;
+        assert_eq!(behind_s, 1_783);
+        assert!(
+            (1_064..=1_898).contains(&behind_s),
+            "inside the §14.5 measured band"
+        );
+        // The same payload's CEX row points forward, so this is HlPerp's
+        // defect and not a stale fixture.
+        let binance = rows[0].1.iter().find(|(v, _)| v == "BinPerp");
+        let binance = binance
+            .and_then(|(_, f)| f.as_ref())
+            .expect("BinPerp row")
+            .next_funding_time
+            .venue_reported_boundary_ms_do_not_compare_to_now();
+        assert!(binance > CAPTURED_AT_MS);
     }
 
     /// §14.4 correction 4. Payload captured verbatim from mainnet 2026-09-03.
@@ -698,16 +1077,43 @@ mod tests {
 
     /// An empty book side must not fail the message the way a null ctx field
     /// would; `l2Book` answers `[[],[]]` for a bookless asset.
+    ///
+    /// The null-side shape was never observed on the wire (75 s across seven
+    /// bookless mainnet coins produced zero `bbo` frames), so every plausible
+    /// encoding of "a side is missing" has to survive. Under the old
+    /// fixed-length array, `"bbo":[]` failed with `invalid length 0, expected
+    /// an array of length 2` and lost the **whole** frame — timestamp and
+    /// both sides — which is §14.4 correction 2's lesson exactly.
     #[test]
-    fn bbo_tolerates_an_empty_side() {
-        let json = r#"{"coin":"FRIEND","time":1788490146994,"bbo":[null,null]}"#;
-        let bbo: Bbo = serde_json::from_str(json).expect("one-sided book");
-        assert!(bbo.bid().is_none() && bbo.ask().is_none());
+    fn bbo_tolerates_every_shape_of_a_missing_side() {
+        let bid = r#"{"px":"1.0","sz":"2.0","n":1}"#;
+        let cases = [
+            (
+                r#"{"coin":"F","time":1,"bbo":[null,null]}"#.to_owned(),
+                false,
+            ),
+            (r#"{"coin":"F","time":1,"bbo":[]}"#.to_owned(), false),
+            (r#"{"coin":"F","time":1,"bbo":null}"#.to_owned(), false),
+            (r#"{"coin":"F","time":1}"#.to_owned(), false),
+            (format!(r#"{{"coin":"F","time":1,"bbo":[{bid}]}}"#), true),
+            (
+                format!(r#"{{"coin":"F","time":1,"bbo":[{bid},null]}}"#),
+                true,
+            ),
+        ];
+        for (json, has_bid) in cases {
+            let bbo: Bbo = serde_json::from_str(&json).unwrap_or_else(|e| {
+                panic!("a missing side must not lose the frame: {json} -> {e}")
+            });
+            assert_eq!(bbo.time, 1, "the timestamp survives: {json}");
+            assert_eq!(bbo.bid().is_some(), has_bid, "{json}");
+            assert!(bbo.ask().is_none(), "{json}");
+        }
 
-        let json =
-            r#"{"coin":"FRIEND","time":1788490146994,"bbo":[{"px":"1.0","sz":"2.0","n":1},null]}"#;
-        let bbo: Bbo = serde_json::from_str(json).expect("bid only");
-        assert!(bbo.bid().is_some() && bbo.ask().is_none());
+        // A longer array is normalised rather than refused.
+        let json = format!(r#"{{"coin":"F","time":1,"bbo":[{bid},{bid},{bid}]}}"#);
+        let bbo: Bbo = serde_json::from_str(&json).expect("extra sides are ignored");
+        assert!(bbo.bid().is_some() && bbo.ask().is_some());
     }
 
     /// §14.3: `fundingHistory` publishes the uncensored premium next to the
@@ -723,18 +1129,61 @@ mod tests {
         assert_eq!(rows[0].premium, d("0.0001446433"));
         assert_eq!(rows[1].premium, d("-0.0004653492"));
         assert_eq!(rows[1].time - rows[0].time, 860_399_985);
+        assert_eq!(rows[0].coin, *"BTC");
+    }
+
+    /// §14.4 correction 15. A HIP-3 funding row deserialises cleanly against
+    /// every other field, and the reconstruction property this type documents
+    /// is false for it, so it must not become a `FundingHistoryRow` at all.
+    #[test]
+    fn a_hip3_funding_row_is_refused_on_the_wire() {
+        let json = r#"[{"coin":"xyz:TSLA","fundingRate":"0.0000125","premium":"0.0001446433","time":1787626800017}]"#;
+        let err = serde_json::from_str::<Vec<FundingHistoryRow>>(json)
+            .expect_err("a HIP-3 row must not deserialize into a validator-dex row");
+        assert!(
+            err.to_string().contains("HIP-3"),
+            "the error must name the scope fence, got {err}"
+        );
+
+        // Every other field is well-formed, which is why nothing downstream
+        // would have caught it.
+        let value: serde_json::Value = serde_json::from_str(json).expect("valid json");
+        assert_eq!(value[0]["premium"], "0.0001446433");
+
+        assert_eq!(
+            ValidatorDexCoin::new("xyz:TSLA"),
+            Err(ScopeError::OutOfScopeDex("xyz:TSLA".to_owned()))
+        );
+        assert_eq!(
+            ValidatorDexCoin::new("BTC").expect("BTC is on the validator dex"),
+            ValidatorDexCoin::new("BTC").expect("BTC")
+        );
     }
 
     /// §14.4 correction 12: `null` is an unlisted coin, `[]` is genuine
     /// no-data, and only the first must stop the walk.
+    ///
+    /// `rows()` is an `Option` because the empty slice it used to return for
+    /// `UnlistedCoin` is precisely the `Vec` this enum exists to keep out of
+    /// a `null`: `if page.rows().is_empty() { mark_complete() }` marked a
+    /// misspelled coin complete and reported success.
     #[test]
-    fn unlisted_coin_never_advances_the_cursor() {
+    fn unlisted_coin_has_no_rows_and_never_advances_the_cursor() {
         assert_eq!(FundingHistoryPage::UnlistedCoin.next_start_ms(), None);
-        assert!(FundingHistoryPage::UnlistedCoin.rows().is_empty());
+        assert_eq!(
+            FundingHistoryPage::UnlistedCoin.rows(),
+            None,
+            "an unlisted coin has no rows; it is not a coin with zero rows"
+        );
 
         let empty = FundingHistoryPage::Rows(Vec::new());
         assert_eq!(empty.next_start_ms(), None, "a short page is the end");
-        assert!(empty.rows().is_empty());
+        assert_eq!(
+            empty.rows(),
+            Some(&[][..]),
+            "genuine no-data is an empty page, which is a fact worth recording"
+        );
+        assert_ne!(empty.rows(), FundingHistoryPage::UnlistedCoin.rows());
         assert_ne!(empty, FundingHistoryPage::UnlistedCoin);
     }
 
@@ -743,7 +1192,7 @@ mod tests {
     #[test]
     fn full_pages_paginate_forward_by_the_last_row_time() {
         let row = |time| FundingHistoryRow {
-            coin: "BTC".into(),
+            coin: ValidatorDexCoin::new("BTC").expect("BTC"),
             funding_rate: Decimal::ZERO,
             premium: Decimal::ZERO,
             time,
@@ -754,7 +1203,7 @@ mod tests {
         let last = full[FUNDING_HISTORY_PAGE_LIMIT - 1].time;
         let page = FundingHistoryPage::Rows(full);
         assert_eq!(page.next_start_ms(), Some(last));
-        assert_eq!(page.rows().len(), FUNDING_HISTORY_PAGE_LIMIT);
+        assert_eq!(page.rows().expect("rows").len(), FUNDING_HISTORY_PAGE_LIMIT);
 
         let short = FundingHistoryPage::Rows(vec![row(1), row(2)]);
         assert_eq!(short.next_start_ms(), None);

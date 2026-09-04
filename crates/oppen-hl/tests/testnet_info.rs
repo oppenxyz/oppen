@@ -12,7 +12,7 @@ async fn info_endpoints_round_trip() {
     let user = Address::parse("0x0000000000000000000000000000000000000001").unwrap();
 
     let meta = info.meta().await.unwrap();
-    let universe = Universe::from_meta(&meta);
+    let universe = Universe::from_meta(&meta).expect("validator dex");
     let btc = universe.get("BTC").unwrap();
     assert_eq!(btc.sz_decimals(), 5);
 

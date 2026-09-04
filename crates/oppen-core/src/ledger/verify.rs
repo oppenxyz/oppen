@@ -5,10 +5,20 @@
 //! it. What the chain buys is that an edit cannot be hidden, and that the report
 //! names the row where the history stops being trustworthy.
 
+use std::collections::BTreeSet;
+
 use rusqlite::Connection;
 use serde::Serialize;
+use serde_json::Value;
 
-use super::{LedgerError, Result, hash};
+use super::{Anchor, EventKind, LedgerError, Result, hash};
+
+/// How far the chain may legitimately run ahead of the anchor.
+///
+/// `note_head` writes the anchor after the row commits, so a crash in that
+/// window leaves exactly one unwitnessed row. Anything beyond that is not a
+/// crash.
+pub const ANCHOR_LAG_TOLERANCE: u64 = 1;
 
 /// Why the walk stopped.
 ///
@@ -18,6 +28,33 @@ use super::{LedgerError, Result, hash};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, thiserror::Error)]
 #[serde(tag = "reason", rename_all = "snake_case")]
 pub enum BreakReason {
+    /// The chain is LONGER than the anchor by more than the one row a crash
+    /// between commit and anchor-write can explain.
+    ///
+    /// This is the forged-tail case. An attacker with write access to the
+    /// database can recompute a row hash from the open-source preimage and
+    /// *append* — laundering a nulled payload behind a tombstone event it
+    /// wrote itself — rather than rewriting history. Comparing only at the
+    /// anchored seq accepts that, because a prefix still matches. So the
+    /// anchor must bound the head from above as well as below.
+    #[error("chain is {head_seq} rows but the anchor witnessed {anchor_seq}; {ahead} unwitnessed")]
+    ChainAheadOfAnchor {
+        /// The seq the anchor last witnessed.
+        anchor_seq: u64,
+        /// The seq the chain now claims.
+        head_seq: u64,
+        /// How far ahead, beyond the tolerated crash lag.
+        ahead: u64,
+    },
+    /// The ledger was opened with an anchor and the anchor is now gone.
+    ///
+    /// `open_anchored` populates the anchor at open, adopting the current head
+    /// when the sidecar is empty. A later read of `None` is therefore positive
+    /// proof the sidecar was removed, not an unanchored ledger — and folding
+    /// the two together would be a fail-open on exactly the file an attacker
+    /// would delete first.
+    #[error("this ledger was anchored and the anchor is missing")]
+    AnchorMissing,
     /// A row is missing: the walk expected `expected` and found the reporting
     /// seq instead. Rows are never deleted (`docs/decisions.md` D-e), so this
     /// is deletion, not retention.
@@ -57,10 +94,15 @@ pub enum BreakReason {
     /// null. It cannot be hashed, so the commitment cannot be checked.
     #[error("payload column is not text, blob or null")]
     PayloadUnreadable,
-    /// The payload is gone but no redaction was recorded. An authorised
-    /// redaction stamps `redacted_at` and appends its own chained event; a
-    /// silent NULL is someone deleting evidence.
-    #[error("payload is null but no redaction was recorded")]
+    /// The payload is gone and no *chained* redaction covers it. An authorised
+    /// redaction appends an [`EventKind::PayloadRedacted`] row naming the seq
+    /// it nulled, and that row is inside the hash chain; a silent NULL is
+    /// someone deleting evidence.
+    ///
+    /// The `redacted_at` column is deliberately not consulted. It is not in the
+    /// row-hash preimage, so anyone who can null a payload can set it in the
+    /// same `UPDATE` — evidence an attacker can write is not evidence.
+    #[error("payload is null and no chained redaction covers it")]
     UnrecordedTombstone,
     /// The chain itself verifies but the head no longer points at its last
     /// row, so the next append would build on the wrong hash.
@@ -75,6 +117,28 @@ pub enum BreakReason {
         /// Seq recorded in the head.
         found_seq: u64,
         /// Hash recorded in the head.
+        found_hash: String,
+    },
+    /// The chain no longer reaches, or no longer agrees with, the head that was
+    /// anchored outside the database file.
+    ///
+    /// Covers both shapes of rewriting history from the end: the chain is now
+    /// shorter than the anchor (a truncated suffix, with `chain_head` rewound
+    /// to match so [`BreakReason::HeadMismatch`] stays quiet), and the chain is
+    /// long enough but the row at the anchored seq hashes to something else (a
+    /// forged row with every hash after it recomputed).
+    #[error(
+        "anchored head is ({anchor_seq}, {anchor_hash}), chain has ({found_seq}, {found_hash})"
+    )]
+    HeadBehindAnchor {
+        /// Seq recorded outside the database.
+        anchor_seq: u64,
+        /// Row hash recorded outside the database.
+        anchor_hash: String,
+        /// Seq the chain actually reaches, or the anchored seq when the chain
+        /// is long enough but disagrees.
+        found_seq: u64,
+        /// The hash actually found there.
         found_hash: String,
     },
 }
@@ -115,15 +179,57 @@ impl ChainReport {
 }
 
 /// Columns the walk needs, in preimage order so the reader below stays honest.
+///
+/// `redacted_at` and `redaction_reason` are absent on purpose: neither is in
+/// the row-hash preimage, so neither can be evidence of anything. A redaction
+/// is proven by the chained [`EventKind::PayloadRedacted`] row that names it.
 const WALK_COLUMNS: &str = "seq, ts_ms, kind, agent_id, payload, payload_hash, \
-     prev_hash, hash, snapshot_id, snapshot_hash, redacted_at";
+     prev_hash, hash, snapshot_id, snapshot_hash";
+
+/// The seq a `payload_redacted` row says it covers, if it says anything.
+///
+/// The bytes are the ones the chain committed to — this is only ever called
+/// after the row's own hash and its payload hash have both verified — so the
+/// claim is as trustworthy as the chain itself. A body that does not parse, or
+/// that names no seq, simply excuses nothing.
+fn redacted_seq(payload: &[u8]) -> Option<u64> {
+    serde_json::from_slice::<Value>(payload)
+        .ok()?
+        .get("redacted_seq")?
+        .as_u64()
+}
 
 /// Walk the chain from genesis and report the first broken link.
 ///
 /// Streams the rows rather than collecting them: an audited ledger is expected
 /// to be long-lived, and a verification that needs the whole history resident
-/// is a verification that stops being run.
-pub(crate) fn walk(conn: &Connection, genesis: &str) -> Result<ChainReport> {
+/// is a verification that stops being run. The only state that grows is the set
+/// of null payloads not yet excused by a chained redaction, which is bounded by
+/// the redaction count and empties as the walk passes each tombstone.
+///
+/// `anchor` is the head remembered outside the database file, when there is
+/// one. Without it the last row of the chain is whatever the file says it is;
+/// see [`super::anchor`] for exactly what it buys.
+/// The head this database claims, without walking the chain.
+///
+/// Used when verification stops before the walk — a removed anchor, for
+/// instance — so the report still names the head under scrutiny.
+pub(crate) fn head_of(conn: &Connection) -> Result<(u64, String)> {
+    let (seq_raw, hash): (i64, String) =
+        conn.query_row("SELECT seq, hash FROM chain_head WHERE id = 0", [], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?;
+    Ok((
+        u64::try_from(seq_raw).map_err(|_| LedgerError::SeqOutOfRange)?,
+        hash,
+    ))
+}
+
+pub(crate) fn walk(
+    conn: &Connection,
+    genesis: &str,
+    anchor: Option<&Anchor>,
+) -> Result<ChainReport> {
     let (head_seq_raw, head_hash): (i64, String) =
         conn.query_row("SELECT seq, hash FROM chain_head WHERE id = 0", [], |row| {
             Ok((row.get(0)?, row.get(1)?))
@@ -139,6 +245,12 @@ pub(crate) fn walk(conn: &Connection, genesis: &str) -> Result<ChainReport> {
     let mut expected_prev = genesis.to_owned();
     let mut rows_checked: u64 = 0;
     let mut last: Option<(u64, String)> = None;
+    // Rows whose payload is gone and which no chained redaction has explained
+    // yet. A `BTreeSet` rather than a `HashSet` so the seq reported is the
+    // lowest one and is the same on every run.
+    let mut unexplained_nulls: BTreeSet<u64> = BTreeSet::new();
+    // The hash found at the anchored seq, captured on the way past.
+    let mut hash_at_anchor: Option<String> = None;
 
     while let Some(row) = rows.next()? {
         let seq_raw: i64 = row.get(0)?;
@@ -163,7 +275,6 @@ pub(crate) fn walk(conn: &Connection, genesis: &str) -> Result<ChainReport> {
         let stored_hash: String = row.get(7)?;
         let snapshot_id: Option<String> = row.get(8)?;
         let snapshot_hash: Option<String> = row.get(9)?;
-        let redacted_at: Option<i64> = row.get(10)?;
 
         if prev_hash != expected_prev {
             return Ok(broken(
@@ -201,20 +312,14 @@ pub(crate) fn walk(conn: &Connection, genesis: &str) -> Result<ChainReport> {
             ));
         }
 
-        // The payload sits beside the chain (R5). Absent is legitimate only
-        // when a redaction was recorded; present must hash to what the row
-        // committed to.
+        // The payload sits beside the chain (R5). Present must hash to what the
+        // row committed to; absent is held against the row until a chained
+        // redaction explains it, because the only thing that can excuse a
+        // missing payload is a record an attacker would have to forge a hash to
+        // write.
         match row.get_ref(4).map(|value| value.as_bytes_or_null()) {
             Ok(Ok(None)) => {
-                if redacted_at.is_none() {
-                    return Ok(broken(
-                        rows_checked,
-                        head_seq,
-                        head_hash,
-                        seq,
-                        BreakReason::UnrecordedTombstone,
-                    ));
-                }
+                unexplained_nulls.insert(seq);
             }
             Ok(Ok(Some(bytes))) => {
                 let actual = hash::payload_hash(bytes);
@@ -230,6 +335,14 @@ pub(crate) fn walk(conn: &Connection, genesis: &str) -> Result<ChainReport> {
                         },
                     ));
                 }
+                // Hash-verified, so this row is what was written. A redaction
+                // is always appended after the row it nulls, so one forward
+                // pass is enough.
+                if kind == EventKind::PayloadRedacted.as_str()
+                    && let Some(covered) = redacted_seq(bytes)
+                {
+                    unexplained_nulls.remove(&covered);
+                }
             }
             Ok(Err(_)) => {
                 return Ok(broken(
@@ -243,13 +356,81 @@ pub(crate) fn walk(conn: &Connection, genesis: &str) -> Result<ChainReport> {
             Err(error) => return Err(error.into()),
         }
 
+        if anchor.is_some_and(|anchor| anchor.seq == seq) {
+            hash_at_anchor = Some(stored_hash.clone());
+        }
+
         rows_checked += 1;
         expected_seq = seq + 1;
         expected_prev = stored_hash.clone();
         last = Some((seq, stored_hash));
     }
 
+    // Reported after the walk rather than at the row, because the redaction
+    // that would have explained it is a *later* row. Seqs are contiguous by
+    // here — a gap returns above — so the number of rows that verified before
+    // the offending one is exactly `seq - 1`.
+    if let Some(&seq) = unexplained_nulls.first() {
+        return Ok(broken(
+            seq.saturating_sub(1),
+            head_seq,
+            head_hash,
+            seq,
+            BreakReason::UnrecordedTombstone,
+        ));
+    }
+
     let (last_seq, last_hash) = last.unwrap_or((0, genesis.to_owned()));
+
+    // The anchor is checked before the head: a rewound `chain_head` is exactly
+    // what a truncation fixes up to keep `HeadMismatch` quiet, so the anchor is
+    // the more informative story when both fire.
+    if let Some(anchor) = anchor {
+        let found = if anchor.seq > last_seq {
+            Some((last_seq, last_hash.clone()))
+        } else {
+            let at_anchor = if anchor.seq == 0 {
+                genesis.to_owned()
+            } else {
+                hash_at_anchor.clone().unwrap_or_default()
+            };
+            (at_anchor != anchor.hash).then_some((anchor.seq, at_anchor))
+        };
+        if let Some((found_seq, found_hash)) = found {
+            return Ok(broken(
+                rows_checked,
+                head_seq,
+                head_hash,
+                anchor.seq,
+                BreakReason::HeadBehindAnchor {
+                    anchor_seq: anchor.seq,
+                    anchor_hash: anchor.hash.clone(),
+                    found_seq,
+                    found_hash,
+                },
+            ));
+        }
+
+        // Bound the head from ABOVE as well. `note_head` runs after the
+        // commit, so a crash can legitimately leave the anchor exactly one row
+        // behind; anything further is rows the anchor never witnessed, which
+        // is what a forged tail looks like.
+        let ahead = last_seq.saturating_sub(anchor.seq);
+        if ahead > ANCHOR_LAG_TOLERANCE {
+            return Ok(broken(
+                rows_checked,
+                head_seq,
+                head_hash,
+                anchor.seq,
+                BreakReason::ChainAheadOfAnchor {
+                    anchor_seq: anchor.seq,
+                    head_seq: last_seq,
+                    ahead: ahead - ANCHOR_LAG_TOLERANCE,
+                },
+            ));
+        }
+    }
+
     if last_seq != head_seq || last_hash != head_hash {
         return Ok(ChainReport {
             rows_checked,

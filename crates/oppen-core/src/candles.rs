@@ -7,9 +7,16 @@
 //!
 //! | Case | Source | History |
 //! |---|---|---|
-//! | [`Resolution::Native`] | `candleSnapshot` / the `candle` WS channel | full |
-//! | [`Resolution::Resampled`] | aggregate the largest native divisor | full |
+//! | [`Resolution::Native`] | `candleSnapshot` / the `candle` WS channel | the interval's own [`Horizon`] |
+//! | [`Resolution::Resampled`] | aggregate the largest native divisor | the **source's** [`Horizon`], carried in the case |
 //! | [`Resolution::Local`] | aggregate the WS `trades` feed here | forward only |
+//!
+//! "Full" is not a property of the resampled case: a `7m` chart is derived from
+//! `1m`, and `1m` reaches roughly three and a half days back. So the horizon
+//! travels inside [`Resolution::Resampled`] and comes out in the chip text
+//! rather than being assumed by the reader (`charts.md` §3.2's History column
+//! reads "Full" for this row and needs amending to "full, or the source's
+//! rolling floor" — that edit is owed to `docs/specs/charts.md`).
 //!
 //! Bucket boundaries are aligned to the Unix epoch (`bucket_start_ms` is
 //! `floor(t / interval) * interval`), so the same interval produces the same
@@ -55,6 +62,7 @@
 //!   `docs/decisions.md` D-d must plan around that, and a resampled `1m`-based
 //!   interval inherits the same short horizon.
 
+use std::cmp::Ordering;
 use std::fmt;
 use std::str::FromStr;
 
@@ -85,6 +93,26 @@ pub const DEFAULT_LOCAL_RETENTION_MS: i64 = 30 * 24 * 60 * 60 * MS_PER_SECOND;
 /// bar per second of sleep; past this the gap is left as absent rows and
 /// counted by [`LocalAggregator::skipped_fills`].
 pub const MAX_FILL_BARS: i64 = 10_000;
+
+/// Earliest timestamp this module accepts. The venue serves no pre-epoch bar.
+pub const MIN_TIME_MS: i64 = 0;
+
+/// Latest timestamp this module accepts: 9999-12-31T23:59:59.999Z.
+///
+/// Bounding both ends at the boundary — [`Bar::from_candle`] and
+/// [`Trade::checked`] — is what makes every millisecond addition downstream
+/// provably in range, rather than scattering `checked_add` across the module.
+/// `MAX_TIME_MS + MAX_INTERVAL_MS` is four orders of magnitude below
+/// `i64::MAX`, so a bucket close can never wrap.
+pub const MAX_TIME_MS: i64 = 253_402_300_799_999;
+
+/// How many intervals `candleSnapshot` serves, whatever the interval.
+///
+/// Measured 2026-09-04, mainnet: a full-history request returned 5,001 rows on
+/// `1h`, 5,004 on `15m`, 5,064 on BTC `1m` and 5,161 on HYPE `1m`. It is a
+/// rolling floor, not a page size: widening `startTime` past it adds nothing.
+/// See [`Interval::venue_history`].
+pub const VENUE_HISTORY_INTERVALS: u32 = 5_000;
 
 /// The time unit of an interval string. Case matters and is not a typo:
 /// `m` is a minute and `M` is the venue's thirty-day bar.
@@ -153,10 +181,59 @@ impl Unit {
 /// `1m` and `1m` are one value and one storage key, and `720h` is `1M`. Two
 /// intervals are equal exactly when their widths are equal, which is what makes
 /// [`Resolution`] a total function and the storage key unambiguous.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Interval {
     count: u32,
     unit: Unit,
+}
+
+impl Ord for Interval {
+    /// By width, never by field order.
+    ///
+    /// Written out rather than derived because the derived version compares
+    /// `count` first, which puts `1M` below `3m` and `1h` below `3m`, makes
+    /// [`NATIVE_INTERVALS`] unsorted under its own ordering, and would make a
+    /// `BTreeMap<Interval, _>` serialise in that order — a determinism hazard
+    /// on the MCP surface (`AGENTS.md` 6).
+    ///
+    /// Agrees with the derived [`Eq`] because canonicalisation gives exactly
+    /// one `Interval` per width.
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.millis().cmp(&other.millis())
+    }
+}
+
+impl PartialOrd for Interval {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// How far back a source serves, for an interval that has a limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Horizon {
+    /// Everything the venue has ever had for the asset. True where the venue's
+    /// own age is fewer than [`VENUE_HISTORY_INTERVALS`] bars: BTC `1d` returns
+    /// all 2,208 rows back to 2019.
+    Full,
+    /// Only the most recent `intervals` bars exist, no matter how the request
+    /// is paged.
+    Rolling {
+        /// How many bars back the source reaches.
+        intervals: u32,
+    },
+}
+
+impl Horizon {
+    /// The horizon as a duration, for an interval of this width. `None` when
+    /// there is no limit to express.
+    pub const fn span_ms(self, of: Interval) -> Option<i64> {
+        match self {
+            Horizon::Full => None,
+            Horizon::Rolling { intervals } => Some((intervals as i64).saturating_mul(of.millis())),
+        }
+    }
 }
 
 impl Serialize for Interval {
@@ -177,8 +254,11 @@ impl<'de> Deserialize<'de> for Interval {
     }
 }
 
-/// The venue's fixed menu, ascending. `charts.md` §3.1 lists it; the audit in
-/// the module docs confirms these fourteen and only these fourteen are served.
+/// The venue's fixed menu, ascending by width and therefore sorted under
+/// [`Interval`]'s own [`Ord`] — which [`Interval::resolve`] relies on when it
+/// walks the menu backwards looking for the largest divisor. `charts.md` §3.1
+/// lists it; the audit in the module docs confirms these fourteen and only
+/// these fourteen are served.
 pub const NATIVE_INTERVALS: [Interval; 14] = [
     Interval::known(1, Unit::Minute),
     Interval::known(3, Unit::Minute),
@@ -280,6 +360,23 @@ impl Interval {
         NATIVE_INTERVALS.contains(&self)
     }
 
+    /// How far back `candleSnapshot` serves this interval.
+    ///
+    /// The venue serves [`VENUE_HISTORY_INTERVALS`] bars whatever the interval,
+    /// so the floor only bites when the asset is older than that many bars.
+    /// Five thousand days is thirteen years, more than Hyperliquid has existed,
+    /// which is why BTC `1d` returns its whole history and BTC `1m` reaches
+    /// only about three and a half days back.
+    pub const fn venue_history(self) -> Horizon {
+        if self.millis() >= Unit::Day.millis() {
+            Horizon::Full
+        } else {
+            Horizon::Rolling {
+                intervals: VENUE_HISTORY_INTERVALS,
+            }
+        }
+    }
+
     /// Which of `charts.md` §3.2's three cases this interval falls into, and
     /// for the resampled case which native interval to aggregate.
     pub fn resolve(self) -> Resolution {
@@ -296,7 +393,10 @@ impl Interval {
         for native in NATIVE_INTERVALS.iter().rev() {
             let width = native.millis();
             if width < millis && millis % width == 0 {
-                return Resolution::Resampled { from: *native };
+                return Resolution::Resampled {
+                    from: *native,
+                    source_history: native.venue_history(),
+                };
             }
         }
         Resolution::Local {
@@ -311,14 +411,23 @@ impl Interval {
     /// narrow, duplicate or skip a bucket: the local calendar is never
     /// consulted. `div_euclid` floors rather than truncating, so pre-epoch
     /// timestamps land in the bucket below them rather than the one above.
+    ///
+    /// Saturating rather than wrapping: this is a `pub const fn` on a `pub`
+    /// type, so it must not panic for any `i64` (`AGENTS.md` conventions).
+    /// Nothing in range can saturate — [`MIN_TIME_MS`] and [`MAX_TIME_MS`]
+    /// bound every timestamp that enters the module — so saturation is only
+    /// reachable from a direct call with an absurd argument, where a clamped
+    /// answer beats an overflow.
     pub const fn bucket_start_ms(self, t_ms: i64) -> i64 {
-        t_ms.div_euclid(self.millis()) * self.millis()
+        let width = self.millis();
+        t_ms.div_euclid(width).saturating_mul(width)
     }
 
     /// Inclusive close of the bucket containing `t_ms`, in the venue's own
     /// convention: `T = t + width - 1`, verified on every bar in the audit.
+    /// Saturating for the same reason as [`Interval::bucket_start_ms`].
     pub const fn bucket_close_ms(self, t_ms: i64) -> i64 {
-        self.bucket_start_ms(t_ms) + self.millis() - 1
+        self.bucket_start_ms(t_ms).saturating_add(self.millis() - 1)
     }
 }
 
@@ -385,9 +494,17 @@ pub enum Resolution {
     Native,
     /// An exact integer multiple of `from`. Lossless: the venue's bars
     /// partition the same time axis, so aggregating them loses nothing.
+    ///
+    /// Lossless is not the same as unlimited. A resampled interval inherits its
+    /// source's horizon, and a `1m` source reaches roughly three and a half
+    /// days back, so `7m` and `13m` are three-and-a-half-day charts while a
+    /// `2h`-derived `6h` goes back years. `source_history` is what stops the
+    /// chip from claiming otherwise.
     Resampled {
         /// The largest native interval that divides this one.
         from: Interval,
+        /// How far back `from` is served — [`Interval::venue_history`].
+        source_history: Horizon,
     },
     /// Built here from the `trades` feed. **Forward only** — there is no
     /// history and the UI must say so rather than drawing a flat line.
@@ -398,21 +515,65 @@ pub enum Resolution {
 }
 
 impl Resolution {
-    /// The exact chip text from `charts.md` §3.3. Kept in core rather than the
-    /// view so the requirement "the UI must say which one it is" is testable.
+    /// The chip text from `charts.md` §3.3, extended with the source's reach
+    /// when that reach is finite. Kept in core rather than the view so the
+    /// requirement "the UI must say which one it is" is testable.
+    ///
+    /// `RESAMPLED FROM 1m · 3d` rather than a bare `RESAMPLED FROM 1m`: the
+    /// bare form says the same thing for a chart that goes back three days and
+    /// one that goes back a decade, which is the silent degrade this whole type
+    /// exists to prevent.
     pub fn label(self) -> String {
         match self {
             Resolution::Native => "NATIVE".to_owned(),
-            Resolution::Resampled { from } => format!("RESAMPLED FROM {from}"),
+            Resolution::Resampled {
+                from,
+                source_history,
+            } => match source_history.span_ms(from) {
+                None => format!("RESAMPLED FROM {from}"),
+                Some(span) => format!("RESAMPLED FROM {from} · {}", compact_span(span)),
+            },
             Resolution::Local { .. } => "LOCAL · FORWARD ONLY".to_owned(),
         }
     }
 
-    /// Whether this case has history behind it. `false` means the chart starts
-    /// at the moment oppen first listened and the empty region before it must
-    /// be labelled, never drawn.
+    /// Whether this case has *any* history behind it. `false` means the chart
+    /// starts at the moment oppen first listened and the empty region before it
+    /// must be labelled, never drawn.
+    ///
+    /// It does not mean "full history": ask [`Resolution::source_history`] for
+    /// how far back the case actually reaches.
     pub fn has_history(self) -> bool {
         !matches!(self, Resolution::Local { .. })
+    }
+
+    /// How far back the *source* reaches, for the one case where the source is
+    /// not the requested interval. `None` for the native case — ask
+    /// [`Interval::venue_history`] on the interval itself — and `None` for the
+    /// local case, which has no history at all and reports it through
+    /// [`LocalAggregator::no_history_before_ms`] instead.
+    pub const fn source_history(self) -> Option<Horizon> {
+        match self {
+            Resolution::Native => None,
+            Resolution::Resampled { source_history, .. } => Some(source_history),
+            Resolution::Local { .. } => None,
+        }
+    }
+}
+
+/// A millisecond span as the coarsest whole unit that is at least one, for chip
+/// text. Deliberately truncating: `3d` under-promises a 3.47-day horizon, and a
+/// history marker that rounds up is a claim.
+fn compact_span(ms: i64) -> String {
+    const MINUTE_MS: i64 = 60 * MS_PER_SECOND;
+    const HOUR_MS: i64 = 60 * MINUTE_MS;
+    const DAY_MS: i64 = 24 * HOUR_MS;
+    if ms >= DAY_MS {
+        format!("{}d", ms / DAY_MS)
+    } else if ms >= HOUR_MS {
+        format!("{}h", ms / HOUR_MS)
+    } else {
+        format!("{}m", ms / MINUTE_MS)
     }
 }
 
@@ -487,11 +648,17 @@ impl Bar {
     /// Convert one `candleSnapshot` / `candle` row. Fails rather than saturates
     /// on an out-of-range timestamp so a corrupt row cannot become a plausible
     /// one.
+    ///
+    /// This is one of the two doors timestamps enter through — [`Trade::checked`]
+    /// is the other — and bounding them here is what makes the millisecond
+    /// arithmetic in [`resample`] and [`LocalAggregator`] provably in range.
+    /// A row with `t = 2^63 - 2^16` passes every other check this module makes
+    /// (right interval, aligned open, exactly one width wide) and then overflows
+    /// `i64` inside the resampler.
     pub fn from_candle(candle: &Candle) -> Result<Self, BarError> {
         Ok(Self {
-            open_time_ms: i64::try_from(candle.t).map_err(|_| BarError::Timestamp(candle.t))?,
-            close_time_ms: i64::try_from(candle.t_close)
-                .map_err(|_| BarError::Timestamp(candle.t_close))?,
+            open_time_ms: checked_time_ms(candle.t)?,
+            close_time_ms: checked_time_ms(candle.t_close)?,
             open: candle.o,
             high: candle.h,
             low: candle.l,
@@ -504,7 +671,7 @@ impl Bar {
     fn empty_at(open_time_ms: i64, width_ms: i64, price: Decimal) -> Self {
         Self {
             open_time_ms,
-            close_time_ms: open_time_ms + width_ms - 1,
+            close_time_ms: open_time_ms.saturating_add(width_ms - 1),
             open: price,
             high: price,
             low: price,
@@ -527,9 +694,17 @@ pub enum BarError {
         /// The interval the row actually carries in its `i` field.
         found: String,
     },
-    /// A timestamp outside the representable range.
+    /// A candle timestamp outside `MIN_TIME_MS..=MAX_TIME_MS`.
     #[error("candle timestamp {0} ms is out of range")]
     Timestamp(u64),
+    /// A trade timestamp outside `MIN_TIME_MS..=MAX_TIME_MS`. Signed, because
+    /// the WS feed's own field is signed and a negative print is as wrong as an
+    /// absurdly large one.
+    #[error("trade timestamp {time_ms} ms is out of range")]
+    TradeTime {
+        /// The offending print's time, Unix epoch ms.
+        time_ms: i64,
+    },
     /// The row's open is not aligned to its own interval, which would break
     /// every downstream bucket.
     #[error("candle open {open_time_ms} ms is not aligned to {interval}")]
@@ -551,6 +726,17 @@ pub enum BarError {
         /// The interval width it should have been.
         expected_ms: i64,
     },
+}
+
+/// A venue timestamp, bounded. The venue's field is `u64`, so only the upper
+/// bound can bite, but the range is written out so the invariant is one thing
+/// and not two.
+fn checked_time_ms(raw: u64) -> Result<i64, BarError> {
+    let ms = i64::try_from(raw).map_err(|_| BarError::Timestamp(raw))?;
+    if !(MIN_TIME_MS..=MAX_TIME_MS).contains(&ms) {
+        return Err(BarError::Timestamp(raw));
+    }
+    Ok(ms)
 }
 
 /// Convert a `candleSnapshot` response into bars, checking the three things
@@ -629,6 +815,23 @@ pub enum ResampleError {
         /// The open that did not exceed the one before it.
         open_time_ms: i64,
     },
+    /// A target bucket in the interior of the window did not receive all of its
+    /// source bars.
+    ///
+    /// The venue emits a bar for **every** bucket including empty ones (282 of
+    /// PURR's 1,441 `1m` bars in the audit window), so a hole is a feed bug.
+    /// Aggregating around it would produce a bar that is byte-indistinguishable
+    /// from a correct one, which is the one thing this module will not do
+    /// (`charts.md` §3.2, "resampling is exact, not approximate").
+    #[error("target bucket at {open_time_ms} ms got {got} of {want} source bars")]
+    IncompleteBucket {
+        /// The offending target bucket's open, Unix epoch ms.
+        open_time_ms: i64,
+        /// How many source bars actually landed in it.
+        got: i64,
+        /// How many it needed: `target / source`.
+        want: i64,
+    },
 }
 
 /// Aggregate native bars into a coarser interval, exactly.
@@ -643,8 +846,29 @@ pub enum ResampleError {
 /// `o = h = l = c` and zero volume (measured on PURR, 282 of 1,441 bars), so
 /// they neither widen the range nor move the open.
 ///
-/// A trailing partial bucket is returned like any other; the caller decides
-/// whether it is forming with [`Bar::is_closed`].
+/// ## Incomplete target buckets
+///
+/// A target bucket needs exactly `target / source` source bars. What happens
+/// when it does not get them depends on *where* it is, because the three cases
+/// mean three different things:
+///
+/// * **Leading.** The window began part-way through the first target bucket, so
+///   its true open, high and low were never served. This is the normal case,
+///   not an edge one: `candleSnapshot` serves a rolling
+///   [`VENUE_HISTORY_INTERVALS`]-bar window whose oldest bar sits at an
+///   arbitrary offset into a resampled bucket — measured 2026-09-04, BTC `1m`'s
+///   oldest row was 13 minutes into a `45m` bucket. The bucket is **dropped**;
+///   the series simply starts at the next whole one. Emitting it would produce
+///   a bar byte-indistinguishable from a correct one at the left edge of every
+///   resampled chart.
+/// * **Interior.** A hole. The venue emits a bar for every bucket, so this is a
+///   feed bug and it is refused with [`ResampleError::IncompleteBucket`] rather
+///   than absorbed.
+/// * **Trailing.** The last bucket is still forming. It is returned like any
+///   other and the caller decides with [`Bar::is_closed`] — but only if what
+///   arrived is an unbroken run from the bucket's own start. A hole inside the
+///   last bucket is a hole like any other and is refused; "still forming" is
+///   the only reason a returned bucket may be short.
 pub fn resample(
     source_bars: &[Bar],
     source: Interval,
@@ -664,9 +888,15 @@ pub fn resample(
             to: target.to_string(),
         });
     }
+    let want = target_ms / source_ms;
 
     let mut out: Vec<Bar> = Vec::new();
+    let mut pending: Option<Pending> = None;
     let mut previous_open: Option<i64> = None;
+    // Set once the first target bucket has been decided, kept or dropped, so a
+    // dropped leading bucket cannot make the second one look like the first.
+    let mut leading_resolved = false;
+
     for bar in source_bars {
         if bar.open_time_ms % source_ms != 0 {
             return Err(ResampleError::Misaligned {
@@ -682,31 +912,109 @@ pub fn resample(
         previous_open = Some(bar.open_time_ms);
 
         let bucket = target.bucket_start_ms(bar.open_time_ms);
-        match out.last_mut() {
-            Some(current) if current.open_time_ms == bucket => {
-                current.close = bar.close;
-                if bar.high > current.high {
-                    current.high = bar.high;
+        match &mut pending {
+            Some(current) if current.bar.open_time_ms == bucket => {
+                current.bar.close = bar.close;
+                if bar.high > current.bar.high {
+                    current.bar.high = bar.high;
                 }
-                if bar.low < current.low {
-                    current.low = bar.low;
+                if bar.low < current.bar.low {
+                    current.bar.low = bar.low;
                 }
-                current.volume += bar.volume;
-                current.trades = current.trades.saturating_add(bar.trades);
+                current.bar.volume += bar.volume;
+                current.bar.trades = current.bar.trades.saturating_add(bar.trades);
+                current.got += 1;
+                current.last_open_ms = bar.open_time_ms;
             }
-            _ => out.push(Bar {
-                open_time_ms: bucket,
-                close_time_ms: bucket + target_ms - 1,
-                open: bar.open,
-                high: bar.high,
-                low: bar.low,
-                close: bar.close,
-                volume: bar.volume,
-                trades: bar.trades,
-            }),
+            _ => {
+                if let Some(done) = pending.take() {
+                    if let Some(kept) = done.seal(want, leading_resolved)? {
+                        out.push(kept);
+                    }
+                    leading_resolved = true;
+                }
+                pending = Some(Pending {
+                    bar: Bar {
+                        open_time_ms: bucket,
+                        close_time_ms: target.bucket_close_ms(bucket),
+                        open: bar.open,
+                        high: bar.high,
+                        low: bar.low,
+                        close: bar.close,
+                        volume: bar.volume,
+                        trades: bar.trades,
+                    },
+                    got: 1,
+                    opened_on_boundary: bar.open_time_ms == bucket,
+                    last_open_ms: bar.open_time_ms,
+                });
+            }
+        }
+    }
+
+    if let Some(last) = pending {
+        // The trailing bucket is allowed to be short: it is the one still
+        // forming. Unless it is also the leading one and we never saw its open,
+        // in which case it is short for the other reason and has to go.
+        if leading_resolved || last.opened_on_boundary {
+            // Short only earns the benefit of the doubt if what arrived is an
+            // unbroken run from the bucket's own start. A hole inside the last
+            // bucket produces a bar byte-indistinguishable from one that is
+            // genuinely still filling, which is the same defect as an interior
+            // hole and gets the same answer.
+            if !last.is_contiguous_prefix(source_ms) {
+                return Err(ResampleError::IncompleteBucket {
+                    open_time_ms: last.bar.open_time_ms,
+                    got: last.got,
+                    want,
+                });
+            }
+            out.push(last.bar);
         }
     }
     Ok(out)
+}
+
+/// A target bucket under construction, with enough context to judge whether it
+/// is complete and, if not, which kind of incomplete.
+struct Pending {
+    bar: Bar,
+    got: i64,
+    opened_on_boundary: bool,
+    last_open_ms: i64,
+}
+
+impl Pending {
+    /// Decide a bucket that has been left behind, i.e. one that is not the
+    /// trailing bucket. `Ok(None)` means "drop it silently"; see [`resample`].
+    fn seal(self, want: i64, leading_resolved: bool) -> Result<Option<Bar>, ResampleError> {
+        if self.got == want {
+            return Ok(Some(self.bar));
+        }
+        if !leading_resolved && !self.opened_on_boundary {
+            return Ok(None);
+        }
+        Err(ResampleError::IncompleteBucket {
+            open_time_ms: self.bar.open_time_ms,
+            got: self.got,
+            want,
+        })
+    }
+
+    /// Whether the source bars seen so far are the bucket's first `got` slots
+    /// with nothing missing between them. Source bars are aligned and strictly
+    /// ascending, so that is true exactly when the newest one sits `got - 1`
+    /// source widths above the bucket start.
+    ///
+    /// Saturating because [`Bar`]'s fields are public and `resample` takes any
+    /// slice; a caller-built bar near `i64::MAX` must not panic here.
+    fn is_contiguous_prefix(&self, source_ms: i64) -> bool {
+        let expected = self
+            .bar
+            .open_time_ms
+            .saturating_add(self.got.saturating_sub(1).saturating_mul(source_ms));
+        self.last_open_ms == expected
+    }
 }
 
 /// One print off the `trades` WS channel, reduced to what a bar needs.
@@ -723,6 +1031,25 @@ pub struct Trade {
     pub size: Decimal,
 }
 
+impl Trade {
+    /// Build a print, refusing a timestamp this module cannot do arithmetic on.
+    ///
+    /// The WS converter calls this instead of writing the struct literally, so
+    /// an out-of-range time is a typed rejection at the boundary rather than an
+    /// overflow four calls later. [`LocalAggregator::push`] re-checks anyway,
+    /// because the fields are public and a literal is still constructible.
+    pub fn checked(time_ms: i64, price: Decimal, size: Decimal) -> Result<Self, BarError> {
+        if !(MIN_TIME_MS..=MAX_TIME_MS).contains(&time_ms) {
+            return Err(BarError::TradeTime { time_ms });
+        }
+        Ok(Self {
+            time_ms,
+            price,
+            size,
+        })
+    }
+}
+
 /// Builds bars from the trades feed for an interval the venue does not serve.
 ///
 /// **Forward only.** `charts.md` §3.2: a `90s` chart opened for the first time
@@ -737,19 +1064,34 @@ pub struct Trade {
 /// Empty buckets inside the covered range are emitted flat
 /// (`o = h = l = c = previous close`, zero volume), which is exactly what the
 /// venue does for its own empty buckets. That is a continuation, not invented
-/// history: it says "no trades", and it is only ever emitted between two
-/// buckets this aggregator actually observed.
+/// history: it says "no trades".
+///
+/// # The caller owes it an interruption signal
+///
+/// A flat bar means "the feed was watching and nothing traded". This type
+/// cannot tell that apart from "the socket was dead" on its own — a trade ten
+/// minutes after the previous one looks identical either way — so the WS pool
+/// **must** call [`LocalAggregator::feed_interrupted`] on every disconnect and
+/// every staleness trip, and must pass a truthful `feed_live_through_ms` to
+/// [`LocalAggregator::close_through`]. Without that, a ten-minute outage on a
+/// `30s` chart comes back as nineteen fabricated flat bars at the pre-outage
+/// price, which is precisely the "flat line that reads as a quiet market"
+/// `charts.md` §3.2 forbids and the failure [`Resolution::Local`] exists to
+/// prevent.
 #[derive(Debug, Clone)]
 pub struct LocalAggregator {
     interval: Interval,
     no_history_before_ms: i64,
     accepts_from_ms: i64,
     bucket: Option<i64>,
+    newest_bucket_ms: Option<i64>,
     forming: Option<Bar>,
     last_close: Option<Decimal>,
     late: u64,
     before_history: u64,
     skipped_fills: u64,
+    out_of_range: u64,
+    gaps: u64,
 }
 
 impl LocalAggregator {
@@ -763,11 +1105,14 @@ impl LocalAggregator {
             no_history_before_ms: first_whole,
             accepts_from_ms: first_whole,
             bucket: None,
+            newest_bucket_ms: None,
             forming: None,
             last_close: None,
             late: 0,
             before_history: 0,
             skipped_fills: 0,
+            out_of_range: 0,
+            gaps: 0,
         }
     }
 
@@ -792,12 +1137,16 @@ impl LocalAggregator {
         }
     }
 
+    /// Clamped into `MIN_TIME_MS..=MAX_TIME_MS`, because the caller's
+    /// `listening_since_ms` is an unchecked clock reading and every bucket
+    /// derived from it is then provably in range.
     fn first_whole_bucket(interval: Interval, from_ms: i64) -> i64 {
+        let from_ms = from_ms.clamp(MIN_TIME_MS, MAX_TIME_MS);
         let start = interval.bucket_start_ms(from_ms);
         if start == from_ms {
             start
         } else {
-            start + interval.millis()
+            start.saturating_add(interval.millis())
         }
     }
 
@@ -832,6 +1181,47 @@ impl LocalAggregator {
         self.skipped_fills
     }
 
+    /// Prints dropped for carrying a timestamp outside
+    /// `MIN_TIME_MS..=MAX_TIME_MS`. Non-zero means the feed or the converter is
+    /// producing garbage, not that the market did something.
+    pub const fn out_of_range_trades(&self) -> u64 {
+        self.out_of_range
+    }
+
+    /// How many times the feed has been declared interrupted while this
+    /// aggregator held state. Each one is a hole in the stored series that was
+    /// deliberately left as absent rows rather than flat-filled.
+    pub const fn feed_gaps(&self) -> u64 {
+        self.gaps
+    }
+
+    /// Tell the aggregator the trades feed stopped being trustworthy.
+    ///
+    /// Called by the WS pool on every disconnect and on every staleness trip.
+    /// The in-progress bucket is discarded rather than emitted — it is partial,
+    /// and a partial bucket published as a whole bar is a wrong number, not a
+    /// rough one — and the next trade opens a fresh bucket with nothing filled
+    /// in behind it, exactly as [`LocalAggregator::resume`] does across a
+    /// process restart. The gap becomes absent rows, which the renderer labels.
+    ///
+    /// The last close is kept, so a symbol that is genuinely quiet after the
+    /// reconnect still continues from a price rather than from nothing.
+    ///
+    /// The late-trade watermark is **not** cleared. `bucket` is where the
+    /// aggregator is writing; `newest_bucket_ms` is how far it has ever been,
+    /// and only the first is forgotten. Clearing both would let a print
+    /// replayed from before the outage — reconnects deliver those — re-open an
+    /// already-emitted bucket, and the next live print would then flat-fill the
+    /// whole outage from it, which is the fabrication this method exists to
+    /// prevent.
+    pub fn feed_interrupted(&mut self) {
+        if self.bucket.is_some() || self.forming.is_some() {
+            self.gaps += 1;
+        }
+        self.bucket = None;
+        self.forming = None;
+    }
+
     /// The in-progress bar, if any: either the bucket's trades so far, or a
     /// flat continuation when the current bucket has had none.
     pub fn forming(&self) -> Option<Bar> {
@@ -845,17 +1235,30 @@ impl LocalAggregator {
     }
 
     /// Fold one trade in, returning any bars that closed as a result, ascending.
+    ///
+    /// A print asserts the feed was live at its own instant, so the buckets
+    /// between the last one and this one are flat-filled. That is only sound
+    /// because the pool calls [`LocalAggregator::feed_interrupted`] when it is
+    /// not — see this type's documentation.
     pub fn push(&mut self, trade: Trade) -> Vec<Bar> {
+        if !(MIN_TIME_MS..=MAX_TIME_MS).contains(&trade.time_ms) {
+            self.out_of_range += 1;
+            return Vec::new();
+        }
         if trade.time_ms < self.accepts_from_ms {
             self.before_history += 1;
             return Vec::new();
         }
         let bucket = self.interval.bucket_start_ms(trade.time_ms);
-        if self.bucket.is_some_and(|current| bucket < current) {
+        // Against the high-water mark rather than the current bucket: after
+        // `feed_interrupted` there is no current bucket, and a print replayed
+        // from before the outage must still be refused rather than re-opening a
+        // bucket that has already been emitted.
+        if self.newest_bucket_ms.is_some_and(|newest| bucket < newest) {
             self.late += 1;
             return Vec::new();
         }
-        let closed = self.advance_to(bucket);
+        let closed = self.advance_to(bucket, bucket);
         if let Some(bar) = &mut self.forming {
             if trade.price > bar.high {
                 bar.high = trade.price;
@@ -869,7 +1272,7 @@ impl LocalAggregator {
         } else {
             self.forming = Some(Bar {
                 open_time_ms: bucket,
-                close_time_ms: bucket + self.interval.millis() - 1,
+                close_time_ms: self.interval.bucket_close_ms(bucket),
                 open: trade.price,
                 high: trade.price,
                 low: trade.price,
@@ -884,34 +1287,56 @@ impl LocalAggregator {
     /// Close every bucket that has finished as of `now_ms`, returning them
     /// ascending. Driven by the caller's clock so a quiet symbol still produces
     /// bars; without it a bucket with no trades would never close.
-    pub fn close_through(&mut self, now_ms: i64) -> Vec<Bar> {
-        if now_ms < self.accepts_from_ms {
+    ///
+    /// `feed_live_through_ms` is the caller's assertion of how far the trades
+    /// subscription is actually known to have been alive — the pool's last
+    /// received message, not its wall clock. Flat continuation bars are only
+    /// synthesised for buckets at or before it, so a stalled socket produces
+    /// absent rows instead of a plausible flat market. In the healthy case the
+    /// two arguments are the same value and nothing changes.
+    ///
+    /// A bucket that received real prints is emitted with what was observed
+    /// either way; the clamp governs invention, not observation.
+    pub fn close_through(&mut self, now_ms: i64, feed_live_through_ms: i64) -> Vec<Bar> {
+        if now_ms < self.accepts_from_ms || now_ms > MAX_TIME_MS {
             return Vec::new();
         }
-        self.advance_to(self.interval.bucket_start_ms(now_ms))
+        let target = self.interval.bucket_start_ms(now_ms);
+        let fill_through = self
+            .interval
+            .bucket_start_ms(feed_live_through_ms.clamp(MIN_TIME_MS, MAX_TIME_MS));
+        self.advance_to(target, fill_through)
     }
 
     /// Move the current bucket to `target`, emitting everything in between.
-    fn advance_to(&mut self, target: i64) -> Vec<Bar> {
+    ///
+    /// `fill_through` is the newest bucket start for which a flat continuation
+    /// may be synthesised. Buckets past it are left absent.
+    fn advance_to(&mut self, target: i64, fill_through: i64) -> Vec<Bar> {
         let width = self.interval.millis();
         let Some(current) = self.bucket else {
-            self.bucket = Some(target);
+            self.enter_bucket(target);
             return Vec::new();
         };
         if target <= current {
             return Vec::new();
         }
-        self.bucket = Some(target);
+        self.enter_bucket(target);
 
         let mut out = Vec::new();
         if let Some(bar) = self.forming.take() {
             self.last_close = Some(bar.close);
             out.push(bar);
-        } else if let Some(close) = self.last_close {
+        } else if let Some(close) = self.last_close
+            && current <= fill_through
+        {
+            // No prints, and the caller vouches for the feed inside this
+            // bucket, so it really was empty: flat continuation.
             out.push(Bar::empty_at(current, width, close));
         }
         if let Some(close) = self.last_close {
-            let gap = (target - current) / width - 1;
+            let newest_fill = (target - width).min(fill_through);
+            let gap = (newest_fill - current) / width;
             if gap > MAX_FILL_BARS {
                 self.skipped_fills += 1;
             } else {
@@ -921,6 +1346,16 @@ impl LocalAggregator {
             }
         }
         out
+    }
+
+    /// Start writing into `target`, keeping the high-water mark that outlives
+    /// [`LocalAggregator::feed_interrupted`].
+    fn enter_bucket(&mut self, target: i64) {
+        self.bucket = Some(target);
+        self.newest_bucket_ms = Some(match self.newest_bucket_ms {
+            Some(newest) if newest > target => newest,
+            _ => target,
+        });
     }
 }
 
@@ -943,8 +1378,18 @@ pub enum StoreError {
 ///
 /// Borrows the caller's connection rather than owning one, because R4 puts one
 /// database file and one hash chain per network and the ledger owns that file.
+/// Opening a second `Connection` to the same file instead would skip the
+/// ledger's own `configure()` and so run with no `busy_timeout`, no WAL check
+/// and `synchronous` at the default — a concurrent ledger write would come back
+/// `SQLITE_BUSY` immediately rather than waiting.
+///
 /// Nothing here is hash-chained: candles are re-derivable, and a chart is not a
 /// record of record.
+///
+/// Every write nests in a `SAVEPOINT` rather than a top-level transaction, so
+/// these methods are safe to call from inside a ledger transaction. `Ledger`
+/// still owes an accessor that hands out a `CandleStore` under its mutex —
+/// `Connection` is not `Sync`, so the borrow has to come from behind that lock.
 pub struct CandleStore<'a> {
     conn: &'a Connection,
 }
@@ -953,6 +1398,35 @@ impl<'a> CandleStore<'a> {
     /// Attach to an open per-network connection. See [`crate::db_file_name`].
     pub fn new(conn: &'a Connection) -> Self {
         Self { conn }
+    }
+
+    /// Run `f` inside a savepoint.
+    ///
+    /// A savepoint rather than `BEGIN`: `Connection::unchecked_transaction`
+    /// issues a bare `BEGIN DEFERRED`, which fails outright with "cannot start
+    /// a transaction within a transaction" when the ledger already has one
+    /// open on this connection. `SAVEPOINT` nests, and outside a transaction it
+    /// starts one, so this is atomic in both situations.
+    fn in_savepoint<T>(
+        &self,
+        f: impl FnOnce(&Connection) -> Result<T, StoreError>,
+    ) -> Result<T, StoreError> {
+        self.conn.execute_batch("SAVEPOINT oppen_candles")?;
+        match f(self.conn) {
+            Ok(value) => {
+                self.conn.execute_batch("RELEASE oppen_candles")?;
+                Ok(value)
+            }
+            Err(err) => {
+                // Undo the partial write and drop the savepoint, leaving any
+                // enclosing ledger transaction intact. The unwind must not mask
+                // the failure that caused it, so its own result is discarded.
+                let _ = self
+                    .conn
+                    .execute_batch("ROLLBACK TO oppen_candles; RELEASE oppen_candles");
+                Err(err)
+            }
+        }
     }
 
     /// Create the side tables if they are absent. Idempotent, so it is safe to
@@ -985,7 +1459,7 @@ impl<'a> CandleStore<'a> {
         Ok(())
     }
 
-    /// Insert or replace bars for one series, in one transaction.
+    /// Insert or replace bars for one series, atomically.
     ///
     /// Replace rather than ignore: the newest bucket is re-written many times
     /// as it forms, and a backfill legitimately supersedes a bar assembled from
@@ -997,9 +1471,8 @@ impl<'a> CandleStore<'a> {
         source: Source,
         bars: &[Bar],
     ) -> Result<(), StoreError> {
-        let tx = self.conn.unchecked_transaction()?;
-        {
-            let mut stmt = tx.prepare(
+        self.in_savepoint(|conn| {
+            let mut stmt = conn.prepare(
                 "INSERT OR REPLACE INTO candle_bars
                      (coin, interval, open_time_ms, close_time_ms, source,
                       open, high, low, close, volume, trades)
@@ -1021,9 +1494,8 @@ impl<'a> CandleStore<'a> {
                     bar.trades,
                 ])?;
             }
-        }
-        tx.commit()?;
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Bars for one series whose open lies in `[from_ms, to_ms]`, ascending.
@@ -1161,24 +1633,36 @@ impl<'a> CandleStore<'a> {
     /// forever, sub-minute local bars default to thirty days
     /// ([`DEFAULT_LOCAL_RETENTION_MS`]).
     ///
-    /// Every local series' floor is advanced to the cutoff in the same
-    /// transaction. Pruning without moving the floor would leave the UI
-    /// claiming history that has been deleted, which is the one failure this
-    /// marker exists to prevent.
+    /// The floor of each series that actually loses rows is raised to the
+    /// cutoff in the same savepoint, derived from the rows about to go rather
+    /// than written across the whole table. Two failures fall out of that:
+    ///
+    /// * A series that never had a floor row gets one, so the UI can tell
+    ///   "thirty days were just deleted" from "nothing has been aggregated
+    ///   yet". Pruning without that leaves the marker absent at exactly the
+    ///   moment it is needed, which is the one failure it exists to prevent.
+    /// * A series the prune did not touch keeps its floor. A blanket `UPDATE`
+    ///   moves every row, including series with no stored bars at all, which
+    ///   makes the marker claim a deletion that never happened.
     pub fn prune_local(&self, now_ms: i64, retention_ms: i64) -> Result<usize, StoreError> {
         let cutoff = now_ms.saturating_sub(retention_ms);
-        let tx = self.conn.unchecked_transaction()?;
-        let removed = tx.execute(
-            "DELETE FROM candle_bars WHERE source = ?1 AND open_time_ms < ?2",
-            params![Source::Local.as_str(), cutoff],
-        )?;
-        tx.execute(
-            "UPDATE candle_local_history
-                SET no_history_before_ms = MAX(no_history_before_ms, ?1)",
-            params![cutoff],
-        )?;
-        tx.commit()?;
-        Ok(removed)
+        self.in_savepoint(|conn| {
+            // Before the DELETE: the rows are still there to be read from.
+            conn.execute(
+                "INSERT INTO candle_local_history (coin, interval, no_history_before_ms)
+                 SELECT DISTINCT coin, interval, ?2
+                   FROM candle_bars
+                  WHERE source = ?1 AND open_time_ms < ?2
+                 ON CONFLICT (coin, interval) DO UPDATE SET
+                     no_history_before_ms =
+                         MAX(no_history_before_ms, excluded.no_history_before_ms)",
+                params![Source::Local.as_str(), cutoff],
+            )?;
+            Ok(conn.execute(
+                "DELETE FROM candle_bars WHERE source = ?1 AND open_time_ms < ?2",
+                params![Source::Local.as_str(), cutoff],
+            )?)
+        })
     }
 }
 
@@ -1196,6 +1680,17 @@ mod tests {
 
     fn iv(s: &str) -> Interval {
         Interval::parse(s).expect("test interval literal")
+    }
+
+    /// The resampled case for a source spelt as a string, with the horizon the
+    /// module derives for it. Pinned independently by
+    /// `the_resampled_chip_carries_the_source_horizon`.
+    fn resampled(from: &str) -> Resolution {
+        let from = iv(from);
+        Resolution::Resampled {
+            from,
+            source_history: from.venue_history(),
+        }
     }
 
     /// `[open, high, low, close]` as decimal literals, then volume and trade
@@ -1295,14 +1790,10 @@ mod tests {
     fn resolves_the_three_cases() {
         assert_eq!(iv("1h").resolve(), Resolution::Native);
         // charts.md §3.2's own worked examples.
-        assert_eq!(
-            iv("7m").resolve(),
-            Resolution::Resampled { from: iv("1m") },
-            "7m is 7 x 1m"
-        );
+        assert_eq!(iv("7m").resolve(), resampled("1m"), "7m is 7 x 1m");
         assert_eq!(
             iv("45m").resolve(),
-            Resolution::Resampled { from: iv("15m") },
+            resampled("15m"),
             "45m takes the largest divisor, not the smallest"
         );
         assert_eq!(
@@ -1317,19 +1808,124 @@ mod tests {
                 reason: LocalReason::SubMinute
             }
         );
-        assert_eq!(iv("6h").resolve(), Resolution::Resampled { from: iv("2h") });
-        assert_eq!(iv("2d").resolve(), Resolution::Resampled { from: iv("1d") });
-        assert_eq!(iv("4w").resolve(), Resolution::Resampled { from: iv("1w") });
-        assert_eq!(iv("2m").resolve(), Resolution::Resampled { from: iv("1m") });
+        assert_eq!(iv("6h").resolve(), resampled("2h"));
+        assert_eq!(iv("2d").resolve(), resampled("1d"));
+        assert_eq!(iv("4w").resolve(), resampled("1w"));
+        assert_eq!(iv("2m").resolve(), resampled("1m"));
     }
 
     #[test]
     fn labels_say_which_case_it_is() {
-        assert_eq!(iv("7m").resolve().label(), "RESAMPLED FROM 1m");
-        assert_eq!(iv("45m").resolve().label(), "RESAMPLED FROM 15m");
+        assert_eq!(iv("7m").resolve().label(), "RESAMPLED FROM 1m · 3d");
+        assert_eq!(iv("45m").resolve().label(), "RESAMPLED FROM 15m · 52d");
         assert_eq!(iv("90s").resolve().label(), "LOCAL · FORWARD ONLY");
         assert!(!iv("90s").resolve().has_history());
         assert!(iv("7m").resolve().has_history());
+    }
+
+    /// `charts.md` §3.2 promises History = Full for the resampled case. It is
+    /// not: a `1m`-derived interval reaches about three and a half days, because
+    /// `candleSnapshot` serves a rolling ~5,000-bar window (module audit note).
+    /// The chip has to carry that or a 3-day chart and a 15-year one say the
+    /// same thing.
+    #[test]
+    fn the_resampled_chip_carries_the_source_horizon() {
+        // Below 1d the rolling floor bites; the horizon is the source's, not
+        // the requested interval's.
+        assert_eq!(
+            iv("1m").venue_history(),
+            Horizon::Rolling { intervals: 5_000 }
+        );
+        assert_eq!(
+            iv("2h").venue_history(),
+            Horizon::Rolling { intervals: 5_000 }
+        );
+        // 5,000 days is thirteen years, longer than the venue has existed, so
+        // 1d and coarser really are full: BTC 1d serves all 2,208 rows.
+        assert_eq!(iv("1d").venue_history(), Horizon::Full);
+        assert_eq!(iv("1w").venue_history(), Horizon::Full);
+        assert_eq!(iv("1M").venue_history(), Horizon::Full);
+
+        // 5,000 x 1m = 3.47 days, truncated to 3d: a history marker never
+        // rounds up.
+        assert_eq!(iv("7m").resolve().label(), "RESAMPLED FROM 1m · 3d");
+        assert_eq!(iv("13m").resolve().label(), "RESAMPLED FROM 1m · 3d");
+        // 5,000 x 2h = 416 days.
+        assert_eq!(iv("6h").resolve().label(), "RESAMPLED FROM 2h · 416d");
+        // Derived from 1d and coarser: no floor to state.
+        assert_eq!(iv("2d").resolve().label(), "RESAMPLED FROM 1d");
+        assert_eq!(iv("4w").resolve().label(), "RESAMPLED FROM 1w");
+
+        assert_eq!(
+            iv("7m").resolve().source_history(),
+            Some(Horizon::Rolling { intervals: 5_000 }),
+            "the warmup gate reads this, not the chip string"
+        );
+        assert_eq!(iv("2d").resolve().source_history(), Some(Horizon::Full));
+        assert_eq!(iv("1h").resolve().source_history(), None, "native");
+        assert_eq!(iv("90s").resolve().source_history(), None, "local");
+
+        assert_eq!(
+            Horizon::Rolling { intervals: 5_000 }.span_ms(iv("1m")),
+            Some(300_000_000)
+        );
+        assert_eq!(Horizon::Full.span_ms(iv("1m")), None);
+    }
+
+    /// The MCP surface carries this enum, so the extra field has to serialise
+    /// deterministically and survive a round trip (`AGENTS.md` 6).
+    #[test]
+    fn the_resolution_wire_shape_is_stable() {
+        let cases = [
+            (iv("1h"), r#"{"case":"native"}"#),
+            (
+                iv("7m"),
+                r#"{"case":"resampled","from":"1m","source_history":{"rolling":{"intervals":5000}}}"#,
+            ),
+            (
+                iv("2d"),
+                r#"{"case":"resampled","from":"1d","source_history":"full"}"#,
+            ),
+            (
+                iv("90s"),
+                r#"{"case":"local","reason":"not_a_multiple_of_any_native"}"#,
+            ),
+        ];
+        for (interval, expected) in cases {
+            let resolution = interval.resolve();
+            let json = serde_json::to_string(&resolution).expect("serialise");
+            assert_eq!(json, expected, "{interval} wire shape");
+            assert_eq!(
+                serde_json::from_str::<Resolution>(&json).expect("deserialise"),
+                resolution
+            );
+        }
+    }
+
+    /// Interval's ordering must be by width. The derived one compares `count`
+    /// first, which puts `1M` below `3m`, leaves NATIVE_INTERVALS unsorted under
+    /// its own Ord, and would make a `BTreeMap<Interval, _>` serialise in that
+    /// order.
+    #[test]
+    fn interval_ordering_is_by_width() {
+        assert!(iv("1M") > iv("30m"));
+        assert!(iv("1M") > iv("3m"));
+        assert!(iv("1h") > iv("3m"));
+        assert!(iv("1d") > iv("12h"));
+        assert!(iv("90s") > iv("1m"));
+        assert_eq!(iv("60s").cmp(&iv("1m")), Ordering::Equal, "same width");
+
+        assert!(
+            NATIVE_INTERVALS.is_sorted(),
+            "the menu is documented ascending and resolve() walks it backwards"
+        );
+        assert_eq!(NATIVE_INTERVALS.iter().max(), Some(&iv("1M")));
+        assert_eq!(NATIVE_INTERVALS.iter().min(), Some(&iv("1m")));
+
+        let mut shuffled = NATIVE_INTERVALS;
+        shuffled.reverse();
+        shuffled.sort_unstable();
+        assert_eq!(shuffled, NATIVE_INTERVALS, "sort() must rebuild the menu");
     }
 
     // ---- epoch alignment --------------------------------------------------
@@ -1355,12 +1951,22 @@ mod tests {
         assert_eq!(hour.bucket_start_ms(-3_600_000), -3_600_000);
     }
 
-    /// Real HL bar opens observed on 2026-09-04, mainnet BTC. If bucketing ever
-    /// stops agreeing with the venue's own grid, resampling stops being lossless.
+    /// Bar opens observed on mainnet BTC, 2026-09-04, driven through the real
+    /// conversion path rather than through `bucket_start_ms` alone.
+    ///
+    /// `assert_eq!(bucket_start_ms(open), open)` is a tautology for any open
+    /// that is a multiple of the width, so it proved the seven constants were
+    /// round numbers and nothing else. What matters is that a row shaped the way
+    /// the venue shapes them survives `bars_from_candles`' three partition
+    /// checks — and that a row that is off by one millisecond does not.
+    ///
+    /// The opens are the observed ones. The OHLCV is synthetic: the audit
+    /// recorded timestamps, and inventing prices and calling them live data
+    /// would be worse than saying so.
     #[test]
-    fn bucket_grid_matches_observed_venue_bars() {
-        for (interval, open) in [
-            ("1M", 1_783_296_000_000_i64),
+    fn audited_venue_rows_pass_the_partition_checks() {
+        for (spelling, open) in [
+            ("1M", 1_783_296_000_000_u64),
             ("1M", 1_788_480_000_000),
             ("1w", 1_788_393_600_000),
             ("3d", 1_788_480_000_000),
@@ -1368,80 +1974,165 @@ mod tests {
             ("12h", 1_785_024_000_000),
             ("1m", 1_788_490_020_000),
         ] {
-            let interval = iv(interval);
+            let interval = iv(spelling);
+            let width = u64::try_from(interval.millis()).expect("positive width");
+            let row = candle(open, spelling, width);
+            let bars = bars_from_candles(std::slice::from_ref(&row), interval)
+                .unwrap_or_else(|err| panic!("{spelling} row at {open} refused: {err}"));
+            let expected = i64::try_from(open).expect("in range");
             assert_eq!(
-                interval.bucket_start_ms(open),
-                open,
-                "{interval} bar at {open} is not on our grid"
+                bars,
+                vec![Bar {
+                    open_time_ms: expected,
+                    close_time_ms: expected + interval.millis() - 1,
+                    open: d("1"),
+                    high: d("3"),
+                    low: d("0.5"),
+                    close: d("2"),
+                    volume: d("7"),
+                    trades: 4,
+                }]
             );
+
+            // One millisecond off the grid, and one millisecond too wide, are
+            // both refused: those checks are what make resampling lossless.
+            assert!(matches!(
+                bars_from_candles(&[candle(open + 1, spelling, width)], interval),
+                Err(BarError::Misaligned { .. })
+            ));
+            assert!(matches!(
+                bars_from_candles(&[candle(open, spelling, width + 1)], interval),
+                Err(BarError::WrongWidth { .. })
+            ));
         }
     }
 
-    /// Epoch alignment is what makes a bucket timezone- and DST-independent.
+    /// Bucketing is integer arithmetic on the epoch and reads no calendar.
     ///
-    /// The instants below are the exact UTC moments of real daylight-saving
-    /// transitions in named zones:
+    /// Renamed from `dst_transitions_do_not_move_buckets`, which claimed more
+    /// than it tested: it carried no timezone data, linked no calendar library,
+    /// and every assertion in it was self-referential — `start - previous ==
+    /// 3_600_000` holds for any stub that floors to a multiple of the width.
+    /// `charts.md` §6's gate is "identical across a DST change **in the display
+    /// timezone**", and the display timezone lives in the renderer, so that gate
+    /// belongs to the renderer's snapshot test. (`docs/specs/charts.md` §6 is
+    /// owed an edit saying where it lives; this file cannot meet it.)
     ///
-    /// * `America/New_York` 2026-03-08 07:00Z — 01:59:59 EST becomes 03:00 EDT,
-    ///   so that local day is 23 hours long.
-    /// * `America/New_York` 2026-11-01 06:00Z — 01:59:59 EDT becomes 01:00 EST,
-    ///   so 01:30 local happens twice and that local day is 25 hours long.
-    /// * `Europe/London` 2026-03-29 01:00Z — GMT becomes BST.
-    ///
-    /// A wall-clock implementation would duplicate or skip an hourly bucket at
-    /// each of these, and would produce a 25-hour or 23-hour "day". Epoch
-    /// bucketing cannot: the sequence stays a plain arithmetic progression.
+    /// What this file can prove is the premise the gate rests on: the instants
+    /// below are real DST transitions, and the buckets containing them are
+    /// hard-coded integers computed once by hand, not recomputed from the
+    /// function under test.
     #[test]
-    fn dst_transitions_do_not_move_buckets() {
-        const NY_SPRING_FORWARD: i64 = 1_772_953_200_000; // 2026-03-08T07:00:00Z
-        const NY_FALL_BACK: i64 = 1_793_512_800_000; // 2026-11-01T06:00:00Z
-        const LONDON_SPRING_FORWARD: i64 = 1_774_746_000_000; // 2026-03-29T01:00:00Z
+    fn bucketing_is_pure_epoch_arithmetic() {
+        // 2026-03-08T07:00:00Z — 01:59:59 EST becomes 03:00 EDT in New York,
+        // so that local day is 23 hours long.
+        const NY_SPRING_FORWARD: i64 = 1_772_953_200_000;
+        // 2026-11-01T06:00:00Z — 01:30 local happens twice; the day is 25 hours.
+        const NY_FALL_BACK: i64 = 1_793_512_800_000;
+        // 2026-03-29T01:00:00Z — GMT becomes BST in London.
+        const LONDON_SPRING_FORWARD: i64 = 1_774_746_000_000;
 
         let hour = iv("1h");
         let day = iv("1d");
 
-        for transition in [NY_SPRING_FORWARD, NY_FALL_BACK, LONDON_SPRING_FORWARD] {
-            // Twelve hourly buckets spanning the transition are consecutive
-            // multiples of one hour: none repeated, none skipped.
-            let mut previous: Option<i64> = None;
-            for step in -6..=6_i64 {
-                let start = hour.bucket_start_ms(transition + step * 3_600_000);
-                if let Some(previous) = previous {
-                    assert_eq!(
-                        start - previous,
-                        3_600_000,
-                        "hourly bucket stepped by something other than an hour at {transition}"
-                    );
-                }
-                previous = Some(start);
-            }
-            // The transition instant itself is a whole hour on the grid.
-            assert_eq!(hour.bucket_start_ms(transition), transition);
+        // Hand-computed: floor(t / 86_400_000) * 86_400_000.
+        assert_eq!(day.bucket_start_ms(NY_SPRING_FORWARD), 1_772_928_000_000);
+        assert_eq!(day.bucket_start_ms(NY_FALL_BACK), 1_793_491_200_000);
+        assert_eq!(
+            day.bucket_start_ms(LONDON_SPRING_FORWARD),
+            1_774_742_400_000
+        );
+        assert_eq!(day.bucket_close_ms(NY_FALL_BACK), 1_793_577_599_999);
 
-            // The daily bucket containing the transition is exactly 24 h, even
-            // though the local day is 23 or 25.
-            let day_start = day.bucket_start_ms(transition);
-            assert_eq!(day.bucket_close_ms(transition) - day_start + 1, 86_400_000);
-            assert_eq!(day_start % 86_400_000, 0);
-        }
+        // The transition instants are themselves whole hours on the grid.
+        assert_eq!(hour.bucket_start_ms(NY_SPRING_FORWARD), 1_772_953_200_000);
+        assert_eq!(hour.bucket_start_ms(NY_FALL_BACK), 1_793_512_800_000);
+        assert_eq!(
+            hour.bucket_start_ms(LONDON_SPRING_FORWARD),
+            1_774_746_000_000
+        );
 
         // The doubled local hour, 01:30 EDT and 01:30 EST on 2026-11-01, is two
-        // distinct instants and lands in two distinct hourly buckets.
-        let first_0130_local = NY_FALL_BACK - 30 * 60_000;
-        let second_0130_local = NY_FALL_BACK + 30 * 60_000;
-        assert_ne!(
-            hour.bucket_start_ms(first_0130_local),
-            hour.bucket_start_ms(second_0130_local)
+        // instants half an hour either side of the transition, and they land in
+        // two different, consecutive hourly buckets.
+        assert_eq!(
+            hour.bucket_start_ms(NY_FALL_BACK - 30 * 60_000),
+            1_793_509_200_000
+        );
+        assert_eq!(
+            hour.bucket_start_ms(NY_FALL_BACK + 30 * 60_000),
+            1_793_512_800_000
         );
 
-        // And the whole DST year is a fixed number of hourly buckets: no ±1.
-        let span = NY_FALL_BACK - NY_SPRING_FORWARD;
-        assert_eq!(span % 3_600_000, 0);
+        // The span between the two American transitions is 5,711 whole hours:
+        // no 23- or 25-hour day anywhere in it, because there are no days in it,
+        // only milliseconds.
+        assert_eq!((NY_FALL_BACK - NY_SPRING_FORWARD) / 3_600_000, 5_711);
+        assert_eq!((NY_FALL_BACK - NY_SPRING_FORWARD) % 3_600_000, 0);
+    }
+
+    /// Every timestamp door refuses what it cannot do arithmetic on, and the two
+    /// `pub const fn` on the time axis do not panic for any `i64`.
+    ///
+    /// Before the bounds existed, `bucket_close_ms(i64::MAX)` panicked with
+    /// "attempt to add with overflow" and `bucket_start_ms(i64::MIN)` with
+    /// "attempt to multiply with overflow" — and a `candleSnapshot` row at
+    /// t = 9_223_372_036_854_660_000 passed every check `bars_from_candles`
+    /// makes before overflowing inside the resampler.
+    #[test]
+    fn absurd_timestamps_are_refused_rather_than_overflowing() {
+        for interval in NATIVE_INTERVALS {
+            let _ = interval.bucket_close_ms(i64::MAX);
+            let _ = interval.bucket_start_ms(i64::MIN);
+            let _ = interval.bucket_close_ms(i64::MIN);
+        }
+
+        // A row that is well-formed by every other rule in the module.
+        let mut hostile = candle(0, "1m", 60_000);
+        hostile.t = 9_223_372_036_854_660_000;
+        hostile.t_close = 9_223_372_036_854_719_999;
         assert_eq!(
-            (hour.bucket_start_ms(NY_FALL_BACK) - hour.bucket_start_ms(NY_SPRING_FORWARD))
-                / 3_600_000,
-            span / 3_600_000
+            bars_from_candles(&[hostile], iv("1m")),
+            Err(BarError::Timestamp(9_223_372_036_854_660_000))
         );
+        let mut too_far = candle(0, "1m", 60_000);
+        too_far.t = u64::try_from(MAX_TIME_MS).expect("positive") + 60_000;
+        assert!(matches!(
+            bars_from_candles(&[too_far], iv("1m")),
+            Err(BarError::Timestamp(_))
+        ));
+
+        // Trade::checked is the other door.
+        assert_eq!(
+            Trade::checked(i64::MAX, d("1"), d("1")),
+            Err(BarError::TradeTime { time_ms: i64::MAX })
+        );
+        assert_eq!(
+            Trade::checked(-1, d("1"), d("1")),
+            Err(BarError::TradeTime { time_ms: -1 })
+        );
+        assert!(Trade::checked(1_788_490_020_000, d("1"), d("1")).is_ok());
+
+        // Trade's fields are public, so push re-checks rather than trusting it.
+        let mut agg = LocalAggregator::new(iv("1m"), 0);
+        for time_ms in [i64::MAX, i64::MIN, -1, MAX_TIME_MS + 1] {
+            assert!(
+                agg.push(Trade {
+                    time_ms,
+                    price: d("1"),
+                    size: d("1"),
+                })
+                .is_empty()
+            );
+        }
+        assert_eq!(agg.out_of_range_trades(), 4);
+        assert_eq!(agg.late_trades(), 0);
+        assert_eq!(agg.discarded_partial_trades(), 0);
+        assert!(agg.close_through(i64::MAX, i64::MAX).is_empty());
+
+        // An aggregator handed a nonsense start clamps rather than wrapping.
+        let clamped = LocalAggregator::new(iv("1m"), i64::MIN);
+        assert_eq!(clamped.no_history_before_ms(), MIN_TIME_MS);
     }
 
     // ---- resampling -------------------------------------------------------
@@ -1503,21 +2194,145 @@ mod tests {
         assert_eq!(out[1].open_time_ms, out[0].close_time_ms + 1);
     }
 
+    /// A window that begins part-way through a target bucket has that bucket
+    /// **dropped**, not emitted.
+    ///
+    /// This test previously asserted the opposite, and asserted a defect as
+    /// correct behaviour. Feeding only the 00:15 and 00:30 bars of
+    /// [00:00, 00:45) produced `open=10 high=15 low=9 volume=3 trades=3` with
+    /// the same `open_time_ms` and `close_time_ms` as the true bar
+    /// (`open=100 high=100 low=1 volume=12 trades=12` below) — byte-
+    /// indistinguishable from a correct one, at the left edge of every chart,
+    /// because `candleSnapshot` only ever serves a rolling window.
     #[test]
-    fn resample_respects_bucket_boundaries_not_input_offsets() {
+    fn resample_drops_the_incomplete_leading_bucket() {
         let m = 15 * 60_000_i64;
-        // Three 15m bars starting at 00:15, i.e. the input does not begin on a
-        // 45m boundary. The first 45m bucket is [00:00, 00:45), so 00:15 and
-        // 00:30 belong to it and 00:45 opens the next one.
-        let source = vec![
+        // The truth: three 15m bars filling [00:00, 00:45), plus a fourth
+        // opening the next bucket.
+        let whole = vec![
+            bar(0, m, ["100", "100", "1", "50"], "9", 9),
             bar(m, m, ["10", "12", "9", "11"], "1", 1),
             bar(2 * m, m, ["11", "15", "10", "14"], "2", 2),
             bar(3 * m, m, ["14", "14", "13", "13"], "3", 3),
         ];
-        let out = resample(&source, iv("15m"), iv("45m")).expect("45m is 3 x 15m");
-        assert_eq!(out.len(), 2);
-        assert_eq!(out[0], bar(0, 3 * m, ["10", "15", "9", "14"], "3", 3));
-        assert_eq!(out[1], bar(3 * m, 3 * m, ["14", "14", "13", "13"], "3", 3));
+        let full = resample(&whole, iv("15m"), iv("45m")).expect("45m is 3 x 15m");
+        assert_eq!(
+            full[0],
+            bar(0, 3 * m, ["100", "100", "1", "14"], "12", 12),
+            "the true first bucket"
+        );
+
+        // What the venue actually serves: the same window starting at 00:15.
+        let truncated = whole[1..].to_vec();
+        let out = resample(&truncated, iv("15m"), iv("45m")).expect("45m is 3 x 15m");
+        assert_eq!(
+            out,
+            vec![bar(3 * m, 3 * m, ["14", "14", "13", "13"], "3", 3)],
+            "the partial leading bucket is dropped, not published as a whole bar"
+        );
+
+        // A leading bucket that *is* complete survives, and a leading bucket
+        // that starts on the boundary but is still filling is the trailing case.
+        assert_eq!(
+            resample(&whole[..3], iv("15m"), iv("45m")).expect("resample"),
+            vec![bar(0, 3 * m, ["100", "100", "1", "14"], "12", 12)],
+            "a complete leading bucket must not be dropped too"
+        );
+        assert_eq!(
+            resample(&whole[..1], iv("15m"), iv("45m")).expect("resample"),
+            vec![bar(0, 3 * m, ["100", "100", "1", "50"], "9", 9)],
+            "on the boundary and short means forming, not partial"
+        );
+
+        // Off the boundary and also the only bucket: nothing can be said.
+        assert_eq!(
+            resample(&whole[1..2], iv("15m"), iv("45m")).expect("resample"),
+            Vec::new()
+        );
+    }
+
+    /// A hole in the middle of the window is a feed bug, and the module's stated
+    /// policy is refuse-not-approximate. The venue emits a bar for every bucket
+    /// including empty ones, so a missing bar is not a quiet market.
+    #[test]
+    fn resample_refuses_an_interior_hole() {
+        let m = 15 * 60_000_i64;
+        // 00:00, 00:15, [00:30 MISSING], 00:45, 01:00, 01:15.
+        let holed: Vec<Bar> = [0, 1, 3, 4, 5]
+            .iter()
+            .map(|k| bar(k * m, m, ["10", "10", "10", "10"], "1", 1))
+            .collect();
+        assert_eq!(
+            resample(&holed, iv("15m"), iv("45m")),
+            Err(ResampleError::IncompleteBucket {
+                open_time_ms: 0,
+                got: 2,
+                want: 3
+            })
+        );
+
+        // Even when the leading bucket was already dropped, the next hole is
+        // still an error rather than the "leading" case a second time.
+        let dropped_then_holed: Vec<Bar> = [1, 3, 5, 6, 7, 8]
+            .iter()
+            .map(|k| bar(k * m, m, ["10", "10", "10", "10"], "1", 1))
+            .collect();
+        assert_eq!(
+            resample(&dropped_then_holed, iv("15m"), iv("45m")),
+            Err(ResampleError::IncompleteBucket {
+                open_time_ms: 3 * m,
+                got: 2,
+                want: 3
+            })
+        );
+    }
+
+    /// "Still forming" is the only reason a returned bucket may be short.
+    ///
+    /// Counting contributions is not enough on its own: a hole in the **last**
+    /// target bucket leaves it short too, and the bar it produces is byte-for-
+    /// byte the bar an honestly-forming bucket produces. The last bucket of a
+    /// `candleSnapshot` window is always the partial one, so that is exactly
+    /// where a dropped bar would hide.
+    #[test]
+    fn resample_refuses_a_hole_in_the_trailing_bucket() {
+        let m = 15 * 60_000_i64;
+        let rows = |slots: &[i64]| -> Vec<Bar> {
+            slots
+                .iter()
+                .map(|k| bar(k * m, m, ["10", "10", "10", "10"], "1", 1))
+                .collect()
+        };
+
+        // 00:00,00:15,00:30 | 00:45, [01:00 MISSING], 01:15.
+        assert_eq!(
+            resample(&rows(&[0, 1, 2, 3, 5]), iv("15m"), iv("45m")),
+            Err(ResampleError::IncompleteBucket {
+                open_time_ms: 3 * m,
+                got: 2,
+                want: 3
+            })
+        );
+        // The trailing bucket's own open is the missing one: its `open` would
+        // come from a bar 15 minutes into the bucket.
+        assert_eq!(
+            resample(&rows(&[0, 1, 2, 4]), iv("15m"), iv("45m")),
+            Err(ResampleError::IncompleteBucket {
+                open_time_ms: 3 * m,
+                got: 1,
+                want: 3
+            })
+        );
+
+        // The honest forming bucket — the one the holed result was
+        // indistinguishable from — still comes back short and unrefused.
+        assert_eq!(
+            resample(&rows(&[0, 1, 2, 3, 4]), iv("15m"), iv("45m")).expect("forming is not a hole"),
+            vec![
+                bar(0, 3 * m, ["10", "10", "10", "10"], "3", 3),
+                bar(3 * m, 3 * m, ["10", "10", "10", "10"], "2", 2),
+            ]
+        );
     }
 
     #[test]
@@ -1605,6 +2420,132 @@ mod tests {
     #[test]
     fn resample_of_nothing_is_nothing() {
         assert_eq!(resample(&[], iv("1m"), iv("7m")), Ok(Vec::new()));
+    }
+
+    /// Deterministic pseudo-random source, so a counterexample is reproducible
+    /// from the seed alone. No proptest dependency is available to this crate.
+    fn lcg(state: &mut u64) -> u64 {
+        *state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        *state >> 33
+    }
+
+    /// Over random aligned inputs: volume and trades are conserved, every
+    /// emitted bucket got exactly `target / source` source bars, the buckets
+    /// partition the axis with no overlap and no gap, and the high and low
+    /// bound every source bar in the bucket.
+    #[test]
+    fn resample_partitions_every_target_bucket_exactly() {
+        let mut seed = 0x9E37_79B9_7F4A_7C15_u64;
+        for (source, target) in [
+            ("1m", "7m"),
+            ("1m", "13m"),
+            ("15m", "45m"),
+            ("1m", "1h"),
+            ("2h", "6h"),
+            ("1d", "2d"),
+        ] {
+            let (source, target) = (iv(source), iv(target));
+            let per_bucket = target.millis() / source.millis();
+            // Start on a target boundary and leave no holes, so nothing is
+            // dropped and nothing is refused; then drop the final partial
+            // bucket so every survivor must be complete.
+            let count = per_bucket * 9;
+            let bars: Vec<Bar> = (0..count)
+                .map(|k| {
+                    let base = 100 + (lcg(&mut seed) % 500) as i64;
+                    let high = base + (lcg(&mut seed) % 40) as i64;
+                    let low = base - (lcg(&mut seed) % 40) as i64;
+                    bar(
+                        k * source.millis(),
+                        source.millis(),
+                        [
+                            base.to_string().as_str(),
+                            high.to_string().as_str(),
+                            low.to_string().as_str(),
+                            base.to_string().as_str(),
+                        ],
+                        "0.125",
+                        2,
+                    )
+                })
+                .collect();
+
+            let out = resample(&bars, source, target).expect("aligned, hole-free, coarser");
+            assert_eq!(out.len() as i64, 9, "{source} -> {target} bucket count");
+
+            let source_volume: Decimal = bars.iter().map(|b| b.volume).sum();
+            let target_volume: Decimal = out.iter().map(|b| b.volume).sum();
+            assert_eq!(source_volume, target_volume, "{source} -> {target} volume");
+            assert_eq!(
+                bars.iter().map(|b| b.trades).sum::<u32>(),
+                out.iter().map(|b| b.trades).sum::<u32>(),
+                "{source} -> {target} trades"
+            );
+
+            for (index, produced) in out.iter().enumerate() {
+                let start = index as i64 * target.millis();
+                assert_eq!(produced.open_time_ms, start);
+                assert_eq!(produced.close_time_ms, start + target.millis() - 1);
+                let members: Vec<&Bar> = bars
+                    .iter()
+                    .filter(|b| target.bucket_start_ms(b.open_time_ms) == start)
+                    .collect();
+                assert_eq!(members.len() as i64, per_bucket, "bucket at {start}");
+                assert_eq!(produced.open, members[0].open);
+                assert_eq!(produced.close, members[members.len() - 1].close);
+                assert_eq!(
+                    produced.high,
+                    members.iter().map(|b| b.high).max().expect("non-empty")
+                );
+                assert_eq!(
+                    produced.low,
+                    members.iter().map(|b| b.low).min().expect("non-empty")
+                );
+            }
+        }
+    }
+
+    /// `parse(x.to_string()) == x` for every canonical interval, and every
+    /// spelling of a width canonicalises to the same value. Covers the whole
+    /// ladder rather than the nine literals `parses_and_canonicalises` names.
+    #[test]
+    fn every_canonical_interval_round_trips_through_parse() {
+        let mut checked = 0_u32;
+        for unit in [
+            Unit::Second,
+            Unit::Minute,
+            Unit::Hour,
+            Unit::Day,
+            Unit::Week,
+            Unit::Month,
+        ] {
+            let max_count = MAX_INTERVAL_MS / unit.millis();
+            // Every count for the coarse units; a stride through the seconds so
+            // the test stays under a second of wall clock.
+            let stride = if unit == Unit::Second { 997 } else { 1 };
+            let mut count = 1;
+            while count <= max_count {
+                let spelt = format!("{count}{}", unit.suffix());
+                let parsed = Interval::parse(&spelt).expect("in range by construction");
+                assert_eq!(
+                    parsed.millis(),
+                    count * unit.millis(),
+                    "{spelt} changed width"
+                );
+                assert_eq!(
+                    Interval::parse(&parsed.to_string()),
+                    Ok(parsed),
+                    "{spelt} did not survive its own Display"
+                );
+                checked += 1;
+                count += stride;
+            }
+        }
+        assert!(checked > 3_000, "only {checked} intervals covered");
+        // Anything past the top of the menu is refused rather than wrapped.
+        assert!(Interval::parse(&format!("{}s", MAX_INTERVAL_MS / 1_000 + 1)).is_err());
     }
 
     // ---- venue rows -------------------------------------------------------
@@ -1713,8 +2654,9 @@ mod tests {
         assert_eq!(agg.no_history_before_ms(), 0);
         assert!(agg.push(trade(1_000, "50", "2")).is_empty());
 
-        // Nothing trades for two whole buckets; the clock closes them.
-        let closed = agg.close_through(120_000);
+        // Nothing trades for two whole buckets; the clock closes them. The
+        // feed is healthy, so `now` and `live through` are the same instant.
+        let closed = agg.close_through(120_000, 120_000);
         assert_eq!(
             closed,
             vec![
@@ -1737,7 +2679,7 @@ mod tests {
         let mut agg = LocalAggregator::new(iv("1s"), 0);
         assert!(agg.push(trade(0, "50", "1")).is_empty());
         // Twenty thousand seconds of sleep, past MAX_FILL_BARS.
-        let closed = agg.close_through(20_000 * 1_000);
+        let closed = agg.close_through(20_000 * 1_000, 20_000 * 1_000);
         assert_eq!(closed.len(), 1, "only the bar we actually observed");
         assert_eq!(agg.skipped_fills(), 1);
     }
@@ -1757,6 +2699,118 @@ mod tests {
             closed.is_empty(),
             "no flat bars invented for the hours oppen was shut"
         );
+    }
+
+    /// A websocket outage must not come back as a quiet market.
+    ///
+    /// Before `feed_interrupted` existed, this sequence returned twenty bars:
+    /// the one real bucket plus nineteen flat continuations at the pre-outage
+    /// price with `volume = 0` and `trades = 0`, byte-identical to nineteen
+    /// genuinely empty buckets. `charts.md` §3.2 forbids exactly that, and
+    /// `Resolution::Local` exists to prevent it.
+    #[test]
+    fn a_feed_interruption_leaves_a_gap_not_a_fabricated_flat_market() {
+        let mut agg = LocalAggregator::new(iv("30s"), 0);
+        assert!(agg.push(trade(1_000, "50", "2")).is_empty());
+
+        // The pool notices the socket died and says so.
+        agg.feed_interrupted();
+        assert_eq!(agg.feed_gaps(), 1);
+        assert!(
+            agg.forming().is_none(),
+            "the partial bucket is discarded, not published"
+        );
+
+        // Ten minutes later the feed is back and the first print arrives.
+        let closed = agg.push(trade(601_000, "51", "1"));
+        assert!(
+            closed.is_empty(),
+            "nothing is invented across the outage, exactly as resume() does \
+             across a restart; got {closed:#?}"
+        );
+        assert_eq!(
+            agg.forming().expect("post-reconnect bucket"),
+            bar(600_000, 30_000, ["51", "51", "51", "51"], "1", 1)
+        );
+
+        // A second interruption with nothing held is not a second gap.
+        agg.feed_interrupted();
+        agg.feed_interrupted();
+        assert_eq!(agg.feed_gaps(), 2);
+    }
+
+    /// A reconnect that replays a print from before the outage must not re-arm
+    /// the fabrication `feed_interrupted` exists to stop.
+    ///
+    /// `feed_interrupted` clears the current bucket, and the current bucket was
+    /// also the late-trade watermark, so a single replayed print re-opened an
+    /// already-emitted bucket without being counted late — and the next live
+    /// print then flat-filled the entire outage from it: twenty bars, nineteen
+    /// of them invented, at the replayed price rather than the real one.
+    #[test]
+    fn a_replayed_print_after_an_interruption_cannot_reopen_a_closed_bucket() {
+        let mut agg = LocalAggregator::new(iv("30s"), 0);
+        agg.push(trade(1_000, "50", "2"));
+        assert_eq!(
+            agg.push(trade(61_000, "51", "1")).len(),
+            2,
+            "buckets 0 and 30_000 close"
+        );
+
+        agg.feed_interrupted();
+        assert_eq!(agg.feed_gaps(), 1);
+
+        // The socket comes back and the venue replays a print from bucket 0,
+        // which was emitted two lines ago.
+        assert!(agg.push(trade(1_000, "40", "1")).is_empty());
+        assert_eq!(
+            agg.late_trades(),
+            1,
+            "a print for an already-emitted bucket is late whether or not the \
+             feed was interrupted since"
+        );
+        assert!(
+            agg.forming().is_none(),
+            "the replayed print must not re-open the closed bucket"
+        );
+
+        // Ten minutes later the feed produces a real print.
+        let closed = agg.push(trade(601_000, "52", "1"));
+        assert!(
+            closed.is_empty(),
+            "nothing is invented across the outage; got {closed:#?}"
+        );
+        assert_eq!(
+            agg.forming().expect("post-reconnect bucket"),
+            bar(600_000, 30_000, ["52", "52", "52", "52"], "1", 1)
+        );
+    }
+
+    /// The clock alone is not evidence the feed was alive.
+    ///
+    /// `close_through` used to fill from `now_ms` with nothing to check it
+    /// against, so a stalled socket produced a full run of flat bars on the
+    /// caller's timer. The second argument is the caller's assertion of how far
+    /// the subscription is known to have been live.
+    #[test]
+    fn close_through_will_not_fill_past_the_live_feed() {
+        let mut agg = LocalAggregator::new(iv("30s"), 0);
+        assert!(agg.push(trade(1_000, "50", "2")).is_empty());
+
+        // Ten minutes on the clock; the feed's last message was at t = 1_000.
+        let closed = agg.close_through(601_000, 1_000);
+        assert_eq!(
+            closed,
+            vec![bar(0, 30_000, ["50", "50", "50", "50"], "2", 1)],
+            "only the bucket that actually received prints"
+        );
+        assert_eq!(agg.skipped_fills(), 0, "this is not a MAX_FILL_BARS skip");
+
+        // A healthy feed over the same span fills normally: the clamp costs
+        // nothing when the caller can vouch for the socket.
+        let mut healthy = LocalAggregator::new(iv("30s"), 0);
+        assert!(healthy.push(trade(1_000, "50", "2")).is_empty());
+        assert_eq!(healthy.close_through(601_000, 601_000).len(), 20);
     }
 
     #[test]
@@ -1963,6 +3017,137 @@ mod tests {
         );
     }
 
+    /// The store must nest inside the ledger's transaction, not fight it.
+    ///
+    /// `Connection::unchecked_transaction()` issues a bare `BEGIN DEFERRED`,
+    /// which failed with "cannot start a transaction within a transaction" the
+    /// moment a caller held one open on the same connection — and R4 gives the
+    /// whole network one file and one connection, so that caller is the ledger.
+    #[test]
+    fn writes_nest_inside_an_open_ledger_transaction() {
+        let conn = store_conn();
+        let store = CandleStore::new(&conn);
+        let interval = iv("1m");
+        let bars = vec![bar(0, 60_000, ["1", "2", "0.5", "1.5"], "3", 2)];
+
+        conn.execute_batch("BEGIN")
+            .expect("the ledger's transaction");
+        store
+            .put_bars("BTC", interval, Source::Local, &bars)
+            .expect("put_bars nests");
+        store
+            .prune_local(0, DEFAULT_LOCAL_RETENTION_MS)
+            .expect("prune_local nests");
+        conn.execute_batch("COMMIT").expect("commit");
+        assert_eq!(store.bars("BTC", interval, 0, 60_000).expect("read"), bars);
+
+        // And the savepoint really is nested: the enclosing rollback takes the
+        // candle rows with it rather than leaving them independently committed.
+        conn.execute_batch("BEGIN").expect("second transaction");
+        store
+            .put_bars(
+                "ETH",
+                interval,
+                Source::Local,
+                &[bar(0, 60_000, ["9", "9", "9", "9"], "1", 1)],
+            )
+            .expect("put_bars nests");
+        conn.execute_batch("ROLLBACK").expect("rollback");
+        assert_eq!(
+            store.bars("ETH", interval, 0, 60_000).expect("read"),
+            Vec::new(),
+            "a nested write must not survive the outer rollback"
+        );
+    }
+
+    /// Pruning a series that never had a floor row must create one.
+    ///
+    /// Otherwise the marker is absent at exactly the moment it is needed: the
+    /// UI cannot tell "thirty days were just deleted" from "nothing has been
+    /// aggregated yet", which is the failure `prune_local` exists to prevent.
+    #[test]
+    fn prune_creates_a_history_floor_for_a_series_that_never_had_one() {
+        let conn = store_conn();
+        let store = CandleStore::new(&conn);
+        let interval = iv("90s");
+        let day = 24 * 60 * 60 * 1_000_i64;
+        let now = 40 * day;
+        let cutoff = now - DEFAULT_LOCAL_RETENTION_MS;
+
+        store
+            .put_bars(
+                "BTC",
+                interval,
+                Source::Local,
+                &[
+                    bar(day, 90_000, ["1", "1", "1", "1"], "1", 1),
+                    bar(35 * day, 90_000, ["2", "2", "2", "2"], "2", 1),
+                ],
+            )
+            .expect("insert");
+        assert_eq!(
+            store.no_history_before("BTC", interval).expect("none"),
+            None
+        );
+
+        assert_eq!(
+            store
+                .prune_local(now, DEFAULT_LOCAL_RETENTION_MS)
+                .expect("prune"),
+            1
+        );
+        assert_eq!(
+            store.no_history_before("BTC", interval).expect("floor"),
+            Some(cutoff),
+            "history was deleted and nothing said so"
+        );
+    }
+
+    /// A series the prune did not touch keeps its floor.
+    ///
+    /// The blanket `UPDATE candle_local_history SET no_history_before_ms =
+    /// MAX(...)` moved every row in the table, including series with no stored
+    /// bars at all, so the marker claimed a deletion that never happened.
+    #[test]
+    fn prune_leaves_an_untouched_series_floor_alone() {
+        let conn = store_conn();
+        let store = CandleStore::new(&conn);
+        let day = 24 * 60 * 60 * 1_000_i64;
+
+        // DOGE/1s has a floor and no stored bars at all.
+        store
+            .set_no_history_before("DOGE", iv("1s"), 1_000)
+            .expect("floor");
+        // BTC/90s has bars, none of them old enough to prune.
+        store
+            .put_bars(
+                "BTC",
+                iv("90s"),
+                Source::Local,
+                &[bar(35 * day, 90_000, ["2", "2", "2", "2"], "2", 1)],
+            )
+            .expect("insert");
+        store
+            .set_no_history_before("BTC", iv("90s"), 2_000)
+            .expect("floor");
+
+        assert_eq!(
+            store
+                .prune_local(40 * day, DEFAULT_LOCAL_RETENTION_MS)
+                .expect("prune"),
+            0
+        );
+        assert_eq!(
+            store.no_history_before("DOGE", iv("1s")).expect("floor"),
+            Some(1_000),
+            "a series with nothing deleted must not claim a deletion"
+        );
+        assert_eq!(
+            store.no_history_before("BTC", iv("90s")).expect("floor"),
+            Some(2_000)
+        );
+    }
+
     // ---- end to end -------------------------------------------------------
 
     #[test]
@@ -1978,7 +3163,7 @@ mod tests {
             .expect("insert native");
 
         let loaded = store.bars("BTC", iv("1m"), 0, 21 * m).expect("read native");
-        let Resolution::Resampled { from } = iv("7m").resolve() else {
+        let Resolution::Resampled { from, .. } = iv("7m").resolve() else {
             panic!("7m must resample");
         };
         assert_eq!(from, iv("1m"));
