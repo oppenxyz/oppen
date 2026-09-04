@@ -7,7 +7,8 @@
 
 use std::sync::Arc;
 
-use oppen_hl::{InfoClient, Network, Universe, meta::MIN_NOTIONAL_USD};
+use oppen_core::state::{AccountState, VenueReadings, assemble};
+use oppen_hl::{Address, InfoClient, Network, Universe, meta::MIN_NOTIONAL_USD};
 use rmcp::{
     ErrorData, ServerHandler,
     handler::server::wrapper::Parameters,
@@ -25,6 +26,10 @@ pub struct Gateway {
 struct GatewayInner {
     network: Network,
     info: InfoClient,
+    /// The account the gateway reports on. One address in v1: an agent is
+    /// bound to exactly one container (`docs/decisions.md` D1 as revised), and
+    /// a gateway serving two would have to disambiguate on every call.
+    account: Address,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -58,11 +63,12 @@ pub struct SymbolMeta {
 
 #[tool_router]
 impl Gateway {
-    pub fn new(network: Network) -> Result<Self, oppen_hl::Error> {
+    pub fn new(network: Network, account: Address) -> Result<Self, oppen_hl::Error> {
         Ok(Self {
             inner: Arc::new(GatewayInner {
                 network,
                 info: InfoClient::new(network)?,
+                account,
             }),
         })
     }
@@ -110,6 +116,67 @@ impl Gateway {
             .map_err(|e| ErrorData::internal_error(format!("serialise: {e}"), None))?;
         Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
     }
+
+    /// `get_state` — the agent's eyes (`docs/spec.md` item 16).
+    #[tool(
+        description = "The account right now: equity, margin, open positions with distance to \
+                       liquidation, resting orders, and feed freshness. Read this before acting. \
+                       If `feed` is not `live`, the data is stale and execution will fail closed."
+    )]
+    async fn get_state(&self) -> Result<CallToolResult, ErrorData> {
+        let inner = &self.inner;
+        let account = inner.account;
+
+        // Four reads, not one: Hyperliquid publishes no single endpoint that
+        // answers this, and spot is load-bearing because margin is unified.
+        let perps = inner
+            .info
+            .clearinghouse_state(account)
+            .await
+            .map_err(|e| ErrorData::internal_error(format!("clearinghouse: {e}"), None))?;
+        let spot = inner
+            .info
+            .spot_clearinghouse_state(account)
+            .await
+            .map_err(|e| ErrorData::internal_error(format!("spot: {e}"), None))?;
+        let orders = inner
+            .info
+            .frontend_open_orders(account)
+            .await
+            .map_err(|e| ErrorData::internal_error(format!("orders: {e}"), None))?;
+        let mids = inner
+            .info
+            .all_mids()
+            .await
+            .map_err(|e| ErrorData::internal_error(format!("mids: {e}"), None))?;
+
+        let state: AccountState = assemble(
+            inner.network,
+            account,
+            now_ms(),
+            &VenueReadings {
+                perps: &perps,
+                spot: &spot,
+                orders: &orders,
+                mids: &mids,
+                // No socket yet, so nothing has ticked. Reported honestly as
+                // never-connected rather than as live: an agent that reads
+                // this must not believe a feed exists.
+                last_tick_ms: None,
+            },
+        );
+
+        let json = serde_json::to_string(&state)
+            .map_err(|e| ErrorData::internal_error(format!("serialise: {e}"), None))?;
+        Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
+    }
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 fn describe(asset: &oppen_hl::meta::Asset) -> SymbolMeta {

@@ -15,12 +15,21 @@ use oppen_mcp::tools::Gateway;
 use std::sync::{Arc, RwLock};
 use tower::ServiceExt;
 
+/// The funded testnet account these tests report on. No request in this file
+/// reaches the venue — every one is refused at the door or stops at
+/// `initialize` — so the address only has to parse.
+fn account() -> oppen_hl::Address {
+    "0xbf829199c1ae7f0caf21fb6fc45e10edff25b7d2"
+        .parse()
+        .expect("address")
+}
+
 /// A router plus a token that authenticates against it.
 fn fixture() -> (axum::Router, String) {
     let mut store = TokenStore::new();
     let issued = store.issue().expect("entropy");
     let token = issued.reveal().to_owned();
-    let gateway = Gateway::new(Network::Testnet).expect("gateway");
+    let gateway = Gateway::new(Network::Testnet, account()).expect("gateway");
     (router(gateway, Arc::new(RwLock::new(store))), token)
 }
 
@@ -126,7 +135,7 @@ async fn a_revoked_pairing_is_refused_at_the_door() {
     let token = issued.reveal().to_owned();
     store.revoke(issued.id);
 
-    let gateway = Gateway::new(Network::Testnet).expect("gateway");
+    let gateway = Gateway::new(Network::Testnet, account()).expect("gateway");
     let router = router(gateway, Arc::new(RwLock::new(store)));
     let auth = format!("Bearer {token}");
     assert_eq!(
