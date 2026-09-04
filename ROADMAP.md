@@ -4,7 +4,7 @@ Everything mapped so far, from the v1 MVP through the versions after it. Numbers
 
 Legend: `[x]` shipped on `main` or in an open PR · `[ ]` not started · **gate** = what proves the phase.
 
-Status as of 2026-09-03: P0 and the P1 code are on `main` (PRs #1–#4 merged); the P1 gate is waiting on a funded testnet agent key.
+Status as of 2026-09-03: P0 and the P1 code are on `main`; the P1 gate is waiting on a funded testnet agent key. Six feature specs are written and listed below.
 
 ---
 
@@ -17,6 +17,7 @@ Status as of 2026-09-03: P0 and the P1 code are on `main` (PRs #1–#4 merged); 
 - [x] Apache-2.0 + CLA gate, `NOTICE`, `AGENTS.md`, `skills/oppen` stub [23]
 - [x] Testnet-default `Network` type, every network constant selected by it [13, D4]
 - [x] Design system in `docs/design/`, ASCII primitives and the shared 90 ms motion clock in the app shell [36]
+- [x] Ink ladder raised so labels and rules clear WCAG AA
 - **Gate:** app launches, CI green ✔
 
 ### P1 · Hyperliquid protocol crate — code merged, gate pending
@@ -78,6 +79,7 @@ Status as of 2026-09-03: P0 and the P1 code are on `main` (PRs #1–#4 merged); 
 - [ ] OS notifications by severity: liq warning, trips, approval request, wallet expiry, WS down with positions, alert fired [35]
 - [ ] Persistent MAINNET/TESTNET badge; boot sequence bound to real state [36, D4]
 - [ ] Every panel has a designed empty state [4]
+- [ ] **ASCII candle renderer** promoted from the marketing site: real X and Y axes on nice numbers at the asset's own precision, `--up` / `--down` colour with the glyph as a redundant channel — [charts.md](docs/specs/charts.md) §2
 - [ ] Agent `reason` strings rendered as inert plain text, labelled agent-authored [30]
 - **Gate:** parity with the design, stale overlay on socket loss
 
@@ -105,6 +107,23 @@ Status as of 2026-09-03: P0 and the P1 code are on `main` (PRs #1–#4 merged); 
 
 ---
 
+## Specified but not scheduled
+
+These have written specs in [docs/specs/](docs/specs/) and slot into the versions
+below. A spec is not a commitment; each carries open decisions that need an
+answer before it starts.
+
+| Spec | Feature | Target |
+|---|---|---|
+| [workflows.md](docs/specs/workflows.md) | Trading workflows, triggers, schedulers, agent profiles | v1.5 / v2 |
+| [history.md](docs/specs/history.md) | Durable trading history in the Portfolio tab | v1.1 |
+| [charts.md](docs/specs/charts.md) | ASCII candles with real axes, arbitrary intervals, line chart, Quantoppen | v1 / v1.1 |
+| [fair-value.md](docs/specs/fair-value.md) | Fair value engine: basis, dislocation, carry edge | v1.5 |
+| [signals.md](docs/specs/signals.md) | Opt-in signal publishing and the community layer | v2 |
+| [mobile.md](docs/specs/mobile.md) | Read-only mobile companion with a panic button | v2 |
+
+---
+
 ## v1.1 · Hardening and reach
 
 - [ ] HIP-3 dexes: per-dex meta, `100000 + dex × 10000 + index` asset ids, `dex:coin` names, thin-book guardrails
@@ -115,6 +134,9 @@ Status as of 2026-09-03: P0 and the P1 code are on `main` (PRs #1–#4 merged); 
 - [ ] `modify` tool and stop-limit orders
 - [ ] Headless / tray mode
 - [ ] Notarized macOS build, msi, full code-signing; auto-updater with an offline signing key
+- [ ] **Durable trading history** in the Portfolio tab: backfill, gap detection, closed-position lifecycles, PnL split into price / funding / fees, CSV and JSONL export — [history.md](docs/specs/history.md)
+- [ ] **Arbitrary chart intervals**: native, exact resampling, and forward-only local aggregation for sub-minute — [charts.md](docs/specs/charts.md) §3
+- [ ] **Line chart mode** and the **Quantoppen** multi-asset watch grid — [charts.md](docs/specs/charts.md) §4–5
 
 ## v1.5 · Quant depth and the fleet
 
@@ -125,6 +147,10 @@ Status as of 2026-09-03: P0 and the P1 code are on `main` (PRs #1–#4 merged); 
 - [ ] Fleet crowding across sub-accounts and a `FLEET_CAP` guardrail
 - [ ] Markout curves; implementation shortfall anchored on a `preflight` `snapshot_id`
 - [ ] BYO-model runtime: a model loop hosted in-app, still behind the same guardrail path
+- [ ] **Fair value engine**: mark replication, funding dead-zone censoring, min-variance component combination, `basis_bp` / `z` / `z_sigma`, and the five `fair_value.*` MCP tools — [fair-value.md](docs/specs/fair-value.md)
+- [ ] **Paper execution**: one trait, two brokers, real ledger events tagged `paper` — prerequisite for workflows — [workflows.md](docs/specs/workflows.md) §8
+- [ ] **Workflow engine, layer one**: triggers, cron scheduler, conditions, loops, approval gates, `await_agent` nodes for external agents, run state on the existing ledger — [workflows.md](docs/specs/workflows.md) §4.1
+- [ ] **Workflow templates**: `funding-carry`, `basis-dislocation`, `vol-regime`, `position-guardian`, `research-only`, `custom` — structure only, no alpha — [workflows.md](docs/specs/workflows.md) §10
 
 ## v2+ · Venues, strategies, scripts
 
@@ -134,6 +160,9 @@ Status as of 2026-09-03: P0 and the P1 code are on `main` (PRs #1–#4 merged); 
 - [ ] Portfolio analytics
 - [ ] Vaults and spot
 - [ ] Script runtime with sandbox, dry-run and replay
+- [ ] **Workflow engine, layer two**: in-app agent nodes running unattended, same guardrail path — [workflows.md](docs/specs/workflows.md) §4.2
+- [ ] **Opt-in signal publishing** and the community layer on the website, with no path from subscribed content to the signer — [signals.md](docs/specs/signals.md)
+- [ ] **Mobile companion**: read-only from public venue state, plus a cancel-only panic wallet — [mobile.md](docs/specs/mobile.md)
 
 ## Rejected — not on any version
 
