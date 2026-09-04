@@ -10,14 +10,18 @@
 //!
 //! Four properties it exists to hold.
 //!
-//! * **Idempotence, keyed on the venue's own identifiers.** The window is
-//!   re-walked on every reconnect, retry and restart, and the same fill will
-//!   be offered many times — by the backfill, by the `userFills` subscribe
-//!   snapshot, and by an overlapping page (the venue's `startTime` is
-//!   *inclusive*, measured). Nothing may be recorded twice, so `LedgerIndex`
-//!   reads the `tid` of every fill already in the chain and dedupes against
-//!   that. It is rebuilt from the chain rather than kept in memory precisely
-//!   so that a restart mid-reconcile changes nothing.
+//! * **Idempotence, keyed on the venue's own identifiers, enforced by the
+//!   database.** The window is re-walked on every reconnect, retry and
+//!   restart, and the same fill will be offered many times — by the backfill,
+//!   by the `userFills` subscribe snapshot, and by an overlapping page (the
+//!   venue's `startTime` is *inclusive*, measured). Nothing may be recorded
+//!   twice, and the only place a check and a write are one operation is the
+//!   storage engine: `events.idem_key` carries `fill:<account>:<tid>` under a
+//!   partial unique index, so [`Ledger::record_fill`] either writes the row or
+//!   reports it already recorded, atomically. This module holds **no** index
+//!   of what it has seen. It cannot, safely: any such index is consulted
+//!   before the append, and the interval between the two is exactly when a
+//!   resumed socket replays its subscribe snapshot.
 //! * **A fill is never dropped for failing to match.** Every fill is
 //!   classified `Attribution::Attributed`, `Attribution::Manual` or
 //!   `Attribution::External` and recorded either way
@@ -30,7 +34,20 @@
 //! * **A gap closes only once its window is proven contiguous.** A page that
 //!   cannot be advanced, a request that failed, or a walk that ran past its
 //!   page budget leaves `reconciled_ts_ms` null, so the staleness overlay
-//!   (`docs/spec.md` item 34) stays up and the work list keeps the gap.
+//!   (`docs/spec.md` item 34) stays up and the work list keeps the gap. One
+//!   gap that cannot be closed does not stop the others: `reconcile_all`
+//!   carries the failure in that gap's [`GapStatus::Failed`] and keeps going,
+//!   because a permanently failing window must not hold every later window
+//!   hostage.
+//! * **The window is venue time, never local time.** `feed_gaps` stores the
+//!   local wall clock, `userFillsByTime` answers in the venue's. Handing one
+//!   to the other shifts the window by exactly the clock skew, and a fill the
+//!   shifted window missed is lost silently because the gap is marked
+//!   reconciled anyway. The walk starts from an **anchor** — the newest
+//!   instant the venue stamped on a fill the chain already held when the
+//!   socket died. No host reading narrows it: the host clock appears only as a
+//!   thirty-day outer bound, past which there is no anchor at all and the walk
+//!   falls back to [`FIRST_RUN_LOOKBACK_MS`]. See [`outage_window`].
 //!
 //! # What the venue actually does
 //!
@@ -68,10 +85,10 @@ use serde_json::{Value, json};
 use oppen_hl::info::OrderRef;
 use oppen_hl::types::{Fill, OpenOrder, OrderStatusResponse};
 use oppen_hl::wire::Cloid;
-use oppen_hl::ws::GapWindow;
 use oppen_hl::{Address, Error as VenueError, InfoClient};
 
-use crate::ledger::{Event, EventKind, Gap, Ledger, LedgerError, MAX_PAGE, NewEvent, now_ms};
+use crate::Network;
+use crate::ledger::{EventKind, Gap, Ledger, LedgerError, NewFill, now_ms};
 
 /// Rows the venue returns for one `userFillsByTime` request, at most.
 ///
@@ -107,21 +124,78 @@ const ORDER_UPDATES_SCOPE_PREFIX: &str = "orderUpdates:";
 
 /// The payload key a fill event stores the venue trade id under.
 ///
-/// Idempotence is keyed on this, so it is a storage format: moving it orphans
-/// every fill already in the chain and the next reconcile records them all a
-/// second time.
+/// Written into the chained body for the audit export and read by the schema's
+/// upgrade backfill, which keys rows an older build wrote. Idempotence itself
+/// is `events.idem_key`, not this.
 const FILL_TID_FIELD: &str = "tid";
 
+/// The payload key a fill event stores its container address under. Read by the
+/// same upgrade backfill as [`FILL_TID_FIELD`].
+const FILL_ACCOUNT_FIELD: &str = "account";
+
+/// The payload key a fill event stores the **venue's** timestamp under.
+const FILL_TS_FIELD: &str = "ts_ms";
+
 /// The payload key an intent or operator action carries its client order id
-/// under. See [`LedgerIndex`] for why it is searched at any depth.
+/// under. See [`Attributions`] for why it is searched at any depth.
 const CLOID_FIELD: &str = "cloid";
 
-/// How deep [`LedgerIndex`] will search a payload for a `cloid`.
+/// How deep [`find_cloid`] will search a payload.
 ///
 /// Bounded because the walk is recursive and a payload is written by another
 /// component: a stack overflow is a panic on an input path, which
 /// `AGENTS.md` forbids.
-const MAX_CLOID_DEPTH: usize = 8;
+const MAX_PAYLOAD_DEPTH: usize = 8;
+
+/// How far either side of the anchor the outage is taken to reach.
+///
+/// The anchor ([`Ledger::newest_fill_ts_ms`]) is the newest instant the venue
+/// stamped on a fill the chain already held when the socket died. It is a real
+/// venue instant at which oppen was demonstrably being served, but it is a
+/// *stamping* time and delivery is not stamping: the venue stamps a fill when
+/// its matching engine books it and delivers it over a socket some time later.
+/// Fills booked close together can arrive out of order, and one booked just
+/// before the socket died may never have been delivered at all — so a fill
+/// stamped slightly **before** the anchor can still be missing from the chain,
+/// and the walk has to start slightly before it. The same quantity bounds the
+/// far end, where the venue's own instant of the reconnect sits a little past
+/// the anchor plus the measured outage.
+///
+/// Five minutes is far past any delivery reordering the venue exhibits. It is
+/// not free and it is not expensive: at the measured page cap of
+/// `USER_FILLS_PAGE_LIMIT` rows it is a single request for any account not
+/// trading faster than six fills a second, and everything it re-reads is
+/// refused by the fill key, so over-reaching costs the request and nothing
+/// else. Under-reaching costs a fill, permanently. That asymmetry, not a round
+/// number, is why it is minutes rather than seconds.
+///
+/// It is **not** a clock-skew allowance. The host clock never narrows the
+/// window in [`outage_window`] — it only bounds an anchor from above, with
+/// thirty days of slack — so there is no skew for these five minutes to
+/// absorb.
+const VENUE_CLOCK_MARGIN_MS: u64 = 5 * 60 * 1_000;
+
+/// How far back a container with no anchor is walked.
+///
+/// A gap on an account the chain holds no fill for has no venue instant to
+/// reason from at all — the first run of `docs/specs/history.md` §3.2. Walking
+/// from the epoch is not the honest answer to that: it spends the page budget
+/// on an account's entire history, hits [`ReconcileError::TooManyPages`] on any
+/// account that has one, and leaves the gap permanently unclosable. So the
+/// first run walks a bounded window instead, ending at the venue's own now and
+/// beginning `docs/decisions.md` D-d's thirty days before the host's account of
+/// when the socket dropped.
+///
+/// This is the only quantity a host reading is used for, and it is used with
+/// thirty days of slack around it precisely because it cannot be trusted to
+/// minutes. [`outage_window`] spends it twice: here, and as the outer bound
+/// past which a stored anchor is not believed and this branch is taken instead.
+/// What the operator gets in exchange for the bound is a stated boundary:
+/// [`Finding::FirstRunWindow`] carries it, history before it is unknown rather
+/// than empty (`docs/specs/history.md` §3.2 step 3), and no fill recovered by
+/// such a walk is stamped as belonging to the outage, because nothing here
+/// establishes when in venue time the outage was.
+const FIRST_RUN_LOOKBACK_MS: u64 = 30 * 24 * 60 * 60 * 1_000;
 
 /// What can go wrong reconciling.
 ///
@@ -152,21 +226,37 @@ pub enum ReconcileError {
     )]
     PageStalled { at_ms: u64, rows: usize },
     /// The walk hit its page budget. See `ReconcileConfig::max_pages`.
-    #[error("backfill of {start_ms}..{end_ms} exceeded {max_pages} pages")]
-    TooManyPages {
-        start_ms: u64,
-        end_ms: u64,
-        max_pages: usize,
-    },
-    /// A gap's window ends before it starts, or carries a timestamp outside
+    #[error("backfill from {start_ms} exceeded {max_pages} pages")]
+    TooManyPages { start_ms: u64, max_pages: usize },
+    /// A gap's record ends before it starts, or carries a timestamp outside
     /// unix milliseconds. Only reachable by editing the database by hand;
-    /// refused rather than clamped, because a clamped window is a window that
-    /// silently covers the wrong time.
+    /// refused rather than clamped, because the row is the only statement
+    /// oppen has about when it stopped listening, and a reconciler that
+    /// invents a replacement for it marks a window done that it never
+    /// established. The gap stays open and the overlay stays up.
     #[error("gap {gap_id} has an unusable window {start_ms}..{end_ms}")]
     UnusableWindow {
         gap_id: i64,
         start_ms: i64,
         end_ms: i64,
+    },
+    /// The ledger's chain and the venue source are on different networks.
+    ///
+    /// `docs/decisions.md` R4: "a mainnet number that is actually a testnet
+    /// number is the worst bug this product can ship". R4 makes the two
+    /// networks two database files; this is the other half of it, because a
+    /// file boundary does nothing about a mainnet [`InfoClient`] pointed at
+    /// the testnet chain. Refused at construction, so no such reconciler
+    /// exists to be called.
+    #[error(
+        "reconcile source is on {venue:?} but this ledger's chain is {ledger:?} \
+         (docs/decisions.md R4)"
+    )]
+    NetworkMismatch {
+        ledger: Network,
+        /// The network the [`ReconcileSource`] talks to. Not named `source`:
+        /// `thiserror` reads that name as the error's cause.
+        venue: Network,
     },
     /// A venue timestamp did not fit the ledger's signed milliseconds.
     #[error("venue timestamp {0} is out of range")]
@@ -188,13 +278,24 @@ type Result<T> = std::result::Result<T, ReconcileError>;
 /// fixtures through this trait. [`InfoClient`] implements it, so the
 /// production path is the same code with a different source.
 ///
-/// It is deliberately three methods wide. `docs/spec.md` item 9 names exactly
-/// these three, and a wider trait would let this module reach for state it has
-/// no business reconciling against.
+/// It is deliberately four methods wide. `docs/spec.md` item 9 names the three
+/// queries, and a wider trait would let this module reach for state it has no
+/// business reconciling against. [`ReconcileSource::network`] is the fourth
+/// and is not a query: `docs/decisions.md` R4 needs the network a source talks
+/// to be readable, and it is the source that knows it.
 pub trait ReconcileSource {
-    /// Fills for `user` in `[start_ms, end_ms]`, **oldest first**, capped at
+    /// Which network this source talks to.
+    ///
+    /// Checked against [`Ledger::network`] by [`Reconciler::new`], which
+    /// refuses the pair when they disagree. It has to come off the source
+    /// because a caller repeating the network by hand would only be asserting
+    /// the thing R4 is worried about.
+    fn network(&self) -> Network;
+
+    /// Fills for `user` from `start_ms`, **oldest first**, capped at
     /// `USER_FILLS_PAGE_LIMIT` rows and truncated from the newest end.
-    /// `start_ms` is inclusive. See the module docs for the measurements.
+    /// `start_ms` is inclusive, and `end_ms` of `None` means "to the venue's
+    /// own now". See the module docs for the measurements.
     fn user_fills_by_time(
         &self,
         user: Address,
@@ -217,21 +318,51 @@ pub trait ReconcileSource {
     ) -> impl Future<Output = std::result::Result<OrderStatusResponse, VenueError>> + Send;
 }
 
-impl ReconcileSource for InfoClient {
+/// The production [`ReconcileSource`]: an [`InfoClient`] that still knows
+/// which network it is.
+///
+/// [`InfoClient`] turns a [`Network`] into a base URL at construction and
+/// keeps the URL, so the network cannot be read back off it — and
+/// `docs/decisions.md` R4 needs it read back. The client is built here from
+/// the network rather than handed in beside it, so the two cannot disagree,
+/// and [`Reconciler::new`] then has something to check the ledger against.
+/// There is no `ReconcileSource` impl on a bare `InfoClient`: the unchecked
+/// pairing is not representable rather than merely discouraged.
+#[derive(Debug)]
+pub struct VenueSource {
+    network: Network,
+    info: InfoClient,
+}
+
+impl VenueSource {
+    /// Build a source for `network`.
+    pub fn new(network: Network) -> std::result::Result<Self, VenueError> {
+        Ok(VenueSource {
+            network,
+            info: InfoClient::new(network)?,
+        })
+    }
+}
+
+impl ReconcileSource for VenueSource {
+    fn network(&self) -> Network {
+        self.network
+    }
+
     async fn user_fills_by_time(
         &self,
         user: Address,
         start_ms: u64,
         end_ms: Option<u64>,
     ) -> std::result::Result<Vec<Fill>, VenueError> {
-        InfoClient::user_fills_by_time(self, user, start_ms, end_ms).await
+        self.info.user_fills_by_time(user, start_ms, end_ms).await
     }
 
     async fn frontend_open_orders(
         &self,
         user: Address,
     ) -> std::result::Result<Vec<OpenOrder>, VenueError> {
-        InfoClient::frontend_open_orders(self, user).await
+        self.info.frontend_open_orders(user).await
     }
 
     async fn order_status(
@@ -239,7 +370,7 @@ impl ReconcileSource for InfoClient {
         user: Address,
         order: OrderRef,
     ) -> std::result::Result<OrderStatusResponse, VenueError> {
-        InfoClient::order_status(self, user, order).await
+        self.info.order_status(user, order).await
     }
 }
 
@@ -318,6 +449,17 @@ pub enum Finding {
     /// knows the cloid. See [`Settlement::Retired`] — this is not proof it
     /// never existed, only that the order record is gone.
     OrderRetired { cloid: String },
+    /// A gap was reconciled on a container the chain held no usable anchor
+    /// for — no fill at all, or none whose venue stamp can be believed — so the
+    /// walk covered [`FIRST_RUN_LOOKBACK_MS`] rather than a window derived from
+    /// the venue's own clock.
+    ///
+    /// `docs/specs/history.md` §3.2 step 3: what is older than the proven
+    /// window is "explicitly marked unknown rather than assumed empty". This is
+    /// that mark. It is a finding and not an error because closing the gap was
+    /// still the right thing to do — the alternative is a gap that can never
+    /// close on a fresh install.
+    FirstRunWindow { account: String, start_ms: u64 },
 }
 
 /// What one backfill recovered.
@@ -521,26 +663,38 @@ impl GapScope {
 }
 
 /// What happened to one gap.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum GapStatus {
-    /// The window was walked to its end and `reconciled_ts_ms` is now set.
+    /// The window was walked to a short page and `reconciled_ts_ms` is now
+    /// set.
     Reconciled,
-    /// The socket has not come back, so the window has no end yet. Nothing to
-    /// backfill: a window with an open end would be backfilled against a
-    /// moving target and could never be proven contiguous.
+    /// The socket has not come back, so oppen is still missing fills as they
+    /// happen. Nothing to backfill yet: there is no instant to backfill *to*,
+    /// because the feed that would take over from the walk is still down.
     StillOpen,
     /// The scope is not an account feed. Left for whoever owns it, with
     /// `reconciled_ts_ms` untouched.
     NotAnAccountFeed,
+    /// This gap could not be closed, and the typed reason why.
+    ///
+    /// `reconciled_ts_ms` is untouched, so the gap stays on the work list and
+    /// `docs/spec.md` item 34's overlay stays up — the honest state. It is a
+    /// status rather than a returned error because
+    /// [`Reconciler::reconcile_all`] must not let one gap that will never
+    /// close stop every later gap from ever being walked.
+    Failed(ReconcileError),
 }
 
 /// The report for one gap.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct GapOutcome {
     pub gap_id: i64,
     pub scope: String,
     pub status: GapStatus,
-    /// What the fills walk recovered. Empty for a scope that carries no fills.
+    /// What the fills walk recovered. Empty for a scope that carries no fills,
+    /// and empty for a [`GapStatus::Failed`] gap: rows written before the
+    /// failure are already durable and are counted as duplicates on the retry,
+    /// so the counts describe a gap that finished, never a partial one.
     pub recovered: Recovered,
     /// How many orders the venue reports resting, for an account scope that
     /// was checked. `None` when no order query was made.
@@ -578,111 +732,77 @@ struct IntentRef {
     agent_id: Option<String>,
 }
 
-/// The chain, indexed for the two questions reconciling asks of it.
+/// The join from a client order id to the row that explains it.
 ///
-/// * *Have I already recorded this fill?* — the set of every `tid` in an
-///   [`EventKind::Fill`] row. This is what makes re-applying a batch a no-op,
-///   and it is read from the chain rather than remembered in memory so that a
-///   crash mid-window, a restart, or a second process changes nothing.
-/// * *Whose order was this?* — cloid to intent, and cloid to operator action.
+/// `docs/specs/history.md` §2: the venue is authoritative for *what* happened
+/// and the ledger for *why*, and this is the ledger half. Two questions, one
+/// read: which intent claimed this cloid, and which operator ticket did.
 ///
-/// The index is built by paging [`Ledger::get_events`] and refreshed
-/// incrementally from the last seq it saw, so steady-state reconciling reads
-/// only the rows appended since. The first build is a full scan.
+/// **Read at the moment of use, never cached.** The rows that attribute a fill
+/// are written by the execution path, which this module never sees, so a copy
+/// kept across calls is stale by construction. A cached copy also needs a
+/// cursor, a refresh and an answer for a cursor the ledger has retired — and
+/// that answer was an infinite loop on the production path. There is no cursor
+/// here to get wrong.
 ///
-/// **The cloid is searched at any depth, up to [`MAX_CLOID_DEPTH`].** The
-/// payload of an intent row is written by the execution path, and at this
-/// phase its shape is not fixed — the guardrail engine's `Clearance` nests the
-/// cloid one level down inside `kind`, a hand-built intent payload would put it
-/// at the root. Binding the join to one exact pointer would make a later,
+/// **The cloid is searched at any depth, up to [`MAX_PAYLOAD_DEPTH`].** The
+/// payload of an intent row is written by the execution path, and at this phase
+/// its shape is not fixed — the guardrail engine's `Clearance` nests the cloid
+/// one level down inside `kind`, a hand-built intent payload would put it at
+/// the root. Binding the join to one exact pointer would make a later,
 /// reasonable payload change silently reclassify every attributed fill as
 /// external, which is a data-loss-shaped bug that no test outside this module
 /// would catch. Searching for the field is the version that degrades safely.
 ///
-/// **A redacted payload cannot be indexed.** [`Ledger::redact`] nulls the
-/// payload, so a redacted fill row's `tid` is invisible here and a redacted
-/// intent's cloid stops matching. `docs/decisions.md` D-e keeps records
-/// forever and redaction is an operator action on agent-authored text, so this
-/// is not an expected path — but it is the one hole in the idempotence
-/// property, and it closes when `fills` gets its own table with `tid` as the
-/// primary key (`docs/specs/history.md` §3.1).
+/// A redacted intent's cloid stops matching, because [`Ledger::redact`] nulls
+/// the payload the cloid was in. That costs attribution on a row the operator
+/// chose to strip, and it costs nothing else: idempotence does not pass through
+/// here.
 #[derive(Debug, Default)]
-struct LedgerIndex {
+struct Attributions {
     intents: BTreeMap<String, IntentRef>,
     manual: BTreeMap<String, u64>,
-    applied_tids: BTreeSet<u64>,
-    cursor: u64,
 }
 
-impl LedgerIndex {
-    /// Build the index by walking the whole chain.
-    fn build(ledger: &Ledger) -> Result<Self> {
-        let mut index = LedgerIndex::default();
-        index.refresh(ledger)?;
-        Ok(index)
-    }
-
-    /// Take in every row appended since the last look.
+impl Attributions {
+    /// Read the chain's intent and operator rows.
     ///
-    /// A `resync_required` answer restarts the scan from genesis. It cannot
-    /// happen while D-e holds — records are never deleted — so treating it as
-    /// "rebuild" rather than as an error costs nothing and fails safe if that
-    /// ever changes.
-    fn refresh(&mut self, ledger: &Ledger) -> Result<()> {
-        loop {
-            let page = ledger.get_events(self.cursor, MAX_PAGE)?;
-            if page.resync_required {
-                self.intents.clear();
-                self.manual.clear();
-                self.applied_tids.clear();
-                self.cursor = 0;
+    /// Two reads served by the `events_kind` index, and their cost is the
+    /// chain's intent and operator rows — not the whole chain, and not the
+    /// fills, which are the bulk of it. [`Reconciler::apply_fills`] skips this
+    /// entirely for a batch in which no fill carries a cloid, which is every
+    /// batch that can only attribute to `external`.
+    ///
+    /// A later row wins over an earlier one carrying the same cloid: a cloid is
+    /// oppen's own 128-bit identifier, so a repeat is a re-placement rather than
+    /// a collision, and the newest row is the one that describes the order that
+    /// traded.
+    fn read(ledger: &Ledger) -> Result<Self> {
+        let mut found = Attributions::default();
+        for event in ledger.events_of_kind(EventKind::OrderIntent)? {
+            let Some(payload) = event.payload.as_ref() else {
                 continue;
+            };
+            if let Some(cloid) = find_cloid(payload, 0) {
+                found.intents.insert(
+                    cloid,
+                    IntentRef {
+                        seq: event.seq,
+                        hash: event.hash,
+                        agent_id: event.agent_id,
+                    },
+                );
             }
-            if page.events.is_empty() {
-                return Ok(());
-            }
-            for event in &page.events {
-                self.observe(event);
-            }
-            self.cursor = page.next_cursor;
         }
-    }
-
-    /// Index one row.
-    fn observe(&mut self, event: &Event) {
-        let Some(payload) = event.payload.as_ref() else {
-            return;
-        };
-        match event.kind {
-            EventKind::Fill => {
-                if let Some(tid) = payload.get(FILL_TID_FIELD).and_then(Value::as_u64) {
-                    self.applied_tids.insert(tid);
-                }
+        for event in ledger.events_of_kind(EventKind::OperatorAction)? {
+            let Some(payload) = event.payload.as_ref() else {
+                continue;
+            };
+            if let Some(cloid) = find_cloid(payload, 0) {
+                found.manual.insert(cloid, event.seq);
             }
-            EventKind::OrderIntent => {
-                if let Some(cloid) = find_cloid(payload, 0) {
-                    self.intents.insert(
-                        cloid,
-                        IntentRef {
-                            seq: event.seq,
-                            hash: event.hash.clone(),
-                            agent_id: event.agent_id.clone(),
-                        },
-                    );
-                }
-            }
-            EventKind::OperatorAction => {
-                if let Some(cloid) = find_cloid(payload, 0) {
-                    self.manual.insert(cloid, event.seq);
-                }
-            }
-            _ => {}
         }
-    }
-
-    /// Whether this trade id is already in the chain.
-    fn contains_fill(&self, tid: u64) -> bool {
-        self.applied_tids.contains(&tid)
+        Ok(found)
     }
 
     /// Classify one fill.
@@ -691,7 +811,7 @@ impl LedgerIndex {
     /// is oppen's own 128-bit identifier, so the collision means the operator
     /// row is about the agent's order, and the agent attribution is the one
     /// that carries the reason and the guardrail verdict.
-    fn attribution(&self, cloid: Option<&Cloid>) -> Attribution {
+    fn of(&self, cloid: Option<&Cloid>) -> Attribution {
         let Some(cloid) = cloid else {
             return Attribution::External;
         };
@@ -715,45 +835,53 @@ impl LedgerIndex {
     }
 }
 
-/// Find a `cloid` field anywhere in a payload, deterministically.
+/// The client order id a payload carries, at any depth. See [`Attributions`].
 ///
-/// Objects are walked in sorted key order — `serde_json`'s map iteration order
-/// depends on the `preserve_order` feature, which any crate in the workspace
-/// can switch on, and the classification of a fill must not depend on that.
-/// The first well-formed cloid wins; a `cloid` field holding something that is
-/// not a cloid is skipped rather than accepted, so a payload cannot claim an
-/// order by writing nonsense into that key.
-fn find_cloid(value: &Value, depth: usize) -> Option<String> {
-    if depth > MAX_CLOID_DEPTH {
+/// An object's own `cloid` is read before any of its children, so a field at the
+/// payload root always beats one nested under it — that is the property
+/// [`Attributions`] relies on when it says the join degrades safely across a
+/// payload shape change. Below the root the walk is depth-first in sorted key
+/// order: it is **not** breadth-first, and which of two *nested* cloids wins is
+/// not a promise. What is promised is that the answer never depends on
+/// `serde_json`'s map iteration order, which the `preserve_order` feature — any
+/// crate in the workspace can switch it on — would otherwise decide, and that
+/// the classification of a fill is therefore reproducible.
+///
+/// A `cloid` field holding something that is not a cloid is skipped and the walk
+/// continues, so a payload cannot claim an order by writing nonsense into that
+/// key.
+fn find_cloid(payload: &Value, depth: usize) -> Option<String> {
+    if depth > MAX_PAYLOAD_DEPTH {
         return None;
     }
-    match value {
+    let read = |value: &Value| {
+        Cloid::parse(value.as_str()?)
+            .ok()
+            .map(|cloid| cloid.as_str().to_owned())
+    };
+    match payload {
         Value::Object(map) => {
+            if let Some(found) = map.get(CLOID_FIELD).and_then(read) {
+                return Some(found);
+            }
             let mut keys: Vec<&str> = map.keys().map(String::as_str).collect();
             keys.sort_unstable();
-            if let Some(text) = map.get(CLOID_FIELD).and_then(Value::as_str)
-                && let Ok(cloid) = Cloid::parse(text)
-            {
-                return Some(cloid.as_str().to_owned());
-            }
             keys.into_iter()
-                .find_map(|key| map.get(key).and_then(|inner| find_cloid(inner, depth + 1)))
+                .find_map(|next| map.get(next).and_then(|inner| find_cloid(inner, depth + 1)))
         }
         Value::Array(items) => items.iter().find_map(|item| find_cloid(item, depth + 1)),
         _ => None,
     }
 }
 
-/// Walk `userFillsByTime` over exactly one window and return every distinct
-/// fill in it.
+/// Walk `userFillsByTime` from `start_ms` to the venue's own now, and return
+/// every distinct fill.
 ///
 /// This is the whole of the venue's paging contract in one place, and every
 /// line of it is a measurement (see the module docs):
 ///
-/// * the cursor starts at `start_ms` and every request carries `end_ms`, so
-///   the walk covers exactly the window it was given;
 /// * a page shorter than `page_limit` ends the walk — the venue has nothing
-///   more in the window;
+///   more;
 /// * a full page advances the cursor to that page's **newest timestamp**, not
 ///   past it, because the cap can cut a millisecond in half; the boundary rows
 ///   come back and are removed by `tid`;
@@ -761,15 +889,25 @@ fn find_cloid(value: &Value, depth: usize) -> Option<String> {
 ///   all, and that is [`ReconcileError::PageStalled`] rather than a silent
 ///   skip or an infinite loop.
 ///
+/// **There is no end bound.** `endTime` is a venue instant and the only end
+/// oppen could name is the local clock's idea of when the socket came back —
+/// the same skew that makes `startTime` unsafe, and worse, because a
+/// too-early end drops the fills at the tail of the outage while the gap is
+/// marked reconciled anyway. Omitting `endTime` asks the venue for everything
+/// through its own now, which is by construction at or after the reconnect, so
+/// the walk provably meets the live feed that has already resumed. The extra
+/// rows it reads on the way are dropped by `tid`, and the walk still
+/// terminates: a page is short exactly when the venue has nothing newer.
+///
 /// Nothing is written here. Recording is `Reconciler::apply_fills`, so a
 /// window can be walked and inspected without touching the chain.
 async fn backfill_fills<S: ReconcileSource>(
     source: &S,
     user: Address,
-    window: GapWindow,
+    start_ms: u64,
     config: ReconcileConfig,
 ) -> Result<(Vec<Fill>, usize)> {
-    let mut cursor = window.start_ms;
+    let mut cursor = start_ms;
     let mut seen: BTreeSet<u64> = BTreeSet::new();
     let mut out: Vec<Fill> = Vec::new();
     let mut pages = 0usize;
@@ -777,29 +915,22 @@ async fn backfill_fills<S: ReconcileSource>(
     loop {
         if pages >= config.max_pages {
             return Err(ReconcileError::TooManyPages {
-                start_ms: window.start_ms,
-                end_ms: window.end_ms,
+                start_ms,
                 max_pages: config.max_pages,
             });
         }
-        let page = source
-            .user_fills_by_time(user, cursor, Some(window.end_ms))
-            .await?;
+        let page = source.user_fills_by_time(user, cursor, None).await?;
         pages += 1;
         let rows = page.len();
         let mut newest = cursor;
         for fill in page {
             newest = newest.max(fill.time);
-            // A fill outside the requested window is kept rather than
-            // filtered: it is a real fill for this account, dropping it would
-            // be the exact failure this module exists to prevent, and
-            // recording it twice is impossible anyway.
             if seen.insert(fill.tid) {
                 out.push(fill);
             }
         }
         if rows < config.page_limit {
-            // The venue served everything it has in the window.
+            // The venue served everything it has.
             return Ok((out, pages));
         }
         if newest <= cursor {
@@ -814,7 +945,13 @@ async fn backfill_fills<S: ReconcileSource>(
 
 /// The component that closes gaps.
 ///
-/// Holds a borrowed [`Ledger`], a [`ReconcileSource`] and the chain index.
+/// Holds a borrowed [`Ledger`], a [`ReconcileSource`] and its page contract,
+/// and **no state of its own**. Every question it asks of the chain — has this
+/// fill been recorded, whose order was it, when did the venue last stamp
+/// something oppen held — is answered by the database at the moment it is
+/// asked. That is what makes a second reconciler, a restart mid-window and a
+/// retry all indistinguishable from a first run.
+///
 /// Every ledger call blocks, so an async caller runs
 /// [`Reconciler::reconcile_all`] on a blocking pool the same way it runs any
 /// other ledger write (`docs/decisions.md` R1 keeps the core runtime-free).
@@ -822,12 +959,14 @@ async fn backfill_fills<S: ReconcileSource>(
 pub struct Reconciler<'a, S> {
     ledger: &'a Ledger,
     source: S,
-    index: LedgerIndex,
     config: ReconcileConfig,
 }
 
 impl<'a, S: ReconcileSource> Reconciler<'a, S> {
-    /// Build a reconciler and index the chain.
+    /// Build a reconciler.
+    ///
+    /// Refuses a source that is not on the ledger's own network
+    /// ([`ReconcileError::NetworkMismatch`], `docs/decisions.md` R4).
     pub fn new(ledger: &'a Ledger, source: S) -> Result<Self> {
         Self::with_config(ledger, source, ReconcileConfig::default())
     }
@@ -835,28 +974,58 @@ impl<'a, S: ReconcileSource> Reconciler<'a, S> {
     /// Build one with a non-default page contract. See
     /// [`ReconcileConfig::page_limit`].
     fn with_config(ledger: &'a Ledger, source: S, config: ReconcileConfig) -> Result<Self> {
+        // Before anything reads or writes: R4 keeps the two networks in two
+        // files precisely so a testnet number can never be read as a mainnet
+        // one, and a mainnet source pointed at the testnet chain would walk
+        // straight through that boundary — recording real mainnet fills into
+        // the testnet chain, or answering a mainnet gap with testnet fills.
+        // Nothing downstream can tell the difference afterwards, so it is
+        // refused here and no such reconciler exists.
+        let (ledger_network, source_network) = (ledger.network(), source.network());
+        if ledger_network != source_network {
+            return Err(ReconcileError::NetworkMismatch {
+                ledger: ledger_network,
+                venue: source_network,
+            });
+        }
         Ok(Reconciler {
             ledger,
             source,
-            index: LedgerIndex::build(ledger)?,
             config,
         })
     }
 
     /// Work every gap that has not been proven backfilled, oldest first.
     ///
-    /// Stops at the first failure and returns it. Everything recorded before
-    /// that point is already durable, and re-running is free: the walk is
-    /// idempotent, and a gap that was not marked reconciled is still on the
-    /// work list. Failing the whole call rather than swallowing one gap's
-    /// error keeps `docs/spec.md` item 34's overlay honest — a reconcile that
-    /// reported success with one window silently unwalked is the failure mode
-    /// this module exists to remove.
-    pub async fn reconcile_all(&mut self, pending: &[Cloid]) -> Result<Vec<GapOutcome>> {
+    /// **A gap that fails does not stop the ones after it.** Its failure
+    /// becomes that gap's [`GapStatus::Failed`] and the walk moves on. The
+    /// alternative — returning the first error — reads like the stricter
+    /// choice and is the more dangerous one: gaps come off the work list in id
+    /// order, so a single window that can never close (a page the venue
+    /// stalls on, a scope row corrupted by hand) permanently blocks every
+    /// later window from ever being backfilled, and those are the recent ones.
+    /// Continuing costs nothing that matters, because a failed gap is not
+    /// marked reconciled: it stays on the work list, `docs/spec.md` item 34's
+    /// overlay stays up, and the retry is free.
+    ///
+    /// Only the work-list read itself is fatal. If the ledger cannot say which
+    /// gaps are open there is no list to be honest about.
+    pub async fn reconcile_all(&self, pending: &[Cloid]) -> Result<Vec<GapOutcome>> {
         let gaps = self.ledger.unreconciled_gaps()?;
         let mut outcomes = Vec::with_capacity(gaps.len());
         for gap in &gaps {
-            outcomes.push(self.reconcile_gap(gap, pending).await?);
+            let outcome = match self.reconcile_gap(gap, pending).await {
+                Ok(outcome) => outcome,
+                Err(error) => GapOutcome {
+                    gap_id: gap.gap_id,
+                    scope: gap.scope.clone(),
+                    status: GapStatus::Failed(error),
+                    recovered: Recovered::default(),
+                    resting_orders: None,
+                    settled: Vec::new(),
+                },
+            };
+            outcomes.push(outcome);
         }
         Ok(outcomes)
     }
@@ -880,7 +1049,7 @@ impl<'a, S: ReconcileSource> Reconciler<'a, S> {
     /// would hide the mistake at the cost of a query on every call and a
     /// second, silent definition of which gap is being worked; saying so is
     /// the cheaper honest option.
-    async fn reconcile_gap(&mut self, gap: &Gap, pending: &[Cloid]) -> Result<GapOutcome> {
+    async fn reconcile_gap(&self, gap: &Gap, pending: &[Cloid]) -> Result<GapOutcome> {
         let scope = GapScope::parse(&gap.scope)?;
         let unfinished = |status| GapOutcome {
             gap_id: gap.gap_id,
@@ -902,13 +1071,27 @@ impl<'a, S: ReconcileSource> Reconciler<'a, S> {
 
         let mut recovered = Recovered::default();
         if matches!(scope, GapScope::UserFills(_)) {
-            let window = window_of(gap, closed_ts_ms)?;
+            // The anchor is read at `gap.open_seq`, so nothing written after
+            // the socket died — by a later backfill, or by the live feed once
+            // it resumed — can drag the start past the fills it is meant to
+            // recover.
+            let anchor = self
+                .ledger
+                .newest_fill_ts_ms(&account.to_string(), gap.open_seq)?;
+            let window = outage_window(gap, closed_ts_ms, anchor)?;
             // Fills first, and the gap is marked only after everything below
             // has succeeded. The opposite order would mark a window
             // reconciled on the strength of an order query while the fills
             // walk had not run.
-            let (fills, _) = backfill_fills(&self.source, account, window, self.config).await?;
-            recovered = self.apply_fills(account, &fills, Some(gap.gap_id))?;
+            let (fills, _) =
+                backfill_fills(&self.source, account, window.start_ms, self.config).await?;
+            recovered = self.apply_fills(account, &fills, window.recovered_from(gap.gap_id))?;
+            if window.outage_ends_ms.is_none() {
+                recovered.findings.push(Finding::FirstRunWindow {
+                    account: account.to_string(),
+                    start_ms: window.start_ms,
+                });
+            }
         }
 
         // A `userFills` gap costs no order knowledge, so the order query runs
@@ -953,22 +1136,33 @@ impl<'a, S: ReconcileSource> Reconciler<'a, S> {
         })
     }
 
-    /// Record fills, skipping any already in the chain.
+    /// Record fills. One row per fill, each keyed on the venue's own
+    /// identifiers, and the database decides which ones are new.
     ///
-    /// This is the idempotence boundary and the only writer of
-    /// [`EventKind::Fill`] rows. It is also the path the live `userFills`
-    /// feed uses, including for the subscribe snapshot the venue replays on
-    /// every reconnect — the same batch through the same door, deduped the
-    /// same way.
+    /// This is the only writer of [`EventKind::Fill`] rows, and it is also the
+    /// path the live `userFills` feed will use, including for the subscribe
+    /// snapshot the venue replays on every reconnect — the same batch through
+    /// the same door.
+    ///
+    /// **There is no dedupe here to be stale.** Every fill is offered to
+    /// [`Ledger::record_fill`], which writes it or reports it already
+    /// recorded, in one statement, under the partial unique index. A fill that
+    /// another writer chained a microsecond ago is refused by the index, not by
+    /// this function's memory of what it has seen; a batch that carries the
+    /// same trade twice records it once for the same reason.
     ///
     /// Fills are sorted by `(time, tid)` before they are appended, so the
     /// chain order of a recovered window does not depend on which page a row
     /// arrived in. Two runs over the same window produce the same chain.
+    ///
+    /// Nothing is counted or reported until the row is durable: a fill that
+    /// turns out to be a duplicate must not push a
+    /// [`Finding::UnattributedFill`] the operator has already seen.
     fn apply_fills(
-        &mut self,
+        &self,
         account: Address,
         fills: &[Fill],
-        gap_id: Option<i64>,
+        recovered_from: Option<RecoveredWindow>,
     ) -> Result<Recovered> {
         let mut ordered: Vec<&Fill> = fills.iter().collect();
         ordered.sort_by_key(|fill| (fill.time, fill.tid));
@@ -977,14 +1171,31 @@ impl<'a, S: ReconcileSource> Reconciler<'a, S> {
             fills_seen: fills.len(),
             ..Recovered::default()
         };
+        // One read, and only when it can change an answer: a batch in which no
+        // fill carries a cloid attributes to nothing whatever the chain holds.
+        let attributions = if ordered.iter().any(|fill| fill.cloid.is_some()) {
+            Attributions::read(self.ledger)?
+        } else {
+            Attributions::default()
+        };
+        let account_text = account.to_string();
+
         for fill in ordered {
-            if self.index.contains_fill(fill.tid) {
+            let attribution = attributions.of(fill.cloid.as_ref());
+            let ts_ms = i64::try_from(fill.time)
+                .map_err(|_| ReconcileError::TimestampOutOfRange(fill.time))?;
+            let payload = fill_payload(account, fill, &attribution, recovered_from);
+            let appended = self.ledger.record_fill(&NewFill {
+                account: &account_text,
+                tid: fill.tid,
+                ts_ms,
+                agent_id: attribution.agent_id(),
+                payload: &payload,
+            })?;
+            if appended.is_none() {
                 recovered.duplicates += 1;
                 continue;
             }
-            let attribution = self.index.attribution(fill.cloid.as_ref());
-            let ts_ms = i64::try_from(fill.time)
-                .map_err(|_| ReconcileError::TimestampOutOfRange(fill.time))?;
             match &attribution {
                 Attribution::Attributed { .. } => recovered.attributed += 1,
                 Attribution::Manual { .. } => recovered.manual += 1,
@@ -999,40 +1210,144 @@ impl<'a, S: ReconcileSource> Reconciler<'a, S> {
                     });
                 }
             }
-            let payload = fill_payload(account, fill, &attribution, gap_id);
-            self.ledger.append(&NewEvent {
-                kind: EventKind::Fill,
-                ts_ms,
-                agent_id: attribution.agent_id(),
-                payload: &payload,
-                snapshot: None,
-            })?;
-            // Only after the append: a failed write must leave the tid
-            // unrecorded so the retry picks it up again.
-            self.index.applied_tids.insert(fill.tid);
             recovered.fills_recorded += 1;
         }
         Ok(recovered)
     }
 }
 
-/// The window a gap covers, as unsigned venue milliseconds.
+/// Which gap's reconcile pass recovered a fill, and how far into venue time
+/// that gap's outage is taken to reach.
 ///
-/// The ledger stores signed milliseconds because SQLite has no unsigned
-/// integer; the venue's are unsigned. A negative or inverted window is refused
-/// rather than clamped — see [`ReconcileError::UnusableWindow`].
-fn window_of(gap: &Gap, closed_ts_ms: i64) -> Result<GapWindow> {
+/// Carried into the chained payload as `recovered_from_gap`. A fill stamped
+/// with it is one this walk found missing and recovered while closing that gap.
+/// A fill past `horizon_ms` is recorded like any other and carries no stamp,
+/// because the walk has no end bound and therefore meets fills that happened
+/// after the socket came back — those belong to the live feed, and claiming
+/// them for the outage would be a false statement in the one table kept
+/// forever.
+#[derive(Debug, Clone, Copy)]
+struct RecoveredWindow {
+    gap_id: i64,
+    horizon_ms: u64,
+}
+
+/// The venue-time window one gap's fills walk covers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Window {
+    /// Where the walk starts, in **venue** milliseconds.
+    start_ms: u64,
+    /// The venue instant past which a fill is no longer the outage's.
+    ///
+    /// `None` when the chain holds no usable anchor for this container: there
+    /// is then no venue instant to reason from, so no fill can be attributed to
+    /// the outage and none is stamped. See [`FIRST_RUN_LOOKBACK_MS`].
+    outage_ends_ms: Option<u64>,
+}
+
+impl Window {
+    /// The provenance a fill recovered inside this window carries.
+    fn recovered_from(&self, gap_id: i64) -> Option<RecoveredWindow> {
+        self.outage_ends_ms
+            .map(|horizon_ms| RecoveredWindow { gap_id, horizon_ms })
+    }
+}
+
+/// The window this gap's fills walk covers, in **venue** milliseconds.
+///
+/// `feed_gaps` is written from the host's wall clock: `opened_ts_ms` is when
+/// the pool noticed the socket die and `closed_ts_ms` is when it noticed the
+/// socket return. `userFillsByTime` bounds are the venue's own clock. Handing
+/// the first straight to the second — which is what this function used to do —
+/// shifts the window by exactly the skew between them, and it fails in the
+/// silent direction: a host clock ahead of the venue asks for a window that
+/// begins after the fills it was supposed to recover, the venue truthfully
+/// answers with nothing, the walk ends on a short page, and the gap is marked
+/// reconciled. The fill is gone from the record with no error anywhere. That
+/// is the P2 gate failing while reporting success.
+///
+/// **Taking the earlier of the two clocks did not fix that**, which is why it
+/// is gone. `min(anchor, opened_ms)` defends only while the host runs slow; a
+/// host running fast leaves the anchor deciding alone, and an anchor that a
+/// later walk had already pushed past the outage then carried the window with
+/// it. Two readings do not make a clock. So this reads **one**:
+///
+/// * `anchor` — the newest instant the venue itself stamped on a fill the
+///   chain already held **at this gap's own chain position**
+///   ([`Ledger::newest_fill_ts_ms`]). Every such row was durable before the
+///   socket died, so it is a venue instant at which oppen was demonstrably
+///   being served, and nothing recorded afterwards can move it.
+///
+/// One thing does bound that anchor: it may not postdate the disconnect by
+/// more than [`FIRST_RUN_LOOKBACK_MS`]. A stored stamp that claims a venue
+/// instant a month past the moment the host says the socket died is not a
+/// record of oppen being served — it is a bad venue timestamp or an edited row
+/// — and believing it starts the walk after everything the gap exists to
+/// recover. Such an anchor is discarded, not clamped, so the host clock can
+/// only ever widen this window and never shrink it.
+///
+/// The start is that anchor less [`VENUE_CLOCK_MARGIN_MS`], because delivery is
+/// not stamping — see that constant. The far end is the anchor plus the outage
+/// and the same margin. The outage is a **difference** of two host readings, so
+/// the skew that makes each one unusable cancels: what is left is the host
+/// clock's drift over one outage, which is microseconds over the thirty seconds
+/// this module exists for. It bounds only the provenance stamp; the walk itself
+/// carries no end bound, for the reason given on [`backfill_fills`].
+///
+/// The far end can land before the outage really ended — an account that was
+/// idle for an hour before the socket dropped has an anchor an hour early — and
+/// that direction is the safe one: a fill from inside the outage then goes into
+/// the chain without the stamp. It is recorded, classified, exported and
+/// counted either way. The opposite direction writes a claim that is false.
+///
+/// With no anchor — none recorded, or none believable — there is no venue
+/// clock to reason from at all, and [`FIRST_RUN_LOOKBACK_MS`] says what happens
+/// instead.
+///
+/// The one refusal: a gap row whose own timestamps are not usable — negative,
+/// or closing before it opened. That row is the only statement oppen has about
+/// when it stopped listening, and a reconciler that substitutes a guess for it
+/// would mark done a window it never established. `AGENTS.md`: an unevaluable
+/// state must never permit an action. The gap stays open and the overlay stays
+/// up.
+fn outage_window(gap: &Gap, closed_ts_ms: i64, anchor: Option<u64>) -> Result<Window> {
     let unusable = || ReconcileError::UnusableWindow {
         gap_id: gap.gap_id,
         start_ms: gap.opened_ts_ms,
         end_ms: closed_ts_ms,
     };
-    let start_ms = u64::try_from(gap.opened_ts_ms).map_err(|_| unusable())?;
-    let end_ms = u64::try_from(closed_ts_ms).map_err(|_| unusable())?;
-    if end_ms < start_ms {
-        return Err(unusable());
-    }
-    Ok(GapWindow { start_ms, end_ms })
+    let opened_ms = u64::try_from(gap.opened_ts_ms).map_err(|_| unusable())?;
+    let closed_ms = u64::try_from(closed_ts_ms).map_err(|_| unusable())?;
+    let outage_ms = closed_ms.checked_sub(opened_ms).ok_or_else(unusable)?;
+
+    // An anchor is a venue instant at which oppen was *being served*, so it
+    // cannot postdate the disconnect. One that does is not an anchor at all,
+    // and taking it starts the walk after the fills the gap exists to recover:
+    // the venue truthfully answers with nothing, the page is short, and the gap
+    // is marked reconciled. That is the P2 gate failing while reporting
+    // success, so an incredible anchor is discarded and the no-anchor branch
+    // below answers instead. The bound is a host reading and is given the same
+    // thirty days of slack [`FIRST_RUN_LOOKBACK_MS`] already trusts it with, so
+    // no skew reaches it and the window still comes from the chain; and
+    // discarding can only widen the walk, never narrow it, because the fallback
+    // starts thirty days before the host's own account of the disconnect.
+    let anchor =
+        anchor.filter(|anchor_ms| *anchor_ms <= opened_ms.saturating_add(FIRST_RUN_LOOKBACK_MS));
+
+    Ok(match anchor {
+        Some(anchor_ms) => Window {
+            start_ms: anchor_ms.saturating_sub(VENUE_CLOCK_MARGIN_MS),
+            outage_ends_ms: Some(
+                anchor_ms
+                    .saturating_add(outage_ms)
+                    .saturating_add(VENUE_CLOCK_MARGIN_MS),
+            ),
+        },
+        None => Window {
+            start_ms: opened_ms.saturating_sub(FIRST_RUN_LOOKBACK_MS),
+            outage_ends_ms: None,
+        },
+    })
 }
 
 /// The chained payload of one fill.
@@ -1052,10 +1367,15 @@ fn fill_payload(
     account: Address,
     fill: &Fill,
     attribution: &Attribution,
-    gap_id: Option<i64>,
+    recovered_from: Option<RecoveredWindow>,
 ) -> Value {
+    // Stamped only for a fill the outage can actually account for. See
+    // [`RecoveredWindow`] and [`outage_window`].
+    let gap_id = recovered_from
+        .filter(|window| fill.time <= window.horizon_ms)
+        .map(|window| window.gap_id);
     let mut payload = json!({
-        "account": account.to_string(),
+        FILL_ACCOUNT_FIELD: account.to_string(),
         "attribution": attribution.as_str(),
         "builder_fee": fill.builder_fee.map(|fee| fee.to_string()),
         "cloid": fill.cloid.as_ref().map(|cloid| cloid.as_str()),
@@ -1072,7 +1392,7 @@ fn fill_payload(
         "start_position": fill.start_position.to_string(),
         "sz": fill.sz.to_string(),
         FILL_TID_FIELD: fill.tid,
-        "ts_ms": fill.time,
+        FILL_TS_FIELD: fill.time,
         "venue_hash": fill.hash,
     });
     match attribution {
@@ -1119,17 +1439,9 @@ mod tests {
     use oppen_hl::types::Side;
     use oppen_hl::ws::Subscription;
 
-    use crate::Network;
-    use crate::ledger::{Anchor, NewIntent};
+    use crate::ledger::{Anchor, Event, MAX_PAGE, NewEvent, NewIntent};
 
     use super::*;
-
-    /// A window that starts before every fixture fill and ends after all of
-    /// them, for tests about paging rather than about windows.
-    const WIDE: GapWindow = GapWindow {
-        start_ms: 0,
-        end_ms: u64::MAX,
-    };
 
     /// Unix ms, fixed so a chain built by a test is reproducible.
     const T0: i64 = 1_780_000_000_000;
@@ -1199,7 +1511,11 @@ mod tests {
     /// whatever the test wants.
     #[derive(Debug)]
     struct FakeVenue {
-        fills: Vec<Fill>,
+        network: Network,
+        /// Per container address, because `userFillsByTime` is: a fixture that
+        /// answers every account with the same rows cannot tell a test that
+        /// one container's walk stalled while another's finished.
+        fills: BTreeMap<String, Vec<Fill>>,
         page_limit: usize,
         open_orders: Vec<OpenOrder>,
         statuses: BTreeMap<String, OrderStatusResponse>,
@@ -1209,12 +1525,25 @@ mod tests {
     impl FakeVenue {
         fn new(fills: Vec<Fill>) -> Self {
             FakeVenue {
-                fills,
+                // Every test ledger here is `Network::Testnet`, which is also
+                // oppen's default (`AGENTS.md` invariant 5).
+                network: Network::Testnet,
+                fills: BTreeMap::from([(account().to_string(), fills)]),
                 page_limit: USER_FILLS_PAGE_LIMIT,
                 open_orders: Vec::new(),
                 statuses: BTreeMap::new(),
                 requests: Mutex::new(Vec::new()),
             }
+        }
+
+        fn with_fills_for(mut self, user: Address, fills: Vec<Fill>) -> Self {
+            self.fills.insert(user.to_string(), fills);
+            self
+        }
+
+        fn on_network(mut self, network: Network) -> Self {
+            self.network = network;
+            self
         }
 
         fn with_page_limit(mut self, page_limit: usize) -> Self {
@@ -1241,9 +1570,13 @@ mod tests {
     }
 
     impl ReconcileSource for FakeVenue {
+        fn network(&self) -> Network {
+            self.network
+        }
+
         async fn user_fills_by_time(
             &self,
-            _user: Address,
+            user: Address,
             start_ms: u64,
             end_ms: Option<u64>,
         ) -> std::result::Result<Vec<Fill>, VenueError> {
@@ -1252,7 +1585,9 @@ mod tests {
             }
             let mut rows: Vec<Fill> = self
                 .fills
-                .iter()
+                .get(&user.to_string())
+                .into_iter()
+                .flatten()
                 .filter(|fill| {
                     fill.time >= start_ms && end_ms.is_none_or(|end_ms| fill.time <= end_ms)
                 })
@@ -1364,11 +1699,19 @@ mod tests {
     /// liquidation or a trade from the Hyperliquid web app. All three land;
     /// `docs/specs/history.md` §2 forbids dropping the third for failing to
     /// match.
+    ///
+    /// One fill is already in the chain before the socket drops, because that
+    /// is the shape a live socket dies in: it had been delivering. That row is
+    /// also the venue-time anchor the walk starts from, and the walk re-reads
+    /// it by construction — the venue's `startTime` is inclusive — so this
+    /// gate proves the anchor fill is not chained a second time as well as
+    /// proving nothing was lost.
     #[tokio::test]
     async fn zero_fills_lost_across_a_thirty_second_disconnect() {
         let dir = TempDir::new().expect("tempdir");
         let ledger = open(&dir);
         let user = account();
+        let start = u64::try_from(T0).expect("epoch fits");
 
         let agent_cloid = cloid(1);
         let manual_cloid = cloid(2);
@@ -1383,6 +1726,13 @@ mod tests {
             })
             .expect("operator ticket");
 
+        // The last fill the live feed delivered before the socket died.
+        let delivered = fill_at(10, start, None);
+        Reconciler::new(&ledger, FakeVenue::new(Vec::new()))
+            .expect("reconciler")
+            .apply_fills(user, std::slice::from_ref(&delivered), None)
+            .expect("the live feed had been delivering");
+
         let scope = Subscription::UserFills { user }.key();
         let gap = ledger
             .open_gap(&scope, T0 + 1_000, Some("1006 outbox_overflow"))
@@ -1391,35 +1741,43 @@ mod tests {
             .close_gap(gap.gap_id, T0 + 31_000)
             .expect("close gap 30s later");
 
-        let start = u64::try_from(T0).expect("epoch fits");
         let fills = vec![
+            delivered,
             fill_at(11, start + 5_000, Some(agent_cloid.clone())),
             fill_at(12, start + 15_000, Some(manual_cloid.clone())),
             fill_at(13, start + 25_000, None),
         ];
 
-        let mut reconciler =
-            Reconciler::new(&ledger, FakeVenue::new(fills)).expect("index the chain");
+        let reconciler = Reconciler::new(&ledger, FakeVenue::new(fills)).expect("reconciler");
         let outcomes = reconciler.reconcile_all(&[]).await.expect("reconcile");
 
         assert_eq!(outcomes.len(), 1, "one gap, one outcome");
         let outcome = &outcomes[0];
-        assert_eq!(outcome.status, GapStatus::Reconciled);
-        assert_eq!(outcome.recovered.fills_seen, 3);
+        assert!(
+            matches!(outcome.status, GapStatus::Reconciled),
+            "{:?}",
+            outcome.status
+        );
+        assert_eq!(outcome.recovered.fills_seen, 4);
         assert_eq!(outcome.recovered.fills_recorded, 3);
+        assert_eq!(
+            outcome.recovered.duplicates, 1,
+            "the anchor fill came back and must not be chained twice"
+        );
         assert_eq!(outcome.recovered.attributed, 1);
         assert_eq!(outcome.recovered.manual, 1);
         assert_eq!(outcome.recovered.external, 1);
 
         // Not one fill missing.
-        assert_eq!(chain_tids(&ledger), BTreeSet::from([11, 12, 13]));
+        assert_eq!(chain_tids(&ledger), BTreeSet::from([10, 11, 12, 13]));
 
-        // The window covered was exactly the gap's, both ends inclusive.
-        let venue_start = u64::try_from(T0 + 1_000).expect("epoch fits");
-        let venue_end = u64::try_from(T0 + 31_000).expect("epoch fits");
+        // The walk starts from what the venue stamped on the fill the chain
+        // already held, less the delivery margin — no host reading anywhere.
+        // The end is open: the venue's own now is the only instant provably at
+        // or after the reconnect.
         assert_eq!(
             reconciler.source.requests(),
-            vec![(venue_start, Some(venue_end))],
+            vec![(start - VENUE_CLOCK_MARGIN_MS, None)],
             "one short page ends the walk"
         );
 
@@ -1431,6 +1789,7 @@ mod tests {
         // The attributed fill names the agent, and does so from the intent
         // rather than from anything the caller supplied.
         let rows = chain_fills(&ledger);
+        assert_eq!(rows.len(), 4);
         let attributed = rows
             .iter()
             .find(|event| {
@@ -1446,6 +1805,192 @@ mod tests {
         let payload = attributed.payload.as_ref().expect("payload");
         assert_eq!(payload["attribution"], json!("attributed"));
         assert_eq!(payload["recovered_from_gap"], json!(gap.gap_id));
+    }
+
+    /// The P2 gate again, this time with the two clocks disagreeing.
+    ///
+    /// `feed_gaps` is stamped from the host's wall clock and
+    /// `userFillsByTime` answers in the venue's. Here the host is an hour
+    /// ahead — a laptop back from sleep before NTP has stepped it, which is
+    /// the exact machine this module exists for. Passing the gap's own
+    /// timestamps through as venue bounds asks for an hour in the future, the
+    /// venue truthfully answers with nothing, the short page ends the walk,
+    /// and the gap is marked reconciled with three real fills missing and no
+    /// error anywhere.
+    ///
+    /// The chain is seeded with one fill first, so the account has a venue
+    /// instant to reason from: that reading, not the host clock, is what has
+    /// to decide the start.
+    #[tokio::test]
+    async fn a_host_clock_running_ahead_does_not_shrink_the_window() {
+        let dir = TempDir::new().expect("tempdir");
+        let ledger = open(&dir);
+        let user = account();
+        let venue_now = u64::try_from(T0).expect("epoch fits");
+
+        // One fill already in the chain, stamped by the venue.
+        let seed = fill_at(70, venue_now, None);
+        Reconciler::new(&ledger, FakeVenue::new(Vec::new()))
+            .expect("reconciler")
+            .apply_fills(user, std::slice::from_ref(&seed), None)
+            .expect("seed the chain");
+
+        // The socket drops and returns 30 s later, both stamped by a host
+        // clock that is an hour fast.
+        const SKEW_MS: i64 = 60 * 60 * 1_000;
+        let scope = Subscription::UserFills { user }.key();
+        let opened = ledger
+            .open_gap(&scope, T0 + SKEW_MS, None)
+            .expect("open gap");
+        ledger
+            .close_gap(opened.gap_id, T0 + SKEW_MS + 30_000)
+            .expect("close gap 30s later");
+
+        // The fills the outage swallowed, stamped by the venue — an hour
+        // before the window the host would have asked for.
+        let missed = vec![
+            fill_at(71, venue_now + 5_000, None),
+            fill_at(72, venue_now + 15_000, None),
+            fill_at(73, venue_now + 25_000, None),
+        ];
+        let mut venue_fills = vec![seed];
+        venue_fills.extend(missed);
+
+        let reconciler = Reconciler::new(&ledger, FakeVenue::new(venue_fills)).expect("reconciler");
+        let outcomes = reconciler.reconcile_all(&[]).await.expect("reconcile");
+
+        assert_eq!(outcomes.len(), 1);
+        assert!(
+            matches!(outcomes[0].status, GapStatus::Reconciled),
+            "{:?}",
+            outcomes[0].status
+        );
+        assert_eq!(
+            chain_tids(&ledger),
+            BTreeSet::from([70, 71, 72, 73]),
+            "a fill inside the outage was never fetched, and the gap was closed anyway"
+        );
+
+        // The request is derived from the venue's own stamp, not the host's:
+        // the seeded fill's timestamp, less the margin. Never the hour-ahead
+        // gap row, and never with an end the host clock invented.
+        assert_eq!(
+            reconciler.source.requests(),
+            vec![(venue_now - VENUE_CLOCK_MARGIN_MS, None)]
+        );
+    }
+
+    /// The same skew at the other end of the window.
+    ///
+    /// A host clock an hour *behind* the venue makes `closed_ts_ms` an hour
+    /// early. Handing that to `endTime` truncates the window before the fills
+    /// the outage swallowed even reach it — the start can be perfect and the
+    /// tail is still lost, and the gap is still marked reconciled. There is no
+    /// end oppen can name safely, so the walk names none and takes the venue's
+    /// own now, which is by construction at or after the reconnect.
+    #[tokio::test]
+    async fn a_host_clock_running_behind_does_not_truncate_the_window() {
+        let dir = TempDir::new().expect("tempdir");
+        let ledger = open(&dir);
+        let user = account();
+        let venue_now = u64::try_from(T0).expect("epoch fits");
+        const SKEW_MS: i64 = 60 * 60 * 1_000;
+
+        let seed = fill_at(74, venue_now, None);
+        Reconciler::new(&ledger, FakeVenue::new(Vec::new()))
+            .expect("reconciler")
+            .apply_fills(user, std::slice::from_ref(&seed), None)
+            .expect("seed the chain");
+
+        let scope = Subscription::UserFills { user }.key();
+        let opened = ledger
+            .open_gap(&scope, T0 - SKEW_MS, None)
+            .expect("open gap");
+        ledger
+            .close_gap(opened.gap_id, T0 - SKEW_MS + 30_000)
+            .expect("close gap 30s later");
+
+        let mut venue_fills = vec![seed];
+        venue_fills.extend([
+            fill_at(75, venue_now + 5_000, None),
+            fill_at(76, venue_now + 25_000, None),
+        ]);
+
+        let reconciler = Reconciler::new(&ledger, FakeVenue::new(venue_fills)).expect("reconciler");
+        let outcomes = reconciler.reconcile_all(&[]).await.expect("reconcile");
+
+        assert!(
+            matches!(outcomes[0].status, GapStatus::Reconciled),
+            "{:?}",
+            outcomes[0].status
+        );
+        assert_eq!(
+            chain_tids(&ledger),
+            BTreeSet::from([74, 75, 76]),
+            "the tail of the outage fell outside an end the host clock invented"
+        );
+        // An hour of skew moves nothing: the start comes off the anchor and
+        // the walk carries no end bound at all.
+        assert_eq!(
+            reconciler.source.requests(),
+            vec![(venue_now - VENUE_CLOCK_MARGIN_MS, None)],
+        );
+    }
+
+    /// The window is derived from the chain, and the host clock is not an
+    /// input to it.
+    ///
+    /// The old shape took `min(anchor, gap.opened_ts_ms)`, which defends only
+    /// while the host runs slow. Run it fast and the anchor decides alone —
+    /// and an anchor a *later* walk had already pushed past the outage then
+    /// carried the window with it, past the very fills the walk exists to
+    /// recover, with the gap marked reconciled anyway.
+    ///
+    /// So: one gap, three host clocks an hour apart, one anchor. One answer.
+    #[test]
+    fn the_window_comes_from_the_chain_and_never_from_the_host_clock() {
+        let gap = |opened_ts_ms: i64| Gap {
+            gap_id: 1,
+            scope: "userFills:x".to_owned(),
+            opened_ts_ms,
+            closed_ts_ms: Some(opened_ts_ms + 30_000),
+            reconciled_ts_ms: None,
+            open_seq: 1,
+            close_seq: Some(2),
+            note: None,
+        };
+        let anchor = u64::try_from(T0).expect("epoch fits");
+        const HOUR_MS: i64 = 60 * 60 * 1_000;
+
+        let expected = Window {
+            start_ms: anchor - VENUE_CLOCK_MARGIN_MS,
+            outage_ends_ms: Some(anchor + 30_000 + VENUE_CLOCK_MARGIN_MS),
+        };
+        for skew in [-HOUR_MS, 0, HOUR_MS] {
+            let opened = T0 + skew;
+            assert_eq!(
+                outage_window(&gap(opened), opened + 30_000, Some(anchor)).expect("window"),
+                expected,
+                "a host clock {skew} ms out moved the window"
+            );
+        }
+
+        // With no anchor there is no venue instant to reason from: the walk
+        // covers a bounded lookback instead of the epoch, and claims no
+        // outage window at all.
+        let opened = T0 + HOUR_MS;
+        let first_run = outage_window(&gap(opened), opened + 30_000, None).expect("window");
+        assert_eq!(
+            first_run,
+            Window {
+                start_ms: u64::try_from(opened).expect("fits") - FIRST_RUN_LOOKBACK_MS,
+                outage_ends_ms: None,
+            }
+        );
+        assert!(
+            first_run.start_ms > 0,
+            "a first run must not walk from the epoch"
+        );
     }
 
     /// Idempotence, which is the whole property.
@@ -1466,14 +2011,14 @@ mod tests {
             fill_at(23, start + 3, None),
         ];
 
-        let mut first = Reconciler::new(&ledger, FakeVenue::new(Vec::new())).expect("reconciler");
+        let first = Reconciler::new(&ledger, FakeVenue::new(Vec::new())).expect("reconciler");
         let recovered = first.apply_fills(user, &fills, None).expect("apply once");
         assert_eq!(recovered.fills_recorded, 3);
         assert_eq!(recovered.duplicates, 0);
         let after_first = head(&ledger);
 
         for attempt in 2..=3 {
-            let mut again =
+            let again =
                 Reconciler::new(&ledger, FakeVenue::new(Vec::new())).expect("fresh reconciler");
             let repeat = again.apply_fills(user, &fills, None).expect("apply again");
             assert_eq!(repeat.fills_recorded, 0, "attempt {attempt} wrote a row");
@@ -1507,7 +2052,7 @@ mod tests {
         let start = u64::try_from(T0).expect("epoch fits");
         let fills = vec![fill_at(31, start + 10, None), fill_at(32, start + 20, None)];
 
-        let mut reconciler =
+        let reconciler =
             Reconciler::new(&ledger, FakeVenue::new(fills.clone())).expect("reconciler");
         let first = reconciler
             .reconcile_gap(&gap, &[])
@@ -1522,7 +2067,7 @@ mod tests {
             .expect("second pass");
         assert_eq!(second.recovered.fills_recorded, 0);
         assert_eq!(second.recovered.duplicates, 2);
-        assert_eq!(second.status, GapStatus::Reconciled);
+        assert!(matches!(second.status, GapStatus::Reconciled));
         assert_eq!(head(&ledger), after_first);
     }
 
@@ -1541,7 +2086,7 @@ mod tests {
             fill_at(42, start + 2, Some(orphan.clone())),
         ];
 
-        let mut reconciler = Reconciler::new(&ledger, FakeVenue::new(Vec::new())).expect("index");
+        let reconciler = Reconciler::new(&ledger, FakeVenue::new(Vec::new())).expect("reconciler");
         let recovered = reconciler.apply_fills(user, &fills, None).expect("apply");
 
         assert_eq!(recovered.fills_recorded, 2);
@@ -1590,7 +2135,7 @@ mod tests {
             })
             .expect("intent");
 
-        let mut reconciler = Reconciler::new(&ledger, FakeVenue::new(Vec::new())).expect("index");
+        let reconciler = Reconciler::new(&ledger, FakeVenue::new(Vec::new())).expect("reconciler");
         let start = u64::try_from(T0).expect("epoch fits");
         let recovered = reconciler
             .apply_fills(user, &[fill_at(51, start + 1, Some(nested))], None)
@@ -1622,7 +2167,7 @@ mod tests {
             max_pages: 16,
             page_limit: 8,
         };
-        let (recovered, pages) = backfill_fills(&venue, account(), WIDE, config)
+        let (recovered, pages) = backfill_fills(&venue, account(), 0, config)
             .await
             .expect("walk the window");
 
@@ -1640,11 +2185,7 @@ mod tests {
         // and the duplicate it returns is removed by tid.
         assert_eq!(
             venue.requests(),
-            vec![
-                (0, Some(u64::MAX)),
-                (1_006, Some(u64::MAX)),
-                (1_007, Some(u64::MAX)),
-            ]
+            vec![(0, None), (1_006, None), (1_007, None)]
         );
     }
 
@@ -1658,7 +2199,7 @@ mod tests {
             max_pages: 8,
             page_limit: 4,
         };
-        let error = backfill_fills(&venue, account(), WIDE, config)
+        let error = backfill_fills(&venue, account(), 0, config)
             .await
             .expect_err("an unadvanceable cursor must not be papered over");
         assert!(
@@ -1696,16 +2237,20 @@ mod tests {
             max_pages: 8,
             page_limit: 4,
         };
-        let mut reconciler =
-            Reconciler::with_config(&ledger, venue, config).expect("index the chain");
+        let reconciler = Reconciler::with_config(&ledger, venue, config).expect("reconciler");
 
-        let error = reconciler
+        let outcomes = reconciler
             .reconcile_all(&[])
             .await
-            .expect_err("the window could not be proven contiguous");
+            .expect("the run reports");
+        assert_eq!(outcomes.len(), 1);
         assert!(
-            matches!(error, ReconcileError::PageStalled { .. }),
-            "{error}"
+            matches!(
+                outcomes[0].status,
+                GapStatus::Failed(ReconcileError::PageStalled { .. })
+            ),
+            "{:?}",
+            outcomes[0].status
         );
 
         let still_open = ledger.unreconciled_gaps().expect("gaps");
@@ -1733,7 +2278,7 @@ mod tests {
             max_pages: 3,
             page_limit: 2,
         };
-        let error = backfill_fills(&venue, account(), WIDE, config)
+        let error = backfill_fills(&venue, account(), 0, config)
             .await
             .expect_err("the budget must bite");
         assert!(
@@ -1827,13 +2372,13 @@ mod tests {
 
         let gone = cloid(0xc1);
         let venue = FakeVenue::new(Vec::new()).with_open_orders(vec![open_order(9, None)]);
-        let mut reconciler = Reconciler::new(&ledger, venue).expect("index");
+        let reconciler = Reconciler::new(&ledger, venue).expect("reconciler");
         let outcome = reconciler
             .reconcile_gap(&gap, std::slice::from_ref(&gone))
             .await
             .expect("reconcile");
 
-        assert_eq!(outcome.status, GapStatus::Reconciled);
+        assert!(matches!(outcome.status, GapStatus::Reconciled));
         assert_eq!(outcome.resting_orders, Some(1));
         assert_eq!(outcome.settled.len(), 1);
         assert_eq!(outcome.settled[0].1, Settlement::Retired);
@@ -1863,10 +2408,10 @@ mod tests {
             .expect("open gap");
         ledger.close_gap(gap.gap_id, T0 + 1_000).expect("close gap");
 
-        let mut reconciler = Reconciler::new(&ledger, FakeVenue::new(Vec::new())).expect("index");
+        let reconciler = Reconciler::new(&ledger, FakeVenue::new(Vec::new())).expect("reconciler");
         let outcomes = reconciler.reconcile_all(&[]).await.expect("reconcile");
         assert_eq!(outcomes.len(), 1);
-        assert_eq!(outcomes[0].status, GapStatus::NotAnAccountFeed);
+        assert!(matches!(outcomes[0].status, GapStatus::NotAnAccountFeed));
         assert_eq!(
             ledger.unreconciled_gaps().expect("gaps").len(),
             1,
@@ -1884,12 +2429,12 @@ mod tests {
             .open_gap(&Subscription::UserFills { user }.key(), T0, None)
             .expect("open gap");
 
-        let mut reconciler = Reconciler::new(&ledger, FakeVenue::new(Vec::new())).expect("index");
+        let reconciler = Reconciler::new(&ledger, FakeVenue::new(Vec::new())).expect("reconciler");
         let outcome = reconciler
             .reconcile_gap(&gap, &[])
             .await
             .expect("reconcile");
-        assert_eq!(outcome.status, GapStatus::StillOpen);
+        assert!(matches!(outcome.status, GapStatus::StillOpen));
         assert_eq!(ledger.unreconciled_gaps().expect("gaps").len(), 1);
     }
 
@@ -1904,7 +2449,7 @@ mod tests {
     async fn every_money_field_is_stored_as_a_decimal_string() {
         let dir = TempDir::new().expect("tempdir");
         let ledger = open(&dir);
-        let mut reconciler = Reconciler::new(&ledger, FakeVenue::new(Vec::new())).expect("index");
+        let reconciler = Reconciler::new(&ledger, FakeVenue::new(Vec::new())).expect("reconciler");
         let start = u64::try_from(T0).expect("epoch fits");
         reconciler
             .apply_fills(account(), &[fill_at(61, start, None)], None)
@@ -1968,7 +2513,604 @@ mod tests {
         ));
     }
 
-    /// A gap window that runs backwards is refused rather than clamped.
+    /// An intent recorded after the reconciler was built still attributes.
+    ///
+    /// The index is a cache of a chain other code writes to. The execution
+    /// path appends intents whenever an agent orders, and a `Reconciler` that
+    /// indexed once at construction never sees them: the fill matches
+    /// nothing, lands as `external`, and the agent, the reason and the
+    /// guardrail verdict are gone from the record. Nothing errors, and no
+    /// count is off — the fill is there, booked to nobody.
+    #[tokio::test]
+    async fn an_intent_recorded_after_construction_still_attributes_its_fill() {
+        let dir = TempDir::new().expect("tempdir");
+        let ledger = open(&dir);
+        let user = account();
+        let scope = Subscription::UserFills { user }.key();
+        let opened = ledger.open_gap(&scope, T0, None).expect("open gap");
+        ledger
+            .close_gap(opened.gap_id, T0 + 30_000)
+            .expect("close gap");
+        let gap = reload_gap(&ledger, opened.gap_id);
+
+        let late = cloid(0x1a7e);
+        let start = u64::try_from(T0).expect("epoch fits");
+        let venue = FakeVenue::new(vec![fill_at(81, start + 10, Some(late.clone()))]);
+        let reconciler = Reconciler::new(&ledger, venue).expect("reconciler");
+
+        // Only now does the execution path record the intent.
+        record_intent(&ledger, "scout", &late);
+
+        let outcome = reconciler
+            .reconcile_gap(&gap, &[])
+            .await
+            .expect("reconcile");
+        assert_eq!(
+            outcome.recovered.attributed, 1,
+            "the fill was booked to nobody: the index never saw the intent"
+        );
+        assert_eq!(outcome.recovered.external, 0);
+        let row = chain_fills(&ledger).pop().expect("the fill row");
+        assert_eq!(row.agent_id.as_deref(), Some("scout"));
+    }
+
+    /// A fill another writer already chained is not chained a second time.
+    ///
+    /// The chain is append-only, so a duplicate cannot be taken back out. A
+    /// reconciler that indexed at construction does not know about rows a
+    /// restarting process, or the live feed, appended since.
+    #[tokio::test]
+    async fn a_fill_chained_after_construction_is_not_appended_twice() {
+        let dir = TempDir::new().expect("tempdir");
+        let ledger = open(&dir);
+        let user = account();
+        let scope = Subscription::UserFills { user }.key();
+        let opened = ledger.open_gap(&scope, T0, None).expect("open gap");
+        ledger
+            .close_gap(opened.gap_id, T0 + 30_000)
+            .expect("close gap");
+        let gap = reload_gap(&ledger, opened.gap_id);
+
+        let start = u64::try_from(T0).expect("epoch fits");
+        let fill = fill_at(82, start + 10, None);
+        let reconciler =
+            Reconciler::new(&ledger, FakeVenue::new(vec![fill.clone()])).expect("reconciler");
+
+        // Somebody else chains the fill after this reconciler indexed.
+        let other = Reconciler::new(&ledger, FakeVenue::new(Vec::new())).expect("reconciler");
+        other
+            .apply_fills(user, std::slice::from_ref(&fill), None)
+            .expect("the other writer records it");
+        assert_eq!(chain_fills(&ledger).len(), 1);
+
+        let outcome = reconciler
+            .reconcile_gap(&gap, &[])
+            .await
+            .expect("reconcile");
+        assert_eq!(outcome.recovered.fills_recorded, 0);
+        assert_eq!(outcome.recovered.duplicates, 1);
+        assert_eq!(
+            chain_fills(&ledger).len(),
+            1,
+            "tid 82 is in the append-only chain twice and cannot be removed"
+        );
+    }
+
+    /// A fill cannot reach the chain without its idempotence key.
+    ///
+    /// The old shape read the `tid` back out of the payload to dedupe, which
+    /// made every writer's payload *shape* part of the idempotence property:
+    /// [`Ledger::record_outcome`] nests what it is handed under `outcome`, and
+    /// a search that returned the first `tid` in a row re-chained the rest of
+    /// them. None of that is representable now. A fill row has exactly one
+    /// door, that door takes the trade id as an argument, and the generic
+    /// paths refuse the kind outright.
+    #[tokio::test]
+    async fn a_fill_cannot_be_chained_without_its_idempotence_key() {
+        let dir = TempDir::new().expect("tempdir");
+        let ledger = open(&dir);
+        let user = account();
+        let start = u64::try_from(T0).expect("epoch fits");
+        let fill = fill_at(83, start + 10, None);
+        let payload = fill_payload(user, &fill, &Attribution::External, None);
+
+        assert!(matches!(
+            ledger.append(&NewEvent {
+                kind: EventKind::Fill,
+                ts_ms: T0 + 10,
+                agent_id: None,
+                payload: &payload,
+                snapshot: None,
+            }),
+            Err(LedgerError::UseRecordFill)
+        ));
+
+        let receipt = ledger
+            .record_intent(&NewIntent {
+                agent_id: "scout",
+                ts_ms: T0,
+                payload: &json!({ "coin": "ETH" }),
+                snapshot: None,
+            })
+            .expect("record intent");
+        assert!(matches!(
+            ledger.record_outcome(&receipt, EventKind::Fill, T0 + 10, &payload),
+            Err(LedgerError::UseRecordFill)
+        ));
+        assert!(
+            chain_fills(&ledger).is_empty(),
+            "a refused append must not leave a row"
+        );
+
+        // And the one door records it exactly once, however many times it is
+        // offered.
+        let reconciler = Reconciler::new(&ledger, FakeVenue::new(Vec::new())).expect("reconciler");
+        for _ in 0..3 {
+            reconciler
+                .apply_fills(user, std::slice::from_ref(&fill), None)
+                .expect("apply");
+        }
+        assert_eq!(chain_fills(&ledger).len(), 1);
+    }
+
+    /// The duplicate is refused by the database, inside the write.
+    ///
+    /// This is the property an in-memory index could not have. Its refresh
+    /// closed the window before the walk and not during it, and during the
+    /// walk is exactly when a resumed socket replays its subscribe snapshot.
+    /// Here the second write is offered with the first one's row already
+    /// committed and no cache anywhere in between: the partial unique index
+    /// decides, in the same statement that would have inserted.
+    #[tokio::test]
+    async fn a_second_write_of_one_trade_is_refused_by_the_index_not_by_a_cache() {
+        let dir = TempDir::new().expect("tempdir");
+        let ledger = open(&dir);
+        let user = account();
+        let other =
+            Address::parse("0x2222222222222222222222222222222222222222").expect("second container");
+        let payload = json!({ "coin": "ETH" });
+        let (user_text, other_text) = (user.to_string(), other.to_string());
+        fn one_trade<'a>(account: &'a str, payload: &'a Value) -> NewFill<'a> {
+            NewFill {
+                account,
+                tid: 4_242,
+                ts_ms: T0,
+                agent_id: None,
+                payload,
+            }
+        }
+
+        let first = ledger
+            .record_fill(&one_trade(&user_text, &payload))
+            .expect("record")
+            .expect("the first write lands");
+        let head_after_first = head(&ledger);
+        assert!(
+            ledger
+                .record_fill(&one_trade(&user_text, &payload))
+                .expect("record")
+                .is_none(),
+            "the same trade id was chained twice"
+        );
+        assert_eq!(
+            head(&ledger),
+            head_after_first,
+            "a refused write moved the chain head"
+        );
+        assert_eq!(chain_fills(&ledger).len(), 1);
+        assert_eq!(first.seq, 1);
+
+        // The key is the pair, not the trade id alone: a trade has two sides,
+        // and an operator running two containers can be both of them.
+        assert!(
+            ledger
+                .record_fill(&one_trade(&other_text, &payload))
+                .expect("record")
+                .is_some(),
+            "the other side of the trade landed on a different container"
+        );
+        assert_eq!(chain_fills(&ledger).len(), 2);
+        assert!(ledger.verify().expect("verify").first_break.is_none());
+    }
+
+    /// A first run has no venue instant to reason from, and says so.
+    ///
+    /// Walking from the epoch was the old answer, and it could not close: a
+    /// container with any history exhausts the page budget before it reaches
+    /// the outage, so the gap stayed open and the overlay stayed up forever.
+    /// The walk is bounded instead, the boundary is reported, and no fill it
+    /// finds is claimed for an outage whose venue-time window is unknown.
+    #[tokio::test]
+    async fn a_first_run_gap_walks_a_bounded_window_and_says_so() {
+        let dir = TempDir::new().expect("tempdir");
+        let ledger = open(&dir);
+        let user = account();
+        let start = u64::try_from(T0).expect("epoch fits");
+        let scope = Subscription::UserFills { user }.key();
+        let opened = ledger.open_gap(&scope, T0, None).expect("open gap");
+        ledger
+            .close_gap(opened.gap_id, T0 + 30_000)
+            .expect("close gap");
+        let gap = reload_gap(&ledger, opened.gap_id);
+
+        let venue = FakeVenue::new(vec![fill_at(84, start + 10_000, None)]);
+        let reconciler = Reconciler::new(&ledger, venue).expect("reconciler");
+        let outcome = reconciler
+            .reconcile_gap(&gap, &[])
+            .await
+            .expect("reconcile");
+
+        assert!(matches!(outcome.status, GapStatus::Reconciled));
+        assert_eq!(outcome.recovered.fills_recorded, 1);
+        assert_eq!(
+            reconciler.source.requests(),
+            vec![(start - FIRST_RUN_LOOKBACK_MS, None)],
+            "a first run must walk a bounded window, not all of history"
+        );
+        assert!(
+            outcome
+                .recovered
+                .findings
+                .contains(&Finding::FirstRunWindow {
+                    account: user.to_string(),
+                    start_ms: start - FIRST_RUN_LOOKBACK_MS,
+                }),
+            "the completeness boundary was not reported: {:?}",
+            outcome.recovered.findings
+        );
+        let row = chain_fills(&ledger).pop().expect("the fill row");
+        assert_eq!(
+            row.payload.as_ref().expect("payload")["recovered_from_gap"],
+            json!(null),
+            "nothing here establishes that this fill fell inside the outage"
+        );
+    }
+
+    /// A fill from after the reconnect is recorded, and is not claimed for the
+    /// outage.
+    ///
+    /// The walk has no end bound, so it meets fills that happened after the
+    /// socket came back — those are the live feed's. Stamping them
+    /// `recovered_from_gap` writes a false statement into the one table kept
+    /// forever.
+    #[tokio::test]
+    async fn a_fill_after_the_reconnect_is_not_stamped_as_recovered() {
+        let dir = TempDir::new().expect("tempdir");
+        let ledger = open(&dir);
+        let user = account();
+        let venue_now = u64::try_from(T0).expect("epoch fits");
+
+        let anchor = fill_at(85, venue_now, None);
+        Reconciler::new(&ledger, FakeVenue::new(Vec::new()))
+            .expect("reconciler")
+            .apply_fills(user, std::slice::from_ref(&anchor), None)
+            .expect("the live feed had been delivering");
+
+        let scope = Subscription::UserFills { user }.key();
+        let opened = ledger.open_gap(&scope, T0, None).expect("open gap");
+        ledger
+            .close_gap(opened.gap_id, T0 + 30_000)
+            .expect("close gap");
+        let gap = reload_gap(&ledger, opened.gap_id);
+
+        // One fill inside the outage, one an hour after the socket came back.
+        let inside = fill_at(86, venue_now + 10_000, None);
+        let after = fill_at(87, venue_now + 60 * 60 * 1_000, None);
+        let venue = FakeVenue::new(vec![anchor, inside, after]);
+        let reconciler = Reconciler::new(&ledger, venue).expect("reconciler");
+        let outcome = reconciler
+            .reconcile_gap(&gap, &[])
+            .await
+            .expect("reconcile");
+
+        assert!(matches!(outcome.status, GapStatus::Reconciled));
+        assert_eq!(outcome.recovered.fills_recorded, 2);
+        let stamp = |tid: u64| {
+            chain_fills(&ledger)
+                .into_iter()
+                .find_map(|event| {
+                    let payload = event.payload?;
+                    (payload["tid"] == json!(tid)).then(|| payload["recovered_from_gap"].clone())
+                })
+                .expect("the fill row")
+        };
+        assert_eq!(stamp(86), json!(gap.gap_id), "the outage's own fill");
+        assert_eq!(
+            stamp(87),
+            json!(null),
+            "a fill from an hour after the reconnect was claimed for the outage"
+        );
+    }
+
+    /// An anchor that postdates the disconnect is not an anchor.
+    ///
+    /// The anchor is the newest venue stamp on a fill the chain held before the
+    /// socket died, and `MAX(ts_ms)` believes whatever is in the row. One fill
+    /// stamped in the future — a bad venue timestamp, or an edited file, which
+    /// `Ledger` treats as in scope because the database is user-writable — then
+    /// starts every later walk on that container after the fills it exists to
+    /// recover. The venue truthfully answers with nothing, the page is short,
+    /// and the gap is marked reconciled: the P2 gate failing while reporting
+    /// success, permanently, because an append-only chain cannot drop the row.
+    ///
+    /// So an anchor more than [`FIRST_RUN_LOOKBACK_MS`] past the host's account
+    /// of the disconnect is discarded and the bounded first-run walk answers
+    /// instead. That widens the window and never narrows it, and the operator is
+    /// told the boundary rather than shown an empty recovery.
+    #[tokio::test]
+    async fn an_anchor_from_the_future_is_discarded_rather_than_believed() {
+        let dir = TempDir::new().expect("tempdir");
+        let ledger = open(&dir);
+        let user = account();
+        let venue_now = u64::try_from(T0).expect("epoch fits");
+        let decade = 10 * 365 * 24 * 60 * 60 * 1_000;
+
+        // One fill the venue stamped ten years out, durable before the gap
+        // opens and so inside the anchor's own chain window.
+        let poisoned = fill_at(91, venue_now + decade, None);
+        let seeder = Reconciler::new(&ledger, FakeVenue::new(Vec::new())).expect("reconciler");
+        seeder
+            .apply_fills(user, std::slice::from_ref(&poisoned), None)
+            .expect("a stamp nobody checked");
+
+        let scope = Subscription::UserFills { user }.key();
+        let opened = ledger.open_gap(&scope, T0, None).expect("open gap");
+        ledger
+            .close_gap(opened.gap_id, T0 + 30_000)
+            .expect("close gap");
+        let gap = reload_gap(&ledger, opened.gap_id);
+
+        let missed = fill_at(92, venue_now + 10_000, None);
+        let venue = FakeVenue::new(vec![poisoned, missed]);
+        let reconciler = Reconciler::new(&ledger, venue).expect("reconciler");
+        let outcome = reconciler
+            .reconcile_gap(&gap, &[])
+            .await
+            .expect("reconcile");
+
+        assert_eq!(
+            reconciler.source.requests(),
+            vec![(venue_now - FIRST_RUN_LOOKBACK_MS, None)],
+            "a fill stamped in the future moved the window past the outage"
+        );
+        assert!(
+            chain_tids(&ledger).contains(&92),
+            "the missed fill was never fetched, and the gap closed anyway"
+        );
+        assert!(matches!(outcome.status, GapStatus::Reconciled));
+        assert_eq!(
+            outcome.recovered.findings,
+            vec![
+                Finding::UnattributedFill {
+                    tid: 92,
+                    oid: 900_092,
+                    coin: "ETH".to_owned(),
+                    ts_ms: T0 + 10_000,
+                    cloid: None,
+                },
+                Finding::FirstRunWindow {
+                    account: user.to_string(),
+                    start_ms: venue_now - FIRST_RUN_LOOKBACK_MS,
+                },
+            ],
+            "the completeness boundary of a walk with no believable anchor was not reported"
+        );
+        // Nothing is claimed for the outage: with no anchor there is no venue
+        // instant that says when the outage was.
+        let stamped = chain_fills(&ledger).into_iter().any(|event| {
+            event
+                .payload
+                .is_some_and(|payload| payload["recovered_from_gap"] != json!(null))
+        });
+        assert!(
+            !stamped,
+            "a fill was claimed for an outage with no known window"
+        );
+    }
+
+    /// The cloid at the payload root beats every nested one, and the walk below
+    /// the root is deterministic.
+    ///
+    /// [`Attributions`] argues the join "degrades safely" across a payload shape
+    /// change on exactly one property: an object's own `cloid` is read before any
+    /// of its children. That is what this pins. What it deliberately does *not*
+    /// pin as a rule is that the shallowest occurrence anywhere wins — the walk
+    /// is depth-first in sorted key order, so a cloid two levels under an early
+    /// key is found before one a single level under a later key. The second
+    /// assertion locks that answer so the doc comment and the code cannot drift
+    /// apart again.
+    #[test]
+    fn the_cloid_at_the_payload_root_beats_every_nested_one() {
+        let (root, nested) = (cloid(11), cloid(12));
+        assert_eq!(
+            find_cloid(
+                &json!({ "cloid": root.as_str(), "a": { "cloid": nested.as_str() } }),
+                0
+            ),
+            Some(root.as_str().to_owned()),
+            "a nested cloid outranked the one at the root"
+        );
+
+        let (early, late) = (cloid(13), cloid(14));
+        assert_eq!(
+            find_cloid(
+                &json!({
+                    "a": { "b": { "cloid": early.as_str() } },
+                    "z": { "cloid": late.as_str() }
+                }),
+                0
+            ),
+            Some(early.as_str().to_owned()),
+            "the walk is depth-first in sorted key order, not breadth-first"
+        );
+    }
+
+    /// A fill recorded after the disconnect cannot move that gap's anchor.
+    ///
+    /// This is the failure the two-clock `min` hid. The anchor is read at the
+    /// gap's own chain position, so a row written after the socket died — by
+    /// an overlapping walk, or by the live feed once it resumed — is not a
+    /// statement about what oppen was being served during the outage and
+    /// cannot drag the window past the fills it exists to recover.
+    #[tokio::test]
+    async fn a_fill_recorded_after_the_disconnect_cannot_move_the_anchor() {
+        let dir = TempDir::new().expect("tempdir");
+        let ledger = open(&dir);
+        let user = account();
+        let venue_now = u64::try_from(T0).expect("epoch fits");
+
+        let anchor = fill_at(88, venue_now, None);
+        let seeder = Reconciler::new(&ledger, FakeVenue::new(Vec::new())).expect("reconciler");
+        seeder
+            .apply_fills(user, std::slice::from_ref(&anchor), None)
+            .expect("delivered before the socket died");
+
+        let scope = Subscription::UserFills { user }.key();
+        let opened = ledger.open_gap(&scope, T0, None).expect("open gap");
+        ledger
+            .close_gap(opened.gap_id, T0 + 30_000)
+            .expect("close gap");
+        let gap = reload_gap(&ledger, opened.gap_id);
+
+        // A day later another walk recovers a much newer fill onto the same
+        // container, so its venue stamp is now the newest in the chain.
+        let day = 24 * 60 * 60 * 1_000;
+        let late = fill_at(89, venue_now + day, None);
+        seeder
+            .apply_fills(user, std::slice::from_ref(&late), None)
+            .expect("a later walk");
+
+        let missed = fill_at(90, venue_now + 10_000, None);
+        let venue = FakeVenue::new(vec![anchor, missed, late]);
+        let reconciler = Reconciler::new(&ledger, venue).expect("reconciler");
+        let outcome = reconciler
+            .reconcile_gap(&gap, &[])
+            .await
+            .expect("reconcile");
+
+        assert!(matches!(outcome.status, GapStatus::Reconciled));
+        assert_eq!(
+            reconciler.source.requests(),
+            vec![(venue_now - VENUE_CLOCK_MARGIN_MS, None)],
+            "the window started after the fill it was supposed to recover"
+        );
+        assert!(
+            chain_tids(&ledger).contains(&90),
+            "the missed fill was never fetched, and the gap closed anyway"
+        );
+    }
+
+    /// One gap that can never close does not stop the ones after it.
+    ///
+    /// Gaps come off the work list in id order, so returning the first error
+    /// means the oldest broken window blocks every later one — and the later
+    /// ones are the recent trading. Both gaps here are real: the first stalls
+    /// on a page it cannot advance, the second is an ordinary 30 s outage with
+    /// a fill in it.
+    #[tokio::test]
+    async fn a_gap_that_cannot_close_does_not_block_the_ones_behind_it() {
+        let dir = TempDir::new().expect("tempdir");
+        let ledger = open(&dir);
+        let blocked = account();
+        let behind =
+            Address::parse("0x2222222222222222222222222222222222222222").expect("second container");
+        let start = u64::try_from(T0).expect("epoch fits");
+
+        let stuck = ledger
+            .open_gap(&Subscription::UserFills { user: blocked }.key(), T0, None)
+            .expect("open the first gap");
+        ledger
+            .close_gap(stuck.gap_id, T0 + 1_000)
+            .expect("close it");
+        let later = ledger
+            .open_gap(
+                &Subscription::UserFills { user: behind }.key(),
+                T0 + 10_000,
+                None,
+            )
+            .expect("open the second gap");
+        ledger
+            .close_gap(later.gap_id, T0 + 40_000)
+            .expect("close it");
+
+        // Four fills in one millisecond against a two-row page: the first
+        // gap's walk can never advance its cursor. The fifth is the second
+        // gap's, at a millisecond of its own.
+        let stalling: Vec<Fill> = (0..4).map(|i| fill_at(90 + i, start + 5, None)).collect();
+        let config = ReconcileConfig {
+            max_pages: 8,
+            page_limit: 2,
+        };
+        let venue = FakeVenue::new(stalling)
+            .with_fills_for(behind, vec![fill_at(95, start + 20_000, None)])
+            .with_page_limit(2);
+        let reconciler = Reconciler::with_config(&ledger, venue, config).expect("reconciler");
+
+        let outcomes = reconciler
+            .reconcile_all(&[])
+            .await
+            .expect("the run reports");
+        assert_eq!(outcomes.len(), 2, "both gaps were worked");
+        assert!(
+            matches!(
+                outcomes[0].status,
+                GapStatus::Failed(ReconcileError::PageStalled { .. })
+            ),
+            "{:?}",
+            outcomes[0].status
+        );
+        assert!(
+            matches!(outcomes[1].status, GapStatus::Reconciled),
+            "the second gap never got walked: {:?}",
+            outcomes[1].status
+        );
+
+        // The stalled gap keeps its overlay; the one behind it does not.
+        let open_gaps = ledger.unreconciled_gaps().expect("gaps");
+        assert_eq!(open_gaps.len(), 1);
+        assert_eq!(open_gaps[0].gap_id, stuck.gap_id);
+        assert!(
+            chain_tids(&ledger).contains(&95),
+            "the second gap's fill is lost behind the first gap's failure"
+        );
+    }
+
+    /// A mainnet source and a testnet chain never meet.
+    ///
+    /// `docs/decisions.md` R4: "a mainnet number that is actually a testnet
+    /// number is the worst bug this product can ship". R4 puts the two
+    /// networks in two files, which says nothing about a client pointed at the
+    /// wrong one — a mainnet `InfoClient` would answer a testnet gap with real
+    /// mainnet fills and chain them, and nothing downstream could tell.
+    /// Refused where the pair is made, so no such reconciler exists to call.
+    #[test]
+    fn a_source_on_another_network_is_refused_at_construction() {
+        let dir = TempDir::new().expect("tempdir");
+        let ledger = open(&dir);
+        assert_eq!(ledger.network(), Network::Testnet);
+
+        let error = Reconciler::new(
+            &ledger,
+            FakeVenue::new(Vec::new()).on_network(Network::Mainnet),
+        )
+        .expect_err("a mainnet source must not reconcile a testnet chain");
+        assert!(
+            matches!(
+                error,
+                ReconcileError::NetworkMismatch {
+                    ledger: Network::Testnet,
+                    venue: Network::Mainnet,
+                }
+            ),
+            "{error}"
+        );
+
+        // And the matching pair is accepted, so the check is the network and
+        // not the construction.
+        assert!(Reconciler::new(&ledger, FakeVenue::new(Vec::new())).is_ok());
+    }
+
+    /// A gap row that runs backwards is refused rather than clamped.
     #[test]
     fn an_inverted_window_is_refused() {
         let gap = Gap {
@@ -1981,8 +3123,15 @@ mod tests {
             close_seq: Some(2),
             note: None,
         };
+        // Refused with an anchor and without one: the gap row is the only
+        // account oppen has of when it stopped listening, and a row that
+        // closes before it opens is not an account of anything.
         assert!(matches!(
-            window_of(&gap, T0),
+            outage_window(&gap, T0, None),
+            Err(ReconcileError::UnusableWindow { gap_id: 1, .. })
+        ));
+        assert!(matches!(
+            outage_window(&gap, T0, Some(1_000)),
             Err(ReconcileError::UnusableWindow { gap_id: 1, .. })
         ));
     }
@@ -1997,9 +3146,18 @@ mod tests {
             find_cloid(&json!({ "a": [{ "cloid": good.as_str() }] }), 0),
             Some(good.as_str().to_owned())
         );
+        // A malformed value at the root does not end the search: the walk
+        // steps over it and keeps looking.
+        assert_eq!(
+            find_cloid(
+                &json!({ "cloid": "nonsense", "a": { "cloid": good.as_str() } }),
+                0
+            ),
+            Some(good.as_str().to_owned())
+        );
         // Deep enough to be a denial of service is deep enough to refuse.
         let mut nested = json!({ "cloid": good.as_str() });
-        for _ in 0..(MAX_CLOID_DEPTH + 2) {
+        for _ in 0..(MAX_PAYLOAD_DEPTH + 2) {
             nested = json!({ "wrap": nested });
         }
         assert_eq!(find_cloid(&nested, 0), None);
@@ -2016,18 +3174,14 @@ mod tests {
     #[tokio::test]
     #[ignore = "hits the public mainnet info endpoint"]
     async fn live_user_fills_by_time_pages_the_way_this_module_assumes() {
-        let info = InfoClient::new(Network::Mainnet).expect("client");
+        let info = VenueSource::new(Network::Mainnet).expect("client");
         let user =
             Address::parse("0x85ecf584f25db6f146718b86d493e33c5af72052").expect("measured account");
 
-        let first = ReconcileSource::user_fills_by_time(
-            &info,
-            user,
-            1_776_700_000_000,
-            Some(1_776_800_000_000),
-        )
-        .await
-        .expect("first page");
+        let first = info
+            .user_fills_by_time(user, 1_776_700_000_000, Some(1_776_800_000_000))
+            .await
+            .expect("first page");
         assert_eq!(
             first.len(),
             USER_FILLS_PAGE_LIMIT,
@@ -2043,10 +3197,10 @@ mod tests {
             "the page truncated from the newest end, with no cursor"
         );
 
-        let second =
-            ReconcileSource::user_fills_by_time(&info, user, newest, Some(1_776_800_000_000))
-                .await
-                .expect("second page");
+        let second = info
+            .user_fills_by_time(user, newest, Some(1_776_800_000_000))
+            .await
+            .expect("second page");
         // startTime is inclusive, and the cap cut a millisecond in half: the
         // second page carries strictly more rows at the boundary than the
         // first did. Advancing to `newest + 1` would have dropped them.
@@ -2057,17 +3211,12 @@ mod tests {
         );
 
         // And the whole walk recovers every distinct row across both pages.
-        let (all, pages) = backfill_fills(
-            &info,
-            user,
-            GapWindow {
-                start_ms: 1_776_700_000_000,
-                end_ms: 1_776_800_000_000,
-            },
-            ReconcileConfig::default(),
-        )
-        .await
-        .expect("walk");
+        // The walk has no end bound, so this pages from the measured start to
+        // the venue's own now. It recovers every distinct row on the way.
+        let (all, pages) =
+            backfill_fills(&info, user, 1_776_700_000_000, ReconcileConfig::default())
+                .await
+                .expect("walk");
         let tids: BTreeSet<u64> = all.iter().map(|fill| fill.tid).collect();
         assert_eq!(tids.len(), all.len(), "the walk returned a duplicate");
         assert!(all.len() > USER_FILLS_PAGE_LIMIT, "the walk did not page");
@@ -2090,11 +3239,12 @@ mod tests {
     #[tokio::test]
     #[ignore = "hits the public mainnet info endpoint"]
     async fn live_orders_reconcile_and_settle_by_cloid() {
-        let info = InfoClient::new(Network::Mainnet).expect("client");
+        let info = VenueSource::new(Network::Mainnet).expect("client");
         let user =
             Address::parse("0x399965e15d4e61ec3529cc98b7f7ebb93b733336").expect("measured account");
 
-        let open_orders = ReconcileSource::frontend_open_orders(&info, user)
+        let open_orders = info
+            .frontend_open_orders(user)
             .await
             .expect("frontendOpenOrders must deserialize whole");
 
