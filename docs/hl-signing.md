@@ -32,7 +32,7 @@ Third-party facts the rust-SDK vectors depend on: alloy `Signature` byte layout 
 
 Test vectors: `crates/oppen-hl/tests/vectors/signing.json` (40 vectors, all copied verbatim from PY-TESTS, RS-SIG and RS-EXCH; see [Test vectors](#test-vectors)).
 
-Implementation map: §2 → `crates/oppen-hl/src/signing/mod.rs` (`action_hash`, `phantom_agent_digest`, `AgentKey`), §2.3–2.5 → `src/action.rs` + `src/wire.rs`, §3 → `src/signing/eip712.rs` + `src/signing/user_signed.rs`, §4 → `wire::float_to_wire`, §8–9 → `src/exchange.rs`. Harness: `tests/vectors.rs`.
+Implementation map: §2 → `crates/oppen-hl/src/signing/mod.rs` (`action_hash`, `phantom_agent_digest`, `AgentKey`), §2.3–2.5 → `src/action.rs` + `src/wire.rs`, §3 → `src/signing/eip712.rs` + `src/signing/user_signed.rs`, §4 → `wire::float_to_wire`, §8–9 → `src/exchange.rs`, §10 → `crates/oppen-core/src/guardrail/deadman.rs` for the arm policy and `src/exchange.rs` for the action. Harness: `tests/vectors.rs`.
 
 ---
 
@@ -74,7 +74,7 @@ Rules that follow:
 - `nonce` is an unsigned 64-bit big-endian integer appended raw, not msgpacked.
 - The vault marker byte is **always** present (`0x00` or `0x01`).
 - `expiresAfter` is encoded as a second `0x00` byte followed by 8 BE bytes, and only when present. DOC-EXCH "Expires After": "Some actions support an optional field `expiresAfter` which is a timestamp in milliseconds after which the action will be rejected. User-signed actions such as Core USDC transfer do not support the `expiresAfter` field. Note that actions consume 5x the usual address-based rate limit when canceled due to a stale `expiresAfter` field." PY-EXCHANGE lines 134–136: "expires_after is not supported on user_signed actions (e.g. usd_transfer) and must be None in order for those actions to work."
-- The vault address bytes are the sub-account or vault address. DOC-EXCH "Subaccounts and vaults": "Subaccounts and vaults do not have private keys. To perform actions on behalf of a subaccount or vault signing should be done by the master account and the vaultAddress field should be set to the address of the subaccount or vault."
+- The vault address bytes are the sub-account or vault address. DOC-EXCH "Subaccounts and vaults": "Subaccounts and vaults do not have private keys. To perform actions on behalf of a subaccount or vault signing should be done by the master account and the vaultAddress field should be set to the address of the subaccount or vault." A top-level account is neither, so it contributes no address here and the marker byte is `0x00`. Which of the two forms an action takes is a property of the container it is placed for, not a constant — §9.2.
 
 ### 2.2 Phantom agent and EIP-712 envelope
 
@@ -176,6 +176,7 @@ Field typing matters for the hash: `string` fields are keccak'd as the exact tex
 - Action body (DOC-EXCH "Approve an API wallet"): `type: "approveAgent"`, `hyperliquidChain`, `signatureChainId`, `agentAddress`, `agentName`, `nonce`. `agentName`: "Optional name for the API wallet. An account can have 1 unnamed approved wallet and up to 3 named ones. And additional 2 named agents are allowed per subaccount. A custom expiration can be set by appending `valid_until {timestamp}` after the name. The expiration can be at most 180 days in the future".
 - Unnamed agent: the python SDK **signs** with `agentName: ""` and then **deletes** `agentName` from the posted action (PY-EXCHANGE 640–648). The rust SDK hashes `agent_name.unwrap_or("")` (RS-ACTIONS 122) and serializes the `Option` as JSON `null`. Both sign the empty string.
 - The agent key is generated client-side (`"0x" + secrets.token_hex(32)`, PY-EXCHANGE 636) and only its address leaves the process — matches oppen invariant 2.
+- **Scope of an approved wallet.** DOC-NONCE: API wallets sign "on behalf of the master account or any of the sub-accounts". The allowance is counted per account — DOC-EXCH, above: 1 unnamed plus 3 named, "And additional 2 named agents are allowed per subaccount". No page read grants an API wallet any authority over an **unrelated top-level account**, and spec D1 binds oppen to that reading: one `approveAgent` per container, signed by that container's own account. A signer that has to reach N top-level containers therefore holds N approved wallets and N nonce sets (§8) — there is no one-key-for-the-fleet form on this model. Whether a wallet approved on a master reaches *every* sub-account of that master or only the one it was allowanced against is unresolved and decides the same question for the sub-account model ([specs/venue-containers.md](specs/venue-containers.md) §6, question 1; [specs/onboarding.md](specs/onboarding.md) §9, question 5).
 - DOC-NONCE: "API wallets are only used to sign. To query the account data associated with a master or sub-account, you must pass in the actual address of that account." And on pruning: an unnamed agent is deregistered when a new unnamed one is approved; a named one when the same name is re-approved; wallets also expire or are pruned when the account has no funds. "it is **strongly** suggested to not reuse their addresses ... previously signed actions can be replayed once the nonce set is pruned."
 
 ### 3.4 approveBuilderFee specifics
@@ -298,11 +299,15 @@ DOC-NONCE, verbatim:
 - "a single API wallet signing for a user, vault, or subaccount all share the same nonce set." and "If users want to use multiple subaccounts in parallel, it would easier to generate two separate API wallets under the master account, and use one API wallet for each subaccount." (= spec D1 / item 7).
 - Suggested structure: batch orders and cancels every 0.1 s; "It is recommended to batch IOC and GTC orders separately from ALO orders because ALO order-only batches are prioritized by the validators."; "fetch and increment an atomic counter that ensures a unique nonce for the address. The atomic counter can be fast-forwarded to current unix milliseconds if needed."
 
+Read against spec D1's container model: one API wallet per container means N containers are N signers with N independent nonce sets, and nothing serialises across them. The reverse is the case DOC-NONCE warns about — one wallet signing for a master *and* its sub-accounts puts every one of those containers behind a single counter.
+
 SDK behaviour: python uses `int(time.time() * 1000)` per action (PY-SIGNING 501–502); rust uses a process-global `AtomicU64` seeded with now-ms, `fetch_add(1)`, and jumps to now-ms if it has fallen more than 300 s behind (RS-HELPERS 15–27). Nonce is the outer `nonce` field, and for user-signed actions also the `nonce`/`time` inside the action (section 3.1). DOC-EXCH: "Recommended to use the current timestamp in milliseconds".
 
 ---
 
 ## 9. Request envelope
+
+### 9.1 The body
 
 `POST /exchange`, `Content-Type: application/json` (DOC-EXCH). Base URLs: mainnet `https://api.hyperliquid.xyz`, testnet `https://api.hyperliquid-testnet.xyz` (PY-CONST; RS-CONSTS).
 
@@ -316,11 +321,55 @@ Rust `ExchangePayload` (RS-EXCH 53–61): `action`, `signature`, `nonce`, `vault
 
 Signature encoding: python sends `r`/`s` as `eth_utils.to_hex(int)`, which for an integer is Python's `hex()` ("Trims leading zeros", eth-utils `conversions.py` `to_hex`), i.e. minimal-length hex without zero padding (the PY-TESTS values range from 62 to 64 hex chars — compare as integers, and pad to 32 bytes before recovering), `v` as 27/28. Rust sends `v = 27 + y_parity` (RS-EXCH 49). The alloy `Signature` string used in the rust vectors is `0x || r(32) || s(32) || v_byte` with `v_byte = 27 + y_parity` (alloy `sig.rs` `as_bytes`/`v_byte`).
 
-Sub-account routing (spec D1): sign with the sub-account's agent wallet and set `vaultAddress` to the sub-account address (DOC-EXCH "Subaccounts and vaults"). `usdClassTransfer` for a sub-account instead encodes it in the amount string: `"1" subaccount:0x...` (DOC-EXCH "Transfer from Spot account to Perp account"; PY-EXCHANGE 476–478), with `vaultAddress` omitted.
+### 9.2 Sub-account routing, and the top-level container that has none
+
+Spec D1 binds an agent to a **container**: a sub-account where the venue grants one, a top-level account where it does not. The two are routed differently, and the field that carries the difference is `vaultAddress`.
+
+| Container | `vaultAddress` in the body | Vault marker in the hash (§2.1) | Signed by |
+|---|---|---|---|
+| Sub-account | the sub-account's address | `0x01` + 20 address bytes | an API wallet approved on the master (a sub-account has no key of its own) |
+| Top-level account | absent — python passes `None` (PY-EXCHANGE `_post_action` 101–110) | `0x00` | that account's own approved API wallet (§3.3) |
+
+**Sub-account routing** is the form the field exists for. DOC-EXCH "Subaccounts and vaults": "Subaccounts and vaults do not have private keys. To perform actions on behalf of a subaccount or vault signing should be done by the master account and the vaultAddress field should be set to the address of the subaccount or vault."
+
+**A top-level container is addressed as itself.** It is an ordinary account with its own key, so nothing is delegated and there is no vault to name — the field is absent and the hashed marker is `0x00`. This is not a documented special case; it is the ordinary path every single-account SDK example takes, and it is what v1 uses on Hyperliquid, because a new user gets zero sub-accounts (spec D1).
+
+So the route is read from the container record — kind plus address — and is never a constant. v1's containers are top-level and send no `vaultAddress`; the same agent, after the sub-account upgrade ([specs/venue-containers.md](specs/venue-containers.md) §3), sends one, with no other change to the agent. Code that hardcodes either form is wrong for one of the two, and after the first migration a fleet holds both at once.
+
+**Getting the route wrong is a signature error, not a routing error.** The marker and the address are inside the hashed preimage (§2.1), so an action hashed for one route and posted on the other recovers a different address and comes back as `"L1 error: User or API Wallet 0x0123... does not exist."` (§1) — indistinguishable from an unknown user, and carrying no hint that the container kind was the problem. Hash, sign and post from one container record in one step, and never let a caller supply `vaultAddress` separately from the container it belongs to.
+
+`usdClassTransfer` for a sub-account instead encodes it in the amount string: `"1" subaccount:0x...` (DOC-EXCH "Transfer from Spot account to Perp account"; PY-EXCHANGE 476–478), with `vaultAddress` omitted.
+
+**Not settled here:** whether an API wallet may sign `createSubAccount` or `subAccountTransfer` at all — both are L1 actions, whose signer §1 records as "agent (API) wallet or master", and no page read narrows it (open question 3). Until a testnet negative test settles it, oppen routes both through the ceremony as master-signed actions and assumes nothing about the agent path.
 
 ---
 
-## 10. Divergences and quirks to remember
+## 10. `scheduleCancel` — the dead-man's switch and its daily budget
+
+`scheduleCancel` is an L1 action (§1), so it is signed by the container's own agent wallet exactly like an order — no ceremony, no user signature. Wire form (§2.3): `type`, then `time` **only if set** — absent, not null; `time` is an integer in milliseconds. Sent without `time` it clears whatever was scheduled. Both variants are pinned by vectors on both networks (PY-TESTS, [Test vectors](#test-vectors)).
+
+Two venue limits, and they are what spec item 27 has to live inside:
+
+| Limit | Value | Read from |
+|---|---|---|
+| Earliest schedulable time | at least **5 seconds** after the current time | DOC-EXCH's `scheduleCancel` section, carried here from the 2026-09-04 venue audit's transcription ([decisions.md](decisions.md) O1) and mirrored in `crates/oppen-core/src/guardrail/deadman.rs` as `DEAD_MAN_MIN_LEAD_MS = 5_000` |
+| Triggers per day | **maximum 10**, per address, resetting at **00:00 UTC** | same |
+
+Unlike every other rule in this document, these two were not re-read from the pinned page while this section was written; they are the audit's transcription. Neither has been exercised against the live API — `deadman.rs` records the same on its constant, "not yet confirmed against the live API, because `scheduleCancel` is a signed action and there is no funded key". Treat both as documented and unverified until the testnet run below.
+
+Three consequences, in order of how much they constrain the design.
+
+**The budget is per address, so N containers carry N budgets.** Spec D1 gives each agent its own account and each account its own approved API wallet, so each container's dead-man switch is armed, refreshed and exhausted independently — an agent that burns its ten triggers has not touched any other agent's. Nothing aggregates the budgets and nothing borrows across them, which also means a fleet-wide "arm everything" is N separate signed actions against N separate budgets, not one. [decisions.md](decisions.md) O1 requires the risk console to show the remaining count; under D1 that is a count **per container**, never a fleet total. No source read exposes a remaining-trigger count at the venue, so the number is oppen's own tally and is only as good as its persistence across restarts.
+
+**Ten per day is not a rate limit you can retry into.** It resets on a wall clock, not a rolling window, so a policy that re-arms on every reconnect can spend the day's allowance inside a bad hour and leave the account with no dead-man switch until midnight UTC — the failure that decisions.md O1 was recorded to prevent. Arming has to be a deliberate, counted action with the count persisted across restarts.
+
+**Whether a "trigger" is an arm or a firing is not stated in any source read, and the current policy's cost depends entirely on which it is.** `deadman.rs` arms 60 s ahead and re-arms once under 20 s remain, i.e. roughly every 40 s, which is about 2,160 `scheduleCancel` actions per address per day; on the arm reading the tenth lands about six minutes after the first and the switch is unusable, while on the firing reading the same policy costs nothing until it actually fires. Do not resolve this by choosing the convenient reading. The cheap settling test is a funded testnet address: arm and re-arm a dozen times inside a minute without ever letting one fire, and see whether the eleventh is refused.
+
+**Also unconfirmed:** whether `scheduleCancel` is itself volume-gated. A reverse-engineered binary string suggests it and the official docs are silent ([decisions.md](decisions.md) O1, [spec.md](spec.md) D1 "Not confirmed"). If it is, a brand-new account — which is exactly what v1 provisions per agent — has no dead-man switch at all, and item 27 must degrade visibly: onboarding says the switch could not be armed on that container rather than implying one is running ([specs/onboarding.md](specs/onboarding.md) §7, rule 10).
+
+---
+
+## 11. Divergences and quirks to remember
 
 1. Rust SDK 0.6.0 `Actions::hash` ignores `expiresAfter`; python is the reference for it. No official vector exercises `expiresAfter`.
 2. Rust SDK vectors carry un-normalized `"2000.0"` strings (section 4).
@@ -328,7 +377,7 @@ Sub-account routing (spec D1): sign with the sub-account's agent wallet and set 
 4. Python `sign_user_signed_action` hardcodes `signatureChainId = "0x66eee"` and overwrites whatever the caller set (PY-SIGNING 250).
 5. Python `float_to_wire` compares `rounded == "-0"` but `rounded` is `"-0.00000000"` at that point, so a negative zero reaches `Decimal` and formats as `"-0"`; rust returns `"0"`. Sizes and prices are never negative, so this cannot occur on a validated path.
 6. Python `approve_agent` signs `agentName: ""` and then deletes the key before posting (section 3.3).
-7. `scheduleCancel` without `time` omits the key entirely; with `time` it is an integer ms (PY-TESTS both variants).
+7. `scheduleCancel` without `time` omits the key entirely; with `time` it is an integer ms (PY-TESTS both variants). Its 5-second minimum and 10-per-day budget are §10.
 8. Python `Grouping` includes an undocumented `{"p": int}` priority variant (PY-SIGNING 45).
 9. `f` (fast cancel) must be absent when false (DOC-EXCH).
 
@@ -358,7 +407,7 @@ The transcription was validated by running the official `signing.py` (pinned com
 
 1. **`expiresAfter` has no official vector.** The encoding is read from PY-SIGNING 182–184 only. oppen should generate a testnet round-trip (send an order with `expiresAfter` in the past and expect the rejection) before relying on it.
 2. **Accepted `signatureChainId` values.** No source read states whether the L1 validates the chain id against an allowlist; the docs give `0xa4b1` as an example and the SDKs use `0x66eee` on both networks. Confirm on testnet with the WalletConnect wallet's actual chain before shipping the ceremony.
-3. **Agent-wallet scope.** DOC-NONCE says API wallets "sign on behalf of the master account or any of the sub-accounts" and are "only used to sign"; no page read states explicitly which user-signed actions (withdraw3, usdSend, approveAgent) an API wallet is barred from. Spec D5's "no-withdraw scope" needs a citation or a testnet negative test.
+3. **Agent-wallet scope.** DOC-NONCE says API wallets "sign on behalf of the master account or any of the sub-accounts" and are "only used to sign"; no page read states explicitly which user-signed actions (withdraw3, usdSend, approveAgent) an API wallet is barred from. Spec D5's "no-withdraw scope" needs a citation or a testnet negative test. Two L1 actions are in the same fog and matter more under spec D1: whether an API wallet may sign **`createSubAccount`** and **`subAccountTransfer`** (§9.2). If it may, an agent key can create containers and move USDC between a master and its sub-accounts, which no guardrail models ([specs/venue-containers.md](specs/venue-containers.md) §6, question 5). Also unresolved and recorded there as the blocking question: whether a wallet approved on a master signs for *every* sub-account of that master or only the one it was allowanced against (§3.3).
 4. **`PriorityGrouping {"p": int}`** exists in PY-SIGNING but not in DOC-EXCH. Do not use until documented.
 5. **Units of `usd` in `subAccountTransfer`/`vaultTransfer`.** PY-TESTS uses `usd: 10`; DOC-EXCH says `"usd": number`; neither states the unit. (`ntli` for `updateIsolatedMargin` is documented as 6-decimal integer.)
 6. **`agentName` on the wire for unnamed agents.** Python omits the key; rust sends `null`. Both sign `""`. Which the L1 prefers on the JSON side is unstated; omit (python behaviour) is the safer default.

@@ -3,36 +3,21 @@
 //! Implements `docs/specs/charts.md` §3. The operator types any interval and
 //! gets a chart; every requested interval resolves to exactly one of three
 //! cases and the UI is told which one, because silently degrading a chart is
-//! how a reader ends up trusting a line that is not there:
+//! how a reader ends up trusting a line that is not there. [`Resolution`] is
+//! those three cases and what each one promises.
 //!
-//! | Case | Source | History |
-//! |---|---|---|
-//! | [`Resolution::Native`] | `candleSnapshot` / the `candle` WS channel | the interval's own [`Horizon`] |
-//! | [`Resolution::Resampled`] | aggregate the largest native divisor | the **source's** [`Horizon`], carried in the case |
-//! | [`Resolution::Local`] | aggregate the WS `trades` feed here | forward only |
-//!
-//! "Full" is not a property of the resampled case: a `7m` chart is derived from
-//! `1m`, and `1m` reaches roughly three and a half days back. So the horizon
-//! travels inside [`Resolution::Resampled`] and comes out in the chip text
-//! rather than being assumed by the reader (`charts.md` §3.2's History column
-//! reads "Full" for this row and needs amending to "full, or the source's
-//! rolling floor" — that edit is owed to `docs/specs/charts.md`).
-//!
-//! Bucket boundaries are aligned to the Unix epoch (`bucket_start_ms` is
-//! `floor(t / interval) * interval`), so the same interval produces the same
-//! buckets on every machine, in every timezone, across restarts, and across a
-//! daylight-saving transition. Nothing in this module reads a local clock or a
-//! calendar.
+//! Nothing here reads a local clock or a calendar: buckets are epoch-aligned
+//! integer arithmetic ([`Interval::bucket_start_ms`]), so the same interval
+//! produces the same buckets on every machine and across a DST transition.
 //!
 //! Aggregation lives here rather than in the view layer because the fair-value
 //! engine and the renderer must see the same bars (`charts.md` §2.4), and
-//! because `docs/decisions.md` R1 keeps this crate headless.
+//! because `docs/decisions.md` R1 keeps this crate headless. Bars land in the
+//! unchained side tables described on [`CandleStore`] (`docs/decisions.md` R5).
 //!
-//! Bars are stored in **unchained side tables** (`docs/decisions.md` R5):
-//! candles are re-derivable, so they are not part of the hash chain and they
-//! carry a disk budget instead. Locally aggregated bars are the exception to
-//! "re-derivable" — nobody serves them — and D-e still makes them prunable at
-//! a 30-day default.
+//! Owed to `docs/specs/charts.md`: §3.2's History column reads "Full" for the
+//! resampled row and needs amending to "full, or the source's rolling floor" —
+//! see the per-request cap in the audit below.
 //!
 //! ## Live API audit, 2026-09-04 (mainnet `candleSnapshot`, BTC and HYPE)
 //!
@@ -99,34 +84,27 @@ pub const MIN_TIME_MS: i64 = 0;
 
 /// Latest timestamp this module accepts: 9999-12-31T23:59:59.999Z.
 ///
-/// Bounding both ends at the boundary — [`Bar::from_candle`] and
+/// Bounding both ends at the two doors — [`bars_from_candles`] and
 /// [`Trade::checked`] — is what makes every millisecond addition downstream
 /// provably in range, rather than scattering `checked_add` across the module.
 /// `MAX_TIME_MS + MAX_INTERVAL_MS` is four orders of magnitude below
 /// `i64::MAX`, so a bucket close can never wrap.
 pub const MAX_TIME_MS: i64 = 253_402_300_799_999;
 
-/// How many intervals `candleSnapshot` serves, whatever the interval.
-///
-/// Measured 2026-09-04, mainnet: a full-history request returned 5,001 rows on
-/// `1h`, 5,004 on `15m`, 5,064 on BTC `1m` and 5,161 on HYPE `1m`. It is a
-/// rolling floor, not a page size: widening `startTime` past it adds nothing.
-/// See [`Interval::venue_history`].
+/// How many intervals `candleSnapshot` serves, whatever the interval. A rolling
+/// floor, not a page size — see the audit note in the module docs.
 pub const VENUE_HISTORY_INTERVALS: u32 = 5_000;
 
 /// The time unit of an interval string. Case matters and is not a typo:
 /// `m` is a minute and `M` is the venue's thirty-day bar.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Unit {
     /// `s`. Only ever produces a locally aggregated series: the venue's finest
     /// bar is `1m`.
     Second,
     /// `m`, lowercase.
     Minute,
-    /// `h`.
     Hour,
-    /// `d`.
     Day,
     /// `w`. Epoch-aligned, so a week starts Thursday UTC — verified against 367
     /// live `1w` bars.
@@ -188,16 +166,12 @@ pub struct Interval {
 }
 
 impl Ord for Interval {
-    /// By width, never by field order.
-    ///
-    /// Written out rather than derived because the derived version compares
-    /// `count` first, which puts `1M` below `3m` and `1h` below `3m`, makes
+    /// By width, never by field order. Written out because the derived version
+    /// compares `count` first, which puts `1M` below `3m`, leaves
     /// [`NATIVE_INTERVALS`] unsorted under its own ordering, and would make a
     /// `BTreeMap<Interval, _>` serialise in that order — a determinism hazard
-    /// on the MCP surface (`AGENTS.md` 6).
-    ///
-    /// Agrees with the derived [`Eq`] because canonicalisation gives exactly
-    /// one `Interval` per width.
+    /// on the MCP surface (`AGENTS.md` 6). Agrees with the derived [`Eq`]
+    /// because canonicalisation gives exactly one `Interval` per width.
     fn cmp(&self, other: &Self) -> Ordering {
         self.millis().cmp(&other.millis())
     }
@@ -289,9 +263,6 @@ impl Interval {
     /// canonical, so `120s` comes back as `2m` and resolves as native-derived
     /// rather than as a second interval nobody indexed.
     pub fn parse(input: &str) -> Result<Self, IntervalError> {
-        if input.is_empty() {
-            return Err(IntervalError::Empty);
-        }
         let mut chars = input.chars();
         let Some(suffix) = chars.next_back() else {
             return Err(IntervalError::Empty);
@@ -340,16 +311,6 @@ impl Interval {
         }
     }
 
-    /// How many of the unit. Always at least one.
-    pub const fn count(self) -> u32 {
-        self.count
-    }
-
-    /// The canonical unit.
-    pub const fn unit(self) -> Unit {
-        self.unit
-    }
-
     /// Width in milliseconds. Never zero, so it is always a safe divisor.
     pub const fn millis(self) -> i64 {
         self.count as i64 * self.unit.millis()
@@ -362,11 +323,10 @@ impl Interval {
 
     /// How far back `candleSnapshot` serves this interval.
     ///
-    /// The venue serves [`VENUE_HISTORY_INTERVALS`] bars whatever the interval,
-    /// so the floor only bites when the asset is older than that many bars.
-    /// Five thousand days is thirteen years, more than Hyperliquid has existed,
-    /// which is why BTC `1d` returns its whole history and BTC `1m` reaches
-    /// only about three and a half days back.
+    /// The floor only bites when the asset is older than [`VENUE_HISTORY_INTERVALS`]
+    /// bars. Five thousand days is thirteen years, more than Hyperliquid has
+    /// existed, which is why BTC `1d` returns its whole history while BTC `1m`
+    /// reaches only about three and a half days back.
     pub const fn venue_history(self) -> Horizon {
         if self.millis() >= Unit::Day.millis() {
             Horizon::Full
@@ -412,12 +372,10 @@ impl Interval {
     /// consulted. `div_euclid` floors rather than truncating, so pre-epoch
     /// timestamps land in the bucket below them rather than the one above.
     ///
-    /// Saturating rather than wrapping: this is a `pub const fn` on a `pub`
-    /// type, so it must not panic for any `i64` (`AGENTS.md` conventions).
-    /// Nothing in range can saturate — [`MIN_TIME_MS`] and [`MAX_TIME_MS`]
-    /// bound every timestamp that enters the module — so saturation is only
-    /// reachable from a direct call with an absurd argument, where a clamped
-    /// answer beats an overflow.
+    /// Saturating rather than wrapping because a `pub const fn` must not panic
+    /// for any `i64` (`AGENTS.md` conventions). [`MIN_TIME_MS`] and
+    /// [`MAX_TIME_MS`] bound every timestamp that enters the module, so
+    /// saturation is only reachable from a direct call with an absurd argument.
     pub const fn bucket_start_ms(self, t_ms: i64) -> i64 {
         let width = self.millis();
         t_ms.div_euclid(width).saturating_mul(width)
@@ -436,14 +394,6 @@ impl fmt::Display for Interval {
     /// `candleSnapshot`'s `interval` field wants.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}{}", self.count, self.unit.suffix())
-    }
-}
-
-impl FromStr for Interval {
-    type Err = IntervalError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Interval::parse(s)
     }
 }
 
@@ -554,9 +504,8 @@ impl Resolution {
     /// [`LocalAggregator::no_history_before_ms`] instead.
     pub const fn source_history(self) -> Option<Horizon> {
         match self {
-            Resolution::Native => None,
             Resolution::Resampled { source_history, .. } => Some(source_history),
-            Resolution::Local { .. } => None,
+            Resolution::Native | Resolution::Local { .. } => None,
         }
     }
 }
@@ -580,8 +529,7 @@ fn compact_span(ms: i64) -> String {
 /// Where a stored bar came from. Persisted so retention can distinguish the
 /// re-derivable from the unrecoverable: `docs/decisions.md` D-e prunes local
 /// bars on a budget and leaves venue bars alone.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Source {
     /// Straight from `candleSnapshot` or the `candle` WS channel.
     Venue,
@@ -594,7 +542,7 @@ pub enum Source {
 impl Source {
     /// Stable database spelling. Deterministic and stable across releases;
     /// changing one of these strings is a migration, not a rename.
-    pub const fn as_str(self) -> &'static str {
+    const fn as_str(self) -> &'static str {
         match self {
             Source::Venue => "venue",
             Source::Resampled => "resampled",
@@ -625,9 +573,7 @@ pub struct Bar {
     pub close_time_ms: i64,
     /// First trade price in the bucket, or the previous close if it was empty.
     pub open: Decimal,
-    /// Highest trade price in the bucket.
     pub high: Decimal,
-    /// Lowest trade price in the bucket.
     pub low: Decimal,
     /// Last trade price in the bucket, or the previous close if it was empty.
     pub close: Decimal,
@@ -655,7 +601,12 @@ impl Bar {
     /// A row with `t = 2^63 - 2^16` passes every other check this module makes
     /// (right interval, aligned open, exactly one width wide) and then overflows
     /// `i64` inside the resampler.
-    pub fn from_candle(candle: &Candle) -> Result<Self, BarError> {
+    ///
+    /// Private: a venue row reaches the outside world through
+    /// [`bars_from_candles`], which also checks the partition. This alone does
+    /// not, and a bar that skipped those checks corrupts every aggregate above
+    /// it.
+    fn from_candle(candle: &Candle) -> Result<Self, BarError> {
         Ok(Self {
             open_time_ms: checked_time_ms(candle.t)?,
             close_time_ms: checked_time_ms(candle.t_close)?,
@@ -689,9 +640,8 @@ pub enum BarError {
     /// intervals in one series would silently corrupt every aggregate above it.
     #[error("candle interval `{found}` does not match the requested `{expected}`")]
     IntervalMismatch {
-        /// The interval the caller asked `candleSnapshot` for.
         expected: String,
-        /// The interval the row actually carries in its `i` field.
+        /// What the row carries in its `i` field.
         found: String,
     },
     /// A candle timestamp outside `MIN_TIME_MS..=MAX_TIME_MS`.
@@ -701,29 +651,19 @@ pub enum BarError {
     /// the WS feed's own field is signed and a negative print is as wrong as an
     /// absurdly large one.
     #[error("trade timestamp {time_ms} ms is out of range")]
-    TradeTime {
-        /// The offending print's time, Unix epoch ms.
-        time_ms: i64,
-    },
+    TradeTime { time_ms: i64 },
     /// The row's open is not aligned to its own interval, which would break
     /// every downstream bucket.
     #[error("candle open {open_time_ms} ms is not aligned to {interval}")]
-    Misaligned {
-        /// The offending bar's open, Unix epoch ms.
-        open_time_ms: i64,
-        /// The interval it should have been aligned to.
-        interval: String,
-    },
+    Misaligned { open_time_ms: i64, interval: String },
     /// `T` is not `t + width - 1`. The venue has never done this; if it starts,
     /// the resampler's partition assumption is void and we stop rather than
     /// aggregate.
     #[error("candle at {open_time_ms} ms spans {actual_ms} ms, expected {expected_ms} ms")]
     WrongWidth {
-        /// The offending bar's open, Unix epoch ms.
         open_time_ms: i64,
         /// `T - t + 1` as served.
         actual_ms: i64,
-        /// The interval width it should have been.
         expected_ms: i64,
     },
 }
@@ -782,32 +722,18 @@ pub enum ResampleError {
     /// source's bars do not partition the target's buckets and aggregating
     /// them would be an approximation. `charts.md` §3.2 requires exactness.
     ///
-    /// (The fields are `from`/`to` rather than `source`/`target` because
-    /// `thiserror` reads a field named `source` as a nested error.)
+    /// Throughout this enum `from` is the interval the bars are in and `to` the
+    /// one that was requested, rather than `source`/`target`, because
+    /// `thiserror` reads a field named `source` as a nested error.
     #[error("{to} is not an integer multiple of {from}")]
-    NotAMultiple {
-        /// The interval the bars are in.
-        from: String,
-        /// The interval that was requested.
-        to: String,
-    },
+    NotAMultiple { from: String, to: String },
     /// The target is the same width as the source or narrower. Resampling only
     /// ever coarsens; going finer would require inventing intra-bar structure.
     #[error("{to} is not coarser than {from}")]
-    NotCoarser {
-        /// The interval the bars are in.
-        from: String,
-        /// The interval that was requested.
-        to: String,
-    },
+    NotCoarser { from: String, to: String },
     /// A source bar's open is not aligned to the source interval.
     #[error("source bar at {open_time_ms} ms is not aligned to {from}")]
-    Misaligned {
-        /// The interval the bars claim to be in.
-        from: String,
-        /// The offending bar's open, Unix epoch ms.
-        open_time_ms: i64,
-    },
+    Misaligned { from: String, open_time_ms: i64 },
     /// Source bars are not strictly ascending. Deduplicating or sorting here
     /// would hide a feed bug behind a plausible chart.
     #[error("source bars are not strictly ascending at {open_time_ms} ms")]
@@ -825,9 +751,8 @@ pub enum ResampleError {
     /// (`charts.md` §3.2, "resampling is exact, not approximate").
     #[error("target bucket at {open_time_ms} ms got {got} of {want} source bars")]
     IncompleteBucket {
-        /// The offending target bucket's open, Unix epoch ms.
         open_time_ms: i64,
-        /// How many source bars actually landed in it.
+        /// How many source bars landed in it.
         got: i64,
         /// How many it needed: `target / source`.
         want: i64,
@@ -915,12 +840,8 @@ pub fn resample(
         match &mut pending {
             Some(current) if current.bar.open_time_ms == bucket => {
                 current.bar.close = bar.close;
-                if bar.high > current.bar.high {
-                    current.bar.high = bar.high;
-                }
-                if bar.low < current.bar.low {
-                    current.bar.low = bar.low;
-                }
+                current.bar.high = current.bar.high.max(bar.high);
+                current.bar.low = current.bar.low.min(bar.low);
                 current.bar.volume += bar.volume;
                 current.bar.trades = current.bar.trades.saturating_add(bar.trades);
                 current.got += 1;
@@ -937,12 +858,7 @@ pub fn resample(
                     bar: Bar {
                         open_time_ms: bucket,
                         close_time_ms: target.bucket_close_ms(bucket),
-                        open: bar.open,
-                        high: bar.high,
-                        low: bar.low,
-                        close: bar.close,
-                        volume: bar.volume,
-                        trades: bar.trades,
+                        ..bar.clone()
                     },
                     got: 1,
                     opened_on_boundary: bar.open_time_ms == bucket,
@@ -1130,7 +1046,6 @@ impl LocalAggregator {
         last_close: Option<Decimal>,
     ) -> Self {
         Self {
-            accepts_from_ms: Self::first_whole_bucket(interval, listening_since_ms),
             no_history_before_ms,
             last_close,
             ..Self::new(interval, listening_since_ms)
@@ -1148,11 +1063,6 @@ impl LocalAggregator {
         } else {
             start.saturating_add(interval.millis())
         }
-    }
-
-    /// The interval being built.
-    pub const fn interval(&self) -> Interval {
-        self.interval
     }
 
     /// The instant before which this series has nothing. The UI renders the
@@ -1228,10 +1138,8 @@ impl LocalAggregator {
         if let Some(bar) = &self.forming {
             return Some(bar.clone());
         }
-        match (self.bucket, self.last_close) {
-            (Some(open), Some(close)) => Some(Bar::empty_at(open, self.interval.millis(), close)),
-            _ => None,
-        }
+        let (open, close) = (self.bucket?, self.last_close?);
+        Some(Bar::empty_at(open, self.interval.millis(), close))
     }
 
     /// Fold one trade in, returning any bars that closed as a result, ascending.
@@ -1258,29 +1166,18 @@ impl LocalAggregator {
             self.late += 1;
             return Vec::new();
         }
+        let width = self.interval.millis();
         let closed = self.advance_to(bucket, bucket);
-        if let Some(bar) = &mut self.forming {
-            if trade.price > bar.high {
-                bar.high = trade.price;
-            }
-            if trade.price < bar.low {
-                bar.low = trade.price;
-            }
-            bar.close = trade.price;
-            bar.volume += trade.size;
-            bar.trades = bar.trades.saturating_add(1);
-        } else {
-            self.forming = Some(Bar {
-                open_time_ms: bucket,
-                close_time_ms: self.interval.bucket_close_ms(bucket),
-                open: trade.price,
-                high: trade.price,
-                low: trade.price,
-                close: trade.price,
-                volume: trade.size,
-                trades: 1,
-            });
-        }
+        // An absent bucket starts as an empty one at this print's price, so the
+        // fold below is the same arithmetic for the first trade and the tenth.
+        let bar = self
+            .forming
+            .get_or_insert_with(|| Bar::empty_at(bucket, width, trade.price));
+        bar.high = bar.high.max(trade.price);
+        bar.low = bar.low.min(trade.price);
+        bar.close = trade.price;
+        bar.volume += trade.size;
+        bar.trades = bar.trades.saturating_add(1);
         closed
     }
 
@@ -1352,10 +1249,7 @@ impl LocalAggregator {
     /// [`LocalAggregator::feed_interrupted`].
     fn enter_bucket(&mut self, target: i64) {
         self.bucket = Some(target);
-        self.newest_bucket_ms = Some(match self.newest_bucket_ms {
-            Some(newest) if newest > target => newest,
-            _ => target,
-        });
+        self.newest_bucket_ms = Some(self.newest_bucket_ms.map_or(target, |n| n.max(target)));
     }
 }
 
@@ -1386,10 +1280,10 @@ pub enum StoreError {
 /// Nothing here is hash-chained: candles are re-derivable, and a chart is not a
 /// record of record.
 ///
-/// Every write nests in a `SAVEPOINT` rather than a top-level transaction, so
-/// these methods are safe to call from inside a ledger transaction. `Ledger`
-/// still owes an accessor that hands out a `CandleStore` under its mutex —
-/// `Connection` is not `Sync`, so the borrow has to come from behind that lock.
+/// Every write nests in a `SAVEPOINT`, so these methods are safe to call from
+/// inside a ledger transaction. `Ledger` still owes an accessor that hands out a
+/// `CandleStore` under its mutex — `Connection` is not `Sync`, so the borrow has
+/// to come from behind that lock.
 pub struct CandleStore<'a> {
     conn: &'a Connection,
 }

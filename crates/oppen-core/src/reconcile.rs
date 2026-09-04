@@ -101,11 +101,11 @@ pub const DEFAULT_MAX_PAGES: usize = 512;
 /// The pairing is asserted in this module's tests rather than assumed, so a
 /// rename in the pool fails a test here instead of silently making every fills
 /// gap unrecognisable and permanently unreconciled.
-pub const USER_FILLS_SCOPE_PREFIX: &str = "userFills:";
+const USER_FILLS_SCOPE_PREFIX: &str = "userFills:";
 
 /// Prefix of the `feed_gaps.scope` an `orderUpdates` subscription writes.
 /// See [`USER_FILLS_SCOPE_PREFIX`].
-pub const ORDER_UPDATES_SCOPE_PREFIX: &str = "orderUpdates:";
+const ORDER_UPDATES_SCOPE_PREFIX: &str = "orderUpdates:";
 
 /// The payload key a fill event stores the venue trade id under.
 ///
@@ -324,7 +324,6 @@ impl Attribution {
 /// stops the walk.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "finding", rename_all = "snake_case")]
-#[non_exhaustive]
 pub enum Finding {
     /// A fill that matched no intent and no operator action.
     UnattributedFill {
@@ -371,9 +370,6 @@ pub struct Recovered {
     pub manual: usize,
     /// How many matched nothing.
     pub external: usize,
-    /// Pages the walk took. A number well above one over a short window says
-    /// the account is busier than the window suggests.
-    pub pages: usize,
     /// Everything worth reading that was not a failure.
     pub findings: Vec<Finding>,
 }
@@ -903,11 +899,6 @@ impl<'a, S: ReconcileSource> Reconciler<'a, S> {
         })
     }
 
-    /// The chain index, for a caller that wants to classify without recording.
-    pub fn index(&self) -> &LedgerIndex {
-        &self.index
-    }
-
     /// Work every gap that has not been proven backfilled, oldest first.
     ///
     /// Stops at the first failure and returns it. Everything recorded before
@@ -972,9 +963,8 @@ impl<'a, S: ReconcileSource> Reconciler<'a, S> {
             // has succeeded. The opposite order would mark a window
             // reconciled on the strength of an order query while the fills
             // walk had not run.
-            let (fills, pages) = backfill_fills(&self.source, account, window, self.config).await?;
+            let (fills, _) = backfill_fills(&self.source, account, window, self.config).await?;
             recovered = self.apply_fills(account, &fills, Some(gap.gap_id))?;
-            recovered.pages = pages;
         }
 
         // A `userFills` gap costs no order knowledge, so the order query runs
@@ -1079,25 +1069,6 @@ impl<'a, S: ReconcileSource> Reconciler<'a, S> {
             recovered.fills_recorded += 1;
         }
         Ok(recovered)
-    }
-
-    /// Re-read the order book state for one account and settle anything the
-    /// caller cannot account for.
-    ///
-    /// Split out from [`Reconciler::reconcile_gap`] because item 19's rule
-    /// applies to any `timeout_unknown_outcome`, not only to one that followed
-    /// a disconnect.
-    pub async fn reconcile_orders(
-        &self,
-        account: Address,
-        pending: &[Cloid],
-    ) -> Result<OrderReconciliation> {
-        let open_orders = self.source.frontend_open_orders(account).await?;
-        Ok(OrderReconciliation::partition(
-            account,
-            pending,
-            open_orders,
-        ))
     }
 }
 

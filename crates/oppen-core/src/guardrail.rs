@@ -68,15 +68,14 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-pub use breaker::{Breach, LossKind};
-pub use bucket::TokenBucket;
+pub use breaker::LossKind;
 pub use config::{
     APPROVAL_TTL_MS, AgentGuardrails, DEFAULT_DAILY_LOSS_USD, DEFAULT_MARK_DIVERGENCE_BPS,
     DEFAULT_MARK_DIVERGENCE_WINDOW_MS, DEFAULT_MAX_LEVERAGE, DEFAULT_MAX_ORDER_USD,
     DEFAULT_MAX_POSITION_USD, DEFAULT_MAX_SLIPPAGE_BPS, DEFAULT_ORDER_RATE, Freshness,
     GlobalRateBudget, LossLimits, MAX_REASON_BYTES, MarginMode, OrderRate, RiskSettings,
 };
-pub use deadman::{DEAD_MAN_MIN_LEAD_MS, DeadManIntent, DeadManPolicy};
+pub use deadman::{DEAD_MAN_MIN_LEAD_MS, DeadManIntent};
 pub use engine::{
     AuditEntry, AuditError, AuditOutcome, AuditSink, Clearance, Cleared, ClearedKind,
     GuardrailEngine, GuardrailError, NullAuditSink, OperatorAction, OrderIntent, Proposal,

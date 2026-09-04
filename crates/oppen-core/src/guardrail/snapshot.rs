@@ -111,12 +111,12 @@ impl MarketRef {
     }
 }
 
-/// One open position in a sub-account.
+/// One open position in a sub-account. Signed size only — every cap is
+/// measured at the reference price, so an entry price is never read here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PositionSnapshot {
     /// Signed size, negative for a short — the venue's `szi`.
     pub szi: Decimal,
-    pub entry_px: Option<Decimal>,
 }
 
 /// One sub-account's state at one instant, which by D1 is one agent's.

@@ -68,12 +68,15 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 
 use crate::types::{AssetCtx, Candle, Fill, L2Book, Level, OrderStatusEntry, Side};
-use crate::{Address, Error, Network};
+use crate::{Address, Network};
 
 /// The venue's own keepalive. The server drops a connection that has been idle
 /// for roughly 60 s (`docs/spec.md` item 9), and it answers this frame with
 /// `{"channel":"pong"}` (verified live).
 const PING_FRAME: &str = r#"{"method":"ping"}"#;
+
+/// Depth of the consumer's event channel. Bounded on purpose: see [`WsEvent`].
+const EVENT_BUFFER: usize = 4096;
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -141,12 +144,6 @@ pub enum PoolError {
     /// [`Subscription::exclusive_per_connection`].
     #[error("orderUpdates arrived on a connection that owns no orderUpdates subscription")]
     UnattributableOrderUpdates,
-}
-
-impl From<PoolError> for Error {
-    fn from(e: PoolError) -> Self {
-        Error::Ws(e.to_string())
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -249,9 +246,8 @@ impl Subscription {
     /// Thresholds are `docs/specs/fair-value.md` §5.2's: book 2 s, mark 5 s,
     /// oracle 10 s. `activeAssetCtx` carries both a mark leg and an oracle leg,
     /// so the tighter of the two binds it. `l2Book` gets
-    /// [`StalenessThresholds::depth`] instead of `book`: §5.2's 2 s is the
-    /// budget for the book *component*, and §14.4 correction 4 moved that
-    /// component to `bbo`.
+    /// [`StalenessThresholds::depth`] rather than `book`, for the measured
+    /// reason recorded there.
     ///
     /// `None` means silence is not a fault. Trades, candles, fills and order
     /// updates are event-driven: a quiet tape is information, not a broken
@@ -784,18 +780,14 @@ impl Backoff {
     /// `max`. Saturating throughout: no attempt count can overflow it.
     pub fn nominal(&self, attempt: u32) -> Duration {
         let base_ms = u64::try_from(self.base.as_millis()).unwrap_or(u64::MAX);
-        let factor = 1u64.checked_shl(attempt.min(32)).unwrap_or(u64::MAX);
-        Duration::from_millis(base_ms.saturating_mul(factor)).min(self.max)
+        Duration::from_millis(base_ms.saturating_mul(1u64 << attempt.min(32))).min(self.max)
     }
 
-    /// [`Backoff::nominal`] spread uniformly over
-    /// `±jitter_pct%`, never negative.
+    /// [`Backoff::nominal`] spread uniformly over `±jitter_pct%`, never
+    /// negative. A zero band needs no special case: it draws from `0..1`.
     pub fn delay(&self, attempt: u32, jitter: &mut Jitter) -> Duration {
         let nominal_ms = u64::try_from(self.nominal(attempt).as_millis()).unwrap_or(u64::MAX);
         let spread = nominal_ms.saturating_mul(u64::from(self.jitter_pct.min(100))) / 100;
-        if spread == 0 {
-            return Duration::from_millis(nominal_ms);
-        }
         let low = nominal_ms.saturating_sub(spread);
         Duration::from_millis(low.saturating_add(jitter.next_below(2 * spread + 1)))
     }
@@ -910,8 +902,6 @@ pub struct FeedHealth {
     /// killing the socket rather than acknowledging it. Expires; see
     /// [`SubscriptionRegistry::record_failed_session`].
     pub quarantined: bool,
-    /// When the current quarantine lifts, ms. `None` when not quarantined.
-    pub quarantined_until_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -1030,11 +1020,7 @@ impl SubscriptionRegistry {
             return Ok(Placement::AlreadyPresent(slot.id));
         }
         if self.len() >= self.capacity() {
-            return Err(PoolError::CapacityExhausted {
-                used: self.len(),
-                cap: self.capacity(),
-                connections: self.slots.len(),
-            });
+            return Err(self.capacity_exhausted());
         }
         let cap = self.max_subs_per_connection;
         let exclusive = sub.exclusive_per_connection();
@@ -1057,11 +1043,7 @@ impl SubscriptionRegistry {
                     connections: self.slots.len(),
                 });
             }
-            return Err(PoolError::CapacityExhausted {
-                used: self.len(),
-                cap: self.capacity(),
-                connections: self.slots.len(),
-            });
+            return Err(self.capacity_exhausted());
         }
         let id = ConnectionId(self.slots.len());
         let mut subs = BTreeMap::new();
@@ -1088,26 +1070,30 @@ impl SubscriptionRegistry {
         Err(PoolError::NotSubscribed(key))
     }
 
+    /// One connection's subscriptions matching `keep`, in key order. Empty for
+    /// a connection that does not exist.
+    fn subs_where(&self, id: ConnectionId, keep: impl Fn(&SubEntry) -> bool) -> Vec<Subscription> {
+        self.slot(id)
+            .map(|s| {
+                s.subs
+                    .values()
+                    .filter(|e| keep(e))
+                    .map(|e| e.sub.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Everything one connection owns, in key order, quarantined included.
     pub fn subscriptions(&self, id: ConnectionId) -> Vec<Subscription> {
-        self.slot(id)
-            .map(|s| s.subs.values().map(|e| e.sub.clone()).collect())
-            .unwrap_or_default()
+        self.subs_where(id, |_| true)
     }
 
     /// What a reconnect should actually re-send, in key order: everything the
     /// connection owns except what [`SubscriptionRegistry::record_failed_session`]
     /// has quarantined *and whose quarantine has not yet lapsed*.
     pub fn resubscribe_set(&self, id: ConnectionId, now_ms: u64) -> Vec<Subscription> {
-        self.slot(id)
-            .map(|s| {
-                s.subs
-                    .values()
-                    .filter(|e| !e.quarantined_at(now_ms))
-                    .map(|e| e.sub.clone())
-                    .collect()
-            })
-            .unwrap_or_default()
+        self.subs_where(id, |e| !e.quarantined_at(now_ms))
     }
 
     /// Quarantines that have lapsed on a live connection: cleared here and
@@ -1205,15 +1191,7 @@ impl SubscriptionRegistry {
 
     /// Subscriptions the venue has not acknowledged on the current socket.
     pub fn unacked(&self, id: ConnectionId) -> Vec<Subscription> {
-        self.slot(id)
-            .map(|s| {
-                s.subs
-                    .values()
-                    .filter(|e| !e.acked)
-                    .map(|e| e.sub.clone())
-                    .collect()
-            })
-            .unwrap_or_default()
+        self.subs_where(id, |e| !e.acked)
     }
 
     /// The address whose `orderUpdates` this connection owns, used to attribute
@@ -1311,7 +1289,6 @@ impl SubscriptionRegistry {
                     threshold_ms,
                     stale,
                     quarantined,
-                    quarantined_until_ms: entry.quarantined_until_ms.filter(|_| quarantined),
                 });
             }
         }
@@ -1347,13 +1324,8 @@ impl SubscriptionRegistry {
     }
 
     /// Subscriptions held across the whole pool, for the item 9 cap.
-    pub fn len(&self) -> usize {
+    fn len(&self) -> usize {
         self.slots.iter().map(|s| s.subs.len()).sum()
-    }
-
-    /// True when nothing is subscribed.
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
     }
 
     /// Total slots this pool may ever hold, clamped to the venue's per-IP
@@ -1369,6 +1341,14 @@ impl SubscriptionRegistry {
     /// Connections opened so far.
     pub fn connection_count(&self) -> usize {
         self.slots.len()
+    }
+
+    fn capacity_exhausted(&self) -> PoolError {
+        PoolError::CapacityExhausted {
+            used: self.len(),
+            cap: self.capacity(),
+            connections: self.slots.len(),
+        }
     }
 
     fn slot(&self, id: ConnectionId) -> Option<&ConnectionSlot> {
@@ -1436,8 +1416,6 @@ pub struct WsPoolConfig {
     ///
     /// Five seconds, an order of magnitude above the measured round trip.
     pub session_grace: Duration,
-    /// Event channel depth. Bounded on purpose: see [`WsEvent`].
-    pub event_buffer: usize,
 }
 
 impl Default for WsPoolConfig {
@@ -1452,7 +1430,6 @@ impl Default for WsPoolConfig {
             thresholds: StalenessThresholds::default(),
             quarantine_after: 3,
             session_grace: Duration::from_secs(5),
-            event_buffer: 4096,
         }
     }
 }
@@ -1474,6 +1451,7 @@ enum ConnCommand {
     Shutdown,
 }
 
+#[derive(Debug)]
 struct PoolInner {
     registry: SubscriptionRegistry,
     conns: Vec<mpsc::UnboundedSender<ConnCommand>>,
@@ -1489,6 +1467,7 @@ struct PoolInner {
 ///
 /// Dropping the pool closes every command channel, which stops every connection
 /// task; [`WsPool::shutdown`] does the same explicitly.
+#[derive(Debug)]
 pub struct WsPool {
     cfg: WsPoolConfig,
     inner: Arc<Mutex<PoolInner>>,
@@ -1525,7 +1504,7 @@ impl WsPool {
     /// outside a runtime.
     pub fn new(cfg: WsPoolConfig) -> Result<(Self, mpsc::Receiver<WsEvent>), PoolError> {
         let handle = tokio::runtime::Handle::try_current().map_err(|_| PoolError::NoRuntime)?;
-        let (tx, rx) = mpsc::channel(cfg.event_buffer.max(1));
+        let (tx, rx) = mpsc::channel(EVENT_BUFFER);
         let inner = PoolInner {
             registry: SubscriptionRegistry::new(cfg.max_connections, cfg.max_subs_per_connection),
             conns: Vec::new(),
@@ -1667,16 +1646,6 @@ impl WsPool {
             let _ = tx.send(ConnCommand::Shutdown);
         }
         guard.conns.clear();
-    }
-}
-
-impl fmt::Debug for WsPool {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("WsPool")
-            .field("network", &self.cfg.network)
-            .field("subscriptions", &self.subscription_count())
-            .field("connections", &self.connection_count())
-            .finish()
     }
 }
 
@@ -1881,21 +1850,17 @@ async fn run_connection(
                     }
                 }
                 if let Some(reason) = resubscribe_error {
-                    let last_seen_ms = lock(&inner).registry.connection_last_message(id);
-                    let step = next_step(
-                        &mut state,
-                        Turn::ResubscribeFailed {
-                            at_ms: now_ms(),
-                            last_seen_ms,
-                            reason,
-                        },
-                    );
-                    if !apply(step, id, &cfg, &inner, &events, &subs).await {
+                    let turn = Turn::ResubscribeFailed {
+                        at_ms: now_ms(),
+                        last_seen_ms: lock(&inner).registry.connection_last_message(id),
+                        reason,
+                    };
+                    if !apply(&mut state, turn, id, &cfg, &inner, &events, &subs).await {
                         return;
                     }
                 } else {
-                    let step = next_step(&mut state, Turn::Subscribed { at_ms: now_ms() });
-                    if !apply(step, id, &cfg, &inner, &events, &subs).await {
+                    let turn = Turn::Subscribed { at_ms: now_ms() };
+                    if !apply(&mut state, turn, id, &cfg, &inner, &events, &subs).await {
                         return;
                     }
                     let started = tokio::time::Instant::now();
@@ -1906,18 +1871,14 @@ async fn run_connection(
                             return;
                         }
                         SessionEnd::Dropped(reason) => {
-                            let last_seen_ms = lock(&inner).registry.connection_last_message(id);
-                            let step = next_step(
-                                &mut state,
-                                Turn::SessionDropped {
-                                    at_ms: now_ms(),
-                                    last_seen_ms,
-                                    reason,
-                                    lived: started.elapsed(),
-                                    grace: cfg.session_grace,
-                                },
-                            );
-                            if !apply(step, id, &cfg, &inner, &events, &subs).await {
+                            let turn = Turn::SessionDropped {
+                                at_ms: now_ms(),
+                                last_seen_ms: lock(&inner).registry.connection_last_message(id),
+                                reason,
+                                lived: started.elapsed(),
+                                grace: cfg.session_grace,
+                            };
+                            if !apply(&mut state, turn, id, &cfg, &inner, &events, &subs).await {
                                 return;
                             }
                         }
@@ -1925,14 +1886,11 @@ async fn run_connection(
                 }
             }
             Err(e) => {
-                let step = next_step(
-                    &mut state,
-                    Turn::ConnectFailed {
-                        at_ms: now_ms(),
-                        reason: format!("connect failed: {e}"),
-                    },
-                );
-                if !apply(step, id, &cfg, &inner, &events, &[]).await {
+                let turn = Turn::ConnectFailed {
+                    at_ms: now_ms(),
+                    reason: format!("connect failed: {e}"),
+                };
+                if !apply(&mut state, turn, id, &cfg, &inner, &events, &[]).await {
                     return;
                 }
             }
@@ -1954,17 +1912,18 @@ async fn run_connection(
     }
 }
 
-/// Carry out a [`Step`]. Returns false when the consumer's receiver is gone,
-/// which ends the connection task.
+/// Decide what a [`Turn`] means ([`next_step`]) and carry it out. Returns false
+/// when the consumer's receiver is gone, which ends the connection task.
 async fn apply(
-    step: Step,
+    state: &mut ConnState,
+    turn: Turn,
     id: ConnectionId,
     cfg: &WsPoolConfig,
     inner: &Arc<Mutex<PoolInner>>,
     events: &mpsc::Sender<WsEvent>,
     resubscribed: &[Subscription],
 ) -> bool {
-    match step {
+    match next_step(state, turn) {
         Step::Idle => true,
         Step::ReportDown { reason, strike } => {
             report_disconnect(id, cfg, inner, events, reason, strike).await

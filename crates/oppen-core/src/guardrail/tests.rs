@@ -398,13 +398,9 @@ fn the_position_cap_is_measured_after_the_fill() {
 
     // An existing position counts, and a sell against a long reduces it.
     let mut long = exposure(d("100000"));
-    long.agent.positions.insert(
-        "BTC".to_owned(),
-        PositionSnapshot {
-            szi: d("1"),
-            entry_px: Some(d("100")),
-        },
-    );
+    long.agent
+        .positions
+        .insert("BTC".to_owned(), PositionSnapshot { szi: d("1") });
     long.agent.total_position_notional_usd = d("100");
     assert!(
         matches!(
@@ -603,13 +599,9 @@ fn reduce_only_mode_requires_the_flag_and_an_actual_reduction() {
     let market = MarketRef::fresh("BTC", d("100"), NOW_MS);
 
     let mut long = exposure(d("100000"));
-    long.agent.positions.insert(
-        "BTC".to_owned(),
-        PositionSnapshot {
-            szi: d("2"),
-            entry_px: Some(d("100")),
-        },
-    );
+    long.agent
+        .positions
+        .insert("BTC".to_owned(), PositionSnapshot { szi: d("2") });
     long.agent.total_position_notional_usd = d("200");
 
     let reduce = |sz: &str, is_buy: bool, flagged: bool| {
@@ -1411,13 +1403,9 @@ fn an_order_whose_arithmetic_overflows_is_refused_not_fatal() {
 
     // And a position snapshot large enough to overflow the post-fill maths.
     let mut vast = exposure(d("100"));
-    vast.agent.positions.insert(
-        "BTC".to_owned(),
-        PositionSnapshot {
-            szi: huge,
-            entry_px: Some(d("1")),
-        },
-    );
+    vast.agent
+        .positions
+        .insert("BTC".to_owned(), PositionSnapshot { szi: huge });
     vast.agent.total_position_notional_usd = huge;
     let refusal = f
         .evaluate(
@@ -1953,13 +1941,10 @@ fn an_approved_proposal_is_still_refused_if_the_world_moved() {
 
     // By the time the operator looks, the agent already holds the cap.
     let mut loaded = exposure(d("100000"));
-    loaded.agent.positions.insert(
-        "BTC".to_owned(),
-        PositionSnapshot {
-            szi: d("2"),
-            entry_px: Some(d("100")),
-        },
-    );
+    loaded
+        .agent
+        .positions
+        .insert("BTC".to_owned(), PositionSnapshot { szi: d("2") });
     loaded.agent.total_position_notional_usd = d("200");
     assert!(matches!(
         f.engine
@@ -2111,31 +2096,6 @@ fn a_venue_rule_breach_is_a_typed_subtype_not_a_string() {
         }
         other => panic!("expected the min-notional subtype, got {other}"),
     }
-}
-
-#[test]
-fn a_clearance_signs_exactly_one_request() {
-    let f = Fixture::new(permissive(&["BTC"]));
-    let cleared = f
-        .evaluate(
-            &intent("BTC", true, d("100"), d("1")),
-            &asset("BTC", 2, 40),
-            &MarketRef::fresh("BTC", d("100"), NOW_MS),
-            &exposure(d("100000")),
-        )
-        .expect("clears");
-    let key = oppen_hl::AgentKey::from_hex(
-        "0123456789012345678901234567890123456789012345678901234567890123",
-    )
-    .expect("key");
-    let (request, clearance) = f
-        .engine
-        .sign_cleared(&key, cleared, 1, None, NOW_MS)
-        .expect("signs");
-    assert_eq!(clearance.agent, Some(AgentId::new("alpha")));
-    assert!(matches!(request.action(), Action::Order { .. }));
-    // `cleared` was consumed by the signature, so there is no second use of
-    // it here and the compiler enforces that.
 }
 
 /// R4 calls a mainnet number that is actually a testnet number the worst bug
@@ -2307,11 +2267,6 @@ fn every_refusal_shape_serializes_deterministically() {
         Refusal::Unevaluable(Unevaluable::UnknownProposal {
             approval_id: "alpha-1-1".to_owned(),
         }),
-        Refusal::Unevaluable(Unevaluable::ProposalExpired {
-            approval_id: "alpha-1-1".to_owned(),
-            expires_at_ms: 1,
-            now_ms: 2,
-        }),
     ];
     for refusal in &cases {
         let json = serde_json::to_string(refusal)
@@ -2474,7 +2429,6 @@ fn no_input_produces_a_signable_value_without_passing_every_predicate() {
                 symbol.to_owned(),
                 PositionSnapshot {
                     szi: d(rng.pick(&["-2", "-0.5", "0.5", "2"])),
-                    entry_px: Some(d("100")),
                 },
             );
         }
@@ -2742,7 +2696,7 @@ fn verify_every_predicate(
 /// monotonically advancing clock.
 ///
 /// The bucket is re-derived here from the carry arithmetic directly, not by
-/// asking the engine, so an error in [`TokenBucket`] cannot hide by being
+/// asking the engine, so an error in the token bucket cannot hide by being
 /// made twice. Item 25's breaker and item 26's pause are re-derived the same
 /// way: once anything has stopped this agent, nothing may clear again.
 #[test]

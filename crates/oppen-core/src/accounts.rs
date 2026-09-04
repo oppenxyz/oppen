@@ -1,40 +1,17 @@
 //! The sub-account registry: which Hyperliquid accounts oppen knows about,
 //! whether it records each one, who owns it, and where an order for it routes.
 //!
-//! `docs/spec.md` D1 maps the agent roster 1:1 onto sub-accounts, so this is
-//! also the answer to "which address does this agent trade in". `AGENTS.md`
+//! `docs/spec.md` D1 maps the agent roster 1:1 onto accounts, so this is also
+//! the answer to "which address does this agent trade in". `AGENTS.md`
 //! invariant 7 forbids a second event store and the same reasoning applies to
 //! the roster: the ledger's `sub_accounts` table is the only store, and this
 //! module is a typed surface over it rather than a cache beside it. Every
 //! method here reads or writes that table through [`crate::ledger::Ledger`].
 //!
-//! Three product rules are made structural here.
-//!
-//! * **`docs/decisions.md` R3 — discover all, opt in per account.** oppen
-//!   discovers every sub-account under the master and the operator ticks the
-//!   ones it records. Default off for anything oppen did not provision: it
-//!   watches what it made and asks before watching you. [`Registry::observe`]
-//!   therefore never turns recording on, and never turns it off either — a
-//!   rediscovery sweep that reset the opt-in bit would silently stop recording
-//!   an account the operator ticked weeks ago, and nothing downstream would
-//!   report a gap, because a never-recorded account has no gap.
-//! * **`docs/specs/history.md` 3.4 — retiring an agent deletes the pairing,
-//!   not the past.** [`Registry::retire`] marks the row inactive and nothing in
-//!   this module deletes one. [`Scope::Live`] is what a live view asks for and
-//!   [`Scope::All`] is what an all-time total asks for; the difference is a
-//!   named argument rather than a filter each call site remembers.
-//! * **`docs/spec.md` item 33 — the `manual · external` bucket.** It is a
-//!   property of an account, not a special case at each call site, so it lives
-//!   in [`Classification`] with one spelling of the label in
-//!   [`MANUAL_EXTERNAL_BUCKET`]. An address the registry has never seen
-//!   classifies as `manual · external` rather than erroring, because
-//!   `docs/specs/history.md` §2 says a fill is never dropped for failing to
-//!   match: an unmatched fill is a finding, and this is the bucket findings go
-//!   in.
-//!
-//! `docs/decisions.md` R2 keeps an owner discriminator in the schema while the
-//! product rule stays open — see [`Owner`] and the note on
-//! [`Registry::provision`].
+//! The product rules it makes structural are cited where they bite:
+//! `docs/decisions.md` R3 on [`Standing`] and [`Registry::observe`], R2 on
+//! [`Registry::provision`], `docs/specs/history.md` 3.4 on [`Scope`] and
+//! [`Registry::retire`], and `docs/spec.md` item 33 on [`Classification`].
 //!
 //! **Operator-only.** `docs/spec.md` item 22 and `AGENTS.md` invariant 3: no
 //! agent-reachable path modifies the agent registry. That is already true by
@@ -60,23 +37,20 @@ use crate::ledger::{Ledger, LedgerError, Owner, OwnerType, SubAccount};
 /// The operator-facing name of the bucket every unattributed fill lands in
 /// (`docs/spec.md` item 33, `docs/specs/history.md` §2).
 ///
-/// One definition so that no call site spells it, and so the middle dot cannot
-/// drift into a hyphen in one view and a bullet in another. It is a display
-/// string; the wire form is [`Classification`]'s `manual_external`.
+/// One definition, so the middle dot cannot drift into a hyphen in one view and
+/// a bullet in another. It is a display string; the wire form is
+/// [`Classification`]'s `manual_external`.
 pub const MANUAL_EXTERNAL_BUCKET: &str = "manual · external";
 
 /// What oppen is doing with an account right now.
 ///
-/// `docs/decisions.md` R3 describes a lifecycle rather than a pair of
-/// booleans, so it is spelled as one here. The stored row carries three flags
-/// — `recorded`, `provisioned_by_oppen`, `active` — and this is the only place
-/// that reads meaning out of their combination.
-///
-/// Every state the [`Registry`] can produce maps to exactly one variant.
-/// `provisioned_by_oppen` without `recorded` is unreachable through this
-/// module ([`Registry::opt_out`] refuses it), and if a hand-edited database
-/// produces it anyway the row reads as [`Standing::Discovered`] — that is, as
-/// not recorded, which is R3's default and the safe direction to fail in.
+/// `docs/decisions.md` R3 describes a lifecycle rather than a pair of booleans.
+/// The stored row carries three flags — `recorded`, `provisioned_by_oppen`,
+/// `active` — and this is the only place that reads meaning out of their
+/// combination. `provisioned_by_oppen` without `recorded` is unreachable through
+/// this module ([`Registry::opt_out`] refuses it); a hand-edited database that
+/// holds it anyway reads as [`Standing::Discovered`], which is R3's default and
+/// the safe direction to fail in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Standing {
@@ -94,7 +68,6 @@ pub enum Standing {
 }
 
 impl Standing {
-    /// Read the standing out of a stored row.
     fn of(row: &SubAccount) -> Standing {
         if !row.active {
             Standing::Retired
@@ -107,23 +80,10 @@ impl Standing {
         }
     }
 
-    /// Whether oppen collects new history for this account.
-    ///
-    /// [`Standing::Retired`] is `false`: a retired account's past is kept
-    /// forever (`docs/specs/history.md` 3.4), but nothing new is collected for
-    /// it. Use [`Scope::All`] to include it in a total.
+    /// Whether oppen collects new history for this account. [`Standing::Retired`]
+    /// is `false`, so use [`Scope::All`] to count a retired account in a total.
     pub fn is_recording(self) -> bool {
         matches!(self, Standing::OptedIn | Standing::ProvisionedByOppen)
-    }
-
-    /// Stable wire name, matching the `serde` rename.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Standing::Discovered => "discovered",
-            Standing::OptedIn => "opted_in",
-            Standing::ProvisionedByOppen => "provisioned_by_oppen",
-            Standing::Retired => "retired",
-        }
     }
 }
 
@@ -136,9 +96,9 @@ impl Standing {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Classification {
-    /// A paired agent's sub-account (D1, one per agent).
+    /// A paired agent's account (D1, one per agent).
     Agent,
-    /// A workflow's sub-account (`docs/decisions.md` R2; the rule that decides
+    /// A workflow's account (`docs/decisions.md` R2; the rule that decides
     /// whether workflows get their own is still open).
     Workflow,
     /// Everything with no owner, including addresses the registry has never
@@ -147,7 +107,6 @@ pub enum Classification {
 }
 
 impl Classification {
-    /// Classify a stored row by its owner.
     fn of(row: &SubAccount) -> Classification {
         match row.owner.as_ref().map(|owner| owner.owner_type) {
             Some(OwnerType::Agent) => Classification::Agent,
@@ -157,10 +116,6 @@ impl Classification {
     }
 
     /// The operator-facing bucket name, for a roster column or a fill row.
-    ///
-    /// [`Classification::ManualExternal`] renders as
-    /// [`MANUAL_EXTERNAL_BUCKET`], which is the spelling `docs/spec.md` item 33
-    /// uses.
     pub fn label(self) -> &'static str {
         match self {
             Classification::Agent => "agent",
@@ -175,8 +130,7 @@ impl Classification {
 /// Named rather than left to a boolean at each call site, because
 /// `docs/specs/history.md` 3.4 puts a retired account in two answers with
 /// opposite defaults: out of every live view, into every all-time total.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scope {
     /// Active accounts. What a roster, a position table or a live PnL asks for.
     Live,
@@ -189,7 +143,6 @@ pub enum Scope {
 }
 
 impl Scope {
-    /// Whether a standing belongs in this scope.
     fn admits(self, standing: Standing) -> bool {
         match self {
             Scope::Live => standing != Standing::Retired,
@@ -201,21 +154,18 @@ impl Scope {
 
 /// Where an order for an account is routed on the wire.
 ///
-/// `docs/hl-signing.md` §"Sub-account routing": an action for a sub-account is
-/// signed by the master's agent wallet with `vaultAddress` set to the
-/// sub-account. This type exists so a caller asks the registry for a route and
-/// gets an [`Address`], instead of formatting one at the call site — a
-/// `vaultAddress` that is a hand-built string is a `vaultAddress` that can be
-/// the wrong case, the wrong account, or empty, and the venue answers all
-/// three with the same opaque rejection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
+/// `docs/hl-signing.md` §"Sub-account routing": a sub-account action carries
+/// `vaultAddress`, a top-level account carries none. D1 requires the route to be
+/// a property of the container rather than hardcoded either way, and it keeps
+/// `vaultAddress` off the call site — a hand-built one can be the wrong case,
+/// the wrong account, or empty, and the venue answers all three with the same
+/// opaque rejection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Route {
     /// Sign for this sub-account: `vaultAddress` is set to it.
     SubAccount(Address),
     /// Sign for the master account itself: `vaultAddress` is omitted. Only the
-    /// manual escape hatch (`docs/spec.md` item 33) routes here; no agent does,
-    /// because D1 gives every agent its own sub-account.
+    /// manual escape hatch (`docs/spec.md` item 33) routes here.
     Master,
 }
 
@@ -236,7 +186,7 @@ impl Route {
 /// stored text.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Account {
-    /// The sub-account address, lowercase and `0x`-prefixed.
+    /// The account address, lowercase and `0x`-prefixed.
     pub address: Address,
     /// Operator-facing name. Untrusted display text — it comes from the venue
     /// or from an operator, so render it as plain text like any other
@@ -260,11 +210,8 @@ pub struct Account {
 }
 
 impl Account {
-    /// Read a stored row.
-    ///
-    /// Fails rather than panics on an address the row cannot hold: the
-    /// database file is user-writable by definition, so this is an input path
-    /// (`AGENTS.md` conventions).
+    /// Read a stored row, failing rather than panicking on an address it cannot
+    /// hold.
     fn from_row(row: &SubAccount) -> Result<Account, AccountsError> {
         let address =
             Address::parse(&row.address).map_err(|_| AccountsError::MalformedAddress {
@@ -280,15 +227,6 @@ impl Account {
             created_ts_ms: row.created_ts_ms,
         })
     }
-
-    /// Where an order for this account is routed.
-    ///
-    /// Always a sub-account: the `sub_accounts` table holds sub-accounts, and
-    /// the master is reached through [`Route::Master`], which nothing here
-    /// returns.
-    pub fn route(&self) -> Route {
-        Route::SubAccount(self.address)
-    }
 }
 
 /// One sub-account as the venue reports it, reduced to what the registry
@@ -301,7 +239,6 @@ impl Account {
 /// [`Discovered::from_venue`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Discovered {
-    /// The sub-account's own address.
     pub address: Address,
     /// The name the venue reports for it.
     pub name: String,
@@ -363,25 +300,21 @@ pub enum AccountsError {
     /// wants to *change* one gets this.
     #[error("no sub-account is registered at {0}")]
     UnknownAccount(Address),
-    /// No sub-account is bound to that agent. Never resolved to the master
-    /// account: silently routing an agent's order to the master would put its
-    /// position in the operator's own account, which is the failure D1 exists
-    /// to prevent.
+    /// No account is bound to that agent. Never resolved to the master account:
+    /// silently routing an agent's order to the master would put its position in
+    /// the operator's own account, which is the failure D1 exists to prevent.
     #[error("no sub-account is bound to agent {0}")]
     UnknownAgent(AgentId),
-    /// Two rows claim the same agent, so D1's 1:1 roster does not hold and
-    /// there is no single right answer for `vaultAddress`. Unreachable through
-    /// [`Registry::provision`], which refuses to bind an agent twice; reachable
-    /// by editing the database or by calling
-    /// `crate::ledger::Ledger::upsert_sub_account` directly, which is why the
-    /// route lookup checks rather than taking the first row.
+    /// Two rows claim the same agent, so D1's 1:1 roster does not hold and there
+    /// is no single right answer for `vaultAddress`. Reachable by editing the
+    /// database or by calling `crate::ledger::Ledger::upsert_sub_account`
+    /// directly, which is why the route lookup checks rather than taking the
+    /// first row.
     #[error("agent {agent} maps to more than one sub-account: {first} and {second}")]
     AmbiguousAgent {
-        /// The agent with more than one binding.
         agent: AgentId,
         /// Lowest address claiming it.
         first: Address,
-        /// The next one found.
         second: Address,
     },
     /// The account is retired. `docs/specs/history.md` 3.4 keeps its history,
@@ -393,27 +326,24 @@ pub enum AccountsError {
     /// account (D1).
     #[error("sub-account {address} is owned by {current}, not {offered}")]
     OwnerConflict {
-        /// The account being provisioned.
         address: Address,
-        /// The owner already stored, as `type:id`.
+        /// Owners as `type:id`.
         current: String,
-        /// The owner offered, as `type:id`.
         offered: String,
     },
-    /// The owner is already bound to another sub-account. D1 maps the roster
-    /// 1:1, so a second account for the same agent is a fork of its PnL.
+    /// The owner is already bound to another account. D1 maps the roster 1:1, so
+    /// a second account for the same agent is a fork of its PnL.
     #[error("{owner} is already bound to sub-account {address}")]
     OwnerAlreadyBound {
         /// The owner, as `type:id`.
         owner: String,
-        /// The account it is already bound to.
         address: Address,
     },
     /// Recording cannot be turned off for an account oppen created. R3's
-    /// default-off is about accounts oppen did not provision; turning it off
-    /// for one oppen made would stop recording the history of an account its
-    /// own agent is trading, and nothing downstream would report the hole.
-    /// Retire it instead.
+    /// default-off is about accounts oppen did not provision; turning it off for
+    /// one oppen made would stop recording the history of an account its own
+    /// agent is trading, and nothing downstream would report the hole. Retire it
+    /// instead.
     #[error("sub-account {0} was provisioned by oppen; retire it rather than stop recording it")]
     ProvisionedCannotOptOut(Address),
     /// A stored row holds something that is not an address. Only reachable by
@@ -423,11 +353,10 @@ pub enum AccountsError {
         /// The stored text, verbatim.
         stored: String,
     },
-    /// A discovered entry names a different master. Refused rather than
-    /// adopted; see [`Discovered::from_venue`].
+    /// A discovered entry names a different master. Refused rather than adopted;
+    /// see [`Discovered::from_venue`].
     #[error("sub-account {address} reports master {found}, not {expected}")]
     ForeignMaster {
-        /// The sub-account in the response.
         address: Address,
         /// The master the sweep was run for.
         expected: Address,
@@ -439,11 +368,7 @@ pub enum AccountsError {
 /// The sub-account registry.
 ///
 /// A typed surface over the ledger's `sub_accounts` table, holding no state of
-/// its own: `AGENTS.md` invariant 7 forbids a second event store, and a roster
-/// cached beside the table would be a second answer to "which account does this
-/// agent trade in" that can disagree with the first.
-///
-/// Operator-only. See the module doc.
+/// its own. Operator-only; see the module doc.
 #[derive(Debug, Clone, Copy)]
 pub struct Registry<'l> {
     ledger: &'l Ledger,
@@ -453,23 +378,18 @@ impl<'l> Registry<'l> {
     /// Open the registry over a ledger.
     ///
     /// Takes `&Ledger` rather than the agent-facing `AgentView`, which is what
-    /// makes `AGENTS.md` invariant 3 hold by construction: an agent cannot
-    /// obtain one of these because it cannot obtain a `&Ledger`.
+    /// makes `AGENTS.md` invariant 3 hold by construction.
     pub fn new(ledger: &'l Ledger) -> Self {
         Registry { ledger }
     }
 
-    /// Record a sub-account oppen created, bound to its owner.
+    /// Record an account oppen created, bound to its owner.
     ///
     /// Recorded from birth: R3's default-off covers accounts oppen did not
-    /// provision, and this is one it did.
-    ///
-    /// `owner` carries R2's discriminator. **The product rule behind it is
-    /// still open**: whether a workflow gets its own sub-account or binds to an
-    /// agent's is a question `docs/decisions.md` R2 deliberately leaves to real
-    /// usage, so both [`OwnerType`] values are accepted here and neither is
-    /// privileged. The column exists now because it is free today and
-    /// impossible to add cleanly once ledger rows reference sub-accounts.
+    /// provision, and this is one it did. `owner` carries R2's discriminator and
+    /// both [`OwnerType`] values are accepted, because whether a workflow gets
+    /// its own account or binds to an agent's is a product rule
+    /// `docs/decisions.md` R2 deliberately leaves open.
     ///
     /// Idempotent for the same owner, so a re-run after a crash between the
     /// on-chain `createSubAccount` and this write converges. It refuses to
@@ -526,14 +446,17 @@ impl<'l> Registry<'l> {
     /// New accounts land as [`Standing::Discovered`] — present in the roster,
     /// recording nothing, waiting for the operator's tick. Known accounts have
     /// their name refreshed and **nothing else touched**: the opt-in bit,
-    /// retirement and the creation timestamp all survive a sweep, because a
-    /// sweep is an observation and not an instruction.
+    /// retirement and the creation timestamp all survive, because a sweep is an
+    /// observation and not an instruction. A sweep that reset the opt-in bit
+    /// would silently stop recording an account the operator ticked weeks ago,
+    /// and nothing downstream would report a gap — a never-recorded account has
+    /// no gap.
     ///
     /// An account missing from `seen` is never retired. Hyperliquid has no
-    /// delete for a sub-account, so absence means a truncated or failed
-    /// response far more often than it means anything about the account, and
-    /// retiring the roster on one bad response would take every recorded
-    /// account out of the live views at once.
+    /// delete for a sub-account, so absence means a truncated or failed response
+    /// far more often than it means anything about the account, and retiring the
+    /// roster on one bad response would take every recorded account out of the
+    /// live views at once.
     ///
     /// Duplicate addresses in `seen` collapse, last name winning. Iteration is
     /// by address so the report and the write order are the same on every run
@@ -585,19 +508,7 @@ impl<'l> Registry<'l> {
     /// (`docs/specs/history.md` 3.4), and reopening recording on it without
     /// reviving it would produce fills against an account no live view shows.
     pub fn opt_in(&self, address: Address) -> Result<Account, AccountsError> {
-        let row = self.row(address)?;
-        if !row.active {
-            return Err(AccountsError::Retired(address));
-        }
-        if row.recorded {
-            return Account::from_row(&row);
-        }
-        let updated = SubAccount {
-            recorded: true,
-            ..row
-        };
-        self.ledger.upsert_sub_account(&updated)?;
-        Account::from_row(&updated)
+        self.set_recorded(address, true)
     }
 
     /// Stop recording an account the operator had ticked.
@@ -605,20 +516,23 @@ impl<'l> Registry<'l> {
     /// Only for an account oppen did not provision; see
     /// [`AccountsError::ProvisionedCannotOptOut`]. Idempotent otherwise.
     pub fn opt_out(&self, address: Address) -> Result<Account, AccountsError> {
+        self.set_recorded(address, false)
+    }
+
+    /// The one write behind [`Registry::opt_in`] and [`Registry::opt_out`], so
+    /// the retired refusal and the idempotent return cannot drift apart.
+    fn set_recorded(&self, address: Address, recorded: bool) -> Result<Account, AccountsError> {
         let row = self.row(address)?;
         if !row.active {
             return Err(AccountsError::Retired(address));
         }
-        if row.provisioned_by_oppen {
+        if !recorded && row.provisioned_by_oppen {
             return Err(AccountsError::ProvisionedCannotOptOut(address));
         }
-        if !row.recorded {
+        if row.recorded == recorded {
             return Account::from_row(&row);
         }
-        let updated = SubAccount {
-            recorded: false,
-            ..row
-        };
+        let updated = SubAccount { recorded, ..row };
         self.ledger.upsert_sub_account(&updated)?;
         Account::from_row(&updated)
     }
@@ -687,18 +601,17 @@ impl<'l> Registry<'l> {
 
     /// The route for one agent's orders (D1).
     ///
-    /// This is the call that replaces string handling at the signing site: the
-    /// caller hands over an [`AgentId`] and gets a [`Route`] whose
-    /// [`Route::vault_address`] goes straight into
-    /// `oppen_hl::ExchangeRequest`. The guardrail engine keeps its own copy of
-    /// the binding — it stamps the `vaultAddress` onto every clearance so a
-    /// later caller cannot supply a different one — and this registry is where
-    /// that copy comes from at registration time.
+    /// The caller hands over an [`AgentId`] and gets a [`Route`] whose
+    /// [`Route::vault_address`] goes straight into `oppen_hl::ExchangeRequest`.
+    /// The guardrail engine keeps its own copy of the binding — it stamps the
+    /// `vaultAddress` onto every clearance so a later caller cannot supply a
+    /// different one — and this registry is where that copy comes from at
+    /// registration time.
     ///
     /// Refuses rather than guessing in all three ways it can be uncertain: an
-    /// unknown agent, a retired one, and an agent bound to two accounts. Each
-    /// of them, resolved to a plausible answer, signs an order into an account
-    /// that is not the agent's.
+    /// unknown agent, a retired one, and an agent bound to two accounts. Each of
+    /// them, resolved to a plausible answer, signs an order into an account that
+    /// is not the agent's.
     pub fn route_for_agent(&self, agent: &AgentId) -> Result<Route, AccountsError> {
         let mut found: Option<Account> = None;
         for row in self.ledger.sub_accounts()? {
@@ -719,15 +632,14 @@ impl<'l> Registry<'l> {
         if account.standing == Standing::Retired {
             return Err(AccountsError::Retired(account.address));
         }
-        Ok(account.route())
+        Ok(Route::SubAccount(account.address))
     }
 
     /// The address an owner is already bound to, if any.
     ///
-    /// Scans the table rather than indexing it: the roster is the agent list, a
-    /// human keeps it, and D1's 1:1 mapping means tens of rows rather than
-    /// thousands. An index here would be a schema change for no measurable
-    /// gain.
+    /// Scans the table rather than indexing it: D1's 1:1 mapping over a
+    /// human-kept roster means tens of rows, so an index here would be a schema
+    /// change for no measurable gain.
     fn bound_to(&self, owner: &Owner) -> Result<Option<Address>, AccountsError> {
         for row in self.ledger.sub_accounts()? {
             if owned_by(&row, owner.owner_type, &owner.owner_id) {

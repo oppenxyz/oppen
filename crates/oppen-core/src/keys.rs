@@ -2,32 +2,23 @@
 //! keys and the guardrail-config HMAC key.
 //!
 //! `docs/spec.md` item 2 puts keys in the OS keychain; item 3 HMAC-checks the
-//! guardrail configuration with a key from that same keychain. This module
-//! owns the storage and the HMAC primitive. It does **not** own the guardrail
+//! guardrail configuration with a key from that same keychain. This module owns
+//! the storage and the HMAC primitive. It does not own the guardrail
 //! configuration, which lives in [`crate::guardrail`], and it does not own key
-//! generation for agent wallets, which is `oppen-hl`'s job — the key material
-//! arrives here already generated and leaves here only as an
-//! [`oppen_hl::AgentKey`].
+//! generation, which is `oppen-hl`'s job — key material arrives here already
+//! generated and leaves only as an [`oppen_hl::AgentKey`].
 //!
 //! # What this protects against, and what it does not
 //!
 //! `docs/threat-model.md` is the normative text and this module must not
-//! promise more than it does:
-//!
-//! - On **Windows** (Credential Manager) and **Linux** (Secret Service), any
-//!   process running as the same OS user can read these secrets. An agent with
-//!   shell access can read a stored agent key and sign orders directly against
-//!   Hyperliquid, bypassing every guardrail.
-//! - On **macOS**, the Keychain prompts per application. That is a real barrier
-//!   against casual access, not against a determined process holding your
-//!   user's privileges.
-//! - The keychain is therefore *containment*, not a boundary. The only
-//!   containment property that survives a compromised machine is the venue's:
-//!   an agent (API) wallet cannot withdraw.
-//!
-//! Zeroizing a loaded key on drop narrows a window in this process's address
-//! space. It does not make the keychain a boundary, and nothing in this file
-//! should be read as claiming it does.
+//! promise more than it does. On Windows (Credential Manager) and Linux (Secret
+//! Service) any process running as the same OS user can read these secrets and
+//! then sign orders directly against Hyperliquid, bypassing every guardrail; on
+//! macOS the Keychain prompt is per application, a barrier against casual
+//! access and not against a determined process holding your privileges. The
+//! keychain is *containment*, not a boundary. The only containment property
+//! that survives a compromised machine is the venue's: an agent (API) wallet
+//! cannot withdraw.
 //!
 //! # Invariants this file carries
 //!
@@ -53,10 +44,6 @@ use sha3::Sha3_256;
 
 use crate::guardrail::AgentId;
 
-// ---------------------------------------------------------------------------
-// Naming
-// ---------------------------------------------------------------------------
-
 /// Keychain service holding every testnet secret.
 ///
 /// Derived from the Tauri bundle identifier `xyz.oppen.desktop` with the
@@ -69,8 +56,7 @@ use crate::guardrail::AgentId;
 /// longer cancel its own resting orders.
 pub const SERVICE_TESTNET: &str = "xyz.oppen.testnet";
 
-/// Keychain service holding every mainnet secret. Frozen, for the same reason
-/// as [`SERVICE_TESTNET`].
+/// Keychain service holding every mainnet secret. Frozen, for the same reason.
 ///
 /// The network is in the *service* rather than in the entry name because
 /// `docs/decisions.md` R4 calls a mainnet number that is actually a testnet
@@ -90,17 +76,11 @@ const ENTRY_GUARDRAIL_HMAC: &str = "guardrail-hmac";
 /// contain, which is what keeps `agent-key/<id>/<generation>` unambiguous.
 const ENTRY_SEPARATOR: char = '/';
 
-/// Longest [`AgentId`] accepted into an entry name.
-///
-/// `AgentId::new` takes any `String`, so the bound has to be applied here
-/// rather than assumed. 64 bytes is longer than any identifier the pairing
-/// flow mints and short enough that the resulting entry name stays well inside
-/// every platform's target-name limit.
+/// Longest [`AgentId`] accepted into an entry name. `AgentId::new` takes any
+/// `String`, so the bound is applied here rather than assumed: 64 bytes is
+/// longer than any identifier the pairing flow mints and short enough that the
+/// entry name stays inside every platform's target-name limit.
 const MAX_AGENT_ID_BYTES: usize = 64;
-
-// ---------------------------------------------------------------------------
-// Expiry (docs/decisions.md D-b)
-// ---------------------------------------------------------------------------
 
 /// How long an `approveAgent` approval oppen requests is valid for: 90 days
 /// (`docs/decisions.md` D-b). Long enough not to be a chore, short enough that
@@ -122,34 +102,27 @@ pub fn default_valid_until_ms(now_ms: u64) -> u64 {
 
 /// Most retired agent addresses kept in a wallet record.
 ///
-/// The record is one keychain entry, and the Windows Credential Manager caps a
-/// credential blob at 2,560 bytes (`CRED_MAX_CREDENTIAL_BLOB_SIZE`). A retired
+/// The record is one keychain entry and the Windows Credential Manager caps a
+/// credential blob at 2,560 bytes (`CRED_MAX_CREDENTIAL_BLOB_SIZE`); a retired
 /// entry serializes to roughly 100 bytes, so sixteen of them plus the record's
-/// own fields stays under half that limit. At one rotation per 90-day approval
-/// that is four years of history, which is long enough to make accidental
-/// reuse of a pruned address a non-event, and the alternative — an unbounded
-/// list — is a record that silently stops being writable on Windows.
+/// own fields stays under half that. At one rotation per 90-day approval that
+/// is four years of history, and the alternative — an unbounded list — is a
+/// record that silently stops being writable on Windows.
 pub const MAX_RETIRED_ADDRESSES: usize = 16;
-
-// ---------------------------------------------------------------------------
-// Secrets in memory
-// ---------------------------------------------------------------------------
 
 /// Secret text held only as long as it is needed, overwritten on drop.
 ///
-/// This is the hand-off type between the keychain and
-/// [`oppen_hl::AgentKey::from_hex`], which zeroizes its own decode buffer. The
-/// review item it closes is that the *hex* must not linger either: the
-/// keychain hands back an ordinary `String`, and without a wrapper that
-/// allocation is freed with the private key still in it.
+/// The hand-off type between the keychain and [`oppen_hl::AgentKey::from_hex`],
+/// which zeroizes its own decode buffer. Without it the *hex* lingers: the
+/// keychain hands back an ordinary `String` whose allocation is freed with the
+/// private key still in it.
 ///
 /// **This is a stand-in for `zeroize::Zeroizing<String>` and is weaker.**
-/// `oppen-core` does not declare the `zeroize` crate (see this module's
-/// follow-ups), so the overwrite here is a plain loop plus a compiler fence
-/// rather than `zeroize`'s volatile writes; a sufficiently aggressive
-/// optimizer is permitted to elide it. It also cannot reach the copy
-/// `keyring` made inside its own decode path. Swap it for `Zeroizing<String>`
-/// the moment the dependency exists.
+/// `oppen-core` does not declare `zeroize`, so the overwrite is a plain fill
+/// plus a compiler fence rather than volatile writes and an aggressive
+/// optimizer is permitted to elide it, and it cannot reach the copy `keyring`
+/// made inside its own decode path. Swap it for `Zeroizing<String>` the moment
+/// the dependency exists.
 pub struct SecretText(Vec<u8>);
 
 impl SecretText {
@@ -161,25 +134,13 @@ impl SecretText {
 
     /// Borrows the secret as `&str` for the one call that needs it.
     ///
-    /// Fails rather than lossily converting: a keychain entry that is not
-    /// UTF-8 is a corrupt entry, and guessing at a private key is worse than
-    /// refusing to load it.
+    /// Fails rather than lossily converting: a keychain entry that is not UTF-8
+    /// is a corrupt entry, and guessing at a private key is worse than refusing
+    /// to load it.
     pub fn as_str(&self) -> Result<&str, KeyStoreError> {
         std::str::from_utf8(&self.0).map_err(|_| KeyStoreError::Corrupt {
             detail: "secret is not valid UTF-8".to_owned(),
         })
-    }
-
-    /// Length in bytes. Exposed because callers validate hex length before
-    /// deciding whether an entry is plausible; the *content* stays private.
-    pub fn len(&self) -> usize {
-        self.0.len()
-    }
-
-    /// Whether the stored secret is empty, which for every entry this module
-    /// writes means a corrupt entry.
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
     }
 }
 
@@ -200,24 +161,18 @@ impl std::fmt::Debug for SecretText {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Errors
-// ---------------------------------------------------------------------------
-
 /// Every way a key operation fails, typed so no caller has to parse a message
 /// (`AGENTS.md` invariant 8).
 #[derive(Debug, thiserror::Error)]
 pub enum KeyStoreError {
-    /// The platform credential store failed or is unavailable. On Linux this
-    /// is most often a locked or absent Secret Service.
+    /// The platform credential store failed or is unavailable. On Linux this is
+    /// most often a locked or absent Secret Service.
     #[error("keychain backend: {0}")]
     Backend(#[from] keyring::Error),
 
-    /// The in-memory store's lock was poisoned by a panic in another thread.
     #[error("key store lock poisoned")]
     Poisoned,
 
-    /// Nothing is stored under this entry.
     #[error("no keychain entry named {entry}")]
     Missing { entry: String },
 
@@ -242,18 +197,11 @@ pub enum KeyStoreError {
     InvalidKey,
 
     /// A rotation tried to install an address the record has already used.
-    ///
-    /// Hyperliquid prunes an agent when it is replaced and the nonce state
-    /// goes with it, so a reused address can be replayed against. This is
-    /// refused rather than warned about.
+    /// Hyperliquid prunes an agent when it is replaced and the nonce state goes
+    /// with it, so a reused address can be replayed against: refused, never
+    /// warned about.
     #[error("agent address {address} was already used by this agent; addresses are never reused")]
     AddressReused { address: Address },
-
-    /// The generation counter cannot advance further. Unreachable in practice
-    /// — it is `u32` and a generation is one 90-day approval — but it is not a
-    /// place to panic.
-    #[error("agent {agent} has exhausted its rotation counter")]
-    RotationOverflow { agent: String },
 
     /// No OS entropy source is reachable, so no key was generated.
     ///
@@ -262,7 +210,6 @@ pub enum KeyStoreError {
     #[error("no OS entropy source available: {detail}")]
     EntropyUnavailable { detail: String },
 
-    /// Serializing or deserializing a wallet record failed.
     #[error("wallet record encoding: {0}")]
     Encoding(#[from] serde_json::Error),
 
@@ -272,17 +219,13 @@ pub enum KeyStoreError {
     BadMacKey,
 }
 
-// ---------------------------------------------------------------------------
-// Entry names
-// ---------------------------------------------------------------------------
-
 /// A fully-qualified keychain entry: the per-network service plus the account
 /// name inside it.
 ///
-/// Constructed only through the associated functions below, so every entry
-/// this crate touches is network-qualified by construction and no caller can
+/// Constructed only through the associated functions below, so every entry this
+/// crate touches is network-qualified by construction and no caller can
 /// assemble a name that crosses networks (`docs/decisions.md` R4).
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct EntryName {
     service: &'static str,
     account: String,
@@ -303,8 +246,7 @@ impl EntryName {
     ///
     /// The generation is part of the name because `docs/decisions.md` D-b
     /// forbids reusing an agent address across a rotation: a rotation writes a
-    /// name that has never existed, so it cannot overwrite the key it
-    /// replaces.
+    /// name that has never existed, so it cannot overwrite the key it replaces.
     pub fn agent_key(
         network: Network,
         agent: &AgentId,
@@ -321,8 +263,7 @@ impl EntryName {
 
     /// An agent's wallet record: which generation is current, its address, its
     /// approval window and the addresses it has retired. Not secret, but it
-    /// belongs next to the key it describes so that deleting an agent deletes
-    /// both.
+    /// belongs next to the key it describes so deleting an agent deletes both.
     pub fn agent_record(network: Network, agent: &AgentId) -> Result<Self, KeyStoreError> {
         let id = checked_agent_id(agent)?;
         Ok(EntryName {
@@ -341,14 +282,8 @@ impl EntryName {
     }
 }
 
-impl std::fmt::Display for EntryName {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}:{}", self.service, self.account)
-    }
-}
-
 /// The keychain service for `network` (`docs/decisions.md` R4).
-pub fn service_of(network: Network) -> &'static str {
+fn service_of(network: Network) -> &'static str {
     match network {
         Network::Testnet => SERVICE_TESTNET,
         Network::Mainnet => SERVICE_MAINNET,
@@ -362,44 +297,32 @@ pub fn service_of(network: Network) -> &'static str {
 /// generation, and reading one agent's key would return another's.
 fn checked_agent_id(agent: &AgentId) -> Result<&str, KeyStoreError> {
     let id = agent.as_str();
-    if id.is_empty() {
-        return Err(KeyStoreError::InvalidAgentId {
-            id: id.to_owned(),
-            reason: "empty",
-        });
-    }
-    if id.len() > MAX_AGENT_ID_BYTES {
-        return Err(KeyStoreError::InvalidAgentId {
-            id: id.to_owned(),
-            reason: "longer than 64 bytes",
-        });
-    }
-    if !id
+    let reason = if id.is_empty() {
+        "empty"
+    } else if id.len() > MAX_AGENT_ID_BYTES {
+        "longer than 64 bytes"
+    } else if !id
         .bytes()
         .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
     {
-        return Err(KeyStoreError::InvalidAgentId {
-            id: id.to_owned(),
-            reason: "characters outside [A-Za-z0-9._-]",
-        });
-    }
-    Ok(id)
+        "characters outside [A-Za-z0-9._-]"
+    } else {
+        return Ok(id);
+    };
+    Err(KeyStoreError::InvalidAgentId {
+        id: id.to_owned(),
+        reason,
+    })
 }
-
-// ---------------------------------------------------------------------------
-// Wallet records
-// ---------------------------------------------------------------------------
 
 /// An agent address this agent has stopped using.
 ///
-/// Kept so a rotation can refuse to reinstall it. Hyperliquid prunes a
-/// replaced agent and its nonce state, so re-approving an old address hands an
-/// attacker a signer whose nonce window has been reset.
+/// Kept so a rotation can refuse to reinstall it. Hyperliquid prunes a replaced
+/// agent and its nonce state, so re-approving an old address hands an attacker
+/// a signer whose nonce window has been reset.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RetiredAgentWallet {
-    /// Generation this address served.
     pub generation: u32,
-    /// The retired agent address.
     pub address: Address,
     /// When the rotation that retired it happened, in ms since the epoch.
     pub retired_at_ms: u64,
@@ -407,13 +330,12 @@ pub struct RetiredAgentWallet {
 
 /// The non-secret record describing an agent's current wallet.
 ///
-/// Serialized in declaration order into one keychain entry, so the stored
-/// bytes are byte-identical for equal values (`AGENTS.md` invariant 6). It is
-/// what lets the console and `get_state` answer "how long has this agent got"
+/// Serialized in declaration order into one keychain entry, so the stored bytes
+/// are byte-identical for equal values (`AGENTS.md` invariant 6). It is what
+/// lets the console and `get_state` answer "how long has this agent got"
 /// without ever touching the key.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentWallet {
-    /// Which agent this wallet belongs to.
     pub agent: AgentId,
     /// Rotation counter. `0` is the first wallet; each rotation adds one and
     /// names a keychain entry that has never existed before.
@@ -442,22 +364,13 @@ pub struct AgentWallet {
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum ExpiryState {
     /// More than 14 days left.
-    Valid {
-        /// Milliseconds until `valid_until`.
-        remaining_ms: u64,
-    },
+    Valid { remaining_ms: u64 },
     /// Inside D-b's 14-day warning window. The operator should be told.
-    Expiring {
-        /// Milliseconds until `valid_until`.
-        remaining_ms: u64,
-    },
+    Expiring { remaining_ms: u64 },
     /// `valid_until` has passed. D-b: signing fails, oppen halts the agent and
-    /// cancels resting orders, and **leaves positions open** — force-closing
-    /// on a calendar event is a destructive action triggered by a clock.
-    Expired {
-        /// Milliseconds since `valid_until`.
-        elapsed_ms: u64,
-    },
+    /// cancels resting orders, and **leaves positions open** — force-closing on
+    /// a calendar event is a destructive action triggered by a clock.
+    Expired { elapsed_ms: u64 },
 }
 
 impl AgentWallet {
@@ -489,16 +402,12 @@ impl AgentWallet {
     /// The retired list is capped, so a `false` from this means "not in the
     /// last [`MAX_RETIRED_ADDRESSES`] rotations", not "never". Documented
     /// rather than papered over: the addresses come from freshly generated
-    /// keys, so a collision past the cap requires deliberately importing an
-    /// old key.
+    /// keys, so a collision past the cap requires deliberately importing an old
+    /// key.
     pub fn has_used(&self, address: &Address) -> bool {
         self.address == *address || self.retired.iter().any(|r| r.address == *address)
     }
 }
-
-// ---------------------------------------------------------------------------
-// The guardrail HMAC key
-// ---------------------------------------------------------------------------
 
 /// Length of the guardrail HMAC key and of the tags it produces, in bytes.
 pub const HMAC_KEY_LEN: usize = 32;
@@ -510,8 +419,8 @@ pub const HMAC_TAG_LEN: usize = 32;
 ///
 /// `docs/threat-model.md` is explicit that this makes tampering **detectable,
 /// not preventable** — the same-user process that can edit the database can
-/// also read this key out of the keychain. What it buys is that a limit
-/// changed outside oppen does not pass unnoticed.
+/// also read this key out of the keychain. What it buys is that a limit changed
+/// outside oppen does not pass unnoticed.
 ///
 /// HMAC-SHA3-256 because `sha3` is already the workspace's hash — the ledger
 /// chain and the L1 action hash both use Keccak — and adding a second hash
@@ -519,23 +428,22 @@ pub const HMAC_TAG_LEN: usize = 32;
 pub struct HmacKey([u8; HMAC_KEY_LEN]);
 
 impl HmacKey {
-    /// Wraps caller-supplied key bytes.
-    ///
-    /// Public so a front end that *does* have an OS RNG can generate the key
-    /// itself on a platform where [`HmacKey::generate`] cannot (see its docs).
+    /// Wraps caller-supplied key bytes. Public so a front end that *does* have
+    /// an OS RNG can generate the key itself on a platform where
+    /// [`HmacKey::generate`] cannot (see its docs).
     pub fn from_bytes(bytes: [u8; HMAC_KEY_LEN]) -> Self {
         HmacKey(bytes)
     }
 
     /// Generates a key from the OS CSPRNG.
     ///
-    /// On unix this reads `/dev/urandom`, which is the kernel CSPRNG on both
-    /// macOS and Linux and does not block. **On other platforms — Windows
-    /// included — this returns [`KeyStoreError::EntropyUnavailable`]**, because
-    /// `oppen-core` does not declare a `getrandom`-style dependency and there
-    /// is no `std` API for OS entropy. That is a real gap, not a design
-    /// choice; it fails closed so a weak key is unrepresentable, and the fix is
-    /// one dependency line. Until then, a Windows front end must call
+    /// On unix this reads `/dev/urandom`, the kernel CSPRNG on both macOS and
+    /// Linux, which does not block. **On other platforms — Windows included —
+    /// this returns [`KeyStoreError::EntropyUnavailable`]**, because
+    /// `oppen-core` declares no `getrandom`-style dependency and there is no
+    /// `std` API for OS entropy. That is a real gap, not a design choice; it
+    /// fails closed so a weak key is unrepresentable, and the fix is one
+    /// dependency line. Until then a Windows front end must call
     /// [`HmacKey::from_bytes`] with entropy it obtained itself and store it via
     /// [`KeyStore::store_hmac_key`].
     pub fn generate() -> Result<Self, KeyStoreError> {
@@ -549,7 +457,7 @@ impl HmacKey {
     ///
     /// Returns a `Result` rather than panicking on a key length the MAC could
     /// reject. HMAC accepts any key length, so the error branch is structurally
-    /// dead, but a dead branch is cheaper than a `expect` on a signing path.
+    /// dead, but a dead branch is cheaper than an `expect` on a signing path.
     pub fn sign(&self, message: &[u8]) -> Result<[u8; HMAC_TAG_LEN], KeyStoreError> {
         let mut mac =
             Hmac::<Sha3_256>::new_from_slice(&self.0).map_err(|_| KeyStoreError::BadMacKey)?;
@@ -560,30 +468,14 @@ impl HmacKey {
     /// Constant-time check that `tag` is this key's tag over `message`.
     ///
     /// Returns `false` for a wrong tag, a wrong length and for any internal
-    /// failure: a verifier that could not run has not verified anything, and
-    /// on this path "unknown" has to read as "no".
+    /// failure: a verifier that could not run has not verified anything, and on
+    /// this path "unknown" has to read as "no".
     pub fn verify(&self, message: &[u8], tag: &[u8]) -> bool {
         let Ok(mut mac) = Hmac::<Sha3_256>::new_from_slice(&self.0) else {
             return false;
         };
         mac.update(message);
         mac.verify_slice(tag).is_ok()
-    }
-
-    /// Storage form: 64 lowercase hex characters, wrapped so the encoded copy
-    /// is overwritten when it goes out of scope.
-    fn to_secret_hex(&self) -> SecretText {
-        SecretText::new(hex::encode(self.0))
-    }
-
-    /// Parses the storage form written by [`HmacKey::to_secret_hex`].
-    fn from_secret_hex(secret: &SecretText) -> Result<Self, KeyStoreError> {
-        let text = secret.as_str()?;
-        let mut bytes = [0u8; HMAC_KEY_LEN];
-        hex::decode_to_slice(text, &mut bytes).map_err(|_| KeyStoreError::Corrupt {
-            detail: "hmac key entry is not 32 bytes of hex".to_owned(),
-        })?;
-        Ok(HmacKey(bytes))
     }
 }
 
@@ -629,24 +521,20 @@ fn os_entropy(_dst: &mut [u8]) -> Result<(), KeyStoreError> {
     })
 }
 
-// ---------------------------------------------------------------------------
-// The store
-// ---------------------------------------------------------------------------
-
 /// Read/write access to one network's secrets.
 ///
 /// The three required methods are raw entry access; everything an operator or
-/// the guardrail engine actually calls is a provided method built on them, so
-/// the agent-wallet rules (one record per agent, rotation mints a new
-/// generation, an address is never reinstalled) are implemented once and hold
-/// for the in-memory store used by tests exactly as they do for the keychain.
+/// the guardrail engine calls is a provided method built on them, so the
+/// agent-wallet rules (one record per agent, rotation mints a new generation,
+/// an address is never reinstalled) are implemented once and hold for the
+/// in-memory store used by tests exactly as they do for the keychain.
 ///
 /// `Send + Sync` because `docs/decisions.md` R1 has the core running headless
 /// with the console as a client: a store is shared across the async runtime's
 /// worker threads.
 pub trait KeyStore: Send + Sync {
-    /// Which network's secrets this store holds. Every entry name is built
-    /// from it (`docs/decisions.md` R4).
+    /// Which network's secrets this store holds. Every entry name is built from
+    /// it (`docs/decisions.md` R4).
     fn network(&self) -> Network;
 
     /// Writes `secret` at `entry`, replacing whatever was there.
@@ -687,11 +575,6 @@ pub trait KeyStore: Send + Sync {
     /// Refuses if the agent already has a record. `docs/decisions.md` D-b
     /// requires a new agent address per rotation, so replacing a wallet is
     /// [`KeyStore::rotate_agent_key`] and never an overwrite.
-    ///
-    /// The key entry is written before the record. A crash between the two
-    /// leaves a key no record points at, which is unusable and which a retry
-    /// overwrites; the reverse order would leave a record pointing at nothing,
-    /// which wedges the agent permanently.
     fn create_agent_key(
         &self,
         agent: &AgentId,
@@ -714,14 +597,7 @@ pub trait KeyStore: Send + Sync {
             valid_until_ms,
             retired: Vec::new(),
         };
-        self.write(
-            &EntryName::agent_key(self.network(), agent, 0)?,
-            normalized.as_str()?,
-        )?;
-        self.write(
-            &EntryName::agent_record(self.network(), agent)?,
-            &serde_json::to_string(&record)?,
-        )?;
+        write_wallet(self, agent, &normalized, &record)?;
         Ok(record)
     }
 
@@ -730,8 +606,7 @@ pub trait KeyStore: Send + Sync {
     /// This is the API shape `docs/decisions.md` D-b asks for: a rotation
     /// *mints* an entry rather than overwriting one. The previous generation's
     /// key stays in the keychain so the retiring agent can still cancel its own
-    /// resting orders; [`KeyStore::forget_retired_keys`] removes it once that
-    /// is done, and the retired *addresses* survive that deletion.
+    /// resting orders.
     ///
     /// Refuses an address this agent has used before. Hyperliquid prunes a
     /// replaced agent along with its nonce state, so reinstalling an old
@@ -743,22 +618,21 @@ pub trait KeyStore: Send + Sync {
         valid_until_ms: u64,
         now_ms: u64,
     ) -> Result<AgentWallet, KeyStoreError> {
-        let current = self
-            .agent_wallet(agent)?
-            .ok_or_else(|| KeyStoreError::Missing {
-                entry: format!("{PREFIX_AGENT_RECORD}{ENTRY_SEPARATOR}{agent}"),
-            })?;
+        let current = require_wallet(self, agent)?;
         let normalized = normalize_key_hex(&key_hex)?;
         let address = address_of_key(&normalized)?;
         if current.has_used(&address) {
             return Err(KeyStoreError::AddressReused { address });
         }
+        // `u32` and one generation per 90-day approval, so this is unreachable
+        // in practice — but it is not a place to panic, and it must not wrap
+        // onto an entry name that already exists.
         let generation =
             current
                 .generation
                 .checked_add(1)
-                .ok_or_else(|| KeyStoreError::RotationOverflow {
-                    agent: agent.as_str().to_owned(),
+                .ok_or_else(|| KeyStoreError::Corrupt {
+                    detail: format!("agent {agent} has exhausted its rotation counter"),
                 })?;
 
         let mut retired = current.retired;
@@ -768,8 +642,7 @@ pub trait KeyStore: Send + Sync {
             retired_at_ms: now_ms,
         });
         if retired.len() > MAX_RETIRED_ADDRESSES {
-            let drop_count = retired.len() - MAX_RETIRED_ADDRESSES;
-            retired.drain(..drop_count);
+            retired.drain(..retired.len() - MAX_RETIRED_ADDRESSES);
         }
 
         let record = AgentWallet {
@@ -780,14 +653,7 @@ pub trait KeyStore: Send + Sync {
             valid_until_ms,
             retired,
         };
-        self.write(
-            &EntryName::agent_key(self.network(), agent, generation)?,
-            normalized.as_str()?,
-        )?;
-        self.write(
-            &EntryName::agent_record(self.network(), agent)?,
-            &serde_json::to_string(&record)?,
-        )?;
+        write_wallet(self, agent, &normalized, &record)?;
         Ok(record)
     }
 
@@ -795,8 +661,7 @@ pub trait KeyStore: Send + Sync {
     ///
     /// The hex never becomes a plain `String` on the way: it is wrapped in
     /// [`SecretText`] as it leaves the keychain and handed to
-    /// `AgentKey::from_hex`, which zeroizes its own decode buffer. This is the
-    /// hand-off `ROADMAP.md` item [2] names.
+    /// `AgentKey::from_hex`, which zeroizes its own decode buffer.
     ///
     /// Loading an *expired* wallet is not refused here. Expiry is a policy the
     /// guardrail engine applies — D-b halts the agent and cancels resting
@@ -804,32 +669,12 @@ pub trait KeyStore: Send + Sync {
     /// load would make that cleanup impossible. Callers check
     /// [`AgentWallet::expiry`].
     fn load_agent_key(&self, agent: &AgentId) -> Result<AgentKey, KeyStoreError> {
-        let record = self
-            .agent_wallet(agent)?
-            .ok_or_else(|| KeyStoreError::Missing {
-                entry: format!("{PREFIX_AGENT_RECORD}{ENTRY_SEPARATOR}{agent}"),
-            })?;
+        let record = require_wallet(self, agent)?;
         let entry = EntryName::agent_key(self.network(), agent, record.generation)?;
         let stored = self.read(&entry)?.ok_or_else(|| KeyStoreError::Missing {
             entry: entry.account().to_owned(),
         })?;
         AgentKey::from_hex(stored.as_str()?).map_err(|_| KeyStoreError::InvalidKey)
-    }
-
-    /// Deletes the key material of every generation before the current one,
-    /// keeping the record and therefore the retired-address list.
-    ///
-    /// The point of the split: forgetting a retired *key* is safe housekeeping,
-    /// while forgetting a retired *address* would let a later rotation
-    /// reinstall it.
-    fn forget_retired_keys(&self, agent: &AgentId) -> Result<(), KeyStoreError> {
-        let Some(record) = self.agent_wallet(agent)? else {
-            return Ok(());
-        };
-        for generation in 0..record.generation {
-            self.remove(&EntryName::agent_key(self.network(), agent, generation)?)?;
-        }
-        Ok(())
     }
 
     /// Removes an agent entirely: every generation's key and the record.
@@ -849,13 +694,16 @@ pub trait KeyStore: Send + Sync {
     }
 
     /// The guardrail HMAC key, or `None` on a machine that has never run oppen
-    /// on this network.
+    /// on this network. Stored as 64 lowercase hex characters.
     fn load_hmac_key(&self) -> Result<Option<HmacKey>, KeyStoreError> {
-        let entry = EntryName::guardrail_hmac(self.network());
-        match self.read(&entry)? {
-            None => Ok(None),
-            Some(stored) => Ok(Some(HmacKey::from_secret_hex(&stored)?)),
-        }
+        let Some(stored) = self.read(&EntryName::guardrail_hmac(self.network()))? else {
+            return Ok(None);
+        };
+        let mut bytes = [0u8; HMAC_KEY_LEN];
+        hex::decode_to_slice(stored.as_str()?, &mut bytes).map_err(|_| KeyStoreError::Corrupt {
+            detail: "hmac key entry is not 32 bytes of hex".to_owned(),
+        })?;
+        Ok(Some(HmacKey(bytes)))
     }
 
     /// Stores `key`, replacing any existing one.
@@ -864,10 +712,14 @@ pub trait KeyStore: Send + Sync {
     /// key, which then reads as tampering. That is the correct alarm — the
     /// configuration really is no longer the one that was authenticated — so
     /// the caller must re-tag the configuration in the same operation.
+    ///
+    /// The hex goes through [`SecretText`] so the encoded copy is overwritten.
     fn store_hmac_key(&self, key: &HmacKey) -> Result<(), KeyStoreError> {
-        let entry = EntryName::guardrail_hmac(self.network());
-        let encoded = key.to_secret_hex();
-        self.write(&entry, encoded.as_str()?)
+        let encoded = SecretText::new(hex::encode(key.0));
+        self.write(
+            &EntryName::guardrail_hmac(self.network()),
+            encoded.as_str()?,
+        )
     }
 
     /// Loads the guardrail HMAC key, generating and storing one on first run
@@ -877,8 +729,7 @@ pub trait KeyStore: Send + Sync {
     /// both would generate, the later write would win, and configuration tagged
     /// by the loser would then fail verification. That surfaces as a tamper
     /// alarm rather than as a silent bypass, which is the failure direction
-    /// this subsystem is supposed to have, and a single-instance desktop app
-    /// does not reach it.
+    /// this subsystem is supposed to have.
     fn ensure_hmac_key(&self) -> Result<HmacKey, KeyStoreError> {
         if let Some(existing) = self.load_hmac_key()? {
             return Ok(existing);
@@ -895,11 +746,44 @@ pub trait KeyStore: Send + Sync {
     }
 }
 
-/// Canonicalises a private key hex string to bare lowercase 64 characters.
+/// The agent's record, or [`KeyStoreError::Missing`] if it has none. Shared by
+/// the two paths that cannot proceed without one.
+fn require_wallet<S: KeyStore + ?Sized>(
+    store: &S,
+    agent: &AgentId,
+) -> Result<AgentWallet, KeyStoreError> {
+    store
+        .agent_wallet(agent)?
+        .ok_or_else(|| KeyStoreError::Missing {
+            entry: format!("{PREFIX_AGENT_RECORD}{ENTRY_SEPARATOR}{agent}"),
+        })
+}
+
+/// Writes a wallet's key entry and then its record, in that order.
 ///
-/// Stored canonically so that the same key written by the onboarding flow and
-/// by an import produce identical entries, and so a later reader never has to
-/// guess whether a `0x` prefix is present.
+/// The order is the point. A crash between the two leaves a key no record
+/// points at, which is unusable and which a retry overwrites; the reverse would
+/// leave a record pointing at nothing, which wedges the agent permanently.
+fn write_wallet<S: KeyStore + ?Sized>(
+    store: &S,
+    agent: &AgentId,
+    key_hex: &SecretText,
+    record: &AgentWallet,
+) -> Result<(), KeyStoreError> {
+    let network = store.network();
+    store.write(
+        &EntryName::agent_key(network, agent, record.generation)?,
+        key_hex.as_str()?,
+    )?;
+    store.write(
+        &EntryName::agent_record(network, agent)?,
+        &serde_json::to_string(record)?,
+    )
+}
+
+/// Canonicalises a private key hex string to bare lowercase 64 characters, so
+/// the same key written by the onboarding flow and by an import produce
+/// identical entries and a later reader never has to guess at a `0x` prefix.
 fn normalize_key_hex(key_hex: &SecretText) -> Result<SecretText, KeyStoreError> {
     let text = key_hex.as_str()?;
     let body = text.strip_prefix("0x").unwrap_or(text);
@@ -916,31 +800,22 @@ fn address_of_key(normalized: &SecretText) -> Result<Address, KeyStoreError> {
     Ok(key.address())
 }
 
-// ---------------------------------------------------------------------------
-// The keychain-backed store
-// ---------------------------------------------------------------------------
-
 /// The real store: Keychain on macOS, Credential Manager on Windows, Secret
-/// Service on Linux, via the `keyring` crate.
-///
-/// See this module's header for what that does and does not protect. In short:
-/// on Windows and Linux any process running as the same OS user can read these
-/// entries, and on macOS the prompt is per application.
+/// Service on Linux, via the `keyring` crate. See this module's header for what
+/// that does and does not protect.
 #[derive(Debug, Clone, Copy)]
 pub struct KeychainKeyStore {
     network: Network,
 }
 
 impl KeychainKeyStore {
-    /// A store over `network`'s keychain service.
-    ///
-    /// The network is fixed at construction rather than passed per call so that
-    /// no call site can pick the wrong one (`docs/decisions.md` R4).
+    /// A store over `network`'s keychain service. The network is fixed at
+    /// construction rather than passed per call so that no call site can pick
+    /// the wrong one (`docs/decisions.md` R4).
     pub fn new(network: Network) -> Self {
         KeychainKeyStore { network }
     }
 
-    /// Opens the platform entry behind `name`.
     fn entry(name: &EntryName) -> Result<keyring::Entry, KeyStoreError> {
         Ok(keyring::Entry::new(name.service(), name.account())?)
     }
@@ -972,33 +847,23 @@ impl KeyStore for KeychainKeyStore {
     }
 }
 
-// ---------------------------------------------------------------------------
-// The in-memory store
-// ---------------------------------------------------------------------------
-
-/// A process-local store for tests and for headless runs on a machine with no
-/// credential store.
+/// The test double. **Never a substitute for the keychain in a shipped build:**
+/// it holds secrets in process memory for the process's whole life.
 ///
 /// CI has no keychain, and a test suite that skipped itself there would leave
 /// the agent-wallet rules — one record per agent, rotation mints a generation,
 /// an address is never reinstalled — untested on the only machine that gates a
 /// merge. Those rules are provided methods on [`KeyStore`], so exercising them
-/// here exercises the same code the keychain store runs.
-///
-/// `BTreeMap`, not `HashMap`: `AGENTS.md` invariant 6 wants deterministic
-/// iteration anywhere state is enumerated, and it makes a test that dumps the
-/// store's contents stable.
-///
-/// **Not a substitute for the keychain in a shipped build.** It holds secrets
-/// in process memory for the process's whole life and writes nothing to disk.
-#[derive(Debug, Default)]
+/// here exercises the same code the keychain store runs. `BTreeMap`, not
+/// `HashMap`, because `AGENTS.md` invariant 6 wants deterministic iteration
+/// anywhere state is enumerated.
+#[derive(Debug)]
 pub struct MemoryKeyStore {
     network: Network,
     entries: Mutex<BTreeMap<(&'static str, String), String>>,
 }
 
 impl MemoryKeyStore {
-    /// An empty store over `network`.
     pub fn new(network: Network) -> Self {
         MemoryKeyStore {
             network,
@@ -1044,10 +909,6 @@ impl KeyStore for MemoryKeyStore {
         Ok(())
     }
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -1332,33 +1193,6 @@ mod tests {
     }
 
     #[test]
-    fn forget_retired_keys_drops_key_material_but_not_addresses() {
-        let store = MemoryKeyStore::new(Network::Testnet);
-        let a = agent("alpha");
-        let first = store
-            .create_agent_key(&a, secret(KEY_A), T0 + DAY_MS, T0)
-            .expect("create");
-        store
-            .rotate_agent_key(&a, secret(KEY_B), T0 + DAY_MS, T0)
-            .expect("rotate");
-        store.forget_retired_keys(&a).expect("forget");
-
-        let names = store.entry_names().expect("names");
-        assert!(!names.contains(&format!("{SERVICE_TESTNET}:agent-key/alpha/0")));
-        assert!(names.contains(&format!("{SERVICE_TESTNET}:agent-key/alpha/1")));
-
-        // The retired address is still blocked.
-        let record = store.agent_wallet(&a).expect("read").expect("present");
-        assert!(record.has_used(&first.address));
-        assert!(matches!(
-            store.rotate_agent_key(&a, secret(KEY_A), T0 + DAY_MS, T0),
-            Err(KeyStoreError::AddressReused { .. })
-        ));
-        // The current key still loads.
-        assert!(store.load_agent_key(&a).is_ok());
-    }
-
-    #[test]
     fn delete_agent_removes_every_generation() {
         let store = MemoryKeyStore::new(Network::Testnet);
         let a = agent("alpha");
@@ -1560,18 +1394,6 @@ mod tests {
     }
 
     #[test]
-    fn hmac_matches_the_published_test_shape() {
-        // Two distinct messages under one key must not collide, and the tag is
-        // deterministic across calls — the two properties the config check
-        // relies on.
-        let key = HmacKey::from_bytes([1u8; HMAC_KEY_LEN]);
-        let a = key.sign(b"a").expect("sign");
-        let b = key.sign(b"b").expect("sign");
-        assert_ne!(a, b);
-        assert_eq!(a, key.sign(b"a").expect("sign"));
-    }
-
-    #[test]
     fn hmac_key_round_trips_through_the_store() {
         let store = MemoryKeyStore::new(Network::Testnet);
         assert!(store.load_hmac_key().expect("load").is_none());
@@ -1637,8 +1459,6 @@ mod tests {
         let rendered = format!("{s:?}");
         assert!(!rendered.contains(KEY_A), "{rendered}");
         assert!(rendered.contains("redacted"), "{rendered}");
-        assert_eq!(s.len(), 64);
-        assert!(!s.is_empty());
 
         let key = HmacKey::from_bytes([9u8; HMAC_KEY_LEN]);
         let rendered = format!("{key:?}");

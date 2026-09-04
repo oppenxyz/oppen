@@ -20,16 +20,8 @@
 //! 3. **`sign_cleared` cannot skip the gate.** It has no parameter for the
 //!    checker; it passes `self`.
 //!
-//! What it does not check: that nothing *else* signs.
-//! `oppen_hl::ExchangeRequest::sign_unchecked` and
-//! `AgentKey::sign_l1_action` are `pub`, so a module that wants to sign
-//! without a clearance can. They are named to be greppable rather than
-//! hidden, `oppen-core`'s
-//! `no_call_site_in_oppen_core_reaches_the_signer_unchecked` test fails the
-//! suite if one appears in this crate, and closing them workspace-wide is a
-//! `clippy.toml` `disallowed-methods` entry that does not exist yet. So the
-//! honest statement is: a bypass cannot happen by accident, and every
-//! deliberate one is one grep away.
+//! What it does not check: that nothing *else* signs. [`crate::guardrail`]'s
+//! module doc states that residual and why it is the honest one.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -49,7 +41,7 @@ use super::bucket::{BucketError, TokenBucket};
 use super::config::{
     APPROVAL_TTL_MS, AgentGuardrails, GlobalRateBudget, LossLimits, MAX_REASON_BYTES, OrderRate,
 };
-use super::deadman::{DEAD_MAN_MIN_LEAD_MS, DeadManIntent, DeadManPolicy};
+use super::deadman::{DEAD_MAN_MIN_LEAD_MS, DeadManIntent};
 use super::kill::{Engagement, KillEffect, KillReason, KillScope, KillSwitch};
 use super::refusal::{ReduceOnlyBreach, Refusal, Unevaluable, VenueRule};
 use super::snapshot::{AccountSnapshot, Exposure, MarketRef, MarketSnapshotRef};
@@ -105,7 +97,6 @@ pub struct Proposal {
     id: String,
     agent: AgentId,
     intent: OrderIntent,
-    issued_at_ms: u64,
     expires_at_ms: u64,
 }
 
@@ -114,6 +105,8 @@ impl Proposal {
         &self.id
     }
 
+    /// Who asked. `pending_proposals` is fleet-wide, so the approvals queue
+    /// needs this to attribute a proposal to a roster card (item 32).
     pub fn agent(&self) -> &AgentId {
         &self.agent
     }
@@ -125,10 +118,8 @@ impl Proposal {
         &self.intent
     }
 
-    pub fn issued_at_ms(&self) -> u64 {
-        self.issued_at_ms
-    }
-
+    /// Item 28's TTL, and the `expires_at` of the MCP `pending_approval`
+    /// result. Without it the queue cannot show the countdown.
     pub fn expires_at_ms(&self) -> u64 {
         self.expires_at_ms
     }
@@ -260,7 +251,7 @@ impl Cleared {
         &self.clearance
     }
 
-    pub(super) fn into_parts(self) -> (Action, Clearance) {
+    fn into_parts(self) -> (Action, Clearance) {
         (self.action, self.clearance)
     }
 }
@@ -451,7 +442,6 @@ impl EngineState {
 pub struct GuardrailEngine {
     store: Arc<dyn GuardrailStore>,
     sink: Arc<dyn AuditSink>,
-    dead_man: DeadManPolicy,
     /// R4: one engine per network, and every clearance it produces carries
     /// this. Fixed at construction because there is no operator gesture that
     /// should move a running engine from testnet to mainnet — switching
@@ -464,7 +454,6 @@ impl std::fmt::Debug for GuardrailEngine {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GuardrailEngine")
             .field("network", &self.network)
-            .field("dead_man", &self.dead_man)
             .finish_non_exhaustive()
     }
 }
@@ -477,21 +466,11 @@ impl GuardrailEngine {
         sink: Arc<dyn AuditSink>,
         network: Network,
     ) -> Result<Self, GuardrailError> {
-        Self::with_policy(store, sink, network, DeadManPolicy::default())
-    }
-
-    pub fn with_policy(
-        store: Arc<dyn GuardrailStore>,
-        sink: Arc<dyn AuditSink>,
-        network: Network,
-        dead_man: DeadManPolicy,
-    ) -> Result<Self, GuardrailError> {
         let persisted = store.load()?;
         let global_budget = GlobalRateBudget::default();
         Ok(GuardrailEngine {
             store,
             sink,
-            dead_man,
             network,
             state: Mutex::new(EngineState {
                 guardrails: persisted.guardrails,
@@ -507,11 +486,6 @@ impl GuardrailEngine {
                 pending_effects: Vec::new(),
             }),
         })
-    }
-
-    /// Which network every clearance from this engine is bound to (D4, R4).
-    pub fn network(&self) -> Network {
-        self.network
     }
 
     /// A poisoned lock is recovered rather than propagated: the state behind
@@ -656,10 +630,6 @@ impl GuardrailEngine {
         Ok(())
     }
 
-    pub fn global_rate_budget(&self) -> GlobalRateBudget {
-        self.state().global_budget
-    }
-
     /// Engages the kill switch and reports whose resting orders must now be
     /// cancelled (spec item 26). Persisted before it is reported, so an
     /// engagement the operator has been shown is an engagement that survives
@@ -745,6 +715,9 @@ impl GuardrailEngine {
         self.state().vaults.get(agent).copied()
     }
 
+    /// Read back after a restart, so a limit the operator set is one the
+    /// risk console can still display (item 25, item 32). The per-agent
+    /// equivalent is [`GuardrailEngine::guardrails`].
     pub fn account_limits(&self) -> LossLimits {
         self.state().account_limits
     }
@@ -846,12 +819,7 @@ impl GuardrailEngine {
 
     /// Whether `scheduleCancel` should be armed right now (spec item 27).
     pub fn dead_man_intent(&self, now_ms: u64, armed_until_ms: Option<u64>) -> DeadManIntent {
-        super::deadman::evaluate(
-            &self.dead_man,
-            now_ms,
-            self.state().active.len(),
-            armed_until_ms,
-        )
+        super::deadman::evaluate(now_ms, self.state().active.len(), armed_until_ms)
     }
 
     // ---- the signing path ------------------------------------------------
@@ -1693,7 +1661,6 @@ impl EngineState {
                 id: id.clone(),
                 agent: agent.clone(),
                 intent: intent.clone(),
-                issued_at_ms: now_ms,
                 expires_at_ms: now_ms.saturating_add(APPROVAL_TTL_MS),
             },
         );
@@ -1737,21 +1704,16 @@ fn spend_global(
     if mode == Mode::Approved {
         return Ok(bucket.tokens());
     }
-    if bucket.tokens() <= reserve {
+    // The reserve is checked before the take, so a refused order never draws
+    // on the headroom item 10 keeps for cancels.
+    if bucket.tokens() <= reserve || bucket.try_take(now_ms).is_err() {
         return Err(Refusal::GlobalRateBudget {
             tokens_available: bucket.tokens(),
             reserve: budget.reserve,
             retry_after_ms: bucket.retry_after_ms(),
         });
     }
-    match bucket.try_take(now_ms) {
-        Ok(()) => Ok(bucket.tokens()),
-        Err(_) => Err(Refusal::GlobalRateBudget {
-            tokens_available: bucket.tokens(),
-            reserve: budget.reserve,
-            retry_after_ms: bucket.retry_after_ms(),
-        }),
-    }
+    Ok(bucket.tokens())
 }
 
 /// Charges the address-wide budget for a risk-reducing request without ever
@@ -1958,12 +1920,13 @@ fn check_reduce_only(
 /// away from the reference has no slippage, so a resting bid below the mid is
 /// not refused for being far from it.
 ///
+/// The reference is positive by the time this runs: a market one comes from
+/// [`check_market`], and a trigger one has been through `OrderSpec::to_wire`,
+/// which rejects a non-positive price.
+///
 /// `None` when the arithmetic overflows, which the caller turns into a
 /// refusal — the fail-closed reading of "this number is not representable".
 fn adverse_slippage_bps(is_buy: bool, px: Decimal, reference_px: Decimal) -> Option<Decimal> {
-    if reference_px <= Decimal::ZERO {
-        return Some(Decimal::ZERO);
-    }
     let adverse = if is_buy {
         px.checked_sub(reference_px)
     } else {

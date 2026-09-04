@@ -146,10 +146,6 @@ impl KillSwitch {
         self.global.as_ref()
     }
 
-    pub fn engaged_agents(&self) -> impl Iterator<Item = (&AgentId, &Engagement)> {
-        self.agents.iter()
-    }
-
     /// Engages the switch. Idempotent: re-engaging an already-engaged scope
     /// keeps the original timestamp and reason, because the first trip is
     /// the one that explains what happened.

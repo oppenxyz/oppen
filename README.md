@@ -46,8 +46,14 @@ stays fixed; custody never moves.
   from the model to the limits.
 - **An operator console** where the activity stream is the hero surface. Every
   intent, every refusal with its reason, every fill, one kill switch.
-- **One Hyperliquid sub-account per agent.** Attribution and capital segregation
-  enforced by the venue, not by bookkeeping.
+- **One venue account per agent.** Attribution and capital segregation enforced by
+  the venue, not by bookkeeping. oppen calls that account a *container*: a
+  sub-account where the venue grants one, a top-level account otherwise. On
+  Hyperliquid sub-accounts are gated behind $100,000 of traded volume, so a new
+  user gets zero of them and v1 gives each agent its own top-level account
+  (decision D1, revised 2026-09-04). Once your volume clears the gate a container
+  can be migrated onto a real sub-account — oppen attempts the creation and
+  classifies the refusal, rather than predicting whether you are eligible.
 
 ## What it is not
 
@@ -56,6 +62,12 @@ stays fixed; custody never moves.
   discretionary trading.
 - **Not a strategy.** oppen ships no alpha, no signals and no default agent
   behaviour. It computes features and enforces limits. Your agent decides.
+- **Not a cross-venue margin system.** Positions never net across venues: three
+  venues means three margin pools, three liquidation prices and no cross-margin. A
+  book that is economically flat pays full margin on both legs, and one leg can
+  liquidate while the other survives. When a second venue ships, oppen sums exposure
+  across containers and displays it — a report, never a control, because no venue
+  can see the others.
 - **Not a defence against a compromised host.** See the
   [threat model](docs/threat-model.md), which is short and worth reading in full.
 - **Not a guarantee against loss.** Guardrails bound loss to the limits you set.
@@ -94,27 +106,76 @@ guardrail evaluation, signing, reconciliation, ledger writes.
 
 ## How keys work
 
-**The master wallet never enters oppen.** There is no code path that accepts a
-master private key or seed phrase.
+**No account-owner key ever enters oppen.** There is no code path that accepts a
+private key or a seed phrase, on any venue, at any step — not behind an advanced
+toggle, not to import an existing account (decision D5).
+
+Note the plural. Under the revised D1 there is no single master. In v1 each agent's
+container is a top-level Hyperliquid account — a second, third, fourth account in
+your own wallet — so there is one account-owner key per agent, every one of them
+able to withdraw, and every one of them staying in your wallet. oppen holds agent
+wallets and nothing else. (Where a venue grants sub-accounts the shape differs:
+Hyperliquid sub-accounts have no private key at all, and a Lighter sub-account is an
+account index rather than a keypair.)
 
 Agent wallets are generated in-app and stored in the OS keychain — Keychain on
 macOS, Credential Manager on Windows, Secret Service on Linux. The key is used by
 the signer inside the Rust core and never reaches the frontend, the gateway, the
 MCP transport or a log line.
 
-Your master wallet signs three approvals once, in your own wallet, over
-WalletConnect:
+### The ceremonies
 
-1. **Agent wallet authorization**, with an explicit expiry.
-2. **Sub-account provisioning**, so each agent's capital is isolated at the venue.
-3. **Builder fee approval**, a maximum rate you sign and oppen cannot exceed.
+Signed in your own wallet over WalletConnect. None can be initiated by an agent.
+Hyperliquid, v1, one top-level container per agent:
 
-None can be initiated by an agent. **Agent wallets cannot withdraw** — that is
-enforced by Hyperliquid, not by oppen, and it is the one containment property
-that holds even against a fully compromised machine.
+| Ceremony | Signed by | How often | What it cannot authorize |
+|---|---|---|---|
+| `approveAgent` | the agent's own container | once per agent, and on every key rotation | withdrawal; signing for any account that is not that container or one of its sub-accounts |
+| `approveBuilderFee` | the agent's own container | once per agent; again only if the cap changes | any movement of funds; any rate above the signed cap |
+| `usdSend` | the funding account | every funding and rebalancing move | anything recurring — it is one amount to one address |
 
-Authorizations expire. An abandoned deployment stops being able to trade on its
-own.
+**Three signatures per agent, not a one-time setup.** Two if you decline the
+builder fee, which is supported and does not break the order path. Creating the
+container itself costs nothing — it is another account derived in your own wallet,
+no signature and no gas — but `approveAgent` and `approveBuilderFee` are per
+Hyperliquid account and each container is its own account, so ten agents is thirty
+wallet approvals. That is what it costs to have the venue enforce segregation
+instead of oppen's bookkeeping, and it is the first thing you will feel about this
+design. The full per-venue counts are in
+[docs/specs/onboarding.md](docs/specs/onboarding.md).
+
+Authority decays. Agent approvals carry a 90-day expiry, warned from day 14; the
+venue caps `valid_until` at 180 days. An abandoned deployment stops being able to
+trade on its own. Rotation mints a new key under a **new** name: re-approving the
+same `agentName` replaces the previous wallet silently — no error, no event, the
+old key simply stops signing.
+
+### What an agent key cannot do, per venue
+
+| | Hyperliquid API wallet | Aster agent, `canWithdraw:false` | Lighter API key |
+|---|---|---|---|
+| Place and cancel orders | yes | yes | yes |
+| Withdraw to any other address | no | no | no |
+| Withdraw to the owner's own L1 address | no | no | **yes** — "secure" withdrawals |
+
+v1 ships Hyperliquid only; the other two columns are recorded so that the claim is
+never inherited across venues. On Hyperliquid and on Aster, "the agent key cannot
+withdraw" is enforced by the venue and is the one containment property that holds
+even against a fully compromised machine. **On Lighter it is false**: a stolen key
+sends funds to the owner's own L1 address rather than to an attacker's, which
+bounds the loss without making it impossible.
+
+Two qualifications on the Hyperliquid column, stated rather than smoothed over:
+
+- `agentSendAsset` lets an agent wallet move collateral between the **same
+  address's** perp and spot balances — the destination must equal the source, so it
+  reaches no other account, but it is a movement out of the perps margin pool that
+  oppen did not initiate.
+- Which *other* user-signed actions an API wallet is barred from — `usdSend`,
+  `approveAgent`, `subAccountTransfer` — is stated on no page we have read, and the
+  testnet negative test that would settle it is still open
+  ([docs/hl-signing.md](docs/hl-signing.md) open question 3). Only "cannot
+  withdraw" is treated as load-bearing.
 
 ## Guardrails
 
@@ -140,7 +201,16 @@ value and the configured limit, so the agent can adapt and you can read why.
 Refusals are the most informative telemetry the system produces.
 
 Above them sit a **kill switch** (halts entry, cancels resting orders, survives
-restart) and a **dead-man switch** (`scheduleCancel` armed while any agent runs).
+restart) and a **dead-man switch** (`scheduleCancel`, armed while agents are
+active).
+
+The dead-man is a daily budget rather than a standing guarantee, and the README is
+where that is easiest to overclaim: Hyperliquid takes a time at least 5 seconds
+ahead and allows a **maximum of 10 triggers per day per address**, resetting at
+00:00 UTC, so re-arming on every reconnect would exhaust it inside one bad hour.
+Whether `scheduleCancel` is itself volume-gated is unconfirmed — if it is, a
+brand-new account has no dead-man at all, and oppen will say so rather than promise
+one.
 
 ---
 
@@ -162,9 +232,15 @@ cd apps/desktop && bun run tauri dev
 ```
 
 Once the app runs, first-run onboarding will walk you through testnet setup:
-create a sub-account and agent wallet, complete the WalletConnect ceremony, then
-pair your first agent. Until phase P4 lands, that flow does not exist yet — see
-[ROADMAP.md](ROADMAP.md) for what is real today.
+generate an agent wallet, point it at the account that will be its container — a
+second account in your own wallet, on Hyperliquid v1 — complete the three
+WalletConnect ceremonies, then pair your first agent. Until phase P4 lands, that
+flow does not exist yet — see [ROADMAP.md](ROADMAP.md) for what is real today.
+
+One prerequisite is outside oppen and surprising enough to state here: the
+Hyperliquid testnet faucet pays 1,000 mock USDC and only to an address that has
+**previously deposited on mainnet**. Agent containers are then funded from that one
+account with `usdSend`, not by claiming the faucet again per container.
 
 ### Connecting an agent
 
@@ -178,7 +254,7 @@ claude mcp add --transport http oppen http://127.0.0.1:<port>/mcp \
 The endpoint binds to loopback only, validates `Origin` and `Host`, and requires
 a bearer token on every request including the handshake. Pairing is default-deny:
 a new client gets nothing until you approve it in the console, name it, bind it
-to a sub-account and assign its guardrails. New agents start in approval mode
+to its container and assign its guardrails. New agents start in approval mode
 with small caps.
 
 Agent-facing documentation lives in [`skills/oppen/`](skills/oppen/).
@@ -195,8 +271,8 @@ crates/oppen-core    Event ledger, guardrails, kill switch, alerts, journal,
 crates/oppen-mcp     MCP gateway: transport, pairing tokens, tool schemas,
                      typed error taxonomy
 apps/desktop         Tauri 2 shell and the Vue 3 operator console
-docs/                Specification, threat model, MCP contract, signing
-                     reference, design system, feature specs
+docs/                Specification, decision log, threat model, MCP contract,
+                     signing reference, design system, component specs, runbooks
 skills/oppen         Claude Code skill shipped to trading-agent users
 ```
 
@@ -205,13 +281,14 @@ skills/oppen         Claude Code skill shipped to trading-agent users
 | Document | What it covers |
 |---|---|
 | [docs/spec.md](docs/spec.md) | The normative v1 specification. Architecture decisions D1–D8 and items 1–36 |
+| [docs/decisions.md](docs/decisions.md) | Every product and scope decision outside D1–D8, with its reasoning and what it revised |
 | [docs/threat-model.md](docs/threat-model.md) | What is a hard boundary, what is only containment. Read before real funds |
 | [docs/hl-signing.md](docs/hl-signing.md) | Every Hyperliquid signing rule, with the source each is read from |
 | [docs/mcp-contract.md](docs/mcp-contract.md) | The versioned agent-facing contract |
-| [docs/specs/](docs/specs/) | Feature specs beyond v1: workflows, history, charts, fair value, signals, mobile |
+| [docs/specs/](docs/specs/) | Component specs. v1: onboarding ceremonies, venue containers. Beyond v1: workflows, history, charts, fair value, signals, mobile |
 | [docs/design/](docs/design/) | Design tokens and rules, brand book, app mock |
 | [ROADMAP.md](ROADMAP.md) | Item-level checklist per phase, and every later version |
-| [AGENTS.md](AGENTS.md) | Conventions and invariants for anyone, human or model, writing code here |
+| [AGENTS.md](AGENTS.md) | Invariants, leanness rules and conventions for anyone, human or model, writing code here |
 
 ## Roadmap
 
@@ -222,9 +299,9 @@ skills/oppen         Claude Code skill shipped to trading-agent users
 | P2 | WS pool, reconcile, event ledger | Zero fills lost across a 30 s disconnect |
 | P3 | Guardrails, kill switch, dead-man | No signer path without a guardrail check |
 | P4 | MCP gateway | `claude mcp add` → paired → guarded testnet order |
-| P5 | Operator console | Parity with the design; stale overlay on socket loss |
+| P5 | Operator console | The named surfaces render; stale overlay on socket loss |
 | P6 | Quant features | Cross-checked against hand computation |
-| P7 | Approval mode, skill, threat model, release | Fresh machine to testnet trade in 10 minutes |
+| P7 | Approval mode, skill, threat model, release | Fresh machine to a testnet trade in 10 minutes, measured from a wallet that already holds testnet USDC |
 
 Each phase is gated on a falsifiable test rather than a feature list. Beyond v1:
 trading workflows, durable history, the fair value engine, Quantoppen, an opt-in
@@ -259,8 +336,15 @@ Pull requests are welcome. Contributions require signing the
   number.
 - A signer change needs test vectors. A guardrail change needs a property test
   proving no bypass. A ledger change needs the disconnect-reconcile test.
+- Keep the diff lean. Every construct traces to a numbered spec item, a recorded
+  decision or an invariant, and the PR body states the trace. The rules — and the
+  short list of things that are never cut for size, starting with the fail-closed
+  branches — are in [AGENTS.md](AGENTS.md).
 - The architecture decisions D1–D8 in [docs/spec.md](docs/spec.md) are settled
-  and are not re-opened in a pull request.
+  and are not re-opened in a pull request. They change only through a recorded
+  decision: D1 was revised on 2026-09-04 from "one sub-account per agent" to "one
+  venue account per agent" ([docs/decisions.md](docs/decisions.md) V1–V6), and that
+  is the entire process for revising one.
 
 ## Security
 
@@ -271,14 +355,21 @@ Do not open a public issue for an exploitable bug.
 Read [docs/threat-model.md](docs/threat-model.md) before trading real funds. In
 short: oppen defends against a misbehaving *agent*, not a compromised *host*. On
 Windows and Linux any process running as your user can read the stored agent key.
-The agent wallet's inability to withdraw is what bounds the damage.
+On Hyperliquid, that key's inability to withdraw is what bounds the damage — a
+property of the venue rather than of oppen, and one that does not hold on every
+venue (see the per-venue table above).
 
 ## Builder fee
 
 Official oppen builds attach a builder code to every order. The fee is small,
-bounded by the maximum-rate approval you sign at setup, visible in the console
-and recorded per order in the ledger. oppen cannot exceed the signed cap without
-a new signature from your master wallet.
+bounded by the maximum-rate approval you sign, visible in the console and recorded
+per order in the ledger. oppen cannot exceed the signed cap without a new signature
+from that container's owner key.
+
+The approval is per Hyperliquid account and each container is its own account, so
+every agent signs its own — the third of the three signatures above. Hyperliquid
+allows at most 10 active builder approvals per account, which is a limit per
+container and not a limit on how many agents you run.
 
 This is the project's revenue mechanism, stated here rather than buried. A system
 whose value proposition is bounded authority cannot have an unbounded fee.

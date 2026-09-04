@@ -450,20 +450,15 @@ pub enum Unevaluable {
     StateWriteFailed { detail: String },
 
     /// An approval was presented for a proposal the engine is not holding:
-    /// never issued, already consumed, already rejected, or swept as expired.
-    /// The engine mints every proposal itself, so an unknown id is a
-    /// clearance that was never authorised (spec item 28).
+    /// never issued, already consumed, already rejected, or swept as expired
+    /// (spec item 28's TTL). The engine mints every proposal itself, so an
+    /// unknown id is a clearance that was never authorised.
+    ///
+    /// Expiry is deliberately not a separate variant. Proposals are swept
+    /// before every lookup, so an expired one is simply no longer held, and
+    /// the caller's move — re-propose — is the same for all four causes.
     #[error("proposal {approval_id} is not pending")]
     UnknownProposal { approval_id: String },
-
-    /// Spec item 28: proposals carry a TTL and auto-expire. An expired one is
-    /// re-proposed, never approved on stale terms.
-    #[error("proposal {approval_id} expired at {expires_at_ms}; now is {now_ms}")]
-    ProposalExpired {
-        approval_id: String,
-        expires_at_ms: u64,
-        now_ms: u64,
-    },
 }
 
 impl From<Unevaluable> for Refusal {
