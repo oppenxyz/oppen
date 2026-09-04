@@ -11,6 +11,18 @@ decisions" section until then.
 
 ---
 
+## 2026-09-04 · P4 gateway dependencies
+
+`AGENTS.md` leanness rule 9: a new crate gets a line saying what was rejected.
+
+| # | Decision | Choice | Why, and what was rejected |
+|---|---|---|---|
+| G1 | Token digest | **`sha3` (already a direct dependency of `oppen-hl` and `oppen-core`)** | `sha2` would have been the conventional pick for a token digest and adds a crate to buy nothing: SHA3-256 is not weaker here, and the tree already compiles `sha3` for the L1 action hash. A known-answer test against FIPS 202 pins the algorithm so a stand-in that truncates cannot pass. |
+| G2 | Constant-time compare | **`subtle`** | Already in the tree via `k256`. Rejected: hand-rolled `==` on digests, which leaks a prefix-match through response timing; and comparing raw tokens rather than digests, which keeps a live credential in the store. |
+| G3 | Token entropy | **`getrandom`** | Rejected: repeating `oppen-core`'s `/dev/urandom` read, which that module's own doc calls "a real gap, not a design choice" because it returns `EntropyUnavailable` on Windows. Fine for an HMAC key the operator can supply by hand; not fine for a bearer token the gateway must mint itself. `rand` was rejected as strictly more crate for a single `fill` call. **This does not fix `oppen-core`'s gap** — that is a separate change with its own trace (leanness rule 8). |
+| G4 | HTTP framework | **None yet** | `axum` is the obvious choice and builds only on `hyper`, `http` and `tower`, all already compiled here — so it stays cheap and stays available. It is not added until a tool needs a route, because the security-critical half of the transport is header validation, and that is a pure function of the headers ([`guard`](../crates/oppen-mcp/src/guard.rs)) which is more testable without a socket than with one. |
+| G5 | Revocation mechanism | **Mark the record, never remove it** | Removing drops the `watch::Sender`, which closes live sessions as a side effect of deallocation rather than as a decision, and makes `AuthError::Revoked` unconstructible — so a revoked pairing would be indistinguishable from one that never existed. Uses `send_replace`, not `send`: `send` returns `Err` and **leaves the value unchanged** when no receiver is alive, so a pairing with no session open at that instant would silently stay live. Caught by a red-check, not by review. |
+
 ## 2026-09-04 · Venue containers
 
 A venue audit against the official Hyperliquid, Aster and Lighter documentation, run on
