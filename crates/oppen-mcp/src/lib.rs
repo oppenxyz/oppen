@@ -10,4 +10,7 @@
 //! recall, set_alert. Every failure is a typed error with retryability
 //! semantics — see `docs/mcp-contract.md`.
 
+pub mod auth;
+pub mod guard;
+
 pub use oppen_core::Network;

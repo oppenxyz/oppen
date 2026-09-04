@@ -3188,12 +3188,17 @@ dependencies = [
 name = "oppen-mcp"
 version = "0.1.0"
 dependencies = [
+ "getrandom 0.2.17",
  "oppen-core",
  "oppen-hl",
  "serde",
  "serde_json",
+ "sha3",
+ "subtle",
  "thiserror 2.0.20",
+ "tokio",
  "tracing",
+ "zeroize",
 ]
 
 [[package]]
