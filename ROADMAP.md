@@ -72,16 +72,28 @@ Status as of 2026-09-03: P0 and the P1 code are on `main`; the P1 gate is waitin
 
 ### P5 · Operator console
 
-- [ ] Trade / Watch: activity stream with rejection explainability, lightweight-charts with agent annotations and a human-owned follow toggle, features panel, manual ticket with preflight line [31]
+The gate was cut from "parity with the design" to the named list below on
+2026-09-03 — see [decisions.md](docs/decisions.md) P1. Parity is a judgement, not
+a test, and an ungated judgement resolves as schedule drift.
+
+**In the gate:**
+
+- [ ] Activity stream with rejection explainability: guardrail versus venue versus auth, attempted versus limit, inline link to edit [31]
 - [ ] Agents / Control: roster with real PnL, last-seen, idle-with-open-position alert, guardrail utilization; policy panel; approvals queue; risk console with exposure, rate budget, feed health, kill switches [32]
 - [ ] Manual escape hatch drawer; manual actions land as `manual · external` [33]
 - [ ] Staleness: per-feed status, last-tick timestamps, stale overlay, execution fails closed during disconnect [34]
-- [ ] OS notifications by severity: liq warning, trips, approval request, wallet expiry, WS down with positions, alert fired [35]
 - [ ] Persistent MAINNET/TESTNET badge; boot sequence bound to real state [36, D4]
-- [ ] Every panel has a designed empty state [4]
-- [ ] **ASCII candle renderer** promoted from the marketing site: real X and Y axes on nice numbers at the asset's own precision, `--up` / `--down` colour with the glyph as a redundant channel — [charts.md](docs/specs/charts.md) §2
 - [ ] Agent `reason` strings rendered as inert plain text, labelled agent-authored [30]
-- **Gate:** the named list above renders correctly and the stale overlay appears on socket loss. Cut from "parity with the design" on 2026-09-03 — see [decisions.md](docs/decisions.md) P1
+- [ ] **ASCII candle renderer** promoted from the marketing site: real X and Y axes on nice numbers at the asset's own precision, `--up` / `--down` colour with the glyph as a redundant channel — [charts.md](docs/specs/charts.md) §2
+- **Gate:** every surface above renders correctly, and the stale overlay appears on socket loss
+
+**Deferred to v1.1:**
+
+- [ ] Agent fill marks on the chart, with reasons shown in the stream rather than in the plot [31, decisions.md P4]
+- [ ] Follow-agent toggle
+- [ ] OS notifications by severity [35]
+- [ ] Designed empty state for every panel [4]
+- [ ] Full parity with `docs/design/`
 
 ### P6 · Quant features — features, not signals
 
