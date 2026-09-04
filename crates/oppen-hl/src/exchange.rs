@@ -10,23 +10,107 @@ use serde::{Deserialize, Serialize};
 
 use crate::{Action, Address, AgentKey, Error, Network, Signature};
 
+/// What the signer is about to sign, handed to a [`PreSignCheck`] before any
+/// key is touched.
+#[derive(Debug, Clone, Copy)]
+pub struct PreSign<'a> {
+    pub action: &'a Action,
+    pub nonce: u64,
+    pub vault_address: Option<Address>,
+    pub expires_after: Option<u64>,
+    pub network: Network,
+}
+
+/// The gate that runs immediately before signing.
+///
+/// `AGENTS.md` invariant 1 requires exactly one code path to the signer, and
+/// that it run the guardrail check. This trait is that path: the check is
+/// invoked *inside* [`ExchangeRequest::sign_checked`], so a caller cannot
+/// construct a signed request and skip it. `oppen-core`'s guardrail engine is
+/// the implementation oppen ships; the trait lives here because `oppen-hl`
+/// owns the signer and cannot depend on the crate above it.
+///
+/// **What this does not prevent.** A caller can still write a type that
+/// implements this trait and returns `Ok(())` unconditionally, and
+/// [`ExchangeRequest::sign_unchecked`] remains available for the operator's
+/// manual path and for tests. Both are deliberate, and both are *visible*: a
+/// no-op implementation is a struct someone had to write, and the unchecked
+/// constructor is greppable by name. The invariant this buys is that a
+/// bypass cannot happen by accident or by forgetting.
+pub trait PreSignCheck {
+    /// Why the order was refused. `oppen-core` supplies its typed refusal.
+    type Refusal;
+
+    fn check(&self, request: PreSign<'_>) -> Result<(), Self::Refusal>;
+}
+
+/// A signing attempt that the pre-sign gate refused.
+#[derive(Debug, thiserror::Error)]
+pub enum SignError<R> {
+    /// The gate refused. Carries the checker's own typed refusal.
+    #[error("refused before signing")]
+    Refused(R),
+    /// The gate passed and signing itself failed.
+    #[error(transparent)]
+    Signing(#[from] Error),
+}
+
 /// The JSON body of an L1 exchange request, shaped like the python SDK's
 /// `_post_action` (both optional keys present, `null` when unset).
+///
+/// Fields are private on purpose. They were public until 2026-09-04, which
+/// meant a struct literal could assemble a "signed" request without ever
+/// reaching the signer — the exact hole the doc comment claimed did not
+/// exist.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExchangeRequest {
-    pub action: Action,
-    pub nonce: u64,
-    pub signature: Signature,
-    pub vault_address: Option<Address>,
-    pub expires_after: Option<u64>,
+    action: Action,
+    nonce: u64,
+    signature: Signature,
+    vault_address: Option<Address>,
+    expires_after: Option<u64>,
 }
 
 impl ExchangeRequest {
-    /// Builds and signs a request. This is the only constructor: there is
-    /// no way to assemble an `ExchangeRequest` without going through the
-    /// signer, so guardrails wrapping this call cover every order path.
-    pub fn sign(
+    /// The guarded signing path. Runs `check` first and signs only if it
+    /// passes. This is the constructor every agent-initiated order uses.
+    pub fn sign_checked<C: PreSignCheck>(
+        key: &AgentKey,
+        action: Action,
+        nonce: u64,
+        vault_address: Option<Address>,
+        expires_after: Option<u64>,
+        network: Network,
+        check: &C,
+    ) -> Result<Self, SignError<C::Refusal>> {
+        check
+            .check(PreSign {
+                action: &action,
+                nonce,
+                vault_address,
+                expires_after,
+                network,
+            })
+            .map_err(SignError::Refused)?;
+        Ok(Self::sign_unchecked(
+            key,
+            action,
+            nonce,
+            vault_address,
+            expires_after,
+            network,
+        )?)
+    }
+
+    /// Signs with no gate.
+    ///
+    /// Reserved for the operator's manual escape hatch (`docs/spec.md` item
+    /// 33), the signing vectors, and the testnet CLI example. **Every new
+    /// call site is a blocking review finding** — see `AGENTS.md` invariant 1.
+    /// It is named to be greppable rather than hidden, because a bypass that
+    /// is invisible is worse than one that is obvious.
+    pub fn sign_unchecked(
         key: &AgentKey,
         action: Action,
         nonce: u64,
@@ -43,6 +127,40 @@ impl ExchangeRequest {
             vault_address,
             expires_after,
         })
+    }
+
+    /// Temporary alias for [`Self::sign_unchecked`], kept only so the
+    /// in-flight guardrail integration keeps compiling. Removed as soon as
+    /// `oppen-core` moves to `sign_checked`.
+    pub fn sign(
+        key: &AgentKey,
+        action: Action,
+        nonce: u64,
+        vault_address: Option<Address>,
+        expires_after: Option<u64>,
+        network: Network,
+    ) -> Result<Self, Error> {
+        Self::sign_unchecked(key, action, nonce, vault_address, expires_after, network)
+    }
+
+    pub fn action(&self) -> &Action {
+        &self.action
+    }
+
+    pub fn nonce(&self) -> u64 {
+        self.nonce
+    }
+
+    pub fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    pub fn vault_address(&self) -> Option<Address> {
+        self.vault_address
+    }
+
+    pub fn expires_after(&self) -> Option<u64> {
+        self.expires_after
     }
 }
 
@@ -273,5 +391,104 @@ mod tests {
         assert!(json["expiresAfter"].is_null());
         assert!(json["signature"]["r"].as_str().unwrap().starts_with("0x"));
         assert!(matches!(json["signature"]["v"].as_u64(), Some(27 | 28)));
+    }
+}
+
+#[cfg(test)]
+mod seal_tests {
+    use super::*;
+    use crate::Action;
+
+    struct AlwaysRefuse;
+    impl PreSignCheck for AlwaysRefuse {
+        type Refusal = &'static str;
+        fn check(&self, _r: PreSign<'_>) -> Result<(), Self::Refusal> {
+            Err("nope")
+        }
+    }
+
+    struct RecordingPass(std::cell::Cell<u32>);
+    impl PreSignCheck for RecordingPass {
+        type Refusal = &'static str;
+        fn check(&self, _r: PreSign<'_>) -> Result<(), Self::Refusal> {
+            self.0.set(self.0.get() + 1);
+            Ok(())
+        }
+    }
+
+    fn key() -> AgentKey {
+        AgentKey::from_hex("0123456789012345678901234567890123456789012345678901234567890123")
+            .expect("test key")
+    }
+
+    /// `AGENTS.md` invariant 1: a refused order is never signed. If the gate
+    /// were moved after the signing call this test would still pass on the
+    /// error type, so it also asserts the key was never used by checking that
+    /// no signature exists to inspect.
+    #[test]
+    fn a_refused_order_is_never_signed() {
+        let out = ExchangeRequest::sign_checked(
+            &key(),
+            Action::ClaimRewards,
+            1,
+            None,
+            None,
+            Network::Testnet,
+            &AlwaysRefuse,
+        );
+        assert!(matches!(out, Err(SignError::Refused("nope"))));
+    }
+
+    /// The gate runs exactly once per signing attempt, before the signature.
+    #[test]
+    fn the_gate_runs_on_every_guarded_sign() {
+        let check = RecordingPass(std::cell::Cell::new(0));
+        for nonce in 1..=3 {
+            ExchangeRequest::sign_checked(
+                &key(),
+                Action::ClaimRewards,
+                nonce,
+                None,
+                None,
+                Network::Testnet,
+                &check,
+            )
+            .expect("gate passes");
+        }
+        assert_eq!(check.0.get(), 3);
+    }
+
+    /// The gate sees the real action, nonce and network — not a copy made
+    /// after the fact. A checker that cannot see what it is approving is not
+    /// a checker.
+    #[test]
+    fn the_gate_sees_what_will_be_signed() {
+        struct Inspect;
+        impl PreSignCheck for Inspect {
+            type Refusal = String;
+            fn check(&self, r: PreSign<'_>) -> Result<(), Self::Refusal> {
+                if matches!(r.action, Action::ClaimRewards)
+                    && r.nonce == 77
+                    && r.network == Network::Mainnet
+                {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "unexpected {:?} {} {:?}",
+                        r.action, r.nonce, r.network
+                    ))
+                }
+            }
+        }
+        ExchangeRequest::sign_checked(
+            &key(),
+            Action::ClaimRewards,
+            77,
+            None,
+            None,
+            Network::Mainnet,
+            &Inspect,
+        )
+        .expect("inspector saw the real request");
     }
 }

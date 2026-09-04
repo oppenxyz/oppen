@@ -59,7 +59,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let nonces = NonceAllocator::new();
 
     let meta = info.meta().await?;
-    let universe = Universe::from_meta(&meta);
+    let universe = Universe::from_meta(&meta)?;
     let btc = universe.get("BTC")?;
     let mids = info.all_mids().await?;
     let mid = *mids.get("BTC").ok_or("no BTC mid")?;

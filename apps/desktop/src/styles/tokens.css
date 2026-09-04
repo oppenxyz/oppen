@@ -77,6 +77,13 @@
   --uranium: #ffd400;     /* ≤ 2% of any surface; the one live element */
   --hazard: #ff4d2e;      /* liquidation, errors, kill switch only */
 
+  /* Direction on the chart. decisions.md U3: 8.3:1 and 5.0:1 on void, both clearing
+     AA for graphics with margin, and 5.8:1 / 4.4:1 apart in greyscale. --down is
+     deliberately dimmer than --hazard so hazard keeps its exclusive meaning.
+     Direction is always encoded by glyph as well, never by colour alone. */
+  --up: #2fbf71;
+  --down: #e5484d;
+
   /* Fields render at bracket grey or below. Never at body brightness. */
   --ink-field: #262a2e;
   --ink-matrix: #4a5057;
