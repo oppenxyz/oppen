@@ -422,6 +422,239 @@ mod tests {
         assert_eq!(named(Network::Testnet), "testnet");
         assert_eq!(named(Network::Mainnet), "mainnet");
     }
+
+    // -- bridge to the guardrail engine --------------------------------------
+
+    use oppen_hl::types::{Fill, Side};
+
+    fn fill(time: u64, closed_pnl: &str, fee: &str) -> Fill {
+        Fill {
+            coin: "BTC".into(),
+            px: d("80000"),
+            sz: d("0.001"),
+            side: Side::B,
+            time,
+            start_position: Decimal::ZERO,
+            dir: "Open Long".into(),
+            closed_pnl: d(closed_pnl),
+            hash: String::new(),
+            oid: 1,
+            crossed: true,
+            fee: d(fee),
+            fee_token: "USDC".into(),
+            builder_fee: None,
+            tid: time,
+            cloid: None,
+        }
+    }
+
+    #[test]
+    fn realized_pnl_is_net_of_fees_and_windowed() {
+        let fills = [
+            fill(100, "10", "1"),
+            fill(200, "-4", "0.5"),
+            fill(50, "1000", "0"),
+        ];
+        // The 1000 sits before the window and must not count.
+        assert_eq!(realized_pnl_since(&fills, 100), d("4.5"));
+    }
+
+    #[test]
+    fn a_fee_only_fill_is_a_loss() {
+        assert_eq!(realized_pnl_since(&[fill(100, "0", "0.75")], 0), d("-0.75"));
+    }
+
+    #[test]
+    fn the_utc_day_starts_at_midnight() {
+        // 2026-09-04T17:57:47.126Z -> 2026-09-04T00:00:00Z
+        assert_eq!(utc_day_start_ms(1_788_544_667_126), 1_788_480_000_000);
+        assert_eq!(
+            utc_day_start_ms(1_788_480_000_000),
+            1_788_480_000_000,
+            "midnight is its own start"
+        );
+    }
+
+    #[test]
+    fn unreconciled_is_carried_through_rather_than_softened() {
+        let state = state_of(&perps("0.0", "0.0", "0.0"), &spot("999.0", "0.0"));
+        let exposure = exposure_from(&state, Decimal::ZERO, None, false, 0);
+        assert!(
+            !exposure.agent.reconciled,
+            "the engine must see the account as unreconciled"
+        );
+    }
+
+    #[test]
+    fn an_absent_peak_falls_back_to_current_equity_not_to_zero() {
+        let state = state_of(&perps("0.0", "0.0", "0.0"), &spot("999.0", "0.0"));
+        let exposure = exposure_from(&state, Decimal::ZERO, None, true, 0);
+        // A zero peak would report the whole balance as drawdown and refuse
+        // everything; a peak below equity would report a negative one.
+        assert_eq!(exposure.agent.peak_equity_usd, d("999.0"));
+    }
+
+    #[test]
+    fn a_peak_below_current_equity_is_raised_to_it() {
+        let state = state_of(&perps("0.0", "0.0", "0.0"), &spot("999.0", "0.0"));
+        let exposure = exposure_from(&state, Decimal::ZERO, Some(d("500")), true, 0);
+        assert_eq!(
+            exposure.agent.peak_equity_usd,
+            d("999.0"),
+            "drawdown must never be negative"
+        );
+    }
+
+    #[test]
+    fn resting_orders_are_signed_and_summed_per_symbol() {
+        use oppen_hl::types::{OpenOrder, Side};
+        let order = |coin: &str, buy: bool, sz: &str, px: &str| OpenOrder {
+            coin: coin.into(),
+            side: if buy { Side::B } else { Side::A },
+            limit_px: d(px),
+            sz: d(sz),
+            orig_sz: d(sz),
+            oid: 1,
+            timestamp: 0,
+            order_type: "Limit".into(),
+            reduce_only: false,
+            is_trigger: false,
+            trigger_px: None,
+            trigger_condition: None,
+            is_position_tpsl: false,
+            cloid: None,
+        };
+        let perps = perps("0.0", "0.0", "0.0");
+        let spot = spot("999.0", "0.0");
+        let orders = [
+            order("BTC", true, "2", "100"),
+            order("BTC", false, "0.5", "100"),
+        ];
+        let state = assemble(
+            Network::Testnet,
+            addr(),
+            0,
+            &VenueReadings {
+                perps: &perps,
+                spot: &spot,
+                orders: &orders,
+                mids: &HashMap::new(),
+                last_tick_ms: None,
+            },
+        );
+        let exposure = exposure_from(&state, Decimal::ZERO, None, true, 0);
+        let resting = exposure.agent.resting.expect("resting supplied");
+        assert_eq!(
+            resting.szi.get("BTC"),
+            Some(&d("1.5")),
+            "buys and sells net per symbol"
+        );
+        // Notional is the everything-fills reading and does not net.
+        assert_eq!(resting.notional_usd, d("250"));
+    }
+
+    /// The bridge feeds the real engine, and the refusal it produces changes
+    /// with `reconciled` — which is the whole reason that flag is passed in
+    /// honestly rather than defaulted to `true`.
+    ///
+    /// Unreconciled refuses first and masks every other predicate. Reconciled,
+    /// the same order reaches the symbol allowlist, which is D-c's "the
+    /// refusal is the onboarding" moment.
+    #[test]
+    fn the_reconciled_flag_decides_which_refusal_the_agent_sees() {
+        use crate::guardrail::{
+            AgentId, FeedQuality, GuardrailEngine, MarketRef, OrderIntent, SqliteGuardrailStore,
+        };
+        use crate::ledger::{Ledger, LedgerAuditSink};
+        use oppen_hl::OrderKind;
+        use oppen_hl::wire::{Grouping, Tif};
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ledger =
+            Arc::new(Ledger::open_at(&dir.path().join("t.db"), Network::Testnet).expect("ledger"));
+        let engine = GuardrailEngine::new(
+            Arc::new(SqliteGuardrailStore::open(dir.path().join("g.db")).expect("store")),
+            Arc::new(LedgerAuditSink::new(ledger)),
+            Arc::new(crate::keys::KeychainKeyStore::new(Network::Testnet)),
+            Network::Testnet,
+        )
+        .expect("engine");
+
+        let agent = AgentId::new("agent-alpha");
+        engine
+            .register_agent(&agent, None, 1_000)
+            .expect("register");
+
+        let meta: oppen_hl::types::Meta = serde_json::from_str(
+            r#"{"universe":[{"name":"BTC","szDecimals":5,"maxLeverage":40}]}"#,
+        )
+        .expect("meta");
+        let universe = oppen_hl::Universe::from_meta(&meta).expect("universe");
+        let asset = universe.get("BTC").expect("btc");
+
+        let state = state_of(&perps("0.0", "0.0", "0.0"), &spot("999.0", "0.0"));
+        let market = MarketRef {
+            symbol: "BTC".into(),
+            reference_px: Some(d("80000")),
+            as_of_ms: 1_788_544_667_000,
+            quality: FeedQuality::Ok,
+            mark_divergence_bps: None,
+            mark_divergent_since_ms: None,
+            snapshot: None,
+        };
+        let intent = OrderIntent {
+            symbol: "BTC".into(),
+            is_buy: true,
+            px: d("72000"),
+            sz: d("0.0002"),
+            kind: OrderKind::Limit { tif: Tif::Gtc },
+            reduce_only: false,
+            cloid: None,
+            grouping: Grouping::Na,
+            builder: None,
+            max_slippage_bps: None,
+            reason: "probing".into(),
+        };
+
+        let refuse = |reconciled: bool| {
+            let exposure = exposure_from(
+                &state,
+                Decimal::ZERO,
+                None,
+                reconciled,
+                utc_day_start_ms(1_788_544_667_000),
+            );
+            engine
+                .evaluate(
+                    &agent,
+                    &intent,
+                    asset,
+                    &market,
+                    &exposure,
+                    1_788_544_667_000,
+                )
+                .err()
+                .map(|refusal| refusal.to_string())
+                .expect("an order must not clear under D-c defaults")
+        };
+
+        let unreconciled = refuse(false);
+        assert!(
+            unreconciled.contains("reconcil"),
+            "unreconciled state must refuse first, got: {unreconciled}"
+        );
+
+        let reconciled = refuse(true);
+        assert!(
+            !reconciled.contains("reconcil"),
+            "reconciled state still refused on reconciliation: {reconciled}"
+        );
+        assert!(
+            reconciled.contains("BTC") || reconciled.to_lowercase().contains("allow"),
+            "expected the symbol allowlist to be the next refusal, got: {reconciled}"
+        );
+    }
 }
 
 /// Live checks against the public testnet. Ignored by default, like
@@ -479,5 +712,103 @@ mod live {
             perps.margin_summary.account_value + spot.usdc_total(),
             "equity drifted from its own definition"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Bridge to the guardrail engine (spec items 24-25).
+// ---------------------------------------------------------------------------
+
+/// Realised PnL and fees over a window, summed from the venue's own fills.
+///
+/// Fees are subtracted rather than reported beside the PnL: a daily-loss limit
+/// that ignores fees is not a loss limit, and `closedPnl` is gross.
+pub fn realized_pnl_since(fills: &[oppen_hl::types::Fill], since_ms: u64) -> Decimal {
+    fills
+        .iter()
+        .filter(|fill| fill.time >= since_ms)
+        .map(|fill| fill.closed_pnl - fill.fee)
+        .sum()
+}
+
+/// Start of the UTC day containing `now_ms`. The day the loss limit resets on.
+pub fn utc_day_start_ms(now_ms: u64) -> u64 {
+    const DAY: u64 = 86_400_000;
+    now_ms - (now_ms % DAY)
+}
+
+/// Turn the assembled view into the exposure the engine measures caps against.
+///
+/// `reconciled` is passed in rather than inferred, and it is the caller's
+/// honest answer to "has spec item 9's reconcile completed since the last
+/// disconnect". The engine refuses on `false`, which is the point: caps are
+/// measured against position sizes, so an unreconciled account means it does
+/// not know what it is measuring.
+///
+/// `peak_equity_usd` comes from the venue's `portfolio` window because nothing
+/// local can reconstruct a high-water mark that predates oppen's first run.
+/// Absent, it falls back to current equity — the conservative direction, since
+/// a peak equal to today's equity reports zero drawdown and lets the *other*
+/// limits do the refusing rather than inventing a drawdown that did not
+/// happen.
+pub fn exposure_from(
+    state: &AccountState,
+    realized_pnl_today_usd: Decimal,
+    peak_equity_usd: Option<Decimal>,
+    reconciled: bool,
+    day_start_ms: u64,
+) -> crate::guardrail::Exposure {
+    use crate::guardrail::{AccountSnapshot, Exposure, PositionSnapshot, RestingExposure};
+    use std::collections::BTreeMap;
+
+    let equity = state.balances.equity_usd;
+    let unrealized: Decimal = state.positions.iter().map(|p| p.unrealized_pnl_usd).sum();
+
+    let positions: BTreeMap<String, PositionSnapshot> = state
+        .positions
+        .iter()
+        .map(|p| (p.symbol.clone(), PositionSnapshot { szi: p.size }))
+        .collect();
+
+    let mut resting_szi: BTreeMap<String, Decimal> = BTreeMap::new();
+    let mut resting_notional = Decimal::ZERO;
+    for order in &state.orders {
+        // Signed: a working buy adds, a working sell subtracts. This is the
+        // "everything fills" reading, which is what a cap must be measured
+        // against.
+        let signed = if order.is_buy {
+            order.size
+        } else {
+            -order.size
+        };
+        *resting_szi.entry(order.symbol.clone()).or_default() += signed;
+        resting_notional += (order.size * order.limit_px).abs();
+    }
+
+    let agent = AccountSnapshot {
+        as_of_ms: state.as_of_ms,
+        reconciled,
+        equity_usd: equity,
+        peak_equity_usd: peak_equity_usd.unwrap_or(equity).max(equity),
+        realized_pnl_today_usd,
+        unrealized_pnl_usd: unrealized,
+        day_start_ms,
+        total_position_notional_usd: state
+            .positions
+            .iter()
+            .map(|p| p.position_value_usd.abs())
+            .sum(),
+        positions,
+        resting: Some(RestingExposure {
+            szi: resting_szi,
+            notional_usd: resting_notional,
+        }),
+    };
+
+    // One container per agent (D1 as revised), so the fleet aggregate is the
+    // same account. A second container would make these differ.
+    Exposure {
+        agent: agent.clone(),
+        fleet: Some(agent),
     }
 }

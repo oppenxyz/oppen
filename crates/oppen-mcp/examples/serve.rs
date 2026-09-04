@@ -7,10 +7,20 @@
 
 use std::sync::{Arc, RwLock};
 
+use oppen_core::guardrail::{AgentId, GuardrailEngine, SqliteGuardrailStore};
+use oppen_core::keys::KeychainKeyStore;
+use oppen_core::ledger::{Ledger, LedgerAuditSink};
 use oppen_mcp::Network;
 use oppen_mcp::auth::TokenStore;
 use oppen_mcp::server::{MCP_PATH, serve};
 use oppen_mcp::tools::Gateway;
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -36,7 +46,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let account = std::env::var("OPPEN_TESTNET_USER")
         .map_err(|_| "set OPPEN_TESTNET_USER (source ~/.oppen/testnet.env)")?
         .parse()?;
-    let gateway = Gateway::new(Network::Testnet, account)?;
+    // Per-network database (R4): the ledger rowid is an agent's get_events
+    // cursor, so a shared file would make two networks share cursor positions.
+    let dir = std::path::PathBuf::from(
+        std::env::var("OPPEN_DATA_DIR").unwrap_or_else(|_| "/tmp/oppen-dev".into()),
+    );
+    std::fs::create_dir_all(&dir)?;
+    let ledger = Arc::new(Ledger::open_at(
+        &dir.join(oppen_core::db_file_name(Network::Testnet)),
+        Network::Testnet,
+    )?);
+    let engine = Arc::new(GuardrailEngine::new(
+        Arc::new(SqliteGuardrailStore::open(
+            dir.join("guardrails-testnet.db"),
+        )?),
+        Arc::new(LedgerAuditSink::new(ledger.clone())),
+        Arc::new(KeychainKeyStore::new(Network::Testnet)),
+        Network::Testnet,
+    )?);
+
+    let agent = AgentId::new("agent-alpha");
+    // D-c near-zero defaults: empty allowlist, $25 orders, $100 positions.
+    // The first order is refused with the limit to raise named in the reason.
+    let guardrails = engine.register_agent(&agent, None, now_ms())?;
+    println!("agent    {agent} registered");
+    println!("limits   {guardrails:?}");
+    println!();
+
+    let gateway = Gateway::new(Network::Testnet, account, agent, engine)?;
     serve(
         port,
         gateway,

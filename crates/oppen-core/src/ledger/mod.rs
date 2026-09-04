@@ -1828,3 +1828,86 @@ fn sub_account_from_row(row: &Row<'_>) -> Result<SubAccount> {
         created_ts_ms: row.get(7)?,
     })
 }
+
+/// Writes every guardrail verdict into the chained ledger.
+///
+/// D6 makes this ledger the single record of why an order happened, and the
+/// engine's [`AuditSink`](crate::guardrail::AuditSink) doc says the ledger
+/// module implements it. Until this existed the trait shipped with only a
+/// test-only implementation, so a released build had no way to record a
+/// clearance at all.
+///
+/// The event kind is chosen from the outcome rather than passed in, so a
+/// caller cannot file a refusal as an approval:
+///
+/// - a clearance is [`EventKind::OrderIntent`], written *before* signing;
+/// - a refusal is [`EventKind::Refusal`], which `docs/decisions.md` D-c
+///   requires in the record because the refusal is the onboarding;
+/// - an operator mutation is [`EventKind::OperatorAction`].
+pub struct LedgerAuditSink {
+    ledger: std::sync::Arc<Ledger>,
+}
+
+impl LedgerAuditSink {
+    pub fn new(ledger: std::sync::Arc<Ledger>) -> Self {
+        Self { ledger }
+    }
+}
+
+impl std::fmt::Debug for LedgerAuditSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LedgerAuditSink").finish_non_exhaustive()
+    }
+}
+
+impl crate::guardrail::AuditSink for LedgerAuditSink {
+    fn record(
+        &self,
+        entry: &crate::guardrail::AuditEntry<'_>,
+    ) -> std::result::Result<(), crate::guardrail::AuditError> {
+        use crate::guardrail::AuditOutcome;
+
+        let (kind, mut payload) = match &entry.outcome {
+            AuditOutcome::Cleared(clearance) => (
+                EventKind::OrderIntent,
+                serde_json::to_value(clearance).map_err(|e| crate::guardrail::AuditError {
+                    detail: e.to_string(),
+                })?,
+            ),
+            AuditOutcome::Refused(refusal) => (
+                EventKind::Refusal,
+                // The Display impl is the contract: it names the predicate,
+                // the observed value and the limit.
+                serde_json::json!({ "refusal": refusal.to_string() }),
+            ),
+            AuditOutcome::Operator(action) => (
+                EventKind::OperatorAction,
+                serde_json::to_value(action).map_err(|e| crate::guardrail::AuditError {
+                    detail: e.to_string(),
+                })?,
+            ),
+        };
+
+        // The agent's own words travel with the row. Untrusted text
+        // (`AGENTS.md` invariant 9): stored verbatim, never interpreted.
+        if let Some(object) = payload.as_object_mut() {
+            object.insert(
+                "reason".into(),
+                serde_json::Value::String(entry.reason.to_owned()),
+            );
+        }
+
+        self.ledger
+            .append(&NewEvent {
+                kind,
+                ts_ms: entry.at_ms as i64,
+                agent_id: entry.agent.map(|agent| agent.as_str()),
+                payload: &payload,
+                snapshot: None,
+            })
+            .map(|_| ())
+            .map_err(|e| crate::guardrail::AuditError {
+                detail: e.to_string(),
+            })
+    }
+}
