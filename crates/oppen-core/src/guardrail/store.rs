@@ -84,14 +84,20 @@ pub trait GuardrailStore: Send + Sync {
     fn save_vault(&self, agent: &AgentId, vault: &Address) -> Result<(), StoreError>;
 }
 
-/// An in-memory store, for tests and for a headless run with no database.
+/// An in-memory store, so the engine can be exercised without a filesystem.
+///
+/// Test-only. The shipped app persists (spec item 26: the kill switch
+/// survives a restart), so a store that forgets on relaunch has no
+/// production caller and must not have one.
+#[cfg(test)]
 #[derive(Debug, Default)]
-pub struct MemoryStore {
+pub(super) struct MemoryStore {
     state: Mutex<PersistedState>,
 }
 
+#[cfg(test)]
 impl MemoryStore {
-    pub fn new() -> Self {
+    pub(super) fn new() -> Self {
         MemoryStore::default()
     }
 
@@ -101,6 +107,7 @@ impl MemoryStore {
     }
 }
 
+#[cfg(test)]
 impl GuardrailStore for MemoryStore {
     fn load(&self) -> Result<PersistedState, StoreError> {
         Ok(self.with_state(|s| s.clone()))
@@ -127,9 +134,7 @@ impl GuardrailStore for MemoryStore {
     }
 }
 
-/// Key of the kill-switch row in `guardrail_state`.
 const KILL_SWITCH_KEY: &str = "kill_switch";
-/// Key of the account-wide loss limits row in `guardrail_state`.
 const ACCOUNT_LIMITS_KEY: &str = "account_limits";
 
 /// The real store: two small tables in the per-network database file.
@@ -156,7 +161,10 @@ impl SqliteGuardrailStore {
         Self::from_connection(Connection::open(path)?)
     }
 
-    pub fn in_memory() -> Result<Self, StoreError> {
+    /// The same schema and the same SQL, without a file. Test-only: the app
+    /// opens the per-network database file.
+    #[cfg(test)]
+    fn in_memory() -> Result<Self, StoreError> {
         Self::from_connection(Connection::open_in_memory()?)
     }
 

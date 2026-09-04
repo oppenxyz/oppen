@@ -34,14 +34,6 @@ use serde::Serialize;
 use crate::guardrail::AgentId;
 use crate::ledger::{Ledger, LedgerError, Owner, OwnerType, SubAccount};
 
-/// The operator-facing name of the bucket every unattributed fill lands in
-/// (`docs/spec.md` item 33, `docs/specs/history.md` §2).
-///
-/// One definition, so the middle dot cannot drift into a hyphen in one view and
-/// a bullet in another. It is a display string; the wire form is
-/// [`Classification`]'s `manual_external`.
-pub const MANUAL_EXTERNAL_BUCKET: &str = "manual · external";
-
 /// What oppen is doing with an account right now.
 ///
 /// `docs/decisions.md` R3 describes a lifecycle rather than a pair of booleans.
@@ -51,7 +43,7 @@ pub const MANUAL_EXTERNAL_BUCKET: &str = "manual · external";
 /// this module ([`Registry::opt_out`] refuses it); a hand-edited database that
 /// holds it anyway reads as [`Standing::Discovered`], which is R3's default and
 /// the safe direction to fail in.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Standing {
     /// Seen under the master and not opted in. R3's default for anything oppen
@@ -82,7 +74,7 @@ impl Standing {
 
     /// Whether oppen collects new history for this account. [`Standing::Retired`]
     /// is `false`, so use [`Scope::All`] to count a retired account in a total.
-    pub fn is_recording(self) -> bool {
+    fn is_recording(self) -> bool {
         matches!(self, Standing::OptedIn | Standing::ProvisionedByOppen)
     }
 }
@@ -93,7 +85,7 @@ impl Standing {
 /// owner is attributable to that owner; anything else — the master account
 /// itself, an account made in the Hyperliquid web app, a discovered one the
 /// operator merely watches — is `manual · external`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Classification {
     /// A paired agent's account (D1, one per agent).
@@ -112,15 +104,6 @@ impl Classification {
             Some(OwnerType::Agent) => Classification::Agent,
             Some(OwnerType::Workflow) => Classification::Workflow,
             None => Classification::ManualExternal,
-        }
-    }
-
-    /// The operator-facing bucket name, for a roster column or a fill row.
-    pub fn label(self) -> &'static str {
-        match self {
-            Classification::Agent => "agent",
-            Classification::Workflow => "workflow",
-            Classification::ManualExternal => MANUAL_EXTERNAL_BUCKET,
         }
     }
 }
@@ -162,11 +145,13 @@ impl Scope {
 /// opaque rejection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Route {
-    /// Sign for this sub-account: `vaultAddress` is set to it.
+    /// A sub-account container: `vaultAddress` is set to it.
     SubAccount(Address),
-    /// Sign for the master account itself: `vaultAddress` is omitted. Only the
-    /// manual escape hatch (`docs/spec.md` item 33) routes here.
-    Master,
+    /// A top-level container: `vaultAddress` is omitted and the action is signed
+    /// by that account's own API wallet. Under `docs/decisions.md` V2 this is
+    /// every agent container Hyperliquid v1 provisions, and it is also where the
+    /// manual escape hatch (`docs/spec.md` item 33) routes.
+    TopLevel,
 }
 
 impl Route {
@@ -175,7 +160,7 @@ impl Route {
     pub fn vault_address(self) -> Option<Address> {
         match self {
             Route::SubAccount(address) => Some(address),
-            Route::Master => None,
+            Route::TopLevel => None,
         }
     }
 }
@@ -198,11 +183,10 @@ pub struct Account {
     pub owner: Option<Owner>,
     /// Where this account sits in R3's lifecycle.
     pub standing: Standing,
-    /// Which bucket its activity is attributed to (`docs/spec.md` item 33).
-    pub classification: Classification,
     /// Whether oppen created it. Kept beside [`Account::standing`] because
     /// retirement hides it: a retired account that oppen provisioned is still
-    /// distinguishable from one it merely found.
+    /// distinguishable from one it merely found. It is also what the route reads
+    /// the container kind off until the schema records one.
     pub provisioned_by_oppen: bool,
     /// When the row was first written, in unix milliseconds. Rediscovering an
     /// account does not make it new.
@@ -222,10 +206,35 @@ impl Account {
             name: row.name.clone(),
             owner: row.owner.clone(),
             standing: Standing::of(row),
-            classification: Classification::of(row),
             provisioned_by_oppen: row.provisioned_by_oppen,
             created_ts_ms: row.created_ts_ms,
         })
+    }
+
+    /// Where this account's orders route on the wire (`docs/spec.md` D1).
+    ///
+    /// The route follows the container kind and is hardcoded neither way: a
+    /// sub-account container carries `vaultAddress`, a top-level one carries
+    /// none. Both errors sign into an account that is not the agent's — a
+    /// `vaultAddress` on a top-level container names an account its own API
+    /// wallet does not own, and omitting one on a sub-account routes the order
+    /// into the master itself.
+    ///
+    /// The stored row carries no container kind yet —
+    /// `docs/specs/venue-containers.md` §3.5 puts `container_kind` in a later
+    /// migration — so the kind is read off the only two paths that write a row.
+    /// [`Registry::provision`] records a container oppen created, and under
+    /// `docs/decisions.md` V2 Hyperliquid v1 creates a **top-level** account per
+    /// agent. [`Registry::observe`] folds in the venue's `subAccounts` listing,
+    /// every entry of which [`Discovered::from_venue`] has proved to be a
+    /// sub-account of the expected master. When the column lands, this reads it
+    /// instead of inferring it.
+    fn route(&self) -> Route {
+        if self.provisioned_by_oppen {
+            Route::TopLevel
+        } else {
+            Route::SubAccount(self.address)
+        }
     }
 }
 
@@ -560,14 +569,6 @@ impl<'l> Registry<'l> {
         Account::from_row(&updated)
     }
 
-    /// One account by address, or `None` if the registry has never seen it.
-    pub fn get(&self, address: Address) -> Result<Option<Account>, AccountsError> {
-        match self.ledger.sub_account(&address.to_string())? {
-            Some(row) => Ok(Some(Account::from_row(&row)?)),
-            None => Ok(None),
-        }
-    }
-
     /// Every account in `scope`, ascending by address.
     ///
     /// Ordered rather than left to the storage engine, so anything built from
@@ -602,7 +603,8 @@ impl<'l> Registry<'l> {
     /// The route for one agent's orders (D1).
     ///
     /// The caller hands over an [`AgentId`] and gets a [`Route`] whose
-    /// [`Route::vault_address`] goes straight into `oppen_hl::ExchangeRequest`.
+    /// [`Route::vault_address`] goes straight into `oppen_hl::ExchangeRequest`,
+    /// following the agent's container kind rather than a call-site guess.
     /// The guardrail engine keeps its own copy of the binding — it stamps the
     /// `vaultAddress` onto every clearance so a later caller cannot supply a
     /// different one — and this registry is where that copy comes from at
@@ -632,7 +634,7 @@ impl<'l> Registry<'l> {
         if account.standing == Standing::Retired {
             return Err(AccountsError::Retired(account.address));
         }
-        Ok(Route::SubAccount(account.address))
+        Ok(account.route())
     }
 
     /// The address an owner is already bound to, if any.
@@ -704,10 +706,18 @@ mod tests {
         }
     }
 
-    /// D1: an agent's account is recorded from birth and routes as a
-    /// `vaultAddress` without the caller ever touching a string.
+    /// The stored row at `address`, retired ones included.
+    fn stored(registry: &Registry, address: Address) -> Option<Account> {
+        registry
+            .list(Scope::All)
+            .expect("list")
+            .into_iter()
+            .find(|account| account.address == address)
+    }
+
+    /// D1: an agent's account is recorded from birth.
     #[test]
-    fn a_provisioned_account_is_recorded_and_routes() {
+    fn a_provisioned_account_is_recorded_from_birth() {
         let dir = TempDir::new().expect("tempdir");
         let ledger = ledger(&dir);
         let registry = Registry::new(&ledger);
@@ -716,15 +726,11 @@ mod tests {
             .provision(address(AGENT_A), "carry", agent_owner("carry"), 1_700_000)
             .expect("provision");
         assert_eq!(account.standing, Standing::ProvisionedByOppen);
-        assert_eq!(account.classification, Classification::Agent);
         assert!(account.standing.is_recording());
-
-        let route = registry
-            .route_for_agent(&AgentId::new("carry"))
-            .expect("route");
-        assert_eq!(route, Route::SubAccount(address(AGENT_A)));
-        assert_eq!(route.vault_address(), Some(address(AGENT_A)));
-        assert_eq!(Route::Master.vault_address(), None);
+        assert_eq!(
+            registry.classify(address(AGENT_A)).expect("classify"),
+            Classification::Agent
+        );
 
         // Idempotent: the second write keeps the first creation timestamp.
         let again = registry
@@ -737,6 +743,48 @@ mod tests {
             .expect("re-provision");
         assert_eq!(again.created_ts_ms, 1_700_000);
         assert_eq!(again.name, "carry v2");
+    }
+
+    /// D1 and `docs/decisions.md` V2: the route is a property of the container,
+    /// never a call-site constant. A top-level container — what Hyperliquid v1
+    /// provisions for every agent — sends **no** `vaultAddress`; a sub-account
+    /// container sends its own address. Getting it wrong signs into an account
+    /// that is not the agent's: a `vaultAddress` on a top-level container names
+    /// an account its API wallet does not own, and omitting it on a sub-account
+    /// puts the position in the master itself.
+    #[test]
+    fn the_route_follows_the_container_kind() {
+        let dir = TempDir::new().expect("tempdir");
+        let ledger = ledger(&dir);
+        let registry = Registry::new(&ledger);
+
+        registry
+            .provision(address(AGENT_A), "carry", agent_owner("carry"), 1)
+            .expect("provision");
+        let top_level = registry
+            .route_for_agent(&AgentId::new("carry"))
+            .expect("route");
+        assert_eq!(top_level, Route::TopLevel);
+        assert_eq!(top_level.vault_address(), None);
+
+        // A container oppen did not create came from a master's `subAccounts`
+        // listing, so it routes with its own address (V5's upgrade shape).
+        ledger
+            .upsert_sub_account(&SubAccount {
+                address: AGENT_B.to_owned(),
+                name: "basis".to_owned(),
+                owner: Some(agent_owner("basis")),
+                recorded: true,
+                provisioned_by_oppen: false,
+                active: true,
+                created_ts_ms: 2,
+            })
+            .expect("upsert");
+        let sub_account = registry
+            .route_for_agent(&AgentId::new("basis"))
+            .expect("route");
+        assert_eq!(sub_account, Route::SubAccount(address(AGENT_B)));
+        assert_eq!(sub_account.vault_address(), Some(address(AGENT_B)));
     }
 
     /// R3: default off for anything oppen did not provision, and a later sweep
@@ -779,7 +827,7 @@ mod tests {
         assert_eq!(report.renamed, vec![address(OPERATOR)]);
         assert_eq!(report.unchanged, 1);
 
-        let still = registry.get(address(OPERATOR)).expect("get").expect("row");
+        let still = stored(&registry, address(OPERATOR)).expect("row");
         assert_eq!(still.standing, Standing::OptedIn);
         assert_eq!(still.name, "manual renamed");
         assert_eq!(still.created_ts_ms, 10);
@@ -808,12 +856,14 @@ mod tests {
         assert_eq!(retired.standing, Standing::Retired);
         assert!(retired.provisioned_by_oppen);
         // The owner survives, so its old fills stay attributed to the agent.
-        assert_eq!(retired.classification, Classification::Agent);
+        assert_eq!(
+            registry.classify(address(AGENT_A)).expect("classify"),
+            Classification::Agent
+        );
 
         assert!(registry.list(Scope::Live).expect("live").is_empty());
         assert!(registry.list(Scope::Recorded).expect("recorded").is_empty());
         assert_eq!(registry.list(Scope::All).expect("all").len(), 1);
-        assert!(registry.get(address(AGENT_A)).expect("get").is_some());
 
         assert!(matches!(
             registry.route_for_agent(&AgentId::new("carry")),
@@ -828,11 +878,7 @@ mod tests {
             .observe(&[discovered(AGENT_A, "carry")], 30)
             .expect("observe");
         assert_eq!(
-            registry
-                .get(address(AGENT_A))
-                .expect("get")
-                .expect("row")
-                .standing,
+            stored(&registry, address(AGENT_A)).expect("row").standing,
             Standing::Retired
         );
         // Retiring twice is a no-op, not an error.
@@ -869,11 +915,6 @@ mod tests {
             Classification::Agent
         );
         assert_eq!(
-            Classification::ManualExternal.label(),
-            "manual \u{b7} external"
-        );
-        assert_eq!(MANUAL_EXTERNAL_BUCKET, "manual \u{b7} external");
-        assert_eq!(
             serde_json::to_string(&Classification::ManualExternal).expect("json"),
             "\"manual_external\""
         );
@@ -887,7 +928,7 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let ledger = ledger(&dir);
         let registry = Registry::new(&ledger);
-        let account = registry
+        registry
             .provision(
                 address(AGENT_B),
                 "guardian",
@@ -898,7 +939,10 @@ mod tests {
                 1,
             )
             .expect("provision");
-        assert_eq!(account.classification, Classification::Workflow);
+        assert_eq!(
+            registry.classify(address(AGENT_B)).expect("classify"),
+            Classification::Workflow
+        );
         // A workflow-owned account is not an agent route.
         assert!(matches!(
             registry.route_for_agent(&AgentId::new("position-guardian")),
@@ -1053,7 +1097,7 @@ mod tests {
                 created_ts_ms: 1,
             })
             .expect("upsert");
-        let account = registry.get(address(AGENT_A)).expect("get").expect("row");
+        let account = stored(&registry, address(AGENT_A)).expect("row");
         assert_eq!(account.standing, Standing::Discovered);
         assert!(!account.standing.is_recording());
         assert!(account.provisioned_by_oppen);

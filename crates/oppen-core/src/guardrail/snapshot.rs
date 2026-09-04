@@ -32,12 +32,11 @@ pub enum FeedQuality {
     /// over what is left. §14.4 correction 7: this is the common case, not
     /// the exception — 38.6% of the mainnet universe has no book.
     Degraded,
-    /// Nothing survived.
     Unusable,
 }
 
 impl FeedQuality {
-    pub fn is_ok(self) -> bool {
+    pub(super) fn is_ok(self) -> bool {
         matches!(self, FeedQuality::Ok)
     }
 }
@@ -96,9 +95,11 @@ pub struct MarketSnapshotRef {
 }
 
 impl MarketRef {
-    /// A clean tick. Used by callers that have a good price and nothing to
-    /// report about divergence.
-    pub fn fresh(symbol: impl Into<String>, reference_px: Decimal, as_of_ms: u64) -> Self {
+    /// A clean tick, for tests that have a good price and nothing to report
+    /// about divergence. Production ticks come from the feed with the
+    /// divergence fields filled in.
+    #[cfg(test)]
+    pub(super) fn fresh(symbol: impl Into<String>, reference_px: Decimal, as_of_ms: u64) -> Self {
         MarketRef {
             symbol: symbol.into(),
             reference_px: Some(reference_px),
@@ -183,12 +184,13 @@ impl RestingExposure {
     /// An account with nothing working. Named rather than `default()` at call
     /// sites so "the book really is empty" is distinguishable from "nobody
     /// filled this in" — the latter is [`None`], which refuses.
-    pub fn none() -> Self {
+    #[cfg(test)]
+    pub(super) fn none() -> Self {
         RestingExposure::default()
     }
 
     /// Signed resting size for one coin, zero when nothing is working.
-    pub fn szi_of(&self, symbol: &str) -> Decimal {
+    pub(super) fn szi_of(&self, symbol: &str) -> Decimal {
         self.szi.get(symbol).copied().unwrap_or(Decimal::ZERO)
     }
 }
@@ -202,14 +204,14 @@ impl AccountSnapshot {
     ///
     /// Saturating, because `rust_decimal`'s `+` panics on overflow and a
     /// saturated loss still trips the breaker — the fail-closed direction.
-    pub fn day_pnl_usd(&self) -> Decimal {
+    pub(super) fn day_pnl_usd(&self) -> Decimal {
         self.realized_pnl_today_usd
             .saturating_add(self.unrealized_pnl_usd)
     }
 
     /// Signed size of one position, zero when flat. Filled size only — the
     /// working book is [`AccountSnapshot::resting`].
-    pub fn position_szi(&self, symbol: &str) -> Decimal {
+    pub(super) fn position_szi(&self, symbol: &str) -> Decimal {
         self.positions
             .get(symbol)
             .map(|p| p.szi)
@@ -219,7 +221,7 @@ impl AccountSnapshot {
     /// Whether `day_start_ms` is the UTC midnight of the day containing
     /// `now_ms`. A snapshot carrying yesterday's boundary would understate
     /// today's loss, so the engine refuses rather than reinterpreting it.
-    pub fn covers_day_of(&self, now_ms: u64) -> bool {
+    pub(super) fn covers_day_of(&self, now_ms: u64) -> bool {
         now_ms >= self.day_start_ms
             && self.day_start_ms % DAY_MS == 0
             && now_ms - self.day_start_ms < DAY_MS

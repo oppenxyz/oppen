@@ -196,9 +196,10 @@ pub enum Refusal {
 
 impl Refusal {
     /// True when the refusal is a fail-closed one rather than a breached
-    /// limit. The operator console shows these differently: a breached limit
-    /// is the system working, an unevaluable input is the system blind.
-    pub fn is_unevaluable(&self) -> bool {
+    /// limit. Test-only sugar over the public [`Refusal::Unevaluable`]
+    /// variant, which anything else matches on directly.
+    #[cfg(test)]
+    pub(super) fn is_unevaluable(&self) -> bool {
         matches!(self, Refusal::Unevaluable(_))
     }
 }

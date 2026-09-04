@@ -11,14 +11,11 @@
 //! # What this protects against, and what it does not
 //!
 //! `docs/threat-model.md` is the normative text and this module must not
-//! promise more than it does. On Windows (Credential Manager) and Linux (Secret
-//! Service) any process running as the same OS user can read these secrets and
-//! then sign orders directly against Hyperliquid, bypassing every guardrail; on
-//! macOS the Keychain prompt is per application, a barrier against casual
-//! access and not against a determined process holding your privileges. The
-//! keychain is *containment*, not a boundary. The only containment property
-//! that survives a compromised machine is the venue's: an agent (API) wallet
-//! cannot withdraw.
+//! promise more than it does: a same-user process reads these secrets on
+//! Windows and Linux, and the macOS prompt stops casual access rather than a
+//! determined process. The keychain is *containment*, not a boundary. The only
+//! containment property that survives a compromised machine is the venue's: an
+//! agent (API) wallet cannot withdraw.
 //!
 //! # Invariants this file carries
 //!
@@ -33,9 +30,10 @@
 //!   rotation. [`KeyStore::rotate_agent_key`] mints a new entry at a new
 //!   generation and refuses an address the record has already seen.
 
-use std::collections::BTreeMap;
-use std::sync::Mutex;
 use std::sync::atomic::{Ordering, compiler_fence};
+
+#[cfg(test)]
+use std::{collections::BTreeMap, sync::Mutex};
 
 use hmac::{Hmac, KeyInit, Mac};
 use oppen_hl::{Address, AgentKey, Network};
@@ -54,16 +52,16 @@ use crate::guardrail::AgentId;
 /// **This string is frozen.** Changing it orphans every key already stored on
 /// every installed machine, and an orphaned agent key is an agent that can no
 /// longer cancel its own resting orders.
-pub const SERVICE_TESTNET: &str = "xyz.oppen.testnet";
+const SERVICE_TESTNET: &str = "xyz.oppen.testnet";
 
 /// Keychain service holding every mainnet secret. Frozen, for the same reason.
 ///
 /// The network is in the *service* rather than in the entry name because
 /// `docs/decisions.md` R4 calls a mainnet number that is actually a testnet
-/// number the worst bug this product can ship. A per-network service makes the
-/// collision impossible to write, and makes the split visible in Keychain
-/// Access and Credential Manager where an operator can audit it.
-pub const SERVICE_MAINNET: &str = "xyz.oppen.mainnet";
+/// number the worst bug this product can ship. A per-network service makes that
+/// collision impossible to write and visible to an operator auditing Keychain
+/// Access or Credential Manager.
+const SERVICE_MAINNET: &str = "xyz.oppen.mainnet";
 
 /// Entry-name prefix for one generation of one agent's wallet key.
 const PREFIX_AGENT_KEY: &str = "agent-key";
@@ -85,11 +83,11 @@ const MAX_AGENT_ID_BYTES: usize = 64;
 /// How long an `approveAgent` approval oppen requests is valid for: 90 days
 /// (`docs/decisions.md` D-b). Long enough not to be a chore, short enough that
 /// an abandoned deployment stops trading within a quarter.
-pub const AGENT_APPROVAL_TTL_MS: u64 = 90 * 24 * 60 * 60 * 1_000;
+const AGENT_APPROVAL_TTL_MS: u64 = 90 * 24 * 60 * 60 * 1_000;
 
 /// How long before `valid_until` the console and `get_state` start warning:
 /// 14 days (`docs/decisions.md` D-b).
-pub const AGENT_EXPIRY_WARNING_MS: u64 = 14 * 24 * 60 * 60 * 1_000;
+const AGENT_EXPIRY_WARNING_MS: u64 = 14 * 24 * 60 * 60 * 1_000;
 
 /// `valid_until` oppen should request for an approval signed at `now_ms`.
 ///
@@ -108,7 +106,7 @@ pub fn default_valid_until_ms(now_ms: u64) -> u64 {
 /// own fields stays under half that. At one rotation per 90-day approval that
 /// is four years of history, and the alternative — an unbounded list — is a
 /// record that silently stops being writable on Windows.
-pub const MAX_RETIRED_ADDRESSES: usize = 16;
+const MAX_RETIRED_ADDRESSES: usize = 16;
 
 /// Secret text held only as long as it is needed, overwritten on drop.
 ///
@@ -118,11 +116,10 @@ pub const MAX_RETIRED_ADDRESSES: usize = 16;
 /// private key still in it.
 ///
 /// **This is a stand-in for `zeroize::Zeroizing<String>` and is weaker.**
-/// `oppen-core` does not declare `zeroize`, so the overwrite is a plain fill
-/// plus a compiler fence rather than volatile writes and an aggressive
-/// optimizer is permitted to elide it, and it cannot reach the copy `keyring`
-/// made inside its own decode path. Swap it for `Zeroizing<String>` the moment
-/// the dependency exists.
+/// `oppen-core` declares no `zeroize`, so the overwrite is a plain fill plus a
+/// compiler fence that an aggressive optimizer may elide, and it cannot reach
+/// the copy `keyring` made in its own decode path. Swap it the moment the
+/// dependency exists.
 pub struct SecretText(Vec<u8>);
 
 impl SecretText {
@@ -137,7 +134,7 @@ impl SecretText {
     /// Fails rather than lossily converting: a keychain entry that is not UTF-8
     /// is a corrupt entry, and guessing at a private key is worse than refusing
     /// to load it.
-    pub fn as_str(&self) -> Result<&str, KeyStoreError> {
+    pub(crate) fn as_str(&self) -> Result<&str, KeyStoreError> {
         std::str::from_utf8(&self.0).map_err(|_| KeyStoreError::Corrupt {
             detail: "secret is not valid UTF-8".to_owned(),
         })
@@ -169,9 +166,6 @@ pub enum KeyStoreError {
     /// most often a locked or absent Secret Service.
     #[error("keychain backend: {0}")]
     Backend(#[from] keyring::Error),
-
-    #[error("key store lock poisoned")]
-    Poisoned,
 
     #[error("no keychain entry named {entry}")]
     Missing { entry: String },
@@ -222,9 +216,9 @@ pub enum KeyStoreError {
 /// A fully-qualified keychain entry: the per-network service plus the account
 /// name inside it.
 ///
-/// Constructed only through the associated functions below, so every entry this
-/// crate touches is network-qualified by construction and no caller can
-/// assemble a name that crosses networks (`docs/decisions.md` R4).
+/// Public because it appears in [`KeyStore`]'s signatures, but opaque: every
+/// constructor and accessor is `pub(crate)`, so no caller outside this crate
+/// can assemble a name that crosses networks (`docs/decisions.md` R4).
 #[derive(Debug, PartialEq, Eq)]
 pub struct EntryName {
     service: &'static str,
@@ -233,12 +227,12 @@ pub struct EntryName {
 
 impl EntryName {
     /// The keychain service, which carries the network.
-    pub fn service(&self) -> &'static str {
+    pub(crate) fn service(&self) -> &'static str {
         self.service
     }
 
     /// The account (entry) name inside the service.
-    pub fn account(&self) -> &str {
+    pub(crate) fn account(&self) -> &str {
         &self.account
     }
 
@@ -247,7 +241,7 @@ impl EntryName {
     /// The generation is part of the name because `docs/decisions.md` D-b
     /// forbids reusing an agent address across a rotation: a rotation writes a
     /// name that has never existed, so it cannot overwrite the key it replaces.
-    pub fn agent_key(
+    pub(crate) fn agent_key(
         network: Network,
         agent: &AgentId,
         generation: u32,
@@ -264,7 +258,7 @@ impl EntryName {
     /// An agent's wallet record: which generation is current, its address, its
     /// approval window and the addresses it has retired. Not secret, but it
     /// belongs next to the key it describes so deleting an agent deletes both.
-    pub fn agent_record(network: Network, agent: &AgentId) -> Result<Self, KeyStoreError> {
+    pub(crate) fn agent_record(network: Network, agent: &AgentId) -> Result<Self, KeyStoreError> {
         let id = checked_agent_id(agent)?;
         Ok(EntryName {
             service: service_of(network),
@@ -274,7 +268,7 @@ impl EntryName {
 
     /// The guardrail-config HMAC key (`docs/spec.md` item 3). One per network,
     /// because the guardrail configuration is per network too.
-    pub fn guardrail_hmac(network: Network) -> Self {
+    pub(crate) fn guardrail_hmac(network: Network) -> Self {
         EntryName {
             service: service_of(network),
             account: ENTRY_GUARDRAIL_HMAC.to_owned(),
@@ -350,7 +344,7 @@ pub struct AgentWallet {
     /// signed approval is what the venue enforces.
     pub valid_until_ms: u64,
     /// Addresses this agent has retired, oldest first, capped at
-    /// [`MAX_RETIRED_ADDRESSES`].
+    /// `MAX_RETIRED_ADDRESSES` (16).
     pub retired: Vec<RetiredAgentWallet>,
 }
 
@@ -374,15 +368,10 @@ pub enum ExpiryState {
 }
 
 impl AgentWallet {
-    /// Milliseconds left on the approval, `0` once it has passed.
-    ///
-    /// Saturating both ways so a clock that jumped backwards produces a large
-    /// remaining time rather than an underflow.
-    pub fn remaining_ms(&self, now_ms: u64) -> u64 {
-        self.valid_until_ms.saturating_sub(now_ms)
-    }
-
     /// Where this approval sits in D-b's window at `now_ms`.
+    ///
+    /// Saturating both ways, so a clock that jumped backwards reports a large
+    /// remaining time rather than underflowing into `Expired`.
     pub fn expiry(&self, now_ms: u64) -> ExpiryState {
         if now_ms >= self.valid_until_ms {
             return ExpiryState::Expired {
@@ -400,19 +389,18 @@ impl AgentWallet {
     /// Whether `address` has ever been this agent's, current or retired.
     ///
     /// The retired list is capped, so a `false` from this means "not in the
-    /// last [`MAX_RETIRED_ADDRESSES`] rotations", not "never". Documented
-    /// rather than papered over: the addresses come from freshly generated
-    /// keys, so a collision past the cap requires deliberately importing an old
-    /// key.
-    pub fn has_used(&self, address: &Address) -> bool {
+    /// last `MAX_RETIRED_ADDRESSES` rotations", not "never". Documented rather
+    /// than papered over: the addresses come from freshly generated keys, so a
+    /// collision past the cap requires deliberately importing an old key.
+    fn has_used(&self, address: &Address) -> bool {
         self.address == *address || self.retired.iter().any(|r| r.address == *address)
     }
 }
 
 /// Length of the guardrail HMAC key and of the tags it produces, in bytes.
-pub const HMAC_KEY_LEN: usize = 32;
+const HMAC_KEY_LEN: usize = 32;
 /// Length of an HMAC-SHA3-256 tag, in bytes.
-pub const HMAC_TAG_LEN: usize = 32;
+const HMAC_TAG_LEN: usize = 32;
 
 /// The key behind `docs/spec.md` item 3: the guardrail configuration is
 /// HMAC-checked so that editing the SQLite file cannot silently raise a limit.
@@ -428,9 +416,11 @@ pub const HMAC_TAG_LEN: usize = 32;
 pub struct HmacKey([u8; HMAC_KEY_LEN]);
 
 impl HmacKey {
-    /// Wraps caller-supplied key bytes. Public so a front end that *does* have
-    /// an OS RNG can generate the key itself on a platform where
-    /// [`HmacKey::generate`] cannot (see its docs).
+    /// Wraps caller-supplied key bytes. Public as the other half of a
+    /// fail-closed branch: where no OS entropy source is reachable
+    /// [`KeyStore::ensure_hmac_key`] refuses rather than inventing a key, and
+    /// this plus [`KeyStore::store_hmac_key`] is how a front end with its own
+    /// RNG supplies one (`docs/spec.md` item 3).
     pub fn from_bytes(bytes: [u8; HMAC_KEY_LEN]) -> Self {
         HmacKey(bytes)
     }
@@ -446,7 +436,7 @@ impl HmacKey {
     /// dependency line. Until then a Windows front end must call
     /// [`HmacKey::from_bytes`] with entropy it obtained itself and store it via
     /// [`KeyStore::store_hmac_key`].
-    pub fn generate() -> Result<Self, KeyStoreError> {
+    fn generate() -> Result<Self, KeyStoreError> {
         let mut bytes = [0u8; HMAC_KEY_LEN];
         os_entropy(&mut bytes)?;
         Ok(HmacKey(bytes))
@@ -493,7 +483,7 @@ impl std::fmt::Debug for HmacKey {
     }
 }
 
-/// Fills `dst` from the OS CSPRNG. See [`HmacKey::generate`] for the platform
+/// Fills `dst` from the OS CSPRNG. See `HmacKey::generate` for the platform
 /// gap this leaves open.
 #[cfg(unix)]
 fn os_entropy(dst: &mut [u8]) -> Result<(), KeyStoreError> {
@@ -511,7 +501,7 @@ fn os_entropy(dst: &mut [u8]) -> Result<(), KeyStoreError> {
 
 /// No `std` OS-entropy API exists off unix and this crate declares no RNG
 /// dependency, so key generation fails closed here rather than inventing
-/// entropy. See [`HmacKey::generate`].
+/// entropy. See `HmacKey::generate`.
 #[cfg(not(unix))]
 fn os_entropy(_dst: &mut [u8]) -> Result<(), KeyStoreError> {
     Err(KeyStoreError::EntropyUnavailable {
@@ -661,7 +651,8 @@ pub trait KeyStore: Send + Sync {
     ///
     /// The hex never becomes a plain `String` on the way: it is wrapped in
     /// [`SecretText`] as it leaves the keychain and handed to
-    /// `AgentKey::from_hex`, which zeroizes its own decode buffer.
+    /// `AgentKey::from_hex`, which zeroizes its own decode buffer. This is the
+    /// hand-off `ROADMAP.md` item [2] names.
     ///
     /// Loading an *expired* wallet is not refused here. Expiry is a policy the
     /// guardrail engine applies — D-b halts the agent and cancels resting
@@ -737,12 +728,6 @@ pub trait KeyStore: Send + Sync {
         let key = HmacKey::generate()?;
         self.store_hmac_key(&key)?;
         Ok(key)
-    }
-
-    /// Removes the guardrail HMAC key. Every existing configuration tag becomes
-    /// unverifiable, so this is an operator action, not a cleanup step.
-    fn delete_hmac_key(&self) -> Result<(), KeyStoreError> {
-        self.remove(&EntryName::guardrail_hmac(self.network()))
     }
 }
 
@@ -847,8 +832,8 @@ impl KeyStore for KeychainKeyStore {
     }
 }
 
-/// The test double. **Never a substitute for the keychain in a shipped build:**
-/// it holds secrets in process memory for the process's whole life.
+/// The test double, and the test seam that earns [`KeyStore`] its place as a
+/// trait (`AGENTS.md` leanness rule 2).
 ///
 /// CI has no keychain, and a test suite that skipped itself there would leave
 /// the agent-wallet rules — one record per agent, rotation mints a generation,
@@ -857,39 +842,48 @@ impl KeyStore for KeychainKeyStore {
 /// here exercises the same code the keychain store runs. `BTreeMap`, not
 /// `HashMap`, because `AGENTS.md` invariant 6 wants deterministic iteration
 /// anywhere state is enumerated.
-#[derive(Debug)]
-pub struct MemoryKeyStore {
+///
+/// Test-gated because it holds secrets in process memory for the process's
+/// whole life: "never a substitute for the keychain in a shipped build" is a
+/// property the compiler enforces here, not a warning in a doc comment. Its
+/// `Default` is a testnet store (`AGENTS.md` invariant 5), and a poisoned lock
+/// panics — that means another test thread already panicked.
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct MemoryKeyStore {
     network: Network,
     entries: Mutex<BTreeMap<(&'static str, String), String>>,
 }
 
+#[cfg(test)]
 impl MemoryKeyStore {
-    pub fn new(network: Network) -> Self {
+    pub(crate) fn new(network: Network) -> Self {
         MemoryKeyStore {
             network,
-            entries: Mutex::new(BTreeMap::new()),
+            ..MemoryKeyStore::default()
         }
     }
 
     /// Entry names currently populated, in deterministic order. For tests that
     /// assert a rotation minted rather than replaced.
-    pub fn entry_names(&self) -> Result<Vec<String>, KeyStoreError> {
-        let map = self.entries.lock().map_err(|_| KeyStoreError::Poisoned)?;
-        Ok(map
+    pub(crate) fn entry_names(&self) -> Vec<String> {
+        self.entries
+            .lock()
+            .expect("poisoned")
             .keys()
             .map(|(service, account)| format!("{service}:{account}"))
-            .collect())
+            .collect()
     }
 }
 
+#[cfg(test)]
 impl KeyStore for MemoryKeyStore {
     fn network(&self) -> Network {
         self.network
     }
 
     fn write(&self, entry: &EntryName, secret: &str) -> Result<(), KeyStoreError> {
-        let mut map = self.entries.lock().map_err(|_| KeyStoreError::Poisoned)?;
-        map.insert(
+        self.entries.lock().expect("poisoned").insert(
             (entry.service(), entry.account().to_owned()),
             secret.to_owned(),
         );
@@ -897,15 +891,19 @@ impl KeyStore for MemoryKeyStore {
     }
 
     fn read(&self, entry: &EntryName) -> Result<Option<SecretText>, KeyStoreError> {
-        let map = self.entries.lock().map_err(|_| KeyStoreError::Poisoned)?;
-        Ok(map
+        Ok(self
+            .entries
+            .lock()
+            .expect("poisoned")
             .get(&(entry.service(), entry.account().to_owned()))
             .map(|s| SecretText::new(s.clone())))
     }
 
     fn remove(&self, entry: &EntryName) -> Result<(), KeyStoreError> {
-        let mut map = self.entries.lock().map_err(|_| KeyStoreError::Poisoned)?;
-        map.remove(&(entry.service(), entry.account().to_owned()));
+        self.entries
+            .lock()
+            .expect("poisoned")
+            .remove(&(entry.service(), entry.account().to_owned()));
         Ok(())
     }
 }
@@ -934,13 +932,12 @@ mod tests {
 
     /// `KeyStoreError` crosses `.await` points in the headless core
     /// (`docs/decisions.md` R1), so it has to be `Send + Sync`. A compile
-    /// failure here is the whole assertion.
+    /// failure here is the whole assertion. The stores need no line of their
+    /// own: `KeyStore: Send + Sync` makes every implementation prove it.
     #[test]
     fn error_is_send_and_sync() {
         fn require<T: Send + Sync + 'static>() {}
         require::<KeyStoreError>();
-        require::<KeychainKeyStore>();
-        require::<MemoryKeyStore>();
     }
 
     // -- naming ------------------------------------------------------------
@@ -1057,7 +1054,7 @@ mod tests {
             .expect("create");
         assert_eq!(plain.address, prefixed.address);
 
-        let names = store.entry_names().expect("names");
+        let names = store.entry_names();
         assert!(names.contains(&format!("{SERVICE_TESTNET}:agent-key/plain/0")));
         assert!(names.contains(&format!("{SERVICE_TESTNET}:agent-key/prefixed/0")));
     }
@@ -1073,7 +1070,7 @@ mod tests {
             ));
         }
         assert!(store.agent_wallet(&a).expect("read").is_none());
-        assert!(store.entry_names().expect("names").is_empty());
+        assert!(store.entry_names().is_empty());
     }
 
     #[test]
@@ -1115,7 +1112,7 @@ mod tests {
         assert_eq!(second.retired[0].retired_at_ms, T0 + DAY_MS);
 
         // Generation 0's key was not overwritten: both entries exist.
-        let names = store.entry_names().expect("names");
+        let names = store.entry_names();
         assert!(names.contains(&format!("{SERVICE_TESTNET}:agent-key/alpha/0")));
         assert!(names.contains(&format!("{SERVICE_TESTNET}:agent-key/alpha/1")));
 
@@ -1218,7 +1215,7 @@ mod tests {
             Err(KeyStoreError::Missing { .. })
         ));
         assert_eq!(
-            store.entry_names().expect("names"),
+            store.entry_names(),
             vec![
                 format!("{SERVICE_TESTNET}:agent-key/beta/0"),
                 format!("{SERVICE_TESTNET}:agent-record/beta"),
@@ -1317,7 +1314,6 @@ mod tests {
                 remaining_ms: 90 * DAY_MS
             }
         );
-        assert_eq!(record.remaining_ms(T0), 90 * DAY_MS);
 
         // One millisecond before the warning window opens.
         let just_before = T0 + 76 * DAY_MS - 1;
@@ -1343,7 +1339,6 @@ mod tests {
             record.expiry(T0 + 91 * DAY_MS),
             ExpiryState::Expired { elapsed_ms: DAY_MS }
         );
-        assert_eq!(record.remaining_ms(T0 + 91 * DAY_MS), 0);
     }
 
     #[test]
@@ -1352,8 +1347,14 @@ mod tests {
         let record = store
             .create_agent_key(&agent("alpha"), secret(KEY_A), T0 + DAY_MS, T0)
             .expect("create");
-        assert!(matches!(record.expiry(0), ExpiryState::Valid { .. }));
-        assert_eq!(record.remaining_ms(0), T0 + DAY_MS);
+        // A clock behind `approved_at_ms` must report the whole window as
+        // remaining, not wrap into a huge `elapsed_ms` under `Expired`.
+        assert_eq!(
+            record.expiry(0),
+            ExpiryState::Valid {
+                remaining_ms: T0 + DAY_MS
+            }
+        );
     }
 
     #[test]
@@ -1369,7 +1370,6 @@ mod tests {
         let key = HmacKey::from_bytes([7u8; HMAC_KEY_LEN]);
         let message = br#"{"max_order_usd":"25"}"#;
         let tag = key.sign(message).expect("sign");
-        assert_eq!(tag.len(), HMAC_TAG_LEN);
         assert!(key.verify(message, &tag));
     }
 
@@ -1406,12 +1406,9 @@ mod tests {
         assert!(loaded.verify(b"config", &tag));
 
         assert_eq!(
-            store.entry_names().expect("names"),
+            store.entry_names(),
             vec![format!("{SERVICE_TESTNET}:guardrail-hmac")]
         );
-
-        store.delete_hmac_key().expect("delete");
-        assert!(store.load_hmac_key().expect("load").is_none());
     }
 
     #[test]
@@ -1512,24 +1509,5 @@ mod tests {
 
         store.delete_agent(&a).expect("delete");
         assert!(store.agent_wallet(&a).expect("read").is_none());
-    }
-
-    /// Same, for the guardrail HMAC key.
-    #[test]
-    #[ignore = "touches the real OS credential store"]
-    fn keychain_round_trips_the_hmac_key() {
-        // Uses the real entry name, so it is destructive to a local install's
-        // guardrail key. Deliberately not run by default.
-        let store = KeychainKeyStore::new(Network::Testnet);
-        let existing = store.load_hmac_key().expect("load");
-        if existing.is_some() {
-            panic!("refusing to overwrite an existing guardrail-hmac entry");
-        }
-        let key = store.ensure_hmac_key().expect("ensure");
-        let tag = key.sign(b"config").expect("sign");
-        let again = store.ensure_hmac_key().expect("ensure");
-        assert!(again.verify(b"config", &tag));
-        store.delete_hmac_key().expect("delete");
-        assert!(store.load_hmac_key().expect("load").is_none());
     }
 }

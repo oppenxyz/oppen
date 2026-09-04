@@ -7,7 +7,7 @@
 //! those three cases and what each one promises.
 //!
 //! Nothing here reads a local clock or a calendar: buckets are epoch-aligned
-//! integer arithmetic ([`Interval::bucket_start_ms`]), so the same interval
+//! integer arithmetic (`Interval::bucket_start_ms`), so the same interval
 //! produces the same buckets on every machine and across a DST transition.
 //!
 //! Aggregation lives here rather than in the view layer because the fair-value
@@ -23,7 +23,7 @@
 //!
 //! Facts this module depends on, measured rather than assumed:
 //!
-//! - The native menu is exactly the fourteen strings in [`NATIVE_INTERVALS`].
+//! - The native menu is exactly the fourteen strings in `NATIVE_INTERVALS`.
 //!   `1s`, `30s`, `6h`, `2d` and `7m` are rejected with HTTP 422.
 //! - **`1M` is not a calendar month.** Every one of the 86 BTC and 23 HYPE
 //!   `1M` bars is exactly 2,592,000,000 ms wide and satisfies
@@ -66,21 +66,26 @@ const MONTH_MS: i64 = 30 * 24 * 60 * 60 * MS_PER_SECOND;
 
 /// The longest interval oppen will accept, per `charts.md` §3.3 ("reject above
 /// `1M`"). Equal to `1M` because that is the top of the venue menu.
-pub const MAX_INTERVAL_MS: i64 = MONTH_MS;
+const MAX_INTERVAL_MS: i64 = MONTH_MS;
 
-/// Default retention for locally aggregated bars, `docs/decisions.md` D-e:
-/// thirty days. Ledger events are kept forever; recomputable — or, for local
-/// bars, unrecoverable-but-budgeted — inputs are pruned.
-pub const DEFAULT_LOCAL_RETENTION_MS: i64 = 30 * 24 * 60 * 60 * MS_PER_SECOND;
+/// Retention for locally aggregated bars, `docs/decisions.md` D-e: thirty
+/// days. Ledger events are kept forever; recomputable — or, for local bars,
+/// unrecoverable-but-budgeted — inputs are pruned.
+///
+/// D-e calls thirty days a *default*, so this becomes a `prune_local`
+/// parameter again on the day an operator setting exists to vary it. Until
+/// then it is one constant with one value, not a parameter every call site
+/// passes the same way.
+const LOCAL_RETENTION_MS: i64 = 30 * 24 * 60 * 60 * MS_PER_SECOND;
 
 /// Ceiling on how many empty bars [`LocalAggregator`] will synthesise to span
 /// one silence. A closed laptop on a `1s` chart would otherwise materialise a
 /// bar per second of sleep; past this the gap is left as absent rows and
 /// counted by [`LocalAggregator::skipped_fills`].
-pub const MAX_FILL_BARS: i64 = 10_000;
+const MAX_FILL_BARS: i64 = 10_000;
 
 /// Earliest timestamp this module accepts. The venue serves no pre-epoch bar.
-pub const MIN_TIME_MS: i64 = 0;
+const MIN_TIME_MS: i64 = 0;
 
 /// Latest timestamp this module accepts: 9999-12-31T23:59:59.999Z.
 ///
@@ -89,16 +94,16 @@ pub const MIN_TIME_MS: i64 = 0;
 /// provably in range, rather than scattering `checked_add` across the module.
 /// `MAX_TIME_MS + MAX_INTERVAL_MS` is four orders of magnitude below
 /// `i64::MAX`, so a bucket close can never wrap.
-pub const MAX_TIME_MS: i64 = 253_402_300_799_999;
+const MAX_TIME_MS: i64 = 253_402_300_799_999;
 
 /// How many intervals `candleSnapshot` serves, whatever the interval. A rolling
 /// floor, not a page size — see the audit note in the module docs.
-pub const VENUE_HISTORY_INTERVALS: u32 = 5_000;
+const VENUE_HISTORY_INTERVALS: u32 = 5_000;
 
 /// The time unit of an interval string. Case matters and is not a typo:
 /// `m` is a minute and `M` is the venue's thirty-day bar.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Unit {
+enum Unit {
     /// `s`. Only ever produces a locally aggregated series: the venue's finest
     /// bar is `1m`.
     Second,
@@ -117,7 +122,7 @@ pub enum Unit {
 impl Unit {
     /// Width of one unit in milliseconds. Fixed for all six: the audit proved
     /// `Month` is thirty days on the wire, so no unit here is calendar-variable.
-    pub const fn millis(self) -> i64 {
+    const fn millis(self) -> i64 {
         match self {
             Unit::Second => MS_PER_SECOND,
             Unit::Minute => 60 * MS_PER_SECOND,
@@ -129,7 +134,7 @@ impl Unit {
     }
 
     /// The single character used on the wire and in the operator's input box.
-    pub const fn suffix(self) -> char {
+    const fn suffix(self) -> char {
         match self {
             Unit::Second => 's',
             Unit::Minute => 'm',
@@ -168,7 +173,7 @@ pub struct Interval {
 impl Ord for Interval {
     /// By width, never by field order. Written out because the derived version
     /// compares `count` first, which puts `1M` below `3m`, leaves
-    /// [`NATIVE_INTERVALS`] unsorted under its own ordering, and would make a
+    /// `NATIVE_INTERVALS` unsorted under its own ordering, and would make a
     /// `BTreeMap<Interval, _>` serialise in that order — a determinism hazard
     /// on the MCP surface (`AGENTS.md` 6). Agrees with the derived [`Eq`]
     /// because canonicalisation gives exactly one `Interval` per width.
@@ -188,7 +193,7 @@ impl PartialOrd for Interval {
 #[serde(rename_all = "snake_case")]
 pub enum Horizon {
     /// Everything the venue has ever had for the asset. True where the venue's
-    /// own age is fewer than [`VENUE_HISTORY_INTERVALS`] bars: BTC `1d` returns
+    /// own age is fewer than `VENUE_HISTORY_INTERVALS` bars: BTC `1d` returns
     /// all 2,208 rows back to 2019.
     Full,
     /// Only the most recent `intervals` bars exist, no matter how the request
@@ -202,7 +207,7 @@ pub enum Horizon {
 impl Horizon {
     /// The horizon as a duration, for an interval of this width. `None` when
     /// there is no limit to express.
-    pub const fn span_ms(self, of: Interval) -> Option<i64> {
+    const fn span_ms(self, of: Interval) -> Option<i64> {
         match self {
             Horizon::Full => None,
             Horizon::Rolling { intervals } => Some((intervals as i64).saturating_mul(of.millis())),
@@ -233,7 +238,7 @@ impl<'de> Deserialize<'de> for Interval {
 /// walks the menu backwards looking for the largest divisor. `charts.md` §3.1
 /// lists it; the audit in the module docs confirms these fourteen and only
 /// these fourteen are served.
-pub const NATIVE_INTERVALS: [Interval; 14] = [
+const NATIVE_INTERVALS: [Interval; 14] = [
     Interval::known(1, Unit::Minute),
     Interval::known(3, Unit::Minute),
     Interval::known(5, Unit::Minute),
@@ -312,12 +317,12 @@ impl Interval {
     }
 
     /// Width in milliseconds. Never zero, so it is always a safe divisor.
-    pub const fn millis(self) -> i64 {
+    const fn millis(self) -> i64 {
         self.count as i64 * self.unit.millis()
     }
 
     /// Whether the venue serves this interval directly.
-    pub fn is_native(self) -> bool {
+    fn is_native(self) -> bool {
         NATIVE_INTERVALS.contains(&self)
     }
 
@@ -327,7 +332,7 @@ impl Interval {
     /// bars. Five thousand days is thirteen years, more than Hyperliquid has
     /// existed, which is why BTC `1d` returns its whole history while BTC `1m`
     /// reaches only about three and a half days back.
-    pub const fn venue_history(self) -> Horizon {
+    const fn venue_history(self) -> Horizon {
         if self.millis() >= Unit::Day.millis() {
             Horizon::Full
         } else {
@@ -376,7 +381,7 @@ impl Interval {
     /// for any `i64` (`AGENTS.md` conventions). [`MIN_TIME_MS`] and
     /// [`MAX_TIME_MS`] bound every timestamp that enters the module, so
     /// saturation is only reachable from a direct call with an absurd argument.
-    pub const fn bucket_start_ms(self, t_ms: i64) -> i64 {
+    const fn bucket_start_ms(self, t_ms: i64) -> i64 {
         let width = self.millis();
         t_ms.div_euclid(width).saturating_mul(width)
     }
@@ -384,7 +389,7 @@ impl Interval {
     /// Inclusive close of the bucket containing `t_ms`, in the venue's own
     /// convention: `T = t + width - 1`, verified on every bar in the audit.
     /// Saturating for the same reason as [`Interval::bucket_start_ms`].
-    pub const fn bucket_close_ms(self, t_ms: i64) -> i64 {
+    const fn bucket_close_ms(self, t_ms: i64) -> i64 {
         self.bucket_start_ms(t_ms).saturating_add(self.millis() - 1)
     }
 }
@@ -453,7 +458,7 @@ pub enum Resolution {
     Resampled {
         /// The largest native interval that divides this one.
         from: Interval,
-        /// How far back `from` is served — [`Interval::venue_history`].
+        /// How far back `from` is served — `Interval::venue_history`.
         source_history: Horizon,
     },
     /// Built here from the `trades` feed. **Forward only** — there is no
@@ -484,28 +489,6 @@ impl Resolution {
                 Some(span) => format!("RESAMPLED FROM {from} · {}", compact_span(span)),
             },
             Resolution::Local { .. } => "LOCAL · FORWARD ONLY".to_owned(),
-        }
-    }
-
-    /// Whether this case has *any* history behind it. `false` means the chart
-    /// starts at the moment oppen first listened and the empty region before it
-    /// must be labelled, never drawn.
-    ///
-    /// It does not mean "full history": ask [`Resolution::source_history`] for
-    /// how far back the case actually reaches.
-    pub fn has_history(self) -> bool {
-        !matches!(self, Resolution::Local { .. })
-    }
-
-    /// How far back the *source* reaches, for the one case where the source is
-    /// not the requested interval. `None` for the native case — ask
-    /// [`Interval::venue_history`] on the interval itself — and `None` for the
-    /// local case, which has no history at all and reports it through
-    /// [`LocalAggregator::no_history_before_ms`] instead.
-    pub const fn source_history(self) -> Option<Horizon> {
-        match self {
-            Resolution::Resampled { source_history, .. } => Some(source_history),
-            Resolution::Native | Resolution::Local { .. } => None,
         }
     }
 }
@@ -549,15 +532,6 @@ impl Source {
             Source::Local => "local",
         }
     }
-
-    fn from_db(s: &str) -> Option<Self> {
-        match s {
-            "venue" => Some(Source::Venue),
-            "resampled" => Some(Source::Resampled),
-            "local" => Some(Source::Local),
-            _ => None,
-        }
-    }
 }
 
 /// One bar on the time axis, interval-agnostic.
@@ -565,7 +539,7 @@ impl Source {
 /// Money is [`Decimal`] and never `f64`: summing a day of `1m` volumes in
 /// binary floating point drifts, and a chart that disagrees with the ledger
 /// about a number is worse than no chart.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Bar {
     /// Bucket start, Unix epoch ms. Always a multiple of the interval width.
     pub open_time_ms: i64,
@@ -584,13 +558,6 @@ pub struct Bar {
 }
 
 impl Bar {
-    /// Whether the bucket has finished. The caller supplies the clock, because
-    /// this crate must not assume one (`docs/decisions.md` R1) and because a
-    /// backfilled bar and a live bar have to be judged the same way.
-    pub const fn is_closed(&self, now_ms: i64) -> bool {
-        self.close_time_ms < now_ms
-    }
-
     /// Convert one `candleSnapshot` / `candle` row. Fails rather than saturates
     /// on an out-of-range timestamp so a corrupt row cannot become a plausible
     /// one.
@@ -780,7 +747,7 @@ pub enum ResampleError {
 /// * **Leading.** The window began part-way through the first target bucket, so
 ///   its true open, high and low were never served. This is the normal case,
 ///   not an edge one: `candleSnapshot` serves a rolling
-///   [`VENUE_HISTORY_INTERVALS`]-bar window whose oldest bar sits at an
+///   `VENUE_HISTORY_INTERVALS`-bar window whose oldest bar sits at an
 ///   arbitrary offset into a resampled bucket — measured 2026-09-04, BTC `1m`'s
 ///   oldest row was 13 minutes into a `45m` bucket. The bucket is **dropped**;
 ///   the series simply starts at the next whole one. Emitting it would produce
@@ -790,10 +757,11 @@ pub enum ResampleError {
 ///   feed bug and it is refused with [`ResampleError::IncompleteBucket`] rather
 ///   than absorbed.
 /// * **Trailing.** The last bucket is still forming. It is returned like any
-///   other and the caller decides with [`Bar::is_closed`] — but only if what
-///   arrived is an unbroken run from the bucket's own start. A hole inside the
-///   last bucket is a hole like any other and is refused; "still forming" is
-///   the only reason a returned bucket may be short.
+///   other, and whether it has closed is the caller's own clock against its
+///   `close_time_ms` — but only if what arrived is an unbroken run from the
+///   bucket's own start. A hole inside the last bucket is a hole like any other
+///   and is refused; "still forming" is the only reason a returned bucket may
+///   be short.
 pub fn resample(
     source_bars: &[Bar],
     source: Interval,
@@ -1085,7 +1053,7 @@ impl LocalAggregator {
         self.before_history
     }
 
-    /// Silences too long to flat-fill (see [`MAX_FILL_BARS`]). Each one is a
+    /// Silences too long to flat-fill (see `MAX_FILL_BARS`). Each one is a
     /// real gap in the stored series.
     pub const fn skipped_fills(&self) -> u64 {
         self.skipped_fills
@@ -1263,9 +1231,6 @@ pub enum StoreError {
     /// coerced: money is exact or it is an error.
     #[error("candle store: `{0}` is not a decimal")]
     Decimal(String),
-    /// A `source` column value written by a newer schema.
-    #[error("candle store: unknown bar source `{0}`")]
-    UnknownSource(String),
 }
 
 /// The unchained candle side tables (`docs/decisions.md` R5).
@@ -1459,31 +1424,6 @@ impl<'a> CandleStore<'a> {
         }
     }
 
-    /// Which source a stored bar carries, for a caller deciding whether a
-    /// series is re-derivable.
-    pub fn bar_source(
-        &self,
-        coin: &str,
-        interval: Interval,
-        open_time_ms: i64,
-    ) -> Result<Option<Source>, StoreError> {
-        let found: Option<String> = self
-            .conn
-            .query_row(
-                "SELECT source FROM candle_bars
-                  WHERE coin = ?1 AND interval = ?2 AND open_time_ms = ?3",
-                params![coin, interval.to_string(), open_time_ms],
-                |row| row.get(0),
-            )
-            .optional()?;
-        match found {
-            None => Ok(None),
-            Some(raw) => Source::from_db(&raw)
-                .map(Some)
-                .ok_or(StoreError::UnknownSource(raw)),
-        }
-    }
-
     /// Record the instant before which a locally aggregated series has nothing.
     /// Monotonic: the floor only ever moves forward, because it is a claim
     /// about what was deleted or never seen and neither un-happens.
@@ -1522,10 +1462,9 @@ impl<'a> CandleStore<'a> {
             .optional()?)
     }
 
-    /// Drop locally aggregated bars older than `retention_ms`, returning how
-    /// many rows went. `docs/decisions.md` D-e: ledger records are kept
-    /// forever, sub-minute local bars default to thirty days
-    /// ([`DEFAULT_LOCAL_RETENTION_MS`]).
+    /// Drop locally aggregated bars older than `LOCAL_RETENTION_MS`, returning
+    /// how many rows went. `docs/decisions.md` D-e: ledger records are kept
+    /// forever, sub-minute local bars are budgeted at thirty days.
     ///
     /// The floor of each series that actually loses rows is raised to the
     /// cutoff in the same savepoint, derived from the rows about to go rather
@@ -1538,8 +1477,8 @@ impl<'a> CandleStore<'a> {
     /// * A series the prune did not touch keeps its floor. A blanket `UPDATE`
     ///   moves every row, including series with no stored bars at all, which
     ///   makes the marker claim a deletion that never happened.
-    pub fn prune_local(&self, now_ms: i64, retention_ms: i64) -> Result<usize, StoreError> {
-        let cutoff = now_ms.saturating_sub(retention_ms);
+    pub fn prune_local(&self, now_ms: i64) -> Result<usize, StoreError> {
+        let cutoff = now_ms.saturating_sub(LOCAL_RETENTION_MS);
         self.in_savepoint(|conn| {
             // Before the DELETE: the rows are still there to be read from.
             conn.execute(
@@ -1676,7 +1615,6 @@ mod tests {
             assert!(interval.is_native());
             assert_eq!(interval.resolve(), Resolution::Native);
             assert_eq!(interval.resolve().label(), "NATIVE");
-            assert!(interval.resolve().has_history());
         }
     }
 
@@ -1713,8 +1651,6 @@ mod tests {
         assert_eq!(iv("7m").resolve().label(), "RESAMPLED FROM 1m · 3d");
         assert_eq!(iv("45m").resolve().label(), "RESAMPLED FROM 15m · 52d");
         assert_eq!(iv("90s").resolve().label(), "LOCAL · FORWARD ONLY");
-        assert!(!iv("90s").resolve().has_history());
-        assert!(iv("7m").resolve().has_history());
     }
 
     /// `charts.md` §3.2 promises History = Full for the resampled case. It is
@@ -1749,15 +1685,6 @@ mod tests {
         // Derived from 1d and coarser: no floor to state.
         assert_eq!(iv("2d").resolve().label(), "RESAMPLED FROM 1d");
         assert_eq!(iv("4w").resolve().label(), "RESAMPLED FROM 1w");
-
-        assert_eq!(
-            iv("7m").resolve().source_history(),
-            Some(Horizon::Rolling { intervals: 5_000 }),
-            "the warmup gate reads this, not the chip string"
-        );
-        assert_eq!(iv("2d").resolve().source_history(), Some(Horizon::Full));
-        assert_eq!(iv("1h").resolve().source_history(), None, "native");
-        assert_eq!(iv("90s").resolve().source_history(), None, "local");
 
         assert_eq!(
             Horizon::Rolling { intervals: 5_000 }.span_ms(iv("1m")),
@@ -2774,14 +2701,6 @@ mod tests {
             store.latest_bar("BTC", interval).expect("latest").as_ref(),
             bars.last()
         );
-        assert_eq!(
-            store.bar_source("BTC", interval, 0).expect("source"),
-            Some(Source::Venue)
-        );
-        assert_eq!(
-            store.bar_source("BTC", interval, 999).expect("source"),
-            None
-        );
     }
 
     #[test]
@@ -2836,9 +2755,7 @@ mod tests {
             .set_no_history_before("BTC", interval, day)
             .expect("floor");
 
-        let removed = store
-            .prune_local(now, DEFAULT_LOCAL_RETENTION_MS)
-            .expect("prune");
+        let removed = store.prune_local(now).expect("prune");
         assert_eq!(removed, 1);
         assert_eq!(
             store.bars("BTC", interval, 0, now).expect("read"),
@@ -2851,7 +2768,7 @@ mod tests {
         );
         assert_eq!(
             store.no_history_before("BTC", interval).expect("floor"),
-            Some(now - DEFAULT_LOCAL_RETENTION_MS),
+            Some(now - LOCAL_RETENTION_MS),
             "the UI must not claim history that was just deleted"
         );
     }
@@ -2929,9 +2846,7 @@ mod tests {
         store
             .put_bars("BTC", interval, Source::Local, &bars)
             .expect("put_bars nests");
-        store
-            .prune_local(0, DEFAULT_LOCAL_RETENTION_MS)
-            .expect("prune_local nests");
+        store.prune_local(0).expect("prune_local nests");
         conn.execute_batch("COMMIT").expect("commit");
         assert_eq!(store.bars("BTC", interval, 0, 60_000).expect("read"), bars);
 
@@ -2966,7 +2881,7 @@ mod tests {
         let interval = iv("90s");
         let day = 24 * 60 * 60 * 1_000_i64;
         let now = 40 * day;
-        let cutoff = now - DEFAULT_LOCAL_RETENTION_MS;
+        let cutoff = now - LOCAL_RETENTION_MS;
 
         store
             .put_bars(
@@ -2984,12 +2899,7 @@ mod tests {
             None
         );
 
-        assert_eq!(
-            store
-                .prune_local(now, DEFAULT_LOCAL_RETENTION_MS)
-                .expect("prune"),
-            1
-        );
+        assert_eq!(store.prune_local(now).expect("prune"), 1);
         assert_eq!(
             store.no_history_before("BTC", interval).expect("floor"),
             Some(cutoff),
@@ -3025,12 +2935,7 @@ mod tests {
             .set_no_history_before("BTC", iv("90s"), 2_000)
             .expect("floor");
 
-        assert_eq!(
-            store
-                .prune_local(40 * day, DEFAULT_LOCAL_RETENTION_MS)
-                .expect("prune"),
-            0
-        );
+        assert_eq!(store.prune_local(40 * day).expect("prune"), 0);
         assert_eq!(
             store.no_history_before("DOGE", iv("1s")).expect("floor"),
             Some(1_000),
@@ -3068,12 +2973,9 @@ mod tests {
             .expect("insert resampled");
 
         assert_eq!(store.bars("BTC", iv("7m"), 0, 21 * m).expect("read"), out);
-        assert_eq!(
-            store.bar_source("BTC", iv("7m"), 0).expect("source"),
-            Some(Source::Resampled)
-        );
         // Pruning local bars leaves a resampled series alone: it is derivable
-        // from the native rows next to it.
-        assert_eq!(store.prune_local(i64::MAX / 2, 0).expect("prune"), 0);
+        // from the native rows next to it. Every row here predates the cutoff;
+        // only `source = 'local'` saves them.
+        assert_eq!(store.prune_local(i64::MAX / 2).expect("prune"), 0);
     }
 }

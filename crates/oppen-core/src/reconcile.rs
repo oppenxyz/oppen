@@ -14,20 +14,19 @@
 //!   re-walked on every reconnect, retry and restart, and the same fill will
 //!   be offered many times — by the backfill, by the `userFills` subscribe
 //!   snapshot, and by an overlapping page (the venue's `startTime` is
-//!   *inclusive*, measured). Nothing may be recorded twice, so
-//!   [`LedgerIndex`] reads the `tid` of every fill already in the chain and
-//!   dedupes against that. It is rebuilt from the chain rather than kept in
-//!   memory precisely so that a restart mid-reconcile changes nothing.
+//!   *inclusive*, measured). Nothing may be recorded twice, so `LedgerIndex`
+//!   reads the `tid` of every fill already in the chain and dedupes against
+//!   that. It is rebuilt from the chain rather than kept in memory precisely
+//!   so that a restart mid-reconcile changes nothing.
 //! * **A fill is never dropped for failing to match.** Every fill is
-//!   classified [`Attribution::Attributed`], [`Attribution::Manual`] or
-//!   [`Attribution::External`] and recorded either way
+//!   classified `Attribution::Attributed`, `Attribution::Manual` or
+//!   `Attribution::External` and recorded either way
 //!   (`docs/specs/history.md` §2, `docs/spec.md` item 33). An unmatched fill
 //!   is a [`Finding`], not an error: it means the operator traded elsewhere,
 //!   or was liquidated, and both belong in the history.
 //! * **After a timeout the only safe move is query-by-cloid.** `docs/spec.md`
-//!   item 19. [`UnknownOutcome`] is the type an unresolved order arrives as,
-//!   and its only method is a query — see that type for why it has no
-//!   `resend`.
+//!   item 19. `UnknownOutcome` is the type an unresolved order arrives as, and
+//!   its only method is a query — see that type for why it has no `resend`.
 //! * **A gap closes only once its window is proven contiguous.** A page that
 //!   cannot be advanced, a request that failed, or a walk that ran past its
 //!   page budget leaves `reconciled_ts_ms` null, so the staleness overlay
@@ -36,12 +35,12 @@
 //! # What the venue actually does
 //!
 //! Measured against public mainnet `POST /info` on 2026-09-04 (read-only, no
-//! key). These are the facts the walk in [`backfill_fills`] is built on:
+//! key). These are the facts the walk in `backfill_fills` is built on:
 //!
 //! | Fact | Measurement |
 //! |---|---|
 //! | `userFillsByTime` returns **oldest first** | a 100,000 s window returned rows in ascending `time` |
-//! | it caps a page at [`USER_FILLS_PAGE_LIMIT`] rows | two separate windows returned exactly 2,000 |
+//! | it caps a page at `USER_FILLS_PAGE_LIMIT` rows | two separate windows returned exactly 2,000 |
 //! | it truncates from the **newest** end, with no cursor | `endTime` 1776800000000 answered with a newest row of 1776775402431 |
 //! | `startTime` is **inclusive** | re-requesting from the last row's `time` returned that row again |
 //! | **the cap can cut a millisecond in half** | the page ended mid-millisecond: 2 rows at 1776775402431, and the next page returned **28** at that same millisecond |
@@ -64,7 +63,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 
-use serde::Serialize;
 use serde_json::{Value, json};
 
 use oppen_hl::info::OrderRef;
@@ -83,7 +81,7 @@ use crate::ledger::{Event, EventKind, Gap, Ledger, LedgerError, MAX_PAGE, NewEve
 /// carries no cursor, so a caller that widens the window instead of paging
 /// loses the tail silently — the same shape as
 /// [`oppen_hl::types::FUNDING_HISTORY_PAGE_LIMIT`], at four times the size.
-pub const USER_FILLS_PAGE_LIMIT: usize = 2_000;
+const USER_FILLS_PAGE_LIMIT: usize = 2_000;
 
 /// How many pages one window may take before the walk gives up.
 ///
@@ -93,7 +91,7 @@ pub const USER_FILLS_PAGE_LIMIT: usize = 2_000;
 /// fills in one gap, which is far past any reconnect and well into "something
 /// is wrong". Exceeding it is [`ReconcileError::TooManyPages`] and leaves the
 /// gap unreconciled, which is the honest outcome.
-pub const DEFAULT_MAX_PAGES: usize = 512;
+const DEFAULT_MAX_PAGES: usize = 512;
 
 /// Prefix of the `feed_gaps.scope` a `userFills` subscription writes.
 ///
@@ -152,20 +150,12 @@ pub enum ReconcileError {
         "the fills page at {at_ms} is full ({rows} rows) and every row shares that millisecond: \
          the window cannot be paged without losing rows"
     )]
-    PageStalled {
-        /// The millisecond the walk is stuck on.
-        at_ms: u64,
-        /// How many rows came back, for the report.
-        rows: usize,
-    },
-    /// The walk hit [`ReconcileConfig::max_pages`].
+    PageStalled { at_ms: u64, rows: usize },
+    /// The walk hit its page budget. See `ReconcileConfig::max_pages`.
     #[error("backfill of {start_ms}..{end_ms} exceeded {max_pages} pages")]
     TooManyPages {
-        /// Window start, unix ms.
         start_ms: u64,
-        /// Window end, unix ms.
         end_ms: u64,
-        /// The budget that was exceeded.
         max_pages: usize,
     },
     /// A gap's window ends before it starts, or carries a timestamp outside
@@ -174,11 +164,8 @@ pub enum ReconcileError {
     /// silently covers the wrong time.
     #[error("gap {gap_id} has an unusable window {start_ms}..{end_ms}")]
     UnusableWindow {
-        /// Which gap.
         gap_id: i64,
-        /// Recorded start, unix ms.
         start_ms: i64,
-        /// Recorded end, unix ms.
         end_ms: i64,
     },
     /// A venue timestamp did not fit the ledger's signed milliseconds.
@@ -186,14 +173,11 @@ pub enum ReconcileError {
     TimestampOutOfRange(u64),
     /// A gap scope named an address that does not parse.
     #[error("gap scope {scope:?} does not name a valid address")]
-    UnreadableScope {
-        /// The scope string as stored.
-        scope: String,
-    },
+    UnreadableScope { scope: String },
 }
 
 /// Reconcile result alias.
-pub type Result<T> = std::result::Result<T, ReconcileError>;
+type Result<T> = std::result::Result<T, ReconcileError>;
 
 /// The venue reads this module needs, and nothing else.
 ///
@@ -209,7 +193,7 @@ pub type Result<T> = std::result::Result<T, ReconcileError>;
 /// no business reconciling against.
 pub trait ReconcileSource {
     /// Fills for `user` in `[start_ms, end_ms]`, **oldest first**, capped at
-    /// [`USER_FILLS_PAGE_LIMIT`] rows and truncated from the newest end.
+    /// `USER_FILLS_PAGE_LIMIT` rows and truncated from the newest end.
     /// `start_ms` is inclusive. See the module docs for the measurements.
     fn user_fills_by_time(
         &self,
@@ -264,28 +248,21 @@ impl ReconcileSource for InfoClient {
 /// The ledger is authoritative for *why* something happened and the venue for
 /// *what* happened; this is the outcome of joining them. Every fill gets one,
 /// including the ones that match nothing.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(tag = "attribution", rename_all = "snake_case")]
-pub enum Attribution {
+#[derive(Debug)]
+enum Attribution {
     /// Matched to a recorded [`EventKind::OrderIntent`] by cloid, so the fill
     /// carries the agent, and through the intent row the reason and the
-    /// guardrail verdict that allowed it.
+    /// guardrail verdict that allowed it. The intent's hash is carried as well
+    /// as its seq so the link survives someone renumbering rows, the same
+    /// reasoning as [`crate::ledger::IntentReceipt::hash`].
     Attributed {
-        /// The agent whose intent this fill answers.
         agent_id: String,
-        /// Chain position of the intent row.
         intent_seq: u64,
-        /// Chain hash of the intent row. Carried as well as the seq so the
-        /// link survives someone renumbering rows, the same reasoning as
-        /// [`crate::ledger::IntentReceipt::hash`].
         intent_hash: String,
     },
     /// Matched to an [`EventKind::OperatorAction`] — the human's own ticket in
     /// oppen (`docs/spec.md` item 33).
-    Manual {
-        /// Chain position of the operator action row.
-        action_seq: u64,
-    },
+    Manual { action_seq: u64 },
     /// No matching intent. Traded outside oppen, or a liquidation nobody
     /// requested. `docs/spec.md` item 33 reserves the `manual · external`
     /// bucket for exactly this, and `docs/specs/history.md` §2 is explicit
@@ -296,7 +273,7 @@ pub enum Attribution {
 impl Attribution {
     /// The stored discriminator. Hashed into the chain through the payload, so
     /// it is a storage format and stable once written.
-    pub fn as_str(&self) -> &'static str {
+    fn as_str(&self) -> &'static str {
         match self {
             Attribution::Attributed { .. } => "attributed",
             Attribution::Manual { .. } => "manual",
@@ -308,7 +285,7 @@ impl Attribution {
     /// external fills: `docs/decisions.md` R4's sibling rule applies here too,
     /// in that a fabricated agent id in the ledger would be indistinguishable
     /// from a real one.
-    pub fn agent_id(&self) -> Option<&str> {
+    fn agent_id(&self) -> Option<&str> {
         match self {
             Attribution::Attributed { agent_id, .. } => Some(agent_id),
             Attribution::Manual { .. } | Attribution::External => None,
@@ -322,53 +299,44 @@ impl Attribution {
 /// traded elsewhere or oppen missed an event, and the two are distinguished by
 /// whether the ledger has a gap over that window". Both are recorded; neither
 /// stops the walk.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(tag = "finding", rename_all = "snake_case")]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Finding {
     /// A fill that matched no intent and no operator action.
+    ///
+    /// `cloid` is the one the fill carried, when it had one. A fill with a
+    /// cloid that matches nothing is the more interesting case: oppen puts a
+    /// cloid on everything it places (item 19), so this is either another
+    /// tool's order or a row whose intent has been redacted.
     UnattributedFill {
-        /// Venue trade id, the fill's identity.
         tid: u64,
-        /// Venue order id.
         oid: u64,
-        /// Symbol.
         coin: String,
-        /// Venue timestamp, ms.
         ts_ms: i64,
-        /// The cloid the fill carried, when it had one. A fill with a cloid
-        /// that matches nothing is the more interesting case: oppen puts a
-        /// cloid on everything it places (item 19), so this is either another
-        /// tool's order or a row whose intent has been redacted.
         cloid: Option<String>,
     },
     /// An order oppen believed was live is not resting and the venue no longer
     /// knows the cloid. See [`Settlement::Retired`] — this is not proof it
     /// never existed, only that the order record is gone.
-    OrderRetired {
-        /// The client order id that was queried.
-        cloid: String,
-    },
+    OrderRetired { cloid: String },
 }
 
 /// What one backfill recovered.
 ///
 /// Returned rather than logged so the console can state what closing a gap
 /// actually produced, and so a test can assert on it.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Recovered {
     /// Fills the venue returned, after removing the inclusive-boundary
     /// overlap between pages.
     pub fills_seen: usize,
-    /// Fills appended to the chain by this run.
     pub fills_recorded: usize,
     /// Fills already in the chain. Not an anomaly: the window overlaps what
     /// the live feed already delivered, and a retry re-walks it entirely.
     pub duplicates: usize,
-    /// Of the recorded fills, how many matched an intent.
+    /// Of the recorded fills, how many matched an intent, an operator action,
+    /// and nothing at all.
     pub attributed: usize,
-    /// How many matched an operator action.
     pub manual: usize,
-    /// How many matched nothing.
     pub external: usize,
     /// Everything worth reading that was not a failure.
     pub findings: Vec<Finding>,
@@ -383,30 +351,20 @@ pub struct Recovered {
 /// second one.
 ///
 /// So this type has no `resend`, no `place_again`, no `into_order` and no
-/// public constructor. It is produced only by [`OrderReconciliation`], it
+/// constructor of its own. It is produced only by [`OrderReconciliation`], it
 /// carries the cloid and the account it belongs to, and the single thing a
 /// caller can do with it is [`UnknownOutcome::settle`], which is a query. The
 /// rule is not a comment somewhere near the retry loop; there is no retry loop
 /// to put a comment near.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UnknownOutcome {
+#[derive(Debug)]
+struct UnknownOutcome {
     user: Address,
     cloid: Cloid,
 }
 
 impl UnknownOutcome {
-    /// The client order id whose fate is unknown.
-    pub fn cloid(&self) -> &Cloid {
-        &self.cloid
-    }
-
-    /// The account it was placed for.
-    pub fn account(&self) -> Address {
-        self.user
-    }
-
     /// Ask the venue what became of it. The only move item 19 allows.
-    pub async fn settle<S: ReconcileSource>(&self, source: &S) -> Result<Settlement> {
+    async fn settle<S: ReconcileSource>(&self, source: &S) -> Result<Settlement> {
         let response = source
             .order_status(self.user, OrderRef::Cloid(self.cloid.clone()))
             .await?;
@@ -421,20 +379,18 @@ impl UnknownOutcome {
     }
 }
 
-/// What the venue said about an [`UnknownOutcome`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(tag = "settlement", rename_all = "snake_case")]
+/// What the venue said about an order oppen could not account for.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Settlement {
     /// The venue still has the order and reports its state.
+    ///
+    /// `status` is the venue's own word: `open`, `filled`, `canceled`,
+    /// `triggered`, `rejected`, `marginCanceled`, … Kept verbatim rather than
+    /// mapped, because a status this build has not seen must not be silently
+    /// folded into one it has.
     Known {
-        /// Exchange order id.
         oid: u64,
-        /// The venue's own status word: `open`, `filled`, `canceled`,
-        /// `triggered`, `rejected`, `marginCanceled`, … Kept verbatim rather
-        /// than mapped, because a status this build has not seen must not be
-        /// silently folded into one it has.
         status: String,
-        /// When the venue stamped that status, ms.
         status_ts_ms: u64,
     },
     /// The venue answers `unknownOid`.
@@ -449,8 +405,8 @@ pub enum Settlement {
 }
 
 /// The state of an account's orders after a gap.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OrderReconciliation {
+#[derive(Debug)]
+struct OrderReconciliation {
     resting: Vec<OpenOrder>,
     unknown: Vec<UnknownOutcome>,
 }
@@ -468,7 +424,7 @@ impl OrderReconciliation {
     /// bookkeeping — an order can rest for a day without producing a single
     /// ledger row — and guessing it here would either miss orders or invent
     /// them.
-    pub fn partition(user: Address, pending: &[Cloid], open_orders: Vec<OpenOrder>) -> Self {
+    fn partition(user: Address, pending: &[Cloid], open_orders: Vec<OpenOrder>) -> Self {
         let resting_cloids: BTreeSet<&str> = open_orders
             .iter()
             .filter_map(|order| order.cloid.as_ref())
@@ -496,13 +452,8 @@ impl OrderReconciliation {
     }
 
     /// Everything the venue says is on the book.
-    pub fn resting(&self) -> &[OpenOrder] {
+    fn resting(&self) -> &[OpenOrder] {
         &self.resting
-    }
-
-    /// Everything the caller believed was live that the venue is not resting.
-    pub fn unknown(&self) -> &[UnknownOutcome] {
-        &self.unknown
     }
 
     /// Settle every unknown order by query, in cloid order.
@@ -510,10 +461,7 @@ impl OrderReconciliation {
     /// Sequential rather than concurrent: `docs/spec.md` item 10 gives the
     /// whole address one request budget, and a reconcile that fans out after a
     /// reconnect is the worst moment to spend it.
-    pub async fn settle_all<S: ReconcileSource>(
-        &self,
-        source: &S,
-    ) -> Result<Vec<(Cloid, Settlement)>> {
+    async fn settle_all<S: ReconcileSource>(&self, source: &S) -> Result<Vec<(Cloid, Settlement)>> {
         let mut out = Vec::with_capacity(self.unknown.len());
         for order in &self.unknown {
             out.push((order.cloid.clone(), order.settle(source).await?));
@@ -528,8 +476,8 @@ impl OrderReconciliation {
 /// that key read back. Market-data scopes are recognised and returned rather
 /// than treated as an error: candle backfill is a different component, and a
 /// scope this module cannot prove must not be marked reconciled by it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum GapScope {
+#[derive(Debug, PartialEq, Eq)]
+enum GapScope {
     /// `userFills:<address>` — the fills feed for one account.
     UserFills(Address),
     /// `orderUpdates:<address>` — the order-state feed for one account.
@@ -546,7 +494,7 @@ impl GapScope {
     /// [`GapScope::Other`]: it is a corrupted row for a feed this module owns,
     /// and silently reclassifying it as somebody else's problem would strand
     /// the gap forever.
-    pub fn parse(scope: &str) -> Result<Self> {
+    fn parse(scope: &str) -> Result<Self> {
         let unreadable = || ReconcileError::UnreadableScope {
             scope: scope.to_owned(),
         };
@@ -564,7 +512,7 @@ impl GapScope {
     }
 
     /// The account this scope covers, if it covers one.
-    pub fn account(&self) -> Option<Address> {
+    fn account(&self) -> Option<Address> {
         match self {
             GapScope::UserFills(user) | GapScope::OrderUpdates(user) => Some(*user),
             GapScope::Other(_) => None,
@@ -573,8 +521,7 @@ impl GapScope {
 }
 
 /// What happened to one gap.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GapStatus {
     /// The window was walked to its end and `reconciled_ts_ms` is now set.
     Reconciled,
@@ -588,13 +535,10 @@ pub enum GapStatus {
 }
 
 /// The report for one gap.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GapOutcome {
-    /// Which gap.
     pub gap_id: i64,
-    /// Its stored scope.
     pub scope: String,
-    /// What was done about it.
     pub status: GapStatus,
     /// What the fills walk recovered. Empty for a scope that carries no fills.
     pub recovered: Recovered,
@@ -607,14 +551,14 @@ pub struct GapOutcome {
 }
 
 /// Knobs with a defensible default each.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ReconcileConfig {
+#[derive(Debug, Clone, Copy)]
+struct ReconcileConfig {
     /// Page budget for one window. See [`DEFAULT_MAX_PAGES`].
-    pub max_pages: usize,
+    max_pages: usize,
     /// How many rows a full page holds. Overridable only so a test can prove
     /// the split-millisecond and stall behaviours without fabricating 2,000
     /// fixture rows per page; production uses [`USER_FILLS_PAGE_LIMIT`].
-    pub page_limit: usize,
+    page_limit: usize,
 }
 
 impl Default for ReconcileConfig {
@@ -663,7 +607,7 @@ struct IntentRef {
 /// property, and it closes when `fills` gets its own table with `tid` as the
 /// primary key (`docs/specs/history.md` §3.1).
 #[derive(Debug, Default)]
-pub struct LedgerIndex {
+struct LedgerIndex {
     intents: BTreeMap<String, IntentRef>,
     manual: BTreeMap<String, u64>,
     applied_tids: BTreeSet<u64>,
@@ -672,7 +616,7 @@ pub struct LedgerIndex {
 
 impl LedgerIndex {
     /// Build the index by walking the whole chain.
-    pub fn build(ledger: &Ledger) -> Result<Self> {
+    fn build(ledger: &Ledger) -> Result<Self> {
         let mut index = LedgerIndex::default();
         index.refresh(ledger)?;
         Ok(index)
@@ -684,7 +628,7 @@ impl LedgerIndex {
     /// happen while D-e holds — records are never deleted — so treating it as
     /// "rebuild" rather than as an error costs nothing and fails safe if that
     /// ever changes.
-    pub fn refresh(&mut self, ledger: &Ledger) -> Result<()> {
+    fn refresh(&mut self, ledger: &Ledger) -> Result<()> {
         loop {
             let page = ledger.get_events(self.cursor, MAX_PAGE)?;
             if page.resync_required {
@@ -737,7 +681,7 @@ impl LedgerIndex {
     }
 
     /// Whether this trade id is already in the chain.
-    pub fn contains_fill(&self, tid: u64) -> bool {
+    fn contains_fill(&self, tid: u64) -> bool {
         self.applied_tids.contains(&tid)
     }
 
@@ -747,7 +691,7 @@ impl LedgerIndex {
     /// is oppen's own 128-bit identifier, so the collision means the operator
     /// row is about the agent's order, and the agent attribution is the one
     /// that carries the reason and the guardrail verdict.
-    pub fn attribution(&self, cloid: Option<&Cloid>) -> Attribution {
+    fn attribution(&self, cloid: Option<&Cloid>) -> Attribution {
         let Some(cloid) = cloid else {
             return Attribution::External;
         };
@@ -817,9 +761,9 @@ fn find_cloid(value: &Value, depth: usize) -> Option<String> {
 ///   all, and that is [`ReconcileError::PageStalled`] rather than a silent
 ///   skip or an infinite loop.
 ///
-/// Nothing is written here. Recording is [`Reconciler::apply_fills`], so a
-/// caller can walk a window and inspect it without touching the chain.
-pub async fn backfill_fills<S: ReconcileSource>(
+/// Nothing is written here. Recording is `Reconciler::apply_fills`, so a
+/// window can be walked and inspected without touching the chain.
+async fn backfill_fills<S: ReconcileSource>(
     source: &S,
     user: Address,
     window: GapWindow,
@@ -872,7 +816,7 @@ pub async fn backfill_fills<S: ReconcileSource>(
 ///
 /// Holds a borrowed [`Ledger`], a [`ReconcileSource`] and the chain index.
 /// Every ledger call blocks, so an async caller runs
-/// [`Reconciler::apply_fills`] on a blocking pool the same way it runs any
+/// [`Reconciler::reconcile_all`] on a blocking pool the same way it runs any
 /// other ledger write (`docs/decisions.md` R1 keeps the core runtime-free).
 #[derive(Debug)]
 pub struct Reconciler<'a, S> {
@@ -890,7 +834,7 @@ impl<'a, S: ReconcileSource> Reconciler<'a, S> {
 
     /// Build one with a non-default page contract. See
     /// [`ReconcileConfig::page_limit`].
-    pub fn with_config(ledger: &'a Ledger, source: S, config: ReconcileConfig) -> Result<Self> {
+    fn with_config(ledger: &'a Ledger, source: S, config: ReconcileConfig) -> Result<Self> {
         Ok(Reconciler {
             ledger,
             source,
@@ -936,7 +880,7 @@ impl<'a, S: ReconcileSource> Reconciler<'a, S> {
     /// would hide the mistake at the cost of a query on every call and a
     /// second, silent definition of which gap is being worked; saying so is
     /// the cheaper honest option.
-    pub async fn reconcile_gap(&mut self, gap: &Gap, pending: &[Cloid]) -> Result<GapOutcome> {
+    async fn reconcile_gap(&mut self, gap: &Gap, pending: &[Cloid]) -> Result<GapOutcome> {
         let scope = GapScope::parse(&gap.scope)?;
         let unfinished = |status| GapOutcome {
             gap_id: gap.gap_id,
@@ -1020,7 +964,7 @@ impl<'a, S: ReconcileSource> Reconciler<'a, S> {
     /// Fills are sorted by `(time, tid)` before they are appended, so the
     /// chain order of a recovered window does not depend on which page a row
     /// arrived in. Two runs over the same window produce the same chain.
-    pub fn apply_fills(
+    fn apply_fills(
         &mut self,
         account: Address,
         fills: &[Fill],
@@ -1817,9 +1761,9 @@ mod tests {
             venue.open_orders.clone(),
         );
         assert_eq!(reconciliation.resting().len(), 1);
-        assert_eq!(reconciliation.unknown().len(), 1);
-        assert_eq!(reconciliation.unknown()[0].cloid(), &vanished);
-        assert_eq!(reconciliation.unknown()[0].account(), user);
+        assert_eq!(reconciliation.unknown.len(), 1);
+        assert_eq!(reconciliation.unknown[0].cloid, vanished);
+        assert_eq!(reconciliation.unknown[0].user, user);
 
         let settled = reconciliation.settle_all(&venue).await.expect("settle");
         assert_eq!(settled, vec![(vanished, Settlement::Retired)]);
@@ -2163,7 +2107,7 @@ mod tests {
             std::slice::from_ref(&never_placed),
             open_orders.clone(),
         );
-        assert_eq!(reconciliation.unknown().len(), 1);
+        assert_eq!(reconciliation.unknown.len(), 1);
         let settled = reconciliation.settle_all(&info).await.expect("settle");
         assert_eq!(settled, vec![(never_placed, Settlement::Retired)]);
 
@@ -2178,7 +2122,7 @@ mod tests {
             open_orders.clone(),
         );
         assert!(
-            known.unknown().is_empty(),
+            known.unknown.is_empty(),
             "a resting cloid is not an unknown outcome"
         );
         // Partitioned against an empty book it *is* unknown, which is the

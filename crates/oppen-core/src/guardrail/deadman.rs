@@ -14,7 +14,7 @@
 /// future. Sourced from the Hyperliquid exchange-endpoint documentation for
 /// `scheduleCancel`; not yet confirmed against the live API, because
 /// `scheduleCancel` is a signed action and there is no funded key.
-pub const DEAD_MAN_MIN_LEAD_MS: u64 = 5_000;
+pub(super) const DEAD_MAN_MIN_LEAD_MS: u64 = 5_000;
 
 /// How far ahead of now the cancel is scheduled. Twelve times the venue's
 /// [`DEAD_MAN_MIN_LEAD_MS`], so the arm request is never one the venue would
@@ -49,7 +49,11 @@ pub enum DeadManIntent {
 ///
 /// A deadline already in the past is treated as not armed: the venue has
 /// fired it, and arming again is the correct move while agents are active.
-pub fn evaluate(now_ms: u64, active_agents: usize, armed_until_ms: Option<u64>) -> DeadManIntent {
+pub(super) fn evaluate(
+    now_ms: u64,
+    active_agents: usize,
+    armed_until_ms: Option<u64>,
+) -> DeadManIntent {
     let armed = armed_until_ms.filter(|until| *until > now_ms);
     if active_agents == 0 {
         return if armed.is_some() {

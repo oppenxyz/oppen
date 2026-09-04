@@ -21,7 +21,7 @@ const MICRO: u64 = 1_000_000;
 
 /// Why a token could not be taken.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BucketError {
+pub(super) enum BucketError {
     /// Not enough tokens yet. `retry_after_ms` is the wait until one full
     /// token has accrued, rounded up.
     Empty {
@@ -41,7 +41,7 @@ pub enum BucketError {
 /// immediately, and it is the caps in [`super::AgentGuardrails`], not the
 /// rate, that make the first order small.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TokenBucket {
+pub(super) struct TokenBucket {
     rate: OrderRate,
     capacity_micro: u64,
     tokens_micro: u64,
@@ -53,7 +53,7 @@ pub struct TokenBucket {
 }
 
 impl TokenBucket {
-    pub fn new(rate: OrderRate, now_ms: u64) -> Self {
+    pub(super) fn new(rate: OrderRate, now_ms: u64) -> Self {
         let capacity_micro = u64::from(rate.count).saturating_mul(MICRO);
         TokenBucket {
             rate,
@@ -64,14 +64,14 @@ impl TokenBucket {
         }
     }
 
-    pub fn rate(&self) -> OrderRate {
+    pub(super) fn rate(&self) -> OrderRate {
         self.rate
     }
 
     /// Tokens currently available, for `get_state`'s guardrail-utilization
     /// block (spec item 16). Does not refill; call [`TokenBucket::refill`]
     /// first if the caller wants the value as of now.
-    pub fn tokens(&self) -> Decimal {
+    pub(super) fn tokens(&self) -> Decimal {
         Decimal::from(self.tokens_micro) / Decimal::from(MICRO)
     }
 
@@ -92,7 +92,7 @@ impl TokenBucket {
     /// was asked: `carry + Σ(elapsedᵢ × capacity)` telescopes to
     /// `total_elapsed × capacity`, so polling accrues exactly what one call
     /// at the same instant would.
-    pub fn refill(&mut self, now_ms: u64) -> Result<(), BucketError> {
+    pub(super) fn refill(&mut self, now_ms: u64) -> Result<(), BucketError> {
         if self.rate.per_ms == 0 {
             return Err(BucketError::InvalidRate);
         }
@@ -127,7 +127,7 @@ impl TokenBucket {
 
     /// Refills, then spends one token. On failure nothing is spent, so a
     /// refused order never costs an agent budget it did not use.
-    pub fn try_take(&mut self, now_ms: u64) -> Result<(), BucketError> {
+    pub(super) fn try_take(&mut self, now_ms: u64) -> Result<(), BucketError> {
         self.refill(now_ms)?;
         if self.tokens_micro < MICRO {
             return Err(BucketError::Empty {

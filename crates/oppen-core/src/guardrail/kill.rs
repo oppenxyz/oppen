@@ -28,7 +28,7 @@ pub enum KillScope {
 }
 
 impl KillScope {
-    pub fn agent(agent: impl Into<AgentId>) -> Self {
+    pub(super) fn agent(agent: impl Into<AgentId>) -> Self {
         KillScope::Agent {
             agent: agent.into(),
         }
@@ -117,7 +117,7 @@ pub struct KillSwitch {
 }
 
 impl KillSwitch {
-    pub fn new() -> Self {
+    pub(super) fn new() -> Self {
         KillSwitch::default()
     }
 
@@ -126,7 +126,7 @@ impl KillSwitch {
     /// Global is checked first because it is the broader statement: an
     /// operator who stopped everything should see that reason in the
     /// refusal, not whichever per-agent trip happened to be older.
-    pub fn blocking(&self, agent: &AgentId) -> Option<(KillScope, &Engagement)> {
+    pub(super) fn blocking(&self, agent: &AgentId) -> Option<(KillScope, &Engagement)> {
         if let Some(engagement) = &self.global {
             return Some((KillScope::Global, engagement));
         }
@@ -135,21 +135,25 @@ impl KillSwitch {
             .map(|e| (KillScope::agent(agent.clone()), e))
     }
 
-    pub fn is_engaged(&self, scope: &KillScope) -> bool {
+    /// Whether one scope is engaged, independently of any agent.
+    /// Test-only: the engine asks [`KillSwitch::blocking`], and a console
+    /// reads the serialized switch out of `get_state`.
+    #[cfg(test)]
+    pub(super) fn is_engaged(&self, scope: &KillScope) -> bool {
         match scope {
             KillScope::Global => self.global.is_some(),
             KillScope::Agent { agent } => self.agents.contains_key(agent),
         }
     }
 
-    pub fn global(&self) -> Option<&Engagement> {
+    pub(super) fn global(&self) -> Option<&Engagement> {
         self.global.as_ref()
     }
 
     /// Engages the switch. Idempotent: re-engaging an already-engaged scope
     /// keeps the original timestamp and reason, because the first trip is
     /// the one that explains what happened.
-    pub fn engage(&mut self, scope: KillScope, engagement: Engagement) -> bool {
+    pub(super) fn engage(&mut self, scope: KillScope, engagement: Engagement) -> bool {
         match scope {
             KillScope::Global => {
                 if self.global.is_some() {
@@ -171,7 +175,7 @@ impl KillSwitch {
     /// Releases the switch. Releasing global does not release per-agent
     /// engagements: an agent stopped by its own loss breaker stays stopped
     /// when the operator lifts the global pause.
-    pub fn release(&mut self, scope: &KillScope) -> bool {
+    pub(super) fn release(&mut self, scope: &KillScope) -> bool {
         match scope {
             KillScope::Global => self.global.take().is_some(),
             KillScope::Agent { agent } => self.agents.remove(agent).is_some(),

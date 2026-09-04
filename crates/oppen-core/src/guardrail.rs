@@ -70,16 +70,13 @@ use serde::{Deserialize, Serialize};
 
 pub use breaker::LossKind;
 pub use config::{
-    APPROVAL_TTL_MS, AgentGuardrails, DEFAULT_DAILY_LOSS_USD, DEFAULT_MARK_DIVERGENCE_BPS,
-    DEFAULT_MARK_DIVERGENCE_WINDOW_MS, DEFAULT_MAX_LEVERAGE, DEFAULT_MAX_ORDER_USD,
-    DEFAULT_MAX_POSITION_USD, DEFAULT_MAX_SLIPPAGE_BPS, DEFAULT_ORDER_RATE, Freshness,
-    GlobalRateBudget, LossLimits, MAX_REASON_BYTES, MarginMode, OrderRate, RiskSettings,
+    AgentGuardrails, Freshness, GlobalRateBudget, LossLimits, MarginMode, OrderRate, RiskSettings,
 };
-pub use deadman::{DEAD_MAN_MIN_LEAD_MS, DeadManIntent};
+pub use deadman::DeadManIntent;
 pub use engine::{
     AuditEntry, AuditError, AuditOutcome, AuditSink, Clearance, Cleared, ClearedKind,
-    GuardrailEngine, GuardrailError, NullAuditSink, OperatorAction, OrderIntent, Proposal,
-    SignClearedError, Utilization,
+    GuardrailEngine, GuardrailError, OperatorAction, OrderIntent, Proposal, SignClearedError,
+    Utilization,
 };
 pub use kill::{Engagement, KillEffect, KillReason, KillScope, KillSwitch};
 pub use refusal::{ReduceOnlyBreach, Refusal, Unevaluable, VenueRule};
@@ -87,7 +84,7 @@ pub use snapshot::{
     AccountSnapshot, Exposure, FeedQuality, MarketRef, MarketSnapshotRef, PositionSnapshot,
     RestingExposure,
 };
-pub use store::{GuardrailStore, MemoryStore, PersistedState, SqliteGuardrailStore, StoreError};
+pub use store::{GuardrailStore, PersistedState, SqliteGuardrailStore, StoreError};
 
 /// Stable identity of one paired agent. D1 maps the roster 1:1 onto
 /// sub-accounts, so an `AgentId` is also the identity of the sub-account

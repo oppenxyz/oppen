@@ -263,14 +263,6 @@ pub struct AuditError {
     pub detail: String,
 }
 
-impl AuditError {
-    pub fn new(detail: impl Into<String>) -> Self {
-        AuditError {
-            detail: detail.into(),
-        }
-    }
-}
-
 /// The verdict, for the audit record.
 #[derive(Debug)]
 #[non_exhaustive]
@@ -352,12 +344,14 @@ pub trait AuditSink: Send + Sync {
 
 /// Records nothing and always succeeds.
 ///
-/// For tests, and for a headless run before the ledger lands. Shipping this
-/// in the desktop app would make every clearance unexplainable after the
-/// fact, which D6 exists to prevent.
+/// Test-only, and deliberately unreachable from outside this module:
+/// shipping it would make every clearance unexplainable after the fact,
+/// which D6 exists to prevent.
+#[cfg(test)]
 #[derive(Debug, Default)]
-pub struct NullAuditSink;
+pub(super) struct NullAuditSink;
 
+#[cfg(test)]
 impl AuditSink for NullAuditSink {
     fn record(&self, _entry: &AuditEntry<'_>) -> Result<(), AuditError> {
         Ok(())

@@ -25,6 +25,14 @@ use oppen_hl::types::AssetInfo;
 use oppen_hl::wire::{CancelByCloidWire, CancelWire, Cloid, Grouping, OrderWire, Tif, Tpsl};
 use oppen_hl::{Action, Network};
 
+use super::config::{
+    APPROVAL_TTL_MS, DEFAULT_DAILY_LOSS_USD, DEFAULT_MARK_DIVERGENCE_BPS,
+    DEFAULT_MARK_DIVERGENCE_WINDOW_MS, DEFAULT_MAX_ORDER_USD, DEFAULT_MAX_POSITION_USD,
+    DEFAULT_ORDER_RATE, MAX_REASON_BYTES,
+};
+use super::deadman::DEAD_MAN_MIN_LEAD_MS;
+use super::engine::NullAuditSink;
+use super::store::MemoryStore;
 use super::*;
 
 // ---- fixtures -----------------------------------------------------------
@@ -174,7 +182,9 @@ struct FailingSink;
 
 impl AuditSink for FailingSink {
     fn record(&self, _entry: &AuditEntry<'_>) -> Result<(), AuditError> {
-        Err(AuditError::new("the ledger disk is full"))
+        Err(AuditError {
+            detail: "the ledger disk is full".to_owned(),
+        })
     }
 }
 
