@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <!--
+    oppen app icon.
+
+    The aperture mark from apps/desktop/src/components/shell/ApertureMark.vue,
+    at icon scale and in its own proportions: on a 100-unit plate the circle is
+    d=60 and the slot is w=12, running the full height so it cuts the plate top
+    to bottom. The holes show the ground through, so the mark is subtraction
+    rather than drawing — the same idea the ASCII system uses everywhere else.
+    The plate has square corners, as the component does; only the icon's own
+    ground is rounded, because macOS expects a squircle.
+
+    Palette is the brand ladder unchanged: void #0A0B0C ground, signal #E7E9EA
+    plate. No uranium — the brand book caps it near 2% of a surface and any
+    accent large enough to read at 32px would blow that.
+  -->
+  <defs>
+    <mask id="holes">
+      <rect width="1024" height="1024" fill="#fff"/>
+      <!-- circle: d = 60/92 of the plate -->
+      <circle cx="512" cy="512" r="236" fill="#000"/>
+      <!-- slot: w = 12/92 of the plate, cutting the full plate height -->
+      <rect x="465" y="130" width="94" height="764" fill="#000"/>
+    </mask>
+  </defs>
+
+  <rect width="1024" height="1024" rx="229" ry="229" fill="#0A0B0C"/>
+  <rect x="150" y="150" width="724" height="724" fill="#E7E9EA" mask="url(#holes)"/>
+</svg>
