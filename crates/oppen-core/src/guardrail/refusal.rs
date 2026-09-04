@@ -14,10 +14,10 @@
 use rust_decimal::Decimal;
 use serde::Serialize;
 
+use oppen_hl::Network;
 use oppen_hl::meta::ValidationError;
 use oppen_hl::order::OrderError;
 use oppen_hl::wire::WireError;
-use oppen_hl::{Address, Network};
 
 use super::AgentId;
 use super::breaker::LossKind;
@@ -319,21 +319,26 @@ pub enum Unevaluable {
     /// engine gating it. `docs/decisions.md` R4 calls a mainnet number that
     /// is really a testnet number the worst bug this product can ship, and
     /// gives each network its own engine and database file; this is that
-    /// boundary asserted at the last instant, in the
-    /// [`super::GuardrailEngine`]'s own [`oppen_hl::exchange::PreSignCheck`]
-    /// implementation, rather than assumed from how the caller was written.
+    /// boundary asserted at the last instant, in the pre-sign gate
+    /// `super::GuardrailEngine::sign_cleared` builds, rather than assumed
+    /// from how the caller was written.
     #[error("this engine is bound to {expected:?} but the request is for {supplied:?}")]
     WrongNetwork {
         expected: Network,
         supplied: Network,
     },
 
-    /// The request routes through a `vaultAddress` that is not any paired
-    /// agent's sub-account. D1 maps the agent roster 1:1 onto sub-accounts,
-    /// so an address this engine does not know is capital it never measured
-    /// a limit against.
-    #[error("{vault_address} is not a paired agent's sub-account")]
-    UnknownSubAccount { vault_address: Address },
+    /// Spec item 7 puts a submit queue between the decision and the wire, and
+    /// a clearance is a verdict about the market it was evaluated against.
+    /// Held past the agent's own market-data budget it describes a world that
+    /// has moved, so the signer refuses it.
+    ///
+    /// Distinct from [`Unevaluable::StaleMarketData`] in what the reader does
+    /// next: there the feed is down and the answer is to back off until it
+    /// recovers; here the feed is fine and the answer is to evaluate again
+    /// now.
+    #[error("this clearance was evaluated {age_ms}ms ago, past the {max_age_ms}ms limit")]
+    StaleClearance { age_ms: u64, max_age_ms: u64 },
 
     /// The asset or the market tick the caller supplied is not the one the
     /// order names. Measuring an order against another instrument's price is

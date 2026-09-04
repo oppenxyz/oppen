@@ -2,8 +2,16 @@
 //!
 //! Hyperliquid's `scheduleCancel` cancels every resting order of an account
 //! at a stated time unless the time is pushed forward first. oppen keeps it
-//! armed while any agent is active, so a crashed process, a closed laptop or
-//! a killed daemon does not leave orders working with nothing watching them.
+//! armed while the agent that owns that account is active, so a crashed
+//! process, a closed laptop or a killed daemon does not leave orders working
+//! with nothing watching them.
+//!
+//! **The decision is per container.** Item 27: "armed per container, N times,
+//! not once" — `scheduleCancel` is per address, so N containers are N
+//! independent arming duties and N separate ten-trigger daily budgets, and no
+//! container is covered by another's arming. A fleet-wide answer would arm one
+//! address and leave every other agent's orders unwatched while the console
+//! reported the roster covered.
 //!
 //! This module only decides. It holds no timer and issues no request: it
 //! answers "given the clock, who is active and what is currently armed, what
@@ -42,20 +50,16 @@ pub enum DeadManIntent {
 
 /// Decides the arm state.
 ///
-/// Arms when at least one agent is active and nothing is armed, or when the
-/// armed deadline is closer than the refresh threshold. Disarms when no agent
-/// is active and something is armed — otherwise an operator's own resting
-/// orders would be cancelled by an agent's absence.
+/// Arms when this container's agent is active and nothing is armed, or when
+/// the armed deadline is closer than the refresh threshold. Disarms when the
+/// agent is gone and something is armed — otherwise an operator's own resting
+/// orders on that account would be cancelled by an agent's absence.
 ///
 /// A deadline already in the past is treated as not armed: the venue has
-/// fired it, and arming again is the correct move while agents are active.
-pub(super) fn evaluate(
-    now_ms: u64,
-    active_agents: usize,
-    armed_until_ms: Option<u64>,
-) -> DeadManIntent {
+/// fired it, and arming again is the correct move while the agent is active.
+pub(super) fn evaluate(now_ms: u64, active: bool, armed_until_ms: Option<u64>) -> DeadManIntent {
     let armed = armed_until_ms.filter(|until| *until > now_ms);
-    if active_agents == 0 {
+    if !active {
         return if armed.is_some() {
             DeadManIntent::Disarm
         } else {
@@ -77,22 +81,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn arms_when_an_agent_becomes_active_and_disarms_when_none_are() {
-        assert_eq!(evaluate(1_000, 0, None), DeadManIntent::Hold);
+    fn arms_when_the_containers_agent_is_active_and_disarms_when_it_is_not() {
+        assert_eq!(evaluate(1_000, false, None), DeadManIntent::Hold);
         assert_eq!(
-            evaluate(1_000, 1, None),
+            evaluate(1_000, true, None),
             DeadManIntent::Arm {
                 cancel_at_ms: 61_000
             }
         );
-        assert_eq!(evaluate(1_000, 0, Some(61_000)), DeadManIntent::Disarm);
+        assert_eq!(evaluate(1_000, false, Some(61_000)), DeadManIntent::Disarm);
     }
 
     #[test]
     fn refreshes_only_once_the_deadline_is_close() {
-        assert_eq!(evaluate(1_000, 2, Some(41_000)), DeadManIntent::Hold);
+        assert_eq!(evaluate(1_000, true, Some(41_000)), DeadManIntent::Hold);
         assert_eq!(
-            evaluate(1_000, 2, Some(21_000)),
+            evaluate(1_000, true, Some(21_000)),
             DeadManIntent::Arm {
                 cancel_at_ms: 61_000
             }
@@ -102,11 +106,11 @@ mod tests {
     #[test]
     fn an_expired_deadline_counts_as_unarmed() {
         assert_eq!(
-            evaluate(100_000, 1, Some(99_999)),
+            evaluate(100_000, true, Some(99_999)),
             DeadManIntent::Arm {
                 cancel_at_ms: 160_000
             }
         );
-        assert_eq!(evaluate(100_000, 0, Some(99_999)), DeadManIntent::Hold);
+        assert_eq!(evaluate(100_000, false, Some(99_999)), DeadManIntent::Hold);
     }
 }

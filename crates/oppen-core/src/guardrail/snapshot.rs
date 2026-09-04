@@ -165,6 +165,18 @@ pub struct AccountSnapshot {
 /// because each is evaluated against a flat book, and holds $500 if they fill.
 /// Item 9 already fetches `frontendOpenOrders` on reconcile, so the numbers
 /// exist; they simply were not reaching the engine.
+///
+/// **The caller's obligation, and it is load-bearing.** This must include the
+/// orders spec item 7's submit queue has *sent and not yet seen acknowledged*,
+/// not only the ones the venue already reports resting. A cleared order is
+/// exposure the agent has committed to from the instant it is signed, and the
+/// engine cannot see it: a clearance is a value the caller holds, and nothing
+/// here knows when the venue took it. Report only the venue's book and the
+/// same split works one step earlier — five clearances taken against one flat
+/// snapshot each pass the cap alone and breach it together, inside both the
+/// freshness window and the order-rate cap.
+/// `super::tests::the_position_cap_holds_when_the_caller_reports_what_it_has_in_flight`
+/// pins that the cap does hold once this is honoured.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RestingExposure {
     /// Signed resting size per coin — positive for working buys, negative for

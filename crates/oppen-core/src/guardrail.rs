@@ -11,26 +11,51 @@
 //! - [`GuardrailEngine::sign_cleared`] is the only signing entry point
 //!   `oppen-core` exposes. It consumes a `Cleared` by value, and `Cleared` is
 //!   not `Clone`, so one evaluation authorises exactly one signature.
-//! - The engine implements [`oppen_hl::exchange::PreSignCheck`] and hands
-//!   *itself* to `ExchangeRequest::sign_checked`. There is no checker
-//!   parameter, so no caller can pass a permissive one, and the check runs
-//!   inside the signer rather than beside it — which is what "immediately
-//!   before signing" has to mean if it is to mean anything.
+//! - **It takes no key.** The agent wallet is loaded from the engine's own
+//!   key store, for the agent the clearance names. While the key was a
+//!   parameter the seal had a hole exactly the size of the one it had already
+//!   closed for `vaultAddress`, and a live one rather than a theoretical one:
+//!   the revised D1 (V2) gives each agent a *top-level* Hyperliquid account
+//!   that sends no `vaultAddress`, so the venue reads the account off the
+//!   signature and the key **is** the container. Agent X's clearance signed
+//!   with agent Y's key executed on Y's capital under X's caps, X's equity and
+//!   X's kill switch — including while Y was paused.
+//! - `sign_cleared` builds the pre-sign gate itself, over the engine and the
+//!   clearance in hand. There is no checker parameter, so no caller can pass
+//!   a permissive one, and the check runs inside the signer rather than
+//!   beside it — which is what "immediately before signing" has to mean if
+//!   it is to mean anything.
+//! - The gate type is **private**. `GuardrailEngine` itself does not
+//!   implement [`oppen_hl::exchange::PreSignCheck`], and that is load-bearing
+//!   rather than tidy. While it did, both the engine and
+//!   `ExchangeRequest::sign_checked` were public, so any caller could pass
+//!   the real engine an action it had never evaluated and be handed a
+//!   signature: the gate saw only the assembled wire request and had nothing
+//!   to compare it against. The engine was its own rubber stamp. That call
+//!   now fails to compile, because no value of the checker type exists
+//!   outside `engine.rs`.
 //!
 //! **What that does not buy.** It is not the claim that nothing else can
 //! sign. `oppen_hl::ExchangeRequest::sign_unchecked` and
 //! `oppen_hl::AgentKey::sign_l1_action` are both `pub` — spec item 33's
 //! manual escape hatch needs the former — so a module that wants to sign
-//! without a clearance can, and a caller in another crate can implement
-//! `PreSignCheck` as a no-op. Both are visible rather than hidden: a no-op
-//! gate is a struct someone had to write, `sign_unchecked` is greppable by
-//! name, and `tests::no_call_site_in_oppen_core_reaches_the_signer_unchecked`
-//! fails this crate's suite if either name appears at a call site here.
-//! Closing them workspace-wide means a `clippy.toml` with
-//! `disallowed-methods` for both; that file does not exist yet.
+//! without a clearance can, and a caller in another crate can still write
+//! its *own* no-op `PreSignCheck`. That last one is now exactly as visible
+//! as `sign_unchecked` and buys no more than it does: it is a struct someone
+//! had to write, `sign_unchecked` is greppable by name, and
+//! `tests::no_call_site_in_oppen_core_reaches_the_signer_unchecked` fails
+//! this crate's suite if either name appears at a call site here. Closing
+//! them workspace-wide means a `clippy.toml` with `disallowed-methods` for
+//! both; that file does not exist yet.
 //!
 //! So the deliverable invariant is the narrower, true one: **a bypass cannot
 //! happen by accident, and every deliberate one is one grep away.**
+//!
+//! One more thing the type does not buy, stated because it is the same
+//! residual in a new place: the key store is an `Arc<dyn KeyStore>` fixed at
+//! construction, so a caller that builds the engine with a store of its own
+//! choosing chooses the keys. That is the constructor, not the signing path,
+//! and it is the same trust the store and the audit sink already carry.
 //!
 //! What is enforced here, by spec item:
 //!
@@ -39,7 +64,7 @@
 //! | 24 | symbol allowlist, max order notional, max position notional, order rate, reduce-only mode, max slippage, leverage cap |
 //! | 25 | loss circuit breaker: max daily loss and max drawdown, per agent and account-wide, tripping the kill switch |
 //! | 26 | kill switch per agent and global, persisted across restart, typed `trading_paused` |
-//! | 27 | dead-man's switch: whether `scheduleCancel` should be armed |
+//! | 27 | dead-man's switch: whether `scheduleCancel` should be armed, per container |
 //! | D3 | leverage and margin mode are operator-set, readable, never agent-writable |
 //! | D-c | a newly paired agent starts near-zero and the first refusal names the limit to raise |
 //!
@@ -87,8 +112,14 @@ pub use snapshot::{
 pub use store::{GuardrailStore, PersistedState, SqliteGuardrailStore, StoreError};
 
 /// Stable identity of one paired agent. D1 maps the roster 1:1 onto
-/// sub-accounts, so an `AgentId` is also the identity of the sub-account
+/// **containers**, so an `AgentId` is also the identity of the venue account
 /// whose guardrails, kill switch and loss budget are being evaluated.
+///
+/// Not "sub-account": the revised D1 (`docs/decisions.md` V1, V2) makes the
+/// container a venue *account*, which on Hyperliquid v1 is a **top-level**
+/// one carrying no `vaultAddress` at all. An `AgentId` that resolves to no
+/// address is bound to a top-level container, not unbound — reading the two
+/// as the same thing is what let the reconnect path re-point a live agent.
 ///
 /// Ordered rather than hashed: every collection keyed by an agent is a
 /// `BTreeMap`, so anything this module serializes or persists has one

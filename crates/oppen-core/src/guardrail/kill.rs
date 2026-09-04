@@ -146,6 +146,13 @@ impl KillSwitch {
         }
     }
 
+    /// The global engagement, if any. Test-only, like
+    /// [`KillSwitch::is_engaged`] and for the same reason: the engine asks
+    /// [`KillSwitch::blocking`] for an agent, and a console reads the
+    /// serialized switch out of `get_state`. The pre-sign gate used to call
+    /// this for a clearance that named no agent; under D1 every clearance
+    /// names one, so nothing outside the tests needs it.
+    #[cfg(test)]
     pub(super) fn global(&self) -> Option<&Engagement> {
         self.global.as_ref()
     }

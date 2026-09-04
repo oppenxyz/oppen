@@ -28,12 +28,20 @@
 //! - `docs/decisions.md` D-b: agent approvals expire after 90 days with
 //!   warnings from 14 days out, and an agent address is never reused across a
 //!   rotation. [`KeyStore::rotate_agent_key`] mints a new entry at a new
-//!   generation and refuses an address the record has already seen.
+//!   generation, and both it and [`KeyStore::create_agent_key`] refuse an
+//!   address this store has installed before — `docs/specs/onboarding.md` §7.3
+//!   says the old address is retired **permanently**, so the memory that
+//!   answers that question is one keychain entry per address, scoped to the
+//!   network rather than to the agent id, and is never trimmed, never evicted
+//!   and not removed by [`KeyStore::delete_agent`].
 
-use std::sync::atomic::{Ordering, compiler_fence};
+use std::sync::{
+    Mutex, MutexGuard, PoisonError,
+    atomic::{Ordering, compiler_fence},
+};
 
 #[cfg(test)]
-use std::{collections::BTreeMap, sync::Mutex};
+use std::collections::BTreeMap;
 
 use hmac::{Hmac, KeyInit, Mac};
 use oppen_hl::{Address, AgentKey, Network};
@@ -67,6 +75,10 @@ const SERVICE_MAINNET: &str = "xyz.oppen.mainnet";
 const PREFIX_AGENT_KEY: &str = "agent-key";
 /// Entry-name prefix for an agent's non-secret wallet record.
 const PREFIX_AGENT_RECORD: &str = "agent-record";
+/// Entry-name prefix for the permanent mark that an address has been installed
+/// on this network. One entry per address, holding the generation it was
+/// installed at.
+const PREFIX_AGENT_ADDRESS: &str = "agent-address";
 /// Entry name of the guardrail-config HMAC key (`docs/spec.md` item 3).
 const ENTRY_GUARDRAIL_HMAC: &str = "guardrail-hmac";
 
@@ -98,15 +110,24 @@ pub fn default_valid_until_ms(now_ms: u64) -> u64 {
     now_ms.saturating_add(AGENT_APPROVAL_TTL_MS)
 }
 
-/// Most retired agent addresses kept in a wallet record.
+/// Highest generation an agent may reach, and so exactly how many key entries
+/// [`KeyStore::delete_agent`] sweeps.
 ///
-/// The record is one keychain entry and the Windows Credential Manager caps a
-/// credential blob at 2,560 bytes (`CRED_MAX_CREDENTIAL_BLOB_SIZE`); a retired
-/// entry serializes to roughly 100 bytes, so sixteen of them plus the record's
-/// own fields stays under half that. At one rotation per 90-day approval that
-/// is four years of history, and the alternative — an unbounded list — is a
-/// record that silently stops being writable on Windows.
-const MAX_RETIRED_ADDRESSES: usize = 16;
+/// The ceiling is what lets the revoke path be a fixed, record-independent
+/// sweep. `generation` is read back out of the *record*, a non-secret entry any
+/// same-user process can edit (this module's header, and
+/// `docs/threat-model.md`), so a delete guided by it removes whatever that
+/// number says and reports success: too few generations if it was edited down
+/// or the record was lost, and 4,294,967,296 credential-store deletes if it was
+/// edited up. Both leave a live agent key behind, which is the fail-*open*
+/// direction. With a ceiling the delete asks the record nothing and removes
+/// every generation that could exist.
+///
+/// 1,024 rotations is roughly 252 years at `docs/decisions.md` D-b's 90-day
+/// approval, so nothing legitimate reaches it, and 1,026 deletes is bounded
+/// work on a path an operator takes once per revoked agent. Past it,
+/// [`KeyStoreError::RotationLimit`] rather than silence.
+const MAX_GENERATION: u32 = 1_024;
 
 /// Secret text held only as long as it is needed, overwritten on drop.
 ///
@@ -160,7 +181,7 @@ impl std::fmt::Debug for SecretText {
 
 /// Every way a key operation fails, typed so no caller has to parse a message
 /// (`AGENTS.md` invariant 8).
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 pub enum KeyStoreError {
     /// The platform credential store failed or is unavailable. On Linux this is
     /// most often a locked or absent Secret Service.
@@ -190,12 +211,39 @@ pub enum KeyStoreError {
     #[error("stored agent key is not a valid private key")]
     InvalidKey,
 
-    /// A rotation tried to install an address the record has already used.
+    /// An install tried to use an address this store has installed before.
     /// Hyperliquid prunes an agent when it is replaced and the nonce state goes
     /// with it, so a reused address can be replayed against: refused, never
-    /// warned about.
-    #[error("agent address {address} was already used by this agent; addresses are never reused")]
+    /// warned about. Raised by creation as well as by rotation, and scoped to
+    /// the network rather than to the agent id, because
+    /// `docs/specs/onboarding.md` §7.3 retires the *address* permanently —
+    /// neither deleting an agent nor offering the key under a second agent id
+    /// un-retires it.
+    #[error("agent address {address} was already used on this network; addresses are never reused")]
     AddressReused { address: Address },
+
+    /// This agent id has reached [`MAX_GENERATION`], or its record claims a
+    /// generation past it.
+    ///
+    /// One variant for both because the caller does the same thing either way:
+    /// this id can rotate no further, so provision a new agent. This module
+    /// cannot write a record above the ceiling, so reading one means the entry
+    /// was edited: named rather than reported as a missing key.
+    /// [`KeyStore::delete_agent`] never raises it — revoking must not depend on
+    /// the record being intact.
+    #[error("agent generation {generation} is past the {MAX_GENERATION}-rotation limit")]
+    RotationLimit { generation: u32 },
+
+    /// The stored key does not derive the address in the agent's record.
+    ///
+    /// The write path pairs the two, so a mismatch means the entries were
+    /// edited apart after that — and the two sides disagreeing is exactly the
+    /// silent mis-signing [`KeyStore::create_agent_key`] refuses to create.
+    /// Both addresses are carried rather than formatted into a message,
+    /// because an operator deciding whether to rotate or to restore needs to
+    /// see which side moved (`AGENTS.md` invariant 8).
+    #[error("stored agent key derives {derived}, but its record names {record}")]
+    AddressMismatch { record: Address, derived: Address },
 
     /// No OS entropy source is reachable, so no key was generated.
     ///
@@ -211,6 +259,21 @@ pub enum KeyStoreError {
     /// unreachable for a 32-byte key; typed so the primitive never panics.
     #[error("hmac key rejected by the mac construction")]
     BadMacKey,
+}
+
+impl std::fmt::Debug for KeyStoreError {
+    /// Delegates to [`Display`](std::fmt::Display) instead of deriving.
+    ///
+    /// `keyring::Error` derives `Debug`, and its `BadEncoding(Vec<u8>)` and
+    /// `BadDataFormat(Vec<u8>, _)` variants carry **the raw credential blob the
+    /// store just read** — on Windows that is the stored secret's bytes. A
+    /// derived `Debug` here would carry them through [`KeyStoreError::Backend`]
+    /// into every `{:?}`: `tracing::error!(?e)`, an `unwrap`/`expect` panic
+    /// payload, a Tauri command's error result. `AGENTS.md` invariant 2 says no
+    /// key material reaches a log line, and `Display` never renders the blob.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
 }
 
 /// A fully-qualified keychain entry: the per-network service plus the account
@@ -255,15 +318,35 @@ impl EntryName {
         })
     }
 
-    /// An agent's wallet record: which generation is current, its address, its
-    /// approval window and the addresses it has retired. Not secret, but it
-    /// belongs next to the key it describes so deleting an agent deletes both.
+    /// An agent's wallet record: which generation is current, its address and
+    /// its approval window. Not secret, but it belongs next to the key it
+    /// describes so deleting an agent deletes both.
     pub(crate) fn agent_record(network: Network, agent: &AgentId) -> Result<Self, KeyStoreError> {
         let id = checked_agent_id(agent)?;
         Ok(EntryName {
             service: service_of(network),
             account: format!("{PREFIX_AGENT_RECORD}{ENTRY_SEPARATOR}{id}"),
         })
+    }
+
+    /// The permanent mark that `address` has been installed on this network.
+    ///
+    /// Keyed by the address so the reuse question is one read rather than a
+    /// scan, and so the answer is complete: nothing trims this, so
+    /// `docs/specs/onboarding.md` §7.3's "retired permanently" is literally
+    /// what the store implements. An [`Address`] renders as lowercase `0x` hex
+    /// and cannot contain [`ENTRY_SEPARATOR`], so the name stays unambiguous.
+    ///
+    /// Deliberately *not* keyed by the agent id. §7.3 retires the address, not
+    /// the pairing, and a mark filed under `alpha` would let the same key be
+    /// installed again as `beta` — the same pruned nonce set, one container
+    /// over. The network is still in the service, because
+    /// `docs/decisions.md` R4 keeps the two networks' secrets apart.
+    pub(crate) fn agent_address(network: Network, address: &Address) -> Self {
+        EntryName {
+            service: service_of(network),
+            account: format!("{PREFIX_AGENT_ADDRESS}{ENTRY_SEPARATOR}{address}"),
+        }
     }
 
     /// The guardrail-config HMAC key (`docs/spec.md` item 3). One per network,
@@ -309,30 +392,24 @@ fn checked_agent_id(agent: &AgentId) -> Result<&str, KeyStoreError> {
     })
 }
 
-/// An agent address this agent has stopped using.
-///
-/// Kept so a rotation can refuse to reinstall it. Hyperliquid prunes a replaced
-/// agent and its nonce state, so re-approving an old address hands an attacker
-/// a signer whose nonce window has been reset.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RetiredAgentWallet {
-    pub generation: u32,
-    pub address: Address,
-    /// When the rotation that retired it happened, in ms since the epoch.
-    pub retired_at_ms: u64,
-}
-
 /// The non-secret record describing an agent's current wallet.
 ///
 /// Serialized in declaration order into one keychain entry, so the stored bytes
 /// are byte-identical for equal values (`AGENTS.md` invariant 6). It is what
 /// lets the console and `get_state` answer "how long has this agent got"
 /// without ever touching the key.
+///
+/// Every field is fixed-width, so the encoded record has a small constant
+/// worst case and cannot grow into a platform's credential-blob cap. The agent
+/// id is deliberately *not* a field: the entry name already carries it, and a
+/// copy of the id inside the value is a second answer that can disagree with
+/// the first. The address history is not a field either — it is one entry per
+/// address ([`EntryName::agent_address`]), which is what makes it permanent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentWallet {
-    pub agent: AgentId,
     /// Rotation counter. `0` is the first wallet; each rotation adds one and
-    /// names a keychain entry that has never existed before.
+    /// names a keychain entry that has never existed before. Bounded by
+    /// [`MAX_GENERATION`].
     pub generation: u32,
     /// The agent address the master approved, derived from the stored key
     /// rather than supplied, so the record cannot disagree with the signer.
@@ -343,9 +420,6 @@ pub struct AgentWallet {
     /// derived: `docs/decisions.md` D-b sets what oppen *requests*, but the
     /// signed approval is what the venue enforces.
     pub valid_until_ms: u64,
-    /// Addresses this agent has retired, oldest first, capped at
-    /// `MAX_RETIRED_ADDRESSES` (16).
-    pub retired: Vec<RetiredAgentWallet>,
 }
 
 /// Where an approval sits relative to `docs/decisions.md` D-b's 90-day window.
@@ -384,16 +458,6 @@ impl AgentWallet {
         } else {
             ExpiryState::Valid { remaining_ms }
         }
-    }
-
-    /// Whether `address` has ever been this agent's, current or retired.
-    ///
-    /// The retired list is capped, so a `false` from this means "not in the
-    /// last `MAX_RETIRED_ADDRESSES` rotations", not "never". Documented rather
-    /// than papered over: the addresses come from freshly generated keys, so a
-    /// collision past the cap requires deliberately importing an old key.
-    fn has_used(&self, address: &Address) -> bool {
-        self.address == *address || self.retired.iter().any(|r| r.address == *address)
     }
 }
 
@@ -551,6 +615,14 @@ pub trait KeyStore: Send + Sync {
             return Ok(None);
         };
         let record: AgentWallet = serde_json::from_str(stored.as_str()?)?;
+        // Validated here rather than at each use: the number comes from an
+        // entry the threat model treats as externally editable, and every path
+        // that acts on a record reaches it through this one read.
+        if record.generation > MAX_GENERATION {
+            return Err(KeyStoreError::RotationLimit {
+                generation: record.generation,
+            });
+        }
         Ok(Some(record))
     }
 
@@ -565,6 +637,11 @@ pub trait KeyStore: Send + Sync {
     /// Refuses if the agent already has a record. `docs/decisions.md` D-b
     /// requires a new agent address per rotation, so replacing a wallet is
     /// [`KeyStore::rotate_agent_key`] and never an overwrite.
+    ///
+    /// Also refuses an address this store has ever installed, under any agent
+    /// id. Deleting an agent removes its keys but not the address marks, so
+    /// neither re-creating an agent under the same id nor creating a second one
+    /// can be handed an address whose nonce state the venue has already pruned.
     fn create_agent_key(
         &self,
         agent: &AgentId,
@@ -572,6 +649,7 @@ pub trait KeyStore: Send + Sync {
         valid_until_ms: u64,
         now_ms: u64,
     ) -> Result<AgentWallet, KeyStoreError> {
+        let _guard = lock_agent_wallets();
         if self.agent_wallet(agent)?.is_some() {
             return Err(KeyStoreError::AlreadyExists {
                 agent: agent.as_str().to_owned(),
@@ -579,13 +657,14 @@ pub trait KeyStore: Send + Sync {
         }
         let normalized = normalize_key_hex(&key_hex)?;
         let address = address_of_key(&normalized)?;
+        if address_used(self, &address)? {
+            return Err(KeyStoreError::AddressReused { address });
+        }
         let record = AgentWallet {
-            agent: agent.clone(),
             generation: 0,
             address,
             approved_at_ms: now_ms,
             valid_until_ms,
-            retired: Vec::new(),
         };
         write_wallet(self, agent, &normalized, &record)?;
         Ok(record)
@@ -598,9 +677,10 @@ pub trait KeyStore: Send + Sync {
     /// key stays in the keychain so the retiring agent can still cancel its own
     /// resting orders.
     ///
-    /// Refuses an address this agent has used before. Hyperliquid prunes a
-    /// replaced agent along with its nonce state, so reinstalling an old
-    /// address hands out a signer whose replay window has been reset.
+    /// Refuses an address this store has installed before — every one of them,
+    /// for as long as the store exists. Hyperliquid prunes a replaced agent
+    /// along with its nonce state, so reinstalling an old address hands out a
+    /// signer whose replay window has been reset.
     fn rotate_agent_key(
         &self,
         agent: &AgentId,
@@ -608,40 +688,28 @@ pub trait KeyStore: Send + Sync {
         valid_until_ms: u64,
         now_ms: u64,
     ) -> Result<AgentWallet, KeyStoreError> {
+        let _guard = lock_agent_wallets();
         let current = require_wallet(self, agent)?;
         let normalized = normalize_key_hex(&key_hex)?;
         let address = address_of_key(&normalized)?;
-        if current.has_used(&address) {
+        if address_used(self, &address)? {
             return Err(KeyStoreError::AddressReused { address });
         }
-        // `u32` and one generation per 90-day approval, so this is unreachable
-        // in practice — but it is not a place to panic, and it must not wrap
-        // onto an entry name that already exists.
-        let generation =
-            current
-                .generation
-                .checked_add(1)
-                .ok_or_else(|| KeyStoreError::Corrupt {
-                    detail: format!("agent {agent} has exhausted its rotation counter"),
-                })?;
-
-        let mut retired = current.retired;
-        retired.push(RetiredAgentWallet {
-            generation: current.generation,
-            address: current.address,
-            retired_at_ms: now_ms,
-        });
-        if retired.len() > MAX_RETIRED_ADDRESSES {
-            retired.drain(..retired.len() - MAX_RETIRED_ADDRESSES);
+        // Saturating rather than plain: `agent_wallet` already refuses a record
+        // past MAX_GENERATION, but a `+ 1` here would make this path's safety
+        // depend on that read, and `agent_wallet` is an overridable provided
+        // method on a public trait. Wrapping would recompute generation 0 and
+        // overwrite the first key entry.
+        let generation = current.generation.saturating_add(1);
+        if generation > MAX_GENERATION {
+            return Err(KeyStoreError::RotationLimit { generation });
         }
 
         let record = AgentWallet {
-            agent: agent.clone(),
             generation,
             address,
             approved_at_ms: now_ms,
             valid_until_ms,
-            retired,
         };
         write_wallet(self, agent, &normalized, &record)?;
         Ok(record)
@@ -659,29 +727,63 @@ pub trait KeyStore: Send + Sync {
     /// orders, which itself needs a usable key — and a store that refused to
     /// load would make that cleanup impossible. Callers check
     /// [`AgentWallet::expiry`].
+    ///
+    /// The key is checked against the record's address before it is returned.
+    /// [`KeyStore::create_agent_key`] pairs them on the way in, but the two
+    /// entries are separately editable afterwards and this is the read that has
+    /// to hold the guarantee: a key that derives some other address signs
+    /// actions the master never approved.
     fn load_agent_key(&self, agent: &AgentId) -> Result<AgentKey, KeyStoreError> {
         let record = require_wallet(self, agent)?;
         let entry = EntryName::agent_key(self.network(), agent, record.generation)?;
         let stored = self.read(&entry)?.ok_or_else(|| KeyStoreError::Missing {
             entry: entry.account().to_owned(),
         })?;
-        AgentKey::from_hex(stored.as_str()?).map_err(|_| KeyStoreError::InvalidKey)
+        let key = AgentKey::from_hex(stored.as_str()?).map_err(|_| KeyStoreError::InvalidKey)?;
+        let derived = key.address();
+        if derived != record.address {
+            return Err(KeyStoreError::AddressMismatch {
+                record: record.address,
+                derived,
+            });
+        }
+        Ok(key)
     }
 
-    /// Removes an agent entirely: every generation's key and the record.
+    /// Removes every one of an agent's keys and its record, and **keeps its
+    /// address history**.
     ///
-    /// This does drop the retired-address list, so a later agent under the same
-    /// id could in principle be given an old address again. Deliberate and
-    /// narrow: addresses come from freshly generated keys, so reaching that
-    /// state means deliberately importing a retired key into a re-created
-    /// agent. Rotation, which is the path that runs unattended, keeps the list.
+    /// Keeping it is the point: `docs/specs/onboarding.md` §7.3 retires an
+    /// address permanently, so an agent re-created under the same id must not
+    /// be handed one back. The entries kept are non-secret marks; every entry
+    /// that holds key material goes.
+    ///
+    /// Takes [`AGENT_WALLET_LOCK`] because it competes with the two writers for
+    /// the same entries: without it a rotation already inside the lock writes
+    /// its key after this has started, and the delete reports success with an
+    /// agent private key still in the store.
+    ///
+    /// Sweeps every generation [`MAX_GENERATION`] allows rather than the range
+    /// the record names. Revoking is how an operator takes an agent's signer
+    /// away, so it must not believe a number it cannot verify: the record is
+    /// externally editable, and one edited or missing field would otherwise
+    /// leave the higher generations installed while this returned `Ok`. It also
+    /// subsumes the key a crashed [`write_wallet`] orphans one generation past
+    /// the record. The cost is a fixed 1,026 deletes of entries that are mostly
+    /// absent, on a path taken once per revoked agent.
+    ///
+    /// The record goes first, and that ordering is the sweep's price: 1,026
+    /// backend calls is a wide enough window for a credential store to become
+    /// unreachable partway, and the record is what [`KeyStore::load_agent_key`]
+    /// needs. Removed first, a revoke that then fails leaves an agent that
+    /// cannot sign; removed last, it leaves one that still can.
     fn delete_agent(&self, agent: &AgentId) -> Result<(), KeyStoreError> {
-        if let Some(record) = self.agent_wallet(agent)? {
-            for generation in 0..=record.generation {
-                self.remove(&EntryName::agent_key(self.network(), agent, generation)?)?;
-            }
+        let _guard = lock_agent_wallets();
+        self.remove(&EntryName::agent_record(self.network(), agent)?)?;
+        for generation in 0..=MAX_GENERATION {
+            self.remove(&EntryName::agent_key(self.network(), agent, generation)?)?;
         }
-        self.remove(&EntryName::agent_record(self.network(), agent)?)
+        Ok(())
     }
 
     /// The guardrail HMAC key, or `None` on a machine that has never run oppen
@@ -731,6 +833,40 @@ pub trait KeyStore: Send + Sync {
     }
 }
 
+/// Serializes [`KeyStore::create_agent_key`], [`KeyStore::rotate_agent_key`]
+/// and [`KeyStore::delete_agent`] against each other.
+///
+/// The two writers read the wallet record, decide a generation and an address
+/// *from what they read*, and write three entries back; the delete reads the
+/// same record and removes what it names. [`KeyStore`] is `Send + Sync` so the store is
+/// shared across the runtime's worker threads, and without this two rotations
+/// of one agent interleave: both see generation *n*, both mint *n + 1*, the
+/// second key entry overwrites the first, and the surviving record names an
+/// address whose key is gone. A delete interleaved with a rotation is worse in
+/// a different direction: it reports success while the key the rotation minted
+/// after it read the record is still in the credential store.
+///
+/// One process-wide lock rather than one per store or per agent: a rotation
+/// happens once per agent per 90-day approval, so there is no contention to
+/// design around and this is the version that is obviously correct. It does not
+/// reach across processes — no platform credential store offers a
+/// compare-and-swap — and `ensure_hmac_key` already documents that same
+/// boundary for its own race.
+static AGENT_WALLET_LOCK: Mutex<()> = Mutex::new(());
+
+/// Takes [`AGENT_WALLET_LOCK`], recovering a poisoned one.
+///
+/// Poisoning means a thread panicked mid-sequence, and [`write_wallet`]'s
+/// ordering already makes that recoverable: a key entry with no record pointing
+/// at it is unusable and the next attempt overwrites it. Refusing every later
+/// rotation for the rest of the process is the worse failure, not the safer
+/// one.
+fn lock_agent_wallets() -> MutexGuard<'static, ()> {
+    AGENT_WALLET_LOCK
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+}
+
 /// The agent's record, or [`KeyStoreError::Missing`] if it has none. Shared by
 /// the two paths that cannot proceed without one.
 fn require_wallet<S: KeyStore + ?Sized>(
@@ -744,11 +880,27 @@ fn require_wallet<S: KeyStore + ?Sized>(
         })
 }
 
-/// Writes a wallet's key entry and then its record, in that order.
+/// Whether this store has ever installed `address`, under any agent id.
 ///
-/// The order is the point. A crash between the two leaves a key no record
-/// points at, which is unusable and which a retry overwrites; the reverse would
-/// leave a record pointing at nothing, which wedges the agent permanently.
+/// One read of one entry, and complete for the life of the store: the mark is
+/// written before the key it belongs to and nothing ever removes it.
+fn address_used<S: KeyStore + ?Sized>(store: &S, address: &Address) -> Result<bool, KeyStoreError> {
+    Ok(store
+        .read(&EntryName::agent_address(store.network(), address))?
+        .is_some())
+}
+
+/// Writes a wallet's address mark, then its key entry, then its record.
+///
+/// The order is the point, and each step fails in the safe direction. A crash
+/// after the mark refuses that address forever, which costs one generated
+/// keypair. A crash after the key leaves a key no record points at, which is
+/// unusable, which a retry overwrites and which [`KeyStore::delete_agent`]
+/// still removes. The reverse of either would leave a record pointing at
+/// nothing, or an installed address with no mark against reinstalling it.
+///
+/// The mark's value is the generation, so an operator reading the credential
+/// store can map an address to the key entry that holds it.
 fn write_wallet<S: KeyStore + ?Sized>(
     store: &S,
     agent: &AgentId,
@@ -756,6 +908,10 @@ fn write_wallet<S: KeyStore + ?Sized>(
     record: &AgentWallet,
 ) -> Result<(), KeyStoreError> {
     let network = store.network();
+    store.write(
+        &EntryName::agent_address(network, &record.address),
+        &record.generation.to_string(),
+    )?;
     store.write(
         &EntryName::agent_key(network, agent, record.generation)?,
         key_hex.as_str()?,
@@ -853,6 +1009,12 @@ impl KeyStore for KeychainKeyStore {
 pub(crate) struct MemoryKeyStore {
     network: Network,
     entries: Mutex<BTreeMap<(&'static str, String), String>>,
+    /// Slept off after every read, outside the map lock. It widens the
+    /// read-modify-write window in `create_agent_key` and `rotate_agent_key`
+    /// until an interleaving is certain rather than occasional, which is what
+    /// makes the concurrency tests fail deterministically without
+    /// [`AGENT_WALLET_LOCK`]. Zero unless a test asks for it.
+    read_delay: std::time::Duration,
 }
 
 #[cfg(test)]
@@ -861,6 +1023,14 @@ impl MemoryKeyStore {
         MemoryKeyStore {
             network,
             ..MemoryKeyStore::default()
+        }
+    }
+
+    /// A store whose reads take `delay`. See the `read_delay` field.
+    pub(crate) fn with_read_delay(network: Network, delay: std::time::Duration) -> Self {
+        MemoryKeyStore {
+            read_delay: delay,
+            ..MemoryKeyStore::new(network)
         }
     }
 
@@ -891,12 +1061,17 @@ impl KeyStore for MemoryKeyStore {
     }
 
     fn read(&self, entry: &EntryName) -> Result<Option<SecretText>, KeyStoreError> {
-        Ok(self
+        let found = self
             .entries
             .lock()
             .expect("poisoned")
             .get(&(entry.service(), entry.account().to_owned()))
-            .map(|s| SecretText::new(s.clone())))
+            .map(|s| SecretText::new(s.clone()));
+        // After the map lock is released, so the delay widens the caller's
+        // read-modify-write window rather than the store's own critical
+        // section.
+        std::thread::sleep(self.read_delay);
+        Ok(found)
     }
 
     fn remove(&self, entry: &EntryName) -> Result<(), KeyStoreError> {
@@ -910,7 +1085,15 @@ impl KeyStore for MemoryKeyStore {
 
 #[cfg(test)]
 mod tests {
+    use std::{sync::Barrier, thread, time::Duration};
+
     use super::*;
+
+    /// `CRED_MAX_CREDENTIAL_BLOB_SIZE`, the cap
+    /// `windows-native-keyring-store` enforces on a stored secret. It measures
+    /// the secret re-encoded as UTF-16LE, so ASCII JSON costs two bytes a
+    /// character.
+    const WINDOWS_CREDENTIAL_BLOB_MAX_BYTES: usize = 2_560;
 
     /// Four distinct valid secp256k1 scalars. Fixed rather than generated so a
     /// failure reproduces; none of them is a key that has ever held funds.
@@ -973,6 +1156,12 @@ mod tests {
             EntryName::guardrail_hmac(Network::Testnet).account(),
             "guardrail-hmac"
         );
+        // The reuse mark carries no agent id: the address is retired, not the
+        // pairing (`docs/specs/onboarding.md` §7.3).
+        assert_eq!(
+            EntryName::agent_address(Network::Testnet, &Address::from_bytes([0xab; 20])).account(),
+            "agent-address/0xabababababababababababababababababababab"
+        );
     }
 
     #[test]
@@ -1027,7 +1216,6 @@ mod tests {
             .expect("create");
 
         assert_eq!(record.generation, 0);
-        assert!(record.retired.is_empty());
         assert_eq!(record.valid_until_ms, T0 + AGENT_APPROVAL_TTL_MS);
 
         let key = store.load_agent_key(&a).expect("load");
@@ -1040,23 +1228,25 @@ mod tests {
 
     #[test]
     fn a_prefixed_uppercase_key_normalizes_to_the_same_entry() {
-        let store = MemoryKeyStore::new(Network::Testnet);
-        let plain = store
-            .create_agent_key(&agent("plain"), secret(KEY_A), T0 + DAY_MS, T0)
-            .expect("create");
-        let prefixed = store
-            .create_agent_key(
-                &agent("prefixed"),
-                secret(&format!("0x{}", KEY_A.to_ascii_uppercase())),
-                T0 + DAY_MS,
-                T0,
-            )
-            .expect("create");
-        assert_eq!(plain.address, prefixed.address);
-
-        let names = store.entry_names();
-        assert!(names.contains(&format!("{SERVICE_TESTNET}:agent-key/plain/0")));
-        assert!(names.contains(&format!("{SERVICE_TESTNET}:agent-key/prefixed/0")));
+        // A store apiece, because one store refuses the second form as a reuse
+        // of the first's address — which is the same fact from the other side.
+        // The assertion is on the stored *bytes*: an onboarding write and an
+        // import of the same key must leave the entry byte-identical.
+        let install = |hex: &str| {
+            let store = MemoryKeyStore::new(Network::Testnet);
+            let a = agent("alpha");
+            let record = store
+                .create_agent_key(&a, secret(hex), T0 + DAY_MS, T0)
+                .expect("create");
+            let stored = store
+                .read(&EntryName::agent_key(Network::Testnet, &a, 0).expect("valid id"))
+                .expect("read")
+                .expect("the key entry");
+            (record.address, stored.as_str().expect("utf-8").to_owned())
+        };
+        let plain = install(KEY_A);
+        assert_eq!(plain.1, KEY_A, "the stored key is not bare lowercase hex");
+        assert_eq!(plain, install(&format!("0x{}", KEY_A.to_ascii_uppercase())));
     }
 
     #[test]
@@ -1106,10 +1296,6 @@ mod tests {
 
         assert_eq!(second.generation, 1);
         assert_ne!(second.address, first.address);
-        assert_eq!(second.retired.len(), 1);
-        assert_eq!(second.retired[0].generation, 0);
-        assert_eq!(second.retired[0].address, first.address);
-        assert_eq!(second.retired[0].retired_at_ms, T0 + DAY_MS);
 
         // Generation 0's key was not overwritten: both entries exist.
         let names = store.entry_names();
@@ -1164,29 +1350,322 @@ mod tests {
     }
 
     #[test]
-    fn the_retired_list_is_capped_and_keeps_the_newest() {
+    fn an_address_is_never_reinstalled_however_many_rotations_pass() {
         let store = MemoryKeyStore::new(Network::Testnet);
         let a = agent("alpha");
-        // Distinct keys: vary the leading byte across the scalar's range.
         let key_at = |i: u32| format!("{:02x}{}", (i % 200) + 1, &KEY_A[2..]);
 
-        store
+        let first = store
             .create_agent_key(&a, secret(&key_at(0)), T0 + DAY_MS, T0)
             .expect("create");
-        let rotations = MAX_RETIRED_ADDRESSES as u32 + 4;
-        for i in 1..=rotations {
+        // Far past any window a fixed-size retired list could have held.
+        const ROTATIONS: u32 = 40;
+        for i in 1..=ROTATIONS {
             store
                 .rotate_agent_key(&a, secret(&key_at(i)), T0 + DAY_MS, T0 + u64::from(i))
                 .expect("rotate");
         }
 
+        // Generation 0's address, forty rotations later.
+        assert!(
+            matches!(
+                store.rotate_agent_key(&a, secret(&key_at(0)), T0 + DAY_MS, T0 + 99),
+                Err(KeyStoreError::AddressReused { address }) if address == first.address
+            ),
+            "an address left the reuse window after {ROTATIONS} rotations"
+        );
+        // And every generation in between.
+        for i in 1..=ROTATIONS {
+            assert!(matches!(
+                store.rotate_agent_key(&a, secret(&key_at(i)), T0 + DAY_MS, T0 + 99),
+                Err(KeyStoreError::AddressReused { .. })
+            ));
+        }
         let record = store.agent_wallet(&a).expect("read").expect("present");
-        assert_eq!(record.generation, rotations);
-        assert_eq!(record.retired.len(), MAX_RETIRED_ADDRESSES);
-        // Oldest first, and the oldest kept is the one that leaves the window.
-        let generations: Vec<u32> = record.retired.iter().map(|r| r.generation).collect();
-        let expected: Vec<u32> = (rotations - MAX_RETIRED_ADDRESSES as u32..rotations).collect();
-        assert_eq!(generations, expected);
+        assert_eq!(record.generation, ROTATIONS);
+    }
+
+    #[test]
+    fn delete_then_create_cannot_reinstall_a_retired_address() {
+        let store = MemoryKeyStore::new(Network::Testnet);
+        let a = agent("alpha");
+        let first = store
+            .create_agent_key(&a, secret(KEY_A), T0 + DAY_MS, T0)
+            .expect("create");
+        store
+            .rotate_agent_key(&a, secret(KEY_B), T0 + DAY_MS, T0 + 1)
+            .expect("rotate");
+        store.delete_agent(&a).expect("delete");
+
+        // `docs/specs/onboarding.md` §7.3: retired permanently. Deleting the
+        // agent removes its keys, not the fact that it used these addresses.
+        for used in [KEY_A, KEY_B] {
+            assert!(matches!(
+                store.create_agent_key(&a, secret(used), T0 + DAY_MS, T0 + 2),
+                Err(KeyStoreError::AddressReused { .. })
+            ));
+        }
+        assert!(
+            store.agent_wallet(&a).expect("read").is_none(),
+            "a refused create left a record behind"
+        );
+        // A fresh address still works, so the agent id is not bricked.
+        let revived = store
+            .create_agent_key(&a, secret(KEY_C), T0 + DAY_MS, T0 + 3)
+            .expect("create");
+        assert_ne!(revived.address, first.address);
+        assert_eq!(revived.generation, 0);
+    }
+
+    #[test]
+    fn a_record_past_the_rotation_limit_is_named_rather_than_acted_on() {
+        let store = MemoryKeyStore::new(Network::Testnet);
+        let a = agent("alpha");
+        let record = store
+            .create_agent_key(&a, secret(KEY_A), T0 + DAY_MS, T0)
+            .expect("create");
+        // The record is a non-secret entry any same-user process can edit, and
+        // `delete_agent` iterates from 0 to this number.
+        store
+            .write(
+                &EntryName::agent_record(Network::Testnet, &a).expect("valid id"),
+                &serde_json::to_string(&AgentWallet {
+                    generation: u32::MAX,
+                    ..record
+                })
+                .expect("encode"),
+            )
+            .expect("write");
+
+        // Every path that acts on a record reaches it through `agent_wallet`,
+        // so one read refuses for all of them and the edited number is named
+        // rather than mistaken for a missing key.
+        assert!(matches!(
+            store.agent_wallet(&a),
+            Err(KeyStoreError::RotationLimit {
+                generation: u32::MAX
+            })
+        ));
+        assert!(matches!(
+            store.load_agent_key(&a),
+            Err(KeyStoreError::RotationLimit { .. })
+        ));
+        assert!(matches!(
+            store.rotate_agent_key(&a, secret(KEY_B), T0 + DAY_MS, T0 + 1),
+            Err(KeyStoreError::RotationLimit { .. })
+        ));
+        // Revoking is the exception, and has to be: `delete_agent` reads no
+        // record, so an edited generation cannot make an agent undeletable.
+        store
+            .delete_agent(&a)
+            .expect("revoke must not need the record");
+        let left = store.entry_names();
+        assert!(
+            !left.iter().any(|n| n.contains("agent-key/")),
+            "a private key survived the revoke of a tampered record: {left:?}"
+        );
+    }
+
+    /// A store whose key-entry removals fail, the shape a credential store
+    /// that becomes unreachable partway through the sweep produces.
+    struct KeyRemovalFails(MemoryKeyStore);
+
+    impl KeyStore for KeyRemovalFails {
+        fn network(&self) -> Network {
+            self.0.network()
+        }
+        fn write(&self, entry: &EntryName, secret: &str) -> Result<(), KeyStoreError> {
+            self.0.write(entry, secret)
+        }
+        fn read(&self, entry: &EntryName) -> Result<Option<SecretText>, KeyStoreError> {
+            self.0.read(entry)
+        }
+        fn remove(&self, entry: &EntryName) -> Result<(), KeyStoreError> {
+            if entry.account().starts_with(PREFIX_AGENT_KEY) {
+                return Err(KeyStoreError::Backend(keyring::Error::NoDefaultStore));
+            }
+            self.0.remove(entry)
+        }
+    }
+
+    #[test]
+    fn a_revoke_that_fails_partway_leaves_an_agent_that_cannot_sign() {
+        let store = KeyRemovalFails(MemoryKeyStore::new(Network::Testnet));
+        let a = agent("alpha");
+        store
+            .create_agent_key(&a, secret(KEY_A), T0 + DAY_MS, T0)
+            .expect("create");
+
+        assert!(matches!(
+            store.delete_agent(&a),
+            Err(KeyStoreError::Backend(_))
+        ));
+        // The sweep failed, so the key is still stored — but the record it
+        // needs is not, so nothing can load it.
+        assert!(
+            store
+                .read(&EntryName::agent_key(Network::Testnet, &a, 0).expect("valid id"))
+                .expect("read")
+                .is_some()
+        );
+        assert!(matches!(
+            store.load_agent_key(&a),
+            Err(KeyStoreError::Missing { .. })
+        ));
+    }
+
+    #[test]
+    fn a_revoke_ignores_the_generation_the_record_claims() {
+        // The record is a non-secret entry any same-user process can edit, and
+        // it is not the delete's guide: whether the number is edited down, the
+        // whole record is gone, or it is past the ceiling, every generation
+        // that could hold a key is swept.
+        for (name, tamper) in [
+            ("edited down to 0", 0usize),
+            ("record removed", 1),
+            ("edited up past the ceiling", 2),
+        ] {
+            let store = MemoryKeyStore::new(Network::Testnet);
+            let a = agent("alpha");
+            let record = store
+                .create_agent_key(&a, secret(KEY_A), T0 + DAY_MS, T0)
+                .expect("create");
+            for (i, k) in [KEY_B, KEY_C, KEY_D].into_iter().enumerate() {
+                store
+                    .rotate_agent_key(&a, secret(k), T0 + DAY_MS, T0 + i as u64)
+                    .expect("rotate");
+            }
+            let entry = EntryName::agent_record(Network::Testnet, &a).expect("valid id");
+            match tamper {
+                1 => store.remove(&entry).expect("remove"),
+                other => {
+                    let generation = if other == 0 { 0 } else { u32::MAX };
+                    store
+                        .write(
+                            &entry,
+                            &serde_json::to_string(&AgentWallet {
+                                generation,
+                                ..record
+                            })
+                            .expect("encode"),
+                        )
+                        .expect("write");
+                }
+            }
+
+            store
+                .delete_agent(&a)
+                .unwrap_or_else(|e| panic!("revoke refused with the record {name}: {e}"));
+            let left = store.entry_names();
+            let keys: Vec<_> = left.iter().filter(|n| n.contains("agent-key/")).collect();
+            assert!(
+                keys.is_empty(),
+                "with the record {name} the revoke returned Ok and left {keys:?}"
+            );
+        }
+    }
+
+    /// A store whose `agent_wallet` reports a generation this module's write
+    /// path cannot produce. [`KeyStore`] is public and `agent_wallet` is a
+    /// provided method, so this is a shape a downstream implementation really
+    /// can have — and `rotate_agent_key`'s arithmetic must hold on its own
+    /// rather than lean on the guard inside the read it happens to call.
+    struct UnboundedGenerationStore;
+
+    impl KeyStore for UnboundedGenerationStore {
+        fn network(&self) -> Network {
+            Network::Testnet
+        }
+        fn write(&self, _: &EntryName, _: &str) -> Result<(), KeyStoreError> {
+            Ok(())
+        }
+        fn read(&self, _: &EntryName) -> Result<Option<SecretText>, KeyStoreError> {
+            Ok(None)
+        }
+        fn remove(&self, _: &EntryName) -> Result<(), KeyStoreError> {
+            Ok(())
+        }
+        fn agent_wallet(&self, _: &AgentId) -> Result<Option<AgentWallet>, KeyStoreError> {
+            Ok(Some(AgentWallet {
+                generation: u32::MAX,
+                address: Address::from_bytes([0; 20]),
+                approved_at_ms: T0,
+                valid_until_ms: T0 + DAY_MS,
+            }))
+        }
+    }
+
+    #[test]
+    fn a_rotation_never_overflows_the_generation_it_was_handed() {
+        // A plain `+ 1` panics here in debug and wraps to 0 in release, and
+        // generation 0 is an entry that already holds a key.
+        assert!(matches!(
+            UnboundedGenerationStore.rotate_agent_key(
+                &agent("alpha"),
+                secret(KEY_A),
+                T0 + DAY_MS,
+                T0
+            ),
+            Err(KeyStoreError::RotationLimit {
+                generation: u32::MAX
+            })
+        ));
+    }
+
+    #[test]
+    fn rotating_past_the_generation_limit_is_refused() {
+        let store = MemoryKeyStore::new(Network::Testnet);
+        let a = agent("alpha");
+        let record = store
+            .create_agent_key(&a, secret(KEY_A), T0 + DAY_MS, T0)
+            .expect("create");
+        store
+            .write(
+                &EntryName::agent_record(Network::Testnet, &a).expect("valid id"),
+                &serde_json::to_string(&AgentWallet {
+                    generation: MAX_GENERATION,
+                    ..record
+                })
+                .expect("encode"),
+            )
+            .expect("write");
+
+        // The last legal generation still reads; it just cannot go on.
+        assert_eq!(
+            store
+                .agent_wallet(&a)
+                .expect("read")
+                .expect("present")
+                .generation,
+            MAX_GENERATION
+        );
+        assert!(matches!(
+            store.rotate_agent_key(&a, secret(KEY_B), T0 + DAY_MS, T0 + 1),
+            Err(KeyStoreError::RotationLimit { generation }) if generation == MAX_GENERATION + 1
+        ));
+    }
+
+    #[test]
+    fn the_largest_wallet_record_fits_the_windows_credential_blob() {
+        // Every field is fixed-width, so this *is* the worst case: the highest
+        // generation the store accepts and clocks at `u64::MAX`.
+        let record = AgentWallet {
+            generation: MAX_GENERATION,
+            address: Address::from_bytes([0xff; 20]),
+            approved_at_ms: u64::MAX,
+            valid_until_ms: u64::MAX,
+        };
+        let blob_bytes = serde_json::to_string(&record)
+            .expect("encode")
+            .encode_utf16()
+            .count()
+            * 2;
+        assert!(
+            blob_bytes <= WINDOWS_CREDENTIAL_BLOB_MAX_BYTES / 2,
+            "the record is {blob_bytes} bytes as UTF-16, past half the \
+             {WINDOWS_CREDENTIAL_BLOB_MAX_BYTES}-byte Windows credential blob \
+             cap — a variable-length field was added"
+        );
     }
 
     #[test]
@@ -1214,12 +1693,21 @@ mod tests {
             store.load_agent_key(&a),
             Err(KeyStoreError::Missing { .. })
         ));
+        // No entry holding key material survives, and beta is untouched.
+        let left = store.entry_names();
+        assert!(
+            !left
+                .iter()
+                .any(|n| n.contains("agent-key/alpha/") || n.contains("agent-record/alpha")),
+            "an alpha key or record survived the delete: {left:?}"
+        );
+        assert!(left.contains(&format!("{SERVICE_TESTNET}:agent-key/beta/0")));
+        assert!(left.contains(&format!("{SERVICE_TESTNET}:agent-record/beta")));
+        // The address marks stay, so the addresses stay retired.
         assert_eq!(
-            store.entry_names(),
-            vec![
-                format!("{SERVICE_TESTNET}:agent-key/beta/0"),
-                format!("{SERVICE_TESTNET}:agent-record/beta"),
-            ]
+            left.iter().filter(|n| n.contains("agent-address/")).count(),
+            4,
+            "alpha's three marks and beta's one must all survive: {left:?}"
         );
         // Deleting again is a no-op rather than an error.
         store.delete_agent(&a).expect("idempotent delete");
@@ -1277,6 +1765,186 @@ mod tests {
     }
 
     #[test]
+    fn a_key_that_does_not_derive_its_record_address_is_refused_on_load() {
+        let store = MemoryKeyStore::new(Network::Testnet);
+        let a = agent("alpha");
+        let record = store
+            .create_agent_key(&a, secret(KEY_A), T0 + DAY_MS, T0)
+            .expect("create");
+        let key_entry = EntryName::agent_key(Network::Testnet, &a, 0).expect("valid id");
+
+        // A perfectly valid *other* key swapped in under the same entry: the
+        // write path's pairing check cannot see this, because it already ran.
+        store.write(&key_entry, KEY_B).expect("write");
+        let b_address = AgentKey::from_hex(KEY_B).expect("valid key").address();
+        assert!(
+            matches!(
+                store.load_agent_key(&a),
+                Err(KeyStoreError::AddressMismatch { record: r, derived })
+                    if r == record.address && derived == b_address
+            ),
+            "a swapped key loaded as if it were the approved one"
+        );
+
+        // The other direction: the key stands and the record's address is
+        // edited. Same refusal — neither side is trusted over the other.
+        store.write(&key_entry, KEY_A).expect("write");
+        let tampered = AgentWallet {
+            address: b_address,
+            ..record.clone()
+        };
+        store
+            .write(
+                &EntryName::agent_record(Network::Testnet, &a).expect("valid id"),
+                &serde_json::to_string(&tampered).expect("encode"),
+            )
+            .expect("write");
+        assert!(
+            matches!(
+                store.load_agent_key(&a),
+                Err(KeyStoreError::AddressMismatch { record: r, derived })
+                    if r == b_address && derived == record.address
+            ),
+            "an edited record loaded a key the record does not name"
+        );
+    }
+
+    // -- concurrency -------------------------------------------------------
+
+    #[test]
+    fn concurrent_rotations_each_mint_their_own_generation() {
+        const ROTATIONS: usize = 4;
+
+        let store = MemoryKeyStore::with_read_delay(Network::Testnet, Duration::from_millis(25));
+        let a = agent("alpha");
+        let key_at = |i: usize| format!("{:02x}{}", i + 1, &KEY_A[2..]);
+        store
+            .create_agent_key(&a, secret(&key_at(0)), T0 + DAY_MS, T0)
+            .expect("create");
+
+        let barrier = Barrier::new(ROTATIONS);
+        thread::scope(|scope| {
+            for i in 1..=ROTATIONS {
+                let (store, a, barrier) = (&store, &a, &barrier);
+                let key = key_at(i);
+                scope.spawn(move || {
+                    barrier.wait();
+                    store
+                        .rotate_agent_key(a, secret(&key), T0 + DAY_MS, T0 + i as u64)
+                        .expect("rotate")
+                });
+            }
+        });
+
+        let record = store.agent_wallet(&a).expect("read").expect("present");
+        assert_eq!(
+            record.generation, ROTATIONS as u32,
+            "rotations shared a generation: {ROTATIONS} ran, the record is at {}",
+            record.generation
+        );
+        // Every generation still has its key. An interleaved pair writes the
+        // same entry name twice and one agent loses the signer it needs to
+        // cancel its own resting orders.
+        for generation in 0..=record.generation {
+            let entry = EntryName::agent_key(Network::Testnet, &a, generation).expect("valid id");
+            assert!(
+                store.read(&entry).expect("read").is_some(),
+                "generation {generation} lost its key entry"
+            );
+        }
+        // One address mark per generation: every rotation installed a distinct
+        // address, and none was silently overwritten.
+        assert_eq!(
+            store
+                .entry_names()
+                .iter()
+                .filter(|n| n.contains("agent-address/"))
+                .count(),
+            ROTATIONS + 1,
+            "an address was installed twice"
+        );
+        assert_eq!(
+            store.load_agent_key(&a).expect("load").address(),
+            record.address
+        );
+    }
+
+    #[test]
+    fn concurrent_rotations_to_the_same_address_install_it_once() {
+        // The reuse check and the write that satisfies it are a
+        // read-modify-write like the generation is. Two rotations offered the
+        // same key must not both pass the check before either writes its mark.
+        let store = MemoryKeyStore::with_read_delay(Network::Testnet, Duration::from_millis(25));
+        let a = agent("alpha");
+        store
+            .create_agent_key(&a, secret(KEY_A), T0 + DAY_MS, T0)
+            .expect("create");
+
+        let barrier = Barrier::new(2);
+        let outcomes = thread::scope(|scope| {
+            let handles = [1u64, 2].map(|i| {
+                let (store, a, barrier) = (&store, &a, &barrier);
+                scope.spawn(move || {
+                    barrier.wait();
+                    store.rotate_agent_key(a, secret(KEY_B), T0 + DAY_MS, T0 + i)
+                })
+            });
+            handles.map(|h| h.join().expect("thread did not panic"))
+        });
+
+        assert_eq!(
+            outcomes.iter().filter(|r| r.is_ok()).count(),
+            1,
+            "the same address was installed twice"
+        );
+        assert!(
+            outcomes
+                .iter()
+                .any(|r| matches!(r, Err(KeyStoreError::AddressReused { .. }))),
+            "the losing rotation did not report AddressReused"
+        );
+        let record = store.agent_wallet(&a).expect("read").expect("present");
+        assert_eq!(record.generation, 1);
+    }
+
+    #[test]
+    fn concurrent_creates_leave_exactly_one_wallet() {
+        let store = MemoryKeyStore::with_read_delay(Network::Testnet, Duration::from_millis(25));
+        let a = agent("alpha");
+        let barrier = Barrier::new(2);
+
+        let outcomes = thread::scope(|scope| {
+            let handles = [KEY_A, KEY_B].map(|key| {
+                let (store, a, barrier) = (&store, &a, &barrier);
+                scope.spawn(move || {
+                    barrier.wait();
+                    store.create_agent_key(a, secret(key), T0 + DAY_MS, T0)
+                })
+            });
+            handles.map(|h| h.join().expect("thread did not panic"))
+        });
+
+        let created = outcomes.iter().filter(|r| r.is_ok()).count();
+        assert_eq!(
+            created, 1,
+            "both creates succeeded; the second overwrote the first agent's key"
+        );
+        assert!(
+            outcomes
+                .iter()
+                .any(|r| matches!(r, Err(KeyStoreError::AlreadyExists { .. }))),
+            "the losing create did not report AlreadyExists"
+        );
+
+        let record = store.agent_wallet(&a).expect("read").expect("present");
+        assert_eq!(record.generation, 0);
+        assert_eq!(
+            store.load_agent_key(&a).expect("load").address(),
+            record.address
+        );
+    }
+
+    #[test]
     fn the_record_serializes_deterministically() {
         let store = MemoryKeyStore::new(Network::Testnet);
         let a = agent("alpha");
@@ -1291,7 +1959,7 @@ mod tests {
         let twice = serde_json::to_string(&record).expect("encode");
         assert_eq!(once, twice);
         assert!(
-            once.starts_with(r#"{"agent":"alpha","generation":1,"address":"0x"#),
+            once.starts_with(r#"{"generation":1,"address":"0x"#),
             "field order changed: {once}"
         );
         let round_tripped: AgentWallet = serde_json::from_str(&once).expect("decode");
@@ -1464,6 +2132,20 @@ mod tests {
     }
 
     #[test]
+    fn errors_never_debug_print_what_the_backend_read() {
+        // `keyring::Error::BadEncoding` carries the raw credential blob the
+        // store just read and derives `Debug`. A derived `Debug` on
+        // `KeyStoreError` would carry it into `tracing::error!(?e)`, an
+        // `expect` panic payload and a Tauri command's error result.
+        let err = KeyStoreError::Backend(keyring::Error::BadEncoding(KEY_A.as_bytes().to_vec()));
+        let rendered = format!("{err:?}");
+        let first_byte = KEY_A.as_bytes()[0].to_string();
+        assert!(!rendered.contains(&first_byte), "{rendered}");
+        assert!(!rendered.contains("BadEncoding"), "{rendered}");
+        assert_eq!(rendered, format!("{err}"));
+    }
+
+    #[test]
     fn non_utf8_secrets_are_refused_rather_than_guessed_at() {
         let mut bytes = KEY_A.to_owned().into_bytes();
         bytes[0] = 0xff;
@@ -1471,6 +2153,119 @@ mod tests {
         // sequence is representable and must be rejected on read.
         let s = SecretText(bytes);
         assert!(matches!(s.as_str(), Err(KeyStoreError::Corrupt { .. })));
+    }
+
+    #[test]
+    fn a_delete_racing_a_rotation_leaves_no_key_behind() {
+        // The rotation is inside AGENT_WALLET_LOCK with a 60 ms read; the
+        // delete starts 30 ms in. Without the lock on the delete side it reads
+        // the pre-rotation record, deletes what that names, and reports success
+        // while the key the rotation minted is still stored.
+        let store = MemoryKeyStore::with_read_delay(Network::Testnet, Duration::from_millis(60));
+        let a = agent("alpha");
+        store
+            .create_agent_key(&a, secret(KEY_A), T0 + DAY_MS, T0)
+            .expect("create");
+
+        thread::scope(|scope| {
+            let (s1, a1) = (&store, &a);
+            scope.spawn(move || s1.rotate_agent_key(a1, secret(KEY_B), T0 + DAY_MS, T0 + 1));
+            let (s2, a2) = (&store, &a);
+            scope.spawn(move || {
+                thread::sleep(Duration::from_millis(30));
+                s2.delete_agent(a2)
+            });
+        });
+
+        let left = store.entry_names();
+        assert!(
+            !left.iter().any(|n| n.contains("agent-key/")),
+            "a private key survived a delete that returned Ok: {left:?}"
+        );
+    }
+
+    #[test]
+    fn a_delete_removes_the_key_a_crashed_rotation_orphaned() {
+        // `write_wallet` writes the key before the record, so a crash between
+        // the two leaves generation + 1 with no record pointing at it.
+        let store = MemoryKeyStore::new(Network::Testnet);
+        let a = agent("alpha");
+        store
+            .create_agent_key(&a, secret(KEY_A), T0 + DAY_MS, T0)
+            .expect("create");
+        store
+            .write(
+                &EntryName::agent_key(Network::Testnet, &a, 1).expect("valid id"),
+                KEY_B,
+            )
+            .expect("write");
+
+        store.delete_agent(&a).expect("delete");
+        let left = store.entry_names();
+        assert!(
+            !left.iter().any(|n| n.contains("agent-key/")),
+            "the orphaned key survived the delete: {left:?}"
+        );
+    }
+
+    // -- expiry is not a load gate ----------------------------------------
+
+    #[test]
+    fn an_expired_wallet_still_loads() {
+        // `docs/decisions.md` D-b's remedy is to cancel the agent's resting
+        // orders, which needs its key. Expiry is the guardrail engine's
+        // predicate, not this store's.
+        let store = MemoryKeyStore::new(Network::Testnet);
+        let a = agent("alpha");
+        let record = store
+            .create_agent_key(&a, secret(KEY_A), T0 + DAY_MS, T0)
+            .expect("create");
+        assert!(matches!(
+            record.expiry(T0 + 400 * DAY_MS),
+            ExpiryState::Expired { .. }
+        ));
+        assert_eq!(
+            store
+                .load_agent_key(&a)
+                .expect("an expired wallet must still load")
+                .address(),
+            record.address
+        );
+    }
+
+    #[test]
+    fn a_retired_address_cannot_return_under_a_second_agent_id() {
+        // `docs/specs/onboarding.md` §7.3 retires the address, not the pairing.
+        // A mark scoped to the agent id would let the same key — the same
+        // pruned nonce set — be installed one container over.
+        let store = MemoryKeyStore::new(Network::Testnet);
+        let alpha = agent("alpha");
+        let first = store
+            .create_agent_key(&alpha, secret(KEY_A), T0 + DAY_MS, T0)
+            .expect("create");
+        store
+            .rotate_agent_key(&alpha, secret(KEY_B), T0 + DAY_MS, T0 + 1)
+            .expect("rotate");
+
+        for (id, key) in [("beta", KEY_A), ("gamma", KEY_B)] {
+            assert!(
+                matches!(
+                    store.create_agent_key(&agent(id), secret(key), T0 + DAY_MS, T0 + 2),
+                    Err(KeyStoreError::AddressReused { .. })
+                ),
+                "an address alpha retired came back as {id}"
+            );
+        }
+        // Deleting alpha does not release them either.
+        store.delete_agent(&alpha).expect("delete");
+        assert!(matches!(
+            store.create_agent_key(&agent("beta"), secret(KEY_A), T0 + DAY_MS, T0 + 3),
+            Err(KeyStoreError::AddressReused { address }) if address == first.address
+        ));
+        // A key no agent has installed is still accepted.
+        store
+            .create_agent_key(&agent("beta"), secret(KEY_C), T0 + DAY_MS, T0 + 4)
+            .expect("an unused address must still be installable");
     }
 
     // -- the real keychain -------------------------------------------------
@@ -1484,8 +2279,11 @@ mod tests {
     #[ignore = "touches the real OS credential store"]
     fn keychain_round_trips_an_agent_wallet() {
         let store = KeychainKeyStore::new(Network::Testnet);
-        let a = agent("oppen-selftest");
-        // Leave nothing behind from an interrupted earlier run.
+        // A fresh id per run, and the address marks are cleared at the end:
+        // `delete_agent` keeps them on purpose, and they are not scoped to the
+        // agent id, so a run that left them behind would (correctly) refuse
+        // KEY_A and KEY_B for every later run.
+        let a = agent(&format!("oppen-selftest.{T0}"));
         store.delete_agent(&a).expect("pre-clean");
 
         let record = store
@@ -1509,5 +2307,16 @@ mod tests {
 
         store.delete_agent(&a).expect("delete");
         assert!(store.agent_wallet(&a).expect("read").is_none());
+        assert!(matches!(
+            store.load_agent_key(&a),
+            Err(KeyStoreError::Missing { .. })
+        ));
+        // The address marks outlive the delete; clear them so the run leaves
+        // nothing behind.
+        for address in [record.address, rotated.address] {
+            store
+                .remove(&EntryName::agent_address(Network::Testnet, &address))
+                .expect("clean up the address mark");
+        }
     }
 }
