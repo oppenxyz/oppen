@@ -22,6 +22,14 @@ const feeds = computed(() => ({
 
     <span class="sb__spacer" />
 
+    <!--
+      Spec item 34. A failed refresh is stated, not hidden: a blank panel and a
+      stale one look identical to an operator and only one of them is safe.
+    -->
+    <span v-if="shell.accountError" class="sb__alert" role="status">
+      ACCOUNT · {{ shell.accountError }}
+    </span>
+
     <span>
       Feeds ·
       <span class="sb__k">WS·MKT {{ feeds.market }} · WS·USER {{ feeds.user }} · REST {{ feeds.rest }}</span>
@@ -61,5 +69,12 @@ const feeds = computed(() => ({
 
 .sb__spacer {
   flex: 1;
+}
+
+.sb__alert {
+  overflow: hidden;
+  max-width: 46ch;
+  text-overflow: ellipsis;
+  color: var(--hazard, #ff4d2e);
 }
 </style>
