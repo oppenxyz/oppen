@@ -24,12 +24,17 @@ import {
   type CandleInput,
 } from "./candles";
 
-interface Matchers {
+interface Assertions {
   toBe(expected: unknown): void;
   toEqual(expected: unknown): void;
   toBeGreaterThanOrEqual(expected: number): void;
   toBeLessThanOrEqual(expected: number): void;
   toContain(expected: string): void;
+}
+
+interface Matchers extends Assertions {
+  /** Negated form. `bun test` supplies it; this shim keeps `vue-tsc` happy. */
+  not: Assertions;
 }
 
 declare const describe: (name: string, body: () => void) => void;
@@ -554,7 +559,7 @@ describe("createCandleRenderer", () => {
    * anything moved makes the two cost the same. The bound is a ratio against this
    * machine's own changed-tick cost, so it does not depend on how fast the machine is.
    */
-  it("makes an unchanged tick cheaper than a changed one", () => {
+  it("skips the DOM write on an unchanged tick and reports a changed one", () => {
     const closed = ladder(98, 110, 400);
     const base: CandleInput = {
       closed,
@@ -566,32 +571,42 @@ describe("createCandleRenderer", () => {
       tzOffsetMinutes: 0,
     };
     const renderer = createCandleRenderer();
-    renderer.render(base);
+    const first = renderer.render(base);
+    expect(first.changed).toBe(true);
 
-    const bestOf = (body: () => void): number => {
-      let best = Number.POSITIVE_INFINITY;
-      for (let trial = 0; trial < 9; trial += 1) {
-        const started = performance.now();
-        for (let i = 0; i < 50; i += 1) body();
-        const each = (performance.now() - started) / 50;
-        if (each < best) best = each;
-      }
-      return best;
-    };
+    // Measure WORK, not wall-clock. An earlier version of this test timed the
+    // two paths and compared elapsed milliseconds; it passed on a quiet laptop
+    // and failed on a shared CI runner for reasons that have nothing to do
+    // with the renderer. The property worth pinning is that an unchanged tick
+    // reports `changed: false` so the caller can skip the DOM write, and that
+    // it leaves the frame's contents untouched.
+    //
+    // Note the buffers are REUSED by design, so `frame.text` is the same array
+    // every time and asserting on its identity would prove nothing. Snapshot
+    // the contents and compare those.
+    const snapshot = [...first.frame.text];
 
-    const unchanged = bestOf(() => {
-      renderer.render(base);
+    for (let i = 0; i < 10; i += 1) {
+      const tick = renderer.render(base);
+      expect(tick.changed).toBe(false);
+      expect([...tick.frame.text]).toEqual(snapshot);
+    }
+
+    // A moved close must be reported as changed, or the skip above would be
+    // hiding real updates rather than saving work.
+    const moved = renderer.render({
+      ...base,
+      forming: {
+        time: Date.UTC(2026, 8, 3, 0, 0, 0),
+        open: 104,
+        high: 105,
+        low: 103,
+        close: 104.42,
+        volume: 1,
+      },
     });
-    let n = 0;
-    const changed = bestOf(() => {
-      n += 1;
-      const close = 104 + (n % 17) * 0.01;
-      renderer.render({
-        ...base,
-        forming: { time: Date.UTC(2026, 8, 3, 0, 0, 0), open: 104, high: 105, low: 103, close, volume: 1 },
-      });
-    });
-    expect(unchanged).toBeLessThanOrEqual(changed * 0.8);
+    expect(moved.changed).toBe(true);
+    expect([...moved.frame.text]).not.toEqual(snapshot);
   });
 });
 
