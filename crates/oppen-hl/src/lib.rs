@@ -20,6 +20,7 @@ pub mod order;
 pub mod signing;
 pub mod types;
 pub mod wire;
+pub mod ws;
 
 pub use action::Action;
 pub use address::Address;
@@ -92,4 +93,6 @@ pub enum Error {
     /// Non-2xx from the venue, or a `status: "err"` exchange response.
     #[error("venue rejected the request (http {status}): {message}")]
     Venue { status: u16, message: String },
+    #[error("websocket: {0}")]
+    Ws(String),
 }
