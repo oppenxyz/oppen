@@ -21,11 +21,14 @@ use oppen_core::state::{
 };
 use oppen_hl::info::OrderRef;
 use oppen_hl::types::OrderStatusResponse;
-use oppen_hl::wire::{CancelWire, Cloid, Grouping, Tif};
+use oppen_hl::wire::{CancelWire, Cloid, Grouping, Tif, Tpsl};
 use oppen_hl::{Address, InfoClient, Network, Universe, meta::MIN_NOTIONAL_USD};
 use oppen_hl::{ExchangeClient, ExchangeResponse, NonceAllocator, OrderKind, Status};
 
 use crate::auth::Binding;
+
+/// Basis points per unit. A bound 1% wide is 100 bps.
+const BPS: Decimal = Decimal::from_parts(10_000, 0, 0, false, 0);
 use crate::outcome::{self, CancelFailure, Reply, ToolError};
 use rmcp::RoleServer;
 use rmcp::service::RequestContext;
@@ -92,9 +95,9 @@ pub struct PlaceParams {
     /// validates the exact digits, so a size that round-tripped through a
     /// float is a rejected order.
     pub size: String,
-    /// Limit price, at `get_meta`'s `price_decimals`. A decimal string, for
-    /// the same reason as `size`.
-    pub limit_px: String,
+    /// What kind of order: `limit`, `market` or `stop_market`.
+    #[serde(flatten)]
+    pub order: PlaceKind,
     /// Why you are placing this order. Required.
     pub reason: String,
     #[serde(default)]
@@ -103,6 +106,86 @@ pub struct PlaceParams {
     /// the result — item 19's reconcile-by-cloid needs one to exist.
     #[serde(default)]
     pub cloid: Option<String>,
+}
+
+/// The order types of `docs/spec.md` item 12, as one closed choice.
+///
+/// A tagged enum rather than a price plus a pile of optional fields: "a stop
+/// with no trigger price" and "a market order with a limit price" are then not
+/// spellable, which is a better answer than refusing them one by one.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "order_type", rename_all = "snake_case")]
+pub enum PlaceKind {
+    /// Rests on the book at `limit_px`.
+    Limit {
+        /// Limit price, at `get_meta`'s `price_decimals`. A decimal string,
+        /// for the same reason as `size`.
+        limit_px: String,
+        /// `gtc` rests until cancelled, `ioc` cancels any unfilled remainder,
+        /// `alo` is cancelled outright rather than taking the book.
+        #[serde(default)]
+        tif: PlaceTif,
+    },
+
+    /// Crosses now, priced at your configured max slippage from the mid.
+    ///
+    /// Hyperliquid has no market order type: this is an IOC priced through the
+    /// book, and the bound is the operator's, not yours (item 24, D3). The
+    /// price is rounded toward the mid, so pricing *at* that bound cannot be
+    /// refused *for* it (`docs/decisions.md` C5).
+    Market,
+
+    /// Rests off-book until the mark reaches `trigger_px`, then takes the
+    /// book at your configured max slippage.
+    ///
+    /// The guardrail engine measures slippage for a trigger order against the
+    /// trigger price rather than today's mid, because a stop fills when it
+    /// triggers and not now.
+    StopMarket {
+        /// The price that arms it. A decimal string.
+        trigger_px: String,
+        /// `sl` for a stop-loss, `tp` for a take-profit. They differ in which
+        /// side of the trigger the venue arms on.
+        #[serde(default)]
+        tpsl: PlaceTpsl,
+    },
+}
+
+/// Time in force, as the wire spells it in lower case.
+#[derive(Debug, Default, Clone, Copy, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PlaceTif {
+    #[default]
+    Gtc,
+    Ioc,
+    Alo,
+}
+
+impl From<PlaceTif> for Tif {
+    fn from(tif: PlaceTif) -> Self {
+        match tif {
+            PlaceTif::Gtc => Tif::Gtc,
+            PlaceTif::Ioc => Tif::Ioc,
+            PlaceTif::Alo => Tif::Alo,
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PlaceTpsl {
+    #[default]
+    Sl,
+    Tp,
+}
+
+impl From<PlaceTpsl> for Tpsl {
+    fn from(tpsl: PlaceTpsl) -> Self {
+        match tpsl {
+            PlaceTpsl::Sl => Tpsl::Sl,
+            PlaceTpsl::Tp => Tpsl::Tp,
+        }
+    }
 }
 
 /// What `cancel` takes: one order, named the way the agent knows it.
@@ -316,10 +399,6 @@ impl Gateway {
             .get(&params.symbol)
             .map_err(|e| ToolError::invalid("symbol", e))?;
 
-        let px: Decimal = params
-            .limit_px
-            .parse()
-            .map_err(|e| ToolError::invalid("limit_px", e))?;
         let sz: Decimal = params
             .size
             .parse()
@@ -335,12 +414,58 @@ impl Gateway {
             None => mint_cloid()?,
         };
 
+        // The price and the order type together: a market order has no price
+        // of its own, and a stop takes the book when it triggers, so both are
+        // priced from the operator's slippage bound rather than the caller's.
+        let (px, kind) = match &params.order {
+            PlaceKind::Limit { limit_px, tif } => (
+                limit_px
+                    .parse::<Decimal>()
+                    .map_err(|e| ToolError::invalid("limit_px", e))?,
+                OrderKind::Limit { tif: (*tif).into() },
+            ),
+            PlaceKind::Market => {
+                // A missing mid is a refusal, not a guess: this is the gateway
+                // failing to build an order rather than a guardrail verdict.
+                let mid = context
+                    .market
+                    .reference_px
+                    .ok_or_else(|| ToolError::Unavailable {
+                        what: "reference price",
+                        detail: format!(
+                            "no mid for {}; refusing to price a market order",
+                            params.symbol
+                        ),
+                    })?;
+                (
+                    self.crossing_price(&bound, asset, mid, params.is_buy)?,
+                    OrderKind::Limit { tif: Tif::Ioc },
+                )
+            }
+            PlaceKind::StopMarket { trigger_px, tpsl } => {
+                let trigger_px = trigger_px
+                    .parse::<Decimal>()
+                    .map_err(|e| ToolError::invalid("trigger_px", e))?;
+                // Priced from the *trigger*, not today's mid: that is where
+                // the book will be when this fills, and it is the reference
+                // the engine measures the slippage cap against.
+                (
+                    self.crossing_price(&bound, asset, trigger_px, params.is_buy)?,
+                    OrderKind::Trigger {
+                        is_market: true,
+                        trigger_px,
+                        tpsl: (*tpsl).into(),
+                    },
+                )
+            }
+        };
+
         let intent = OrderIntent {
             symbol: params.symbol.clone(),
             is_buy: params.is_buy,
             px,
             sz,
-            kind: OrderKind::Limit { tif: Tif::Gtc },
+            kind,
             reduce_only: params.reduce_only,
             cloid: Some(cloid.clone()),
             grouping: Grouping::Na,
@@ -557,24 +682,13 @@ impl Gateway {
             .into());
         };
 
-        // The bound is the operator's, read from the engine rather than taken
-        // from the caller: item 24 and D3 make slippage operator-set, and an
-        // agent that could widen it to close could widen it to open.
-        let guardrails =
-            inner
-                .engine
-                .guardrails(&bound.agent)
-                .ok_or_else(|| ToolError::Unavailable {
-                    what: "guardrails",
-                    detail: format!("{} is not a paired agent", bound.agent),
-                })?;
-
         let intent = close_intent(
             &params.symbol,
             &params.reason,
             position.size,
             reference_px,
-            guardrails.max_slippage_bps,
+            // The operator's bound, shared with `place`'s market order.
+            self.operator_slippage_bps(&bound)?,
             asset,
             mint_cloid()?,
         );
@@ -930,6 +1044,40 @@ impl Gateway {
         })
     }
 
+    /// The agent's configured max slippage, in basis points.
+    ///
+    /// Read from the engine rather than taken from the caller: item 24 and D3
+    /// make slippage operator-set, and an agent that could widen it to cross
+    /// the book could widen it to cross a worse one. In bps because that is
+    /// what the guardrail config stores and what every refusal reports — the
+    /// one conversion to a fraction lives in [`Gateway::crossing_price`].
+    fn operator_slippage_bps(&self, bound: &Binding) -> Result<Decimal, ToolError> {
+        let guardrails =
+            self.inner
+                .engine
+                .guardrails(&bound.agent)
+                .ok_or_else(|| ToolError::Unavailable {
+                    what: "guardrails",
+                    detail: format!("{} is not a paired agent", bound.agent),
+                })?;
+        Ok(guardrails.max_slippage_bps)
+    }
+
+    /// A price that crosses the book from `reference_px`, within that bound.
+    ///
+    /// Rounded toward the reference, so pricing *at* the operator's limit
+    /// cannot be refused *for* that limit (`docs/decisions.md` C5).
+    fn crossing_price(
+        &self,
+        bound: &Binding,
+        asset: &oppen_hl::meta::Asset,
+        reference_px: Decimal,
+        is_buy: bool,
+    ) -> Result<Decimal, ToolError> {
+        let slippage = self.operator_slippage_bps(bound)? / BPS;
+        Ok(asset.slippage_price_bounded(reference_px, is_buy, slippage))
+    }
+
     /// The validated universe, which every tool that names a symbol needs.
     async fn universe(&self) -> Result<Universe, ToolError> {
         let meta = self
@@ -1064,7 +1212,7 @@ fn close_intent(
 ) -> OrderIntent {
     // Closing a long is a sell and closing a short is a buy.
     let is_buy = position_size.is_sign_negative();
-    let slippage = max_slippage_bps / Decimal::from(10_000);
+    let slippage = max_slippage_bps / BPS;
     OrderIntent {
         symbol: symbol.to_owned(),
         is_buy,
@@ -1611,6 +1759,92 @@ mod tests {
 
     fn body_contains(page: &serde_json::Value, needle: &str) -> bool {
         page.to_string().contains(needle)
+    }
+
+    fn place_params(json: serde_json::Value) -> PlaceParams {
+        serde_json::from_value(json).expect("params")
+    }
+
+    /// Item 12's three single-order types, as an agent would name them.
+    #[test]
+    fn the_order_types_deserialize_from_their_wire_names() {
+        let limit = place_params(serde_json::json!({
+            "symbol": "BTC", "is_buy": true, "size": "1", "reason": "why",
+            "order_type": "limit", "limit_px": "100", "tif": "alo"
+        }));
+        assert!(matches!(
+            limit.order,
+            PlaceKind::Limit { ref limit_px, tif: PlaceTif::Alo } if limit_px == "100"
+        ));
+
+        let market = place_params(serde_json::json!({
+            "symbol": "BTC", "is_buy": false, "size": "1", "reason": "why",
+            "order_type": "market"
+        }));
+        assert!(matches!(market.order, PlaceKind::Market));
+
+        let stop = place_params(serde_json::json!({
+            "symbol": "BTC", "is_buy": false, "size": "1", "reason": "why",
+            "order_type": "stop_market", "trigger_px": "90"
+        }));
+        assert!(matches!(
+            stop.order,
+            PlaceKind::StopMarket { ref trigger_px, tpsl: PlaceTpsl::Sl } if trigger_px == "90"
+        ));
+    }
+
+    /// `tif` defaults to the one that rests. An order that silently became IOC
+    /// would be cancelled instead of working, which is the expensive direction
+    /// to guess wrong in.
+    #[test]
+    fn a_limit_order_without_a_tif_rests() {
+        let p = place_params(serde_json::json!({
+            "symbol": "BTC", "is_buy": true, "size": "1", "reason": "why",
+            "order_type": "limit", "limit_px": "100"
+        }));
+        assert!(matches!(
+            p.order,
+            PlaceKind::Limit {
+                tif: PlaceTif::Gtc,
+                ..
+            }
+        ));
+    }
+
+    /// The combinations the type makes unspellable. A stop with no trigger and
+    /// a market order with a limit price are refused by deserialization, not
+    /// by a runtime check that could be forgotten.
+    #[test]
+    fn an_order_type_cannot_be_given_the_wrong_fields() {
+        let stop_without_trigger = serde_json::from_value::<PlaceParams>(serde_json::json!({
+            "symbol": "BTC", "is_buy": true, "size": "1", "reason": "why",
+            "order_type": "stop_market"
+        }));
+        assert!(
+            stop_without_trigger.is_err(),
+            "a stop needs a trigger price"
+        );
+
+        let limit_without_price = serde_json::from_value::<PlaceParams>(serde_json::json!({
+            "symbol": "BTC", "is_buy": true, "size": "1", "reason": "why",
+            "order_type": "limit"
+        }));
+        assert!(limit_without_price.is_err(), "a limit needs a price");
+
+        let no_type = serde_json::from_value::<PlaceParams>(serde_json::json!({
+            "symbol": "BTC", "is_buy": true, "size": "1", "reason": "why"
+        }));
+        assert!(no_type.is_err(), "an order type is not optional");
+    }
+
+    /// Every time-in-force reaches the wire spelling the signer hashes.
+    #[test]
+    fn each_tif_maps_to_its_wire_variant() {
+        assert_eq!(Tif::from(PlaceTif::Gtc), Tif::Gtc);
+        assert_eq!(Tif::from(PlaceTif::Ioc), Tif::Ioc);
+        assert_eq!(Tif::from(PlaceTif::Alo), Tif::Alo);
+        assert_eq!(Tpsl::from(PlaceTpsl::Sl), Tpsl::Sl);
+        assert_eq!(Tpsl::from(PlaceTpsl::Tp), Tpsl::Tp);
     }
 
     /// `AGENTS.md` invariant 1, for the crate that now has four tools that
