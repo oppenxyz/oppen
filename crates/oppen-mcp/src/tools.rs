@@ -14,9 +14,8 @@
 use std::sync::Arc;
 
 use oppen_core::book;
-use oppen_core::guardrail::AgentId;
 use oppen_core::guardrail::{Cleared, FeedQuality, GuardrailEngine, MarketRef, OrderIntent};
-use oppen_core::ledger::AgentView;
+use oppen_core::ledger::EventViews;
 use oppen_core::state::{
     AccountState, VenueReadings, assemble, exposure_from, realized_pnl_since, utc_day_start_ms,
 };
@@ -26,7 +25,10 @@ use oppen_hl::wire::{CancelWire, Cloid, Grouping, Tif};
 use oppen_hl::{Address, InfoClient, Network, Universe, meta::MIN_NOTIONAL_USD};
 use oppen_hl::{ExchangeClient, ExchangeResponse, NonceAllocator, OrderKind, Status};
 
+use crate::auth::Binding;
 use crate::outcome::{self, CancelFailure, Reply, ToolError};
+use rmcp::RoleServer;
+use rmcp::service::RequestContext;
 use rmcp::{
     ErrorData, ServerHandler,
     handler::server::wrapper::Parameters,
@@ -45,13 +47,11 @@ pub struct Gateway {
 struct GatewayInner {
     network: Network,
     info: InfoClient,
-    /// The account the gateway reports on. One address in v1: an agent is
-    /// bound to exactly one container (`docs/decisions.md` D1 as revised), and
-    /// a gateway serving two would have to disambiguate on every call.
-    account: Address,
-    /// The single agent this gateway speaks for. One pairing, one agent, one
-    /// container (D1 as revised).
-    agent: AgentId,
+    /// The agent and account are **not** here. They come from the pairing
+    /// token on every request (`docs/spec.md` item 15), so one gateway serves
+    /// every paired agent and each acts as itself — under its own guardrails,
+    /// on its own container (D1 as revised), seeing only its own events (C6).
+    /// A fixed identity here would make all of that decorative.
     /// Guardrails live in `oppen-core` and nowhere else (`AGENTS.md`
     /// invariant 1). This gateway cannot evaluate a predicate itself, and
     /// there is no path from a tool to the signer that does not go through
@@ -59,11 +59,12 @@ struct GatewayInner {
     engine: Arc<GuardrailEngine>,
     exchange: ExchangeClient,
     nonces: NonceAllocator,
-    /// The agent's read-only slice of the one ledger (`docs/spec.md` D6).
-    /// An [`AgentView`] and never a `Ledger`: `redact`, `upsert_sub_account`
-    /// and the gap surface are not spellable from here, so `AGENTS.md`
-    /// invariant 3 is a compile error rather than a review note.
-    events: AgentView,
+    /// Hands out one agent's read-only slice of the one ledger
+    /// (`docs/spec.md` D6), built per request for whoever the token names. An
+    /// [`EventViews`] and never a `Ledger`: `redact`, `upsert_sub_account` and
+    /// the gap surface are not spellable from here, so `AGENTS.md` invariant 3
+    /// is a compile error rather than a review note.
+    events: EventViews,
 }
 
 /// The inputs `GuardrailEngine::evaluate` needs, gathered once per call.
@@ -207,23 +208,39 @@ pub struct SymbolMeta {
 impl Gateway {
     pub fn new(
         network: Network,
-        account: Address,
-        agent: AgentId,
         engine: Arc<GuardrailEngine>,
-        events: AgentView,
+        events: EventViews,
     ) -> Result<Self, oppen_hl::Error> {
         Ok(Self {
             inner: Arc::new(GatewayInner {
                 network,
                 info: InfoClient::new(network)?,
-                account,
-                agent,
                 engine,
                 exchange: ExchangeClient::new(network)?,
                 nonces: NonceAllocator::new(),
                 events,
             }),
         })
+    }
+
+    /// Who this request's token names (`docs/spec.md` item 15).
+    ///
+    /// `rmcp` republishes the request's `http::request::Parts` into the tool's
+    /// context, and the door put the [`Binding`] there after authenticating.
+    /// An absent binding is not a caller error to explain: the door refuses
+    /// every unauthenticated request, so reaching a tool without one means the
+    /// gateway was mounted without its guard. Fail closed and say so.
+    fn bound(ctx: &RequestContext<RoleServer>) -> Result<Binding, ToolError> {
+        ctx.extensions
+            .get::<http::request::Parts>()
+            .and_then(|parts| parts.extensions.get::<Binding>())
+            .cloned()
+            .ok_or(ToolError::Unavailable {
+                what: "pairing",
+                detail: "this request carries no pairing binding; the gateway is \
+                         mounted without its door"
+                    .to_owned(),
+            })
     }
 
     pub fn network(&self) -> Network {
@@ -285,11 +302,15 @@ impl Gateway {
     async fn place(
         &self,
         Parameters(params): Parameters<PlaceParams>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let inner = &self.inner;
+        let bound = Self::bound(&ctx)?;
         let now_ms = now_ms();
 
-        let context = self.evaluation_context(&params.symbol, now_ms).await?;
+        let context = self
+            .evaluation_context(bound.account, &params.symbol, now_ms)
+            .await?;
         let asset = context
             .universe
             .get(&params.symbol)
@@ -330,7 +351,7 @@ impl Gateway {
 
         // The gate. There is no branch around it.
         let cleared = match inner.engine.evaluate(
-            &inner.agent,
+            &bound.agent,
             &intent,
             asset,
             &context.market,
@@ -354,8 +375,10 @@ impl Gateway {
     async fn cancel(
         &self,
         Parameters(params): Parameters<CancelParams>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let inner = &self.inner;
+        let bound = Self::bound(&ctx)?;
         let now_ms = now_ms();
 
         // Which resting order this names, and on which asset. The asset id is
@@ -363,7 +386,7 @@ impl Gateway {
         // open-order list is the only place it can come from.
         let orders = inner
             .info
-            .frontend_open_orders(inner.account)
+            .frontend_open_orders(bound.account)
             .await
             .map_err(|e| ToolError::unavailable("orders", e))?;
         let universe = self.universe().await?;
@@ -396,7 +419,7 @@ impl Gateway {
             .map_err(|e| ToolError::unavailable("universe", e))?;
 
         let cleared = match inner.engine.clear_cancel(
-            &inner.agent,
+            &bound.agent,
             vec![CancelWire {
                 a: asset.index,
                 o: order.oid,
@@ -429,13 +452,15 @@ impl Gateway {
     async fn cancel_all(
         &self,
         Parameters(params): Parameters<SymbolActionParams>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let inner = &self.inner;
+        let bound = Self::bound(&ctx)?;
         let now_ms = now_ms();
 
         let orders = inner
             .info
-            .frontend_open_orders(inner.account)
+            .frontend_open_orders(bound.account)
             .await
             .map_err(|e| ToolError::unavailable("orders", e))?;
         let universe = self.universe().await?;
@@ -469,7 +494,7 @@ impl Gateway {
 
         let cleared = match inner
             .engine
-            .clear_cancel(&inner.agent, wires, &params.reason, now_ms)
+            .clear_cancel(&bound.agent, wires, &params.reason, now_ms)
         {
             Ok(cleared) => cleared,
             Err(refusal) => return Ok(outcome::refused(refusal).into_result()),
@@ -490,11 +515,15 @@ impl Gateway {
     async fn close_position(
         &self,
         Parameters(params): Parameters<ClosePositionParams>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let inner = &self.inner;
+        let bound = Self::bound(&ctx)?;
         let now_ms = now_ms();
 
-        let context = self.evaluation_context(&params.symbol, now_ms).await?;
+        let context = self
+            .evaluation_context(bound.account, &params.symbol, now_ms)
+            .await?;
         let asset = context
             .universe
             .get(&params.symbol)
@@ -534,10 +563,10 @@ impl Gateway {
         let guardrails =
             inner
                 .engine
-                .guardrails(&inner.agent)
+                .guardrails(&bound.agent)
                 .ok_or_else(|| ToolError::Unavailable {
                     what: "guardrails",
-                    detail: format!("{} is not a paired agent", inner.agent),
+                    detail: format!("{} is not a paired agent", bound.agent),
                 })?;
 
         let intent = close_intent(
@@ -554,7 +583,7 @@ impl Gateway {
         // when the account is unreconciled or the feed is stale, exactly as an
         // opening order is.
         let cleared = match inner.engine.evaluate(
-            &inner.agent,
+            &bound.agent,
             &intent,
             asset,
             &context.market,
@@ -583,11 +612,15 @@ impl Gateway {
     async fn preflight(
         &self,
         Parameters(params): Parameters<PreflightParams>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let inner = &self.inner;
+        let bound = Self::bound(&ctx)?;
         let now_ms = now_ms();
 
-        let context = self.evaluation_context(&params.symbol, now_ms).await?;
+        let context = self
+            .evaluation_context(bound.account, &params.symbol, now_ms)
+            .await?;
         let asset = context
             .universe
             .get(&params.symbol)
@@ -623,7 +656,7 @@ impl Gateway {
             reason: "preflight".to_owned(),
         };
         let verdict = inner.engine.preflight(
-            &inner.agent,
+            &bound.agent,
             &intent,
             asset,
             &context.market,
@@ -684,15 +717,33 @@ impl Gateway {
     async fn get_events(
         &self,
         Parameters(params): Parameters<GetEventsParams>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         // The ledger clamps to its own page cap, so a caller asking for more
         // gets the cap rather than a refusal — the cursor makes a short page
         // correct either way.
         let limit = params.limit.unwrap_or(oppen_core::ledger::MAX_PAGE);
+        let bound = Self::bound(&ctx)?;
+        Ok(self.events_page(&bound, limit, params.since_cursor)?)
+    }
+
+    /// The body of `get_events`, over an already-resolved binding.
+    ///
+    /// Split out because `rmcp::service::Peer` cannot be constructed outside
+    /// that crate, so a `RequestContext` cannot be built in a unit test. The
+    /// tool method above is then exactly one thing — resolving who is asking —
+    /// and this is everything that depends on the answer.
+    fn events_page(
+        &self,
+        bound: &Binding,
+        limit: usize,
+        since_cursor: u64,
+    ) -> Result<CallToolResult, ToolError> {
         let page = self
             .inner
             .events
-            .get_events(params.since_cursor, limit)
+            .for_agent(bound.agent.as_str())
+            .get_events(since_cursor, limit)
             .map_err(|e| ToolError::unavailable("ledger", e))?;
 
         // `EventPage` is already the wire shape, in declaration order. The
@@ -720,7 +771,9 @@ impl Gateway {
     async fn get_order_status(
         &self,
         Parameters(params): Parameters<OrderStatusParams>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        let bound = Self::bound(&ctx)?;
         let reference = match (params.oid, &params.cloid) {
             (Some(oid), _) => OrderRef::Oid(oid),
             (None, Some(cloid)) => {
@@ -734,7 +787,7 @@ impl Gateway {
         let status = self
             .inner
             .info
-            .order_status(self.inner.account, reference)
+            .order_status(bound.account, reference)
             .await
             .map_err(|e| ToolError::unavailable("order status", e))?;
 
@@ -771,8 +824,12 @@ impl Gateway {
                        liquidation, resting orders, and feed freshness. Read this before acting. \
                        If `feed` is not `live`, the data is stale and execution will fail closed."
     )]
-    async fn get_state(&self) -> Result<CallToolResult, ErrorData> {
-        let state = self.read_state(now_ms()).await?;
+    async fn get_state(
+        &self,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let bound = Self::bound(&ctx)?;
+        let state = self.read_state(bound.account, now_ms()).await?;
         Ok(CallToolResult::success(vec![ContentBlock::text(
             serde_json::to_string(&state).expect("AccountState serializes"),
         )]))
@@ -815,24 +872,25 @@ impl Gateway {
     /// that decides whether an order is refused.
     async fn evaluation_context(
         &self,
+        account: Address,
         symbol: &str,
         now_ms: u64,
     ) -> Result<EvaluationContext, ToolError> {
         let inner = &self.inner;
         let universe = self.universe().await?;
-        let state = self.read_state(now_ms).await?;
+        let state = self.read_state(account, now_ms).await?;
 
         // Realised PnL is summed from the venue's own fills for the UTC day,
         // net of fees: a daily-loss limit that ignores fees is not a limit.
         let day_start_ms = utc_day_start_ms(now_ms);
         let fills = inner
             .info
-            .user_fills_by_time(inner.account, day_start_ms, Some(now_ms))
+            .user_fills_by_time(account, day_start_ms, Some(now_ms))
             .await
             .map_err(|e| ToolError::unavailable("fills", e))?;
         let portfolio = inner
             .info
-            .portfolio(inner.account)
+            .portfolio(account)
             .await
             .map_err(|e| ToolError::unavailable("portfolio", e))?;
 
@@ -887,9 +945,8 @@ impl Gateway {
     ///
     /// Four and not one: Hyperliquid publishes no single endpoint that answers
     /// this, and spot is load-bearing because margin is unified.
-    async fn read_state(&self, now_ms: u64) -> Result<AccountState, ToolError> {
+    async fn read_state(&self, account: Address, now_ms: u64) -> Result<AccountState, ToolError> {
         let inner = &self.inner;
-        let account = inner.account;
 
         let perps = inner
             .info
@@ -1371,43 +1428,46 @@ mod tests {
             )
             .expect("engine"),
         );
-        let view = ledger.agent_view("agent-alpha");
         // The tempdir must outlive the gateway; leaking the handle is fine in a
         // test process that is about to exit.
         std::mem::forget(dir);
-        Gateway::new(
-            Network::Testnet,
-            "0xbf829199c1ae7f0caf21fb6fc45e10edff25b7d2"
-                .parse()
-                .expect("address"),
-            oppen_core::guardrail::AgentId::new("agent-alpha"),
-            engine,
-            view,
-        )
-        .expect("gateway")
+        Gateway::new(Network::Testnet, engine, EventViews::new(ledger)).expect("gateway")
     }
 
-    async fn events_of(gateway: &Gateway, params: GetEventsParams) -> serde_json::Value {
+    /// The binding the door would have injected for `agent`.
+    fn binding_for(agent: &str) -> Binding {
+        Binding {
+            agent: oppen_core::guardrail::AgentId::new(agent),
+            account: "0xbf829199c1ae7f0caf21fb6fc45e10edff25b7d2"
+                .parse()
+                .expect("address"),
+        }
+    }
+
+    fn events_of(gateway: &Gateway, agent: &str, params: GetEventsParams) -> serde_json::Value {
         let result = gateway
-            .get_events(Parameters(params))
-            .await
+            .events_page(
+                &binding_for(agent),
+                params.limit.unwrap_or(oppen_core::ledger::MAX_PAGE),
+                params.since_cursor,
+            )
             .expect("get_events");
         serde_json::from_str(&body(result)).expect("json")
     }
 
     /// The envelope an agent actually receives. Invariant 6 is a claim about
     /// bytes, so the keys and their order are asserted rather than assumed.
-    #[tokio::test]
-    async fn the_event_envelope_is_versioned_and_carries_the_cursor_contract() {
+    #[test]
+    fn the_event_envelope_is_versioned_and_carries_the_cursor_contract() {
         let gateway = gateway_over(&[(Some("agent-alpha"), "mine")]);
         let page = events_of(
             &gateway,
+            "agent-alpha",
             GetEventsParams {
                 since_cursor: 0,
                 limit: None,
             },
-        )
-        .await;
+        );
 
         assert_eq!(page["contract_version"], 0);
         assert_eq!(page["resync_required"], false);
@@ -1418,11 +1478,49 @@ mod tests {
         assert_eq!(page["events"][0]["payload"]["reason"], "mine");
     }
 
+    /// Item 15, and the thing that makes C6 more than a filter nobody reaches:
+    /// **one gateway, two paired agents, each acting as itself.** Before this,
+    /// the gateway held one hardcoded agent and every token got that identity,
+    /// so per-agent scoping was decorative.
+    #[test]
+    fn two_pairings_on_one_gateway_read_as_two_different_agents() {
+        let gateway = gateway_over(&[
+            (Some("agent-alpha"), "alpha's reason"),
+            (Some("agent-beta"), "beta's reason"),
+            (None, "kill switch engaged"),
+        ]);
+
+        let reasons = |agent: &str| -> Vec<String> {
+            events_of(
+                &gateway,
+                agent,
+                GetEventsParams {
+                    since_cursor: 0,
+                    limit: None,
+                },
+            )["events"]
+                .as_array()
+                .expect("array")
+                .iter()
+                .map(|e| e["payload"]["reason"].as_str().expect("reason").to_owned())
+                .collect()
+        };
+
+        assert_eq!(
+            reasons("agent-alpha"),
+            ["alpha's reason", "kill switch engaged"]
+        );
+        assert_eq!(
+            reasons("agent-beta"),
+            ["beta's reason", "kill switch engaged"]
+        );
+    }
+
     /// `docs/decisions.md` C6, at the surface an agent actually calls. The
     /// scope is enforced in `oppen-core`; this proves the gateway asks for the
     /// scoped read rather than the operator one.
-    #[tokio::test]
-    async fn an_agent_does_not_receive_another_agents_events() {
+    #[test]
+    fn an_agent_does_not_receive_another_agents_events() {
         let gateway = gateway_over(&[
             (Some("agent-alpha"), "mine"),
             (Some("agent-beta"), "secret strategy"),
@@ -1430,12 +1528,12 @@ mod tests {
         ]);
         let page = events_of(
             &gateway,
+            "agent-alpha",
             GetEventsParams {
                 since_cursor: 0,
                 limit: None,
             },
-        )
-        .await;
+        );
 
         let reasons: Vec<&str> = page["events"]
             .as_array()
@@ -1453,17 +1551,17 @@ mod tests {
     /// Item 18: a cursor the ledger cannot serve is explicit, never a page with
     /// a hole in it. A cursor past the head is what a mainnet cursor presented
     /// to a testnet file looks like (R4).
-    #[tokio::test]
-    async fn a_cursor_past_the_head_asks_for_a_resync_rather_than_an_empty_page() {
+    #[test]
+    fn a_cursor_past_the_head_asks_for_a_resync_rather_than_an_empty_page() {
         let gateway = gateway_over(&[(Some("agent-alpha"), "mine")]);
         let page = events_of(
             &gateway,
+            "agent-alpha",
             GetEventsParams {
                 since_cursor: 9_999,
                 limit: None,
             },
-        )
-        .await;
+        );
 
         assert_eq!(page["resync_required"], true);
         assert_eq!(page["events"].as_array().expect("array").len(), 0);
@@ -1472,8 +1570,8 @@ mod tests {
 
     /// The caller's page size is honoured, and the cursor it returns resumes
     /// exactly where the page stopped.
-    #[tokio::test]
-    async fn a_limit_bounds_the_page_and_the_cursor_resumes_from_it() {
+    #[test]
+    fn a_limit_bounds_the_page_and_the_cursor_resumes_from_it() {
         let gateway = gateway_over(&[
             (Some("agent-alpha"), "one"),
             (Some("agent-alpha"), "two"),
@@ -1481,23 +1579,23 @@ mod tests {
         ]);
         let first = events_of(
             &gateway,
+            "agent-alpha",
             GetEventsParams {
                 since_cursor: 0,
                 limit: Some(2),
             },
-        )
-        .await;
+        );
         assert_eq!(first["events"].as_array().expect("array").len(), 2);
         assert_eq!(first["next_cursor"], 2);
 
         let rest = events_of(
             &gateway,
+            "agent-alpha",
             GetEventsParams {
                 since_cursor: 2,
                 limit: Some(10),
             },
-        )
-        .await;
+        );
         let reasons: Vec<&str> = rest["events"]
             .as_array()
             .expect("array")

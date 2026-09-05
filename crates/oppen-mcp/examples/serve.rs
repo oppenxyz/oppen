@@ -9,9 +9,9 @@ use std::sync::{Arc, RwLock};
 
 use oppen_core::guardrail::{AgentId, GuardrailEngine, SqliteGuardrailStore};
 use oppen_core::keys::KeychainKeyStore;
-use oppen_core::ledger::{Ledger, LedgerAuditSink};
+use oppen_core::ledger::{EventViews, Ledger, LedgerAuditSink};
 use oppen_mcp::Network;
-use oppen_mcp::auth::TokenStore;
+use oppen_mcp::auth::{Binding, TokenStore};
 use oppen_mcp::server::{MCP_PATH, serve};
 use oppen_mcp::tools::Gateway;
 
@@ -33,9 +33,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|p| p.parse().ok())
         .unwrap_or(7433);
 
+    let account: oppen_hl::Address = std::env::var("OPPEN_TESTNET_USER")
+        .map_err(|_| "set OPPEN_TESTNET_USER (source ~/.oppen/testnet.env)")?
+        .parse()?;
+    let agent = AgentId::new("agent-alpha");
+
+    // Item 15's approve dialog, as a one-liner: name the agent, bind it to its
+    // container, then mint the token. There is no unbound token to mint.
     let mut store = TokenStore::new();
-    let issued = store.issue()?;
-    println!("pairing  {}", issued.id);
+    let issued = store.issue(Binding {
+        agent: agent.clone(),
+        account,
+    })?;
+    println!("pairing  {} -> {agent}", issued.id);
     println!("token    {}", issued.reveal());
     println!("url      http://127.0.0.1:{port}{MCP_PATH}");
     println!();
@@ -43,9 +53,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  --header \"Authorization: Bearer {}\"", issued.reveal());
     println!();
 
-    let account = std::env::var("OPPEN_TESTNET_USER")
-        .map_err(|_| "set OPPEN_TESTNET_USER (source ~/.oppen/testnet.env)")?
-        .parse()?;
     // Per-network database (R4): the ledger rowid is an agent's get_events
     // cursor, so a shared file would make two networks share cursor positions.
     let dir = std::path::PathBuf::from(
@@ -65,7 +72,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Network::Testnet,
     )?);
 
-    let agent = AgentId::new("agent-alpha");
     // D-c near-zero defaults: empty allowlist, $25 orders, $100 positions.
     // The first order is refused with the limit to raise named in the reason.
     let guardrails = engine.register_agent(&agent, None, now_ms())?;
@@ -73,9 +79,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("limits   {guardrails:?}");
     println!();
 
-    // The agent's own read-only slice of the ledger (D6, decisions.md C6).
-    let events = ledger.agent_view(agent.to_string());
-    let gateway = Gateway::new(Network::Testnet, account, agent, engine, events)?;
+    // One gateway serves every paired agent; each request resolves its own
+    // identity from the token (item 15).
+    let gateway = Gateway::new(Network::Testnet, engine, EventViews::new(ledger))?;
     serve(
         port,
         gateway,

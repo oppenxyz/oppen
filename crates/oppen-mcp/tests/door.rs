@@ -10,9 +10,9 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use oppen_core::guardrail::{AgentId, GuardrailEngine, SqliteGuardrailStore};
 use oppen_core::keys::KeychainKeyStore;
-use oppen_core::ledger::{Ledger, LedgerAuditSink};
+use oppen_core::ledger::{EventViews, Ledger, LedgerAuditSink};
 use oppen_mcp::Network;
-use oppen_mcp::auth::TokenStore;
+use oppen_mcp::auth::{Binding, TokenStore};
 use oppen_mcp::server::{MCP_PATH, router};
 use oppen_mcp::tools::Gateway;
 use std::sync::{Arc, RwLock};
@@ -21,6 +21,13 @@ use tower::ServiceExt;
 /// The funded testnet account these tests report on. No request in this file
 /// reaches the venue — every one is refused at the door or stops at
 /// `initialize` — so the address only has to parse.
+fn binding(agent: &str) -> Binding {
+    Binding {
+        agent: AgentId::new(agent),
+        account: account(),
+    }
+}
+
 fn account() -> oppen_hl::Address {
     "0xbf829199c1ae7f0caf21fb6fc45e10edff25b7d2"
         .parse()
@@ -30,7 +37,7 @@ fn account() -> oppen_hl::Address {
 /// A router plus a token that authenticates against it.
 fn fixture() -> (axum::Router, String) {
     let mut store = TokenStore::new();
-    let issued = store.issue().expect("entropy");
+    let issued = store.issue(binding("agent-alpha")).expect("entropy");
     let token = issued.reveal().to_owned();
     (router(gateway(), Arc::new(RwLock::new(store))), token)
 }
@@ -56,14 +63,7 @@ fn gateway() -> Gateway {
     // The tempdir must outlive the gateway; leaking the handle is fine in a
     // test process that is about to exit.
     std::mem::forget(dir);
-    Gateway::new(
-        Network::Testnet,
-        account(),
-        AgentId::new("agent-alpha"),
-        engine,
-        ledger.agent_view("agent-alpha"),
-    )
-    .expect("gateway")
+    Gateway::new(Network::Testnet, engine, EventViews::new(ledger)).expect("gateway")
 }
 
 /// A syntactically valid MCP initialize call, so that anything reaching the
@@ -164,7 +164,7 @@ async fn a_paired_agent_reaches_the_transport() {
 #[tokio::test]
 async fn a_revoked_pairing_is_refused_at_the_door() {
     let mut store = TokenStore::new();
-    let issued = store.issue().expect("entropy");
+    let issued = store.issue(binding("agent-alpha")).expect("entropy");
     let token = issued.reveal().to_owned();
     store.revoke(issued.id);
 

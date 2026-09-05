@@ -13,6 +13,7 @@ oppen-core = { path = "../oppen-core" }
 oppen-hl = { path = "../oppen-hl" }
 axum = "0.8"
 getrandom = "0.2"
+http = "1"
 rmcp = { version = "3", features = ["server", "transport-streamable-http-server"] }
 rust_decimal = { version = "1.43", default-features = false, features = ["std", "serde-with-str"] }
 schemars = "1"

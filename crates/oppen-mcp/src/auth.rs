@@ -17,6 +17,9 @@
 use std::collections::HashMap;
 use std::fmt;
 
+use oppen_core::guardrail::AgentId;
+use oppen_hl::Address;
+
 use sha3::{Digest, Sha3_256};
 use subtle::ConstantTimeEq;
 use tokio::sync::watch;
@@ -35,6 +38,21 @@ impl fmt::Display for PairingId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "pairing-{}", self.0)
     }
+}
+
+/// What a pairing token names (`docs/spec.md` item 15).
+///
+/// A token is not an anonymous key to the gateway: it names one agent, bound
+/// to one venue account (D1 as revised — one container per agent). Every tool
+/// call resolves this from the token presented, so two paired agents on the
+/// same gateway act as themselves, under their own guardrails, and see only
+/// their own events (`docs/decisions.md` C6). Assigning the guardrails is the
+/// operator's half of the approve dialog and lives on the engine; this is the
+/// identity those guardrails are keyed by.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Binding {
+    pub agent: AgentId,
+    pub account: Address,
 }
 
 /// A freshly minted token, returned once at pairing time and never recoverable
@@ -94,6 +112,10 @@ struct Record {
     /// Flips to `true` on revoke. Every live session for this pairing holds a
     /// receiver.
     revoked_tx: watch::Sender<bool>,
+    /// Who this token speaks for. Fixed at pairing: rebinding a live token to
+    /// a different agent would move an agent's authority without the operator
+    /// re-approving it, so a new binding is a new pairing.
+    binding: Binding,
 }
 
 /// The set of pairings the gateway will accept, and the authority that revokes
@@ -109,10 +131,15 @@ impl TokenStore {
         Self::default()
     }
 
-    /// Mint a pairing. The caller shows [`IssuedToken::reveal`] once and then
-    /// drops it; from here the store can only recognise the token, never
-    /// reproduce it.
-    pub fn issue(&mut self) -> Result<IssuedToken, EntropyUnavailable> {
+    /// Mint a pairing for one named agent on one account.
+    ///
+    /// The caller shows [`IssuedToken::reveal`] once and then drops it; from
+    /// here the store can only recognise the token, never reproduce it. Item
+    /// 15's approve dialog is what calls this: it names the agent, binds the
+    /// container, and assigns the guardrails on the engine before the token
+    /// exists. There is no unbound token — default-deny means an agent oppen
+    /// has not been told about has no credential to present.
+    pub fn issue(&mut self, binding: Binding) -> Result<IssuedToken, EntropyUnavailable> {
         let mut raw = Zeroizing::new([0u8; TOKEN_BYTES]);
         getrandom::getrandom(raw.as_mut()).map_err(|e| EntropyUnavailable(e.to_string()))?;
         let secret = Zeroizing::new(hex_of(raw.as_ref()));
@@ -126,6 +153,7 @@ impl TokenStore {
             Record {
                 digest: digest_of(secret.as_bytes()),
                 revoked_tx,
+                binding,
             },
         );
 
@@ -154,6 +182,7 @@ impl TokenStore {
         }
         Ok(Session {
             id,
+            binding: record.binding.clone(),
             revoked: record.revoked_tx.subscribe(),
         })
     }
@@ -186,6 +215,8 @@ impl TokenStore {
 #[derive(Debug)]
 pub struct Session {
     pub id: PairingId,
+    /// Who the presented token names. Every tool acts as this agent.
+    pub binding: Binding,
     revoked: watch::Receiver<bool>,
 }
 
@@ -223,10 +254,21 @@ fn hex_of(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    /// A binding for a named agent. The pairing under test is about the token,
+    /// not the identity, so every test that does not care uses this.
+    fn binding(agent: &str) -> Binding {
+        Binding {
+            agent: AgentId::new(agent),
+            account: "0xbf829199c1ae7f0caf21fb6fc45e10edff25b7d2"
+                .parse()
+                .expect("address"),
+        }
+    }
+
     #[test]
     fn a_minted_token_authenticates_and_names_its_pairing() {
         let mut store = TokenStore::new();
-        let issued = store.issue().expect("entropy");
+        let issued = store.issue(binding("agent-alpha")).expect("entropy");
         let session = store.authenticate(issued.reveal()).expect("authenticates");
         assert_eq!(session.id, issued.id);
     }
@@ -240,10 +282,47 @@ mod tests {
         assert_eq!(hex_of(&digest_of(b"")), expected);
     }
 
+    /// Item 15: a token names one agent on one account, and authenticating
+    /// hands that back. Everything downstream acts as whoever this says.
+    #[test]
+    fn authenticating_returns_the_binding_the_pairing_was_minted_with() {
+        let mut store = TokenStore::new();
+        let issued = store.issue(binding("agent-alpha")).expect("entropy");
+        let session = store.authenticate(issued.reveal()).expect("authenticates");
+        assert_eq!(session.binding, binding("agent-alpha"));
+    }
+
+    /// Two pairings are two identities, not two keys to the same one.
+    #[test]
+    fn two_pairings_carry_their_own_agents() {
+        let mut store = TokenStore::new();
+        let alpha = store.issue(binding("agent-alpha")).expect("entropy");
+        let beta = store.issue(binding("agent-beta")).expect("entropy");
+
+        let a = store.authenticate(alpha.reveal()).expect("alpha");
+        let b = store.authenticate(beta.reveal()).expect("beta");
+        assert_eq!(a.binding.agent.as_str(), "agent-alpha");
+        assert_eq!(b.binding.agent.as_str(), "agent-beta");
+        assert_ne!(a.id, b.id);
+
+        // Revoking one leaves the other acting as itself.
+        store.revoke(alpha.id);
+        assert!(store.authenticate(alpha.reveal()).is_err());
+        assert_eq!(
+            store
+                .authenticate(beta.reveal())
+                .expect("beta still paired")
+                .binding
+                .agent
+                .as_str(),
+            "agent-beta"
+        );
+    }
+
     #[test]
     fn the_store_does_not_hold_the_token() {
         let mut store = TokenStore::new();
-        let issued = store.issue().expect("entropy");
+        let issued = store.issue(binding("agent-alpha")).expect("entropy");
         let secret = issued.reveal().to_owned();
         let stored = store.records.values().next().expect("one record").digest;
 
@@ -263,7 +342,7 @@ mod tests {
     #[test]
     fn a_wrong_token_is_unauthenticated() {
         let mut store = TokenStore::new();
-        let _issued = store.issue().expect("entropy");
+        let _issued = store.issue(binding("agent-alpha")).expect("entropy");
         assert_eq!(
             store.authenticate(&"0".repeat(64)).err(),
             Some(AuthError::Unauthenticated)
@@ -273,7 +352,7 @@ mod tests {
     #[test]
     fn an_empty_and_a_short_token_do_not_panic() {
         let mut store = TokenStore::new();
-        let _issued = store.issue().expect("entropy");
+        let _issued = store.issue(binding("agent-alpha")).expect("entropy");
         for candidate in ["", "0x", "deadbeef", &"f".repeat(200)] {
             assert!(
                 store.authenticate(candidate).is_err(),
@@ -285,7 +364,7 @@ mod tests {
     #[test]
     fn a_revoked_token_stops_authenticating() {
         let mut store = TokenStore::new();
-        let issued = store.issue().expect("entropy");
+        let issued = store.issue(binding("agent-alpha")).expect("entropy");
         assert!(store.authenticate(issued.reveal()).is_ok());
         assert!(
             store.revoke(issued.id),
@@ -305,7 +384,7 @@ mod tests {
     #[tokio::test]
     async fn revocation_closes_a_live_session() {
         let mut store = TokenStore::new();
-        let issued = store.issue().expect("entropy");
+        let issued = store.issue(binding("agent-alpha")).expect("entropy");
         let mut session = store.authenticate(issued.reveal()).expect("authenticates");
 
         // The session is open: `closed()` must not resolve yet.
@@ -326,8 +405,8 @@ mod tests {
     #[test]
     fn two_pairings_get_distinct_ids_and_distinct_tokens() {
         let mut store = TokenStore::new();
-        let a = store.issue().expect("entropy");
-        let b = store.issue().expect("entropy");
+        let a = store.issue(binding("agent-alpha")).expect("entropy");
+        let b = store.issue(binding("agent-alpha")).expect("entropy");
         assert_ne!(a.id, b.id);
         assert_ne!(a.reveal(), b.reveal());
         assert_eq!(store.authenticate(a.reveal()).expect("a").id, a.id);
@@ -337,8 +416,8 @@ mod tests {
     #[test]
     fn revoking_one_pairing_leaves_the_other_working() {
         let mut store = TokenStore::new();
-        let a = store.issue().expect("entropy");
-        let b = store.issue().expect("entropy");
+        let a = store.issue(binding("agent-alpha")).expect("entropy");
+        let b = store.issue(binding("agent-alpha")).expect("entropy");
         store.revoke(a.id);
         assert!(store.authenticate(a.reveal()).is_err());
         assert!(
@@ -350,7 +429,7 @@ mod tests {
     #[test]
     fn the_debug_impl_redacts_the_secret() {
         let mut store = TokenStore::new();
-        let issued = store.issue().expect("entropy");
+        let issued = store.issue(binding("agent-alpha")).expect("entropy");
         let rendered = format!("{issued:?}");
         assert!(
             !rendered.contains(issued.reveal()),

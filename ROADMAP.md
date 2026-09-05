@@ -61,7 +61,8 @@ Status as of 2026-09-05: P0 and the P1 code are on `main`; the P1 gate is waitin
 ### P4 · MCP gateway
 
 - [x] Streamable HTTP on loopback only: `Origin`/`Host` validation, bearer on every request, constant-time compare, revocation closes live sessions [14, D2] — PR #11, #12. The on/off toggle is an operator surface and waits on P5
-- [ ] Default-deny pairing: approve dialog names the agent, binds a container, assigns guardrails; new agents start in approval mode with tiny caps [15]
+- [x] Default-deny pairing in the crates: a token binds one named agent to one container, and every tool resolves its identity from the token presented [15] — [decisions.md](docs/decisions.md) C9–C10
+- [ ] The approve dialog itself, and assigning guardrails from it [15] — operator surface, waits on P5
 - [x] `get_state`: versioned deterministic envelope, staleness flags, positions with liq distance, orders, balances [16] — PR #13. Time-since-last-action, funding, guardrail utilization, pending proposals, kill state and rate budget are not in the envelope yet
 - [x] `get_meta` [17] — PR #12
 - [x] `get_events(since_cursor)` with `resync_required` [18] — scoped to the calling agent, [decisions.md](docs/decisions.md) C6
