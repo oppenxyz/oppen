@@ -8,10 +8,13 @@
 use std::sync::{Arc, RwLock};
 
 use oppen_core::feed::FeedSession;
+use oppen_core::feed::pump::FeedPump;
 use oppen_core::guardrail::{AgentId, GuardrailEngine, SqliteGuardrailStore};
 use oppen_core::journal::Journal;
 use oppen_core::keys::KeychainKeyStore;
 use oppen_core::ledger::{EventViews, Ledger, LedgerAuditSink};
+use oppen_core::reconcile::VenueSource;
+use oppen_hl::ws::{Subscription, WsPool, WsPoolConfig};
 use oppen_mcp::Network;
 use oppen_mcp::auth::{Binding, TokenStore};
 use oppen_mcp::server::{MCP_PATH, serve};
@@ -85,11 +88,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // identity from the token (item 15).
     // Item 21's scratchpad, per network for the same reason the ledger is.
     let journal = Arc::new(Journal::open(dir.join("journal-testnet.db"))?);
-    // Nothing pumps this yet: no socket is running, so it reports never
-    // connected and unreconciled, and `place` refuses exactly as before. What
-    // changed is that those are now the session's answers rather than
-    // constants — wiring a pool to it is what flips them.
+
+    // The socket, and the thing that folds it into the session (item 9). The
+    // pool must outlive the pump: dropping it closes every connection, which
+    // ends the event stream and returns `FeedPump::run`.
     let feed = Arc::new(FeedSession::new());
+    let (pool, mut events) = WsPool::new(WsPoolConfig {
+        network: Network::Testnet,
+        ..WsPoolConfig::default()
+    })?;
+    // The two account channels the reconciler can close. Market data is
+    // subscribed per request by the tools that need it.
+    pool.subscribe(Subscription::UserFills { user: account })?;
+    pool.subscribe(Subscription::OrderUpdates { user: account })?;
+    let pump_ledger = Arc::clone(&ledger);
+    let pump_feed = Arc::clone(&feed);
+    tokio::spawn(async move {
+        let source = match VenueSource::new(Network::Testnet) {
+            Ok(source) => source,
+            Err(error) => return tracing::error!(%error, "no venue source; feed not pumped"),
+        };
+        match FeedPump::new(&pump_feed, &pump_ledger, account, source) {
+            Ok(pump) => pump.run(&mut events).await,
+            Err(error) => tracing::error!(%error, "no feed pump"),
+        }
+    });
     let gateway = Gateway::new(
         Network::Testnet,
         engine,
@@ -97,6 +120,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         journal,
         feed,
     )?;
+    // Held to the end of `main`: the pool's `Drop` stops every connection.
+    let _pool = pool;
     serve(
         port,
         gateway,

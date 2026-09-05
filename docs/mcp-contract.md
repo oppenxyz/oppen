@@ -84,6 +84,8 @@ Per-symbol trading rules. Read-only. Returns an array sorted by `asset_id`: `sym
 
 The account now: `contract_version`, `network`, `address`, `as_of_ms`, `feed_age_ms`, `feed`, `balances`, `positions` (with distance to liquidation), `orders`. If `feed` is not `live` the data is stale and execution fails closed.
 
+**Two moments where that is expected rather than broken.** oppen walks a catch-up window at startup and again after every socket drop, and until that window returns the account is unreconciled and every order is refused — the window may hold fills nothing has seen, and sizing against a position oppen has mis-stated is the failure this exists to prevent. Both are seconds, not minutes. Poll `get_state` rather than retrying the order: the refusal names the condition, and it clears on its own.
+
 ### `get_events(since_cursor?, limit?)`
 
 The durable record. Returns `{contract_version, events[], next_cursor, resync_required, head_seq}`; pass `next_cursor` back to continue. `limit` is clamped to the ledger's page cap (1000) rather than refused.
