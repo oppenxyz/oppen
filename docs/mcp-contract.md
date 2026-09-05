@@ -15,7 +15,7 @@ This document is the normative reference for every tool the gateway exposes. `do
 
 `get_state` · `get_meta` · `get_events` · `get_features` · `preflight` · `place` · `cancel` · `cancel_all` · `close_position` · `get_order_status` · `remember` · `recall` · `set_alert`
 
-Shipped so far: `get_meta`, `get_state`, `place`, `cancel`, `cancel_all`, `close_position`, `get_order_status`. The rest are unimplemented and are not described below — a schema for a tool that does not exist is a promise nothing keeps.
+Shipped so far: `get_meta`, `get_state`, `get_events`, `place`, `cancel`, `cancel_all`, `close_position`, `get_order_status`. The rest are unimplemented and are not described below — a schema for a tool that does not exist is a promise nothing keeps.
 
 ## The result envelope
 
@@ -77,6 +77,18 @@ Per-symbol trading rules. Read-only. Returns an array sorted by `asset_id`: `sym
 ### `get_state()`
 
 The account now: `contract_version`, `network`, `address`, `as_of_ms`, `feed_age_ms`, `feed`, `balances`, `positions` (with distance to liquidation), `orders`. If `feed` is not `live` the data is stale and execution fails closed.
+
+### `get_events(since_cursor?, limit?)`
+
+The durable record. Returns `{contract_version, events[], next_cursor, resync_required, head_seq}`; pass `next_cursor` back to continue. `limit` is clamped to the ledger's page cap (1000) rather than refused.
+
+Each event carries `seq`, `ts_ms`, `kind`, `agent_id`, `payload`, `payload_hash`, `prev_hash`, `hash`, and the snapshot reference where one exists. `kind` is item 18's taxonomy: `order_intent`, `agent_decision`, `refusal`, `fill`, `order_state_change`, `operator_action`, `approval_decision`, `kill_switch_changed`, `guardrail_trip`, `ws_disconnected`, `ws_reconnected`, `alert`, `agent_wallet_expiry_warning`, `payload_redacted`.
+
+**`resync_required: true` means the cursor cannot be served** — it is older than what the ledger retains, or ahead of the head, which is what a mainnet cursor presented to a testnet file looks like (R4). Discard local state and re-read from `get_state`. Never treat it as an empty gap: item 18 makes this explicit precisely so a hole is never silent.
+
+**Scope.** An agent reads its own events plus the account-wide ones no agent owns — the kill switch, feed drops, alerts. Another agent's intents and `reason` strings are not returned (`docs/decisions.md` C6). `next_cursor` still advances past rows that were filtered out, so a page can be empty without the cursor stalling; compare it against `head_seq` to know how far behind you are.
+
+Operator surfaces read the whole chain unscoped — the activity stream and the audit export are the human's view.
 
 ### `place(symbol, is_buy, size, limit_px, reason, reduce_only?, cloid?)`
 

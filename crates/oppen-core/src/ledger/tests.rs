@@ -1648,18 +1648,145 @@ fn the_canonical_form_is_sorted_compact_and_integer_only() {
 
 // --- the surface an agent may hold ------------------------------------------
 
+/// Append one event owned by `agent`, or by nobody when `agent` is `None`.
+fn append_for(ledger: &Ledger, agent: Option<&str>, n: u64) -> u64 {
+    ledger
+        .append(&NewEvent {
+            // `append` refuses OrderIntent and Fill; those have their own
+            // recording paths. AgentDecision is the agent-owned kind this can use.
+            kind: EventKind::AgentDecision,
+            ts_ms: 1_756_000_000_000 + n as i64,
+            agent_id: agent,
+            payload: &payload(n),
+            snapshot: None,
+        })
+        .expect("append")
+        .seq
+}
+
 #[test]
 fn the_agent_view_reads_events_and_exposes_nothing_else() {
     let dir = TempDir::new().expect("tempdir");
-    let ledger = open(&dir, Network::Testnet);
+    let ledger = Arc::new(open(&dir, Network::Testnet));
     fill(&ledger, 4, 66);
 
     // AGENTS.md invariant 3. `oppen-mcp` is handed one of these, so redact,
     // upsert_sub_account, put_snapshot, prune and the gap surface are not
     // spellable from an agent tool — a compile error rather than a review note.
-    let view = ledger.agent_view();
-    assert_eq!(view.get_events(0, 10).expect("page").events.len(), 4);
-    assert_eq!(view.event(2).expect("event").expect("present").seq, 2);
+    let view = ledger.agent_view("agent-0");
+    assert_eq!(view.agent_id(), "agent-0");
+    // The operator surface still sees every row.
+    assert_eq!(ledger.get_events(0, 10).expect("page").events.len(), 4);
+}
+
+/// `docs/decisions.md` C6. One agent's intents and reason strings are not
+/// another agent's to read, and the ledger is shared per network (R4).
+#[test]
+fn an_agent_sees_its_own_events_and_the_ownerless_ones_but_not_another_agents() {
+    let dir = TempDir::new().expect("tempdir");
+    let ledger = Arc::new(open(&dir, Network::Testnet));
+    let mine = append_for(&ledger, Some("agent-a"), 1);
+    let theirs = append_for(&ledger, Some("agent-b"), 2);
+    let shared = append_for(&ledger, None, 3);
+
+    let view = ledger.agent_view("agent-a");
+    let seqs: Vec<u64> = view
+        .get_events(0, 10)
+        .expect("page")
+        .events
+        .iter()
+        .map(|event| event.seq)
+        .collect();
+    assert_eq!(seqs, vec![mine, shared], "expected own + ownerless only");
+    assert!(!seqs.contains(&theirs));
+}
+
+/// The kill switch, a feed dropping and an alert belong to no agent, and item
+/// 18 promises every agent that taxonomy. Scoping must not drop it.
+#[test]
+fn account_wide_events_reach_every_agent() {
+    let dir = TempDir::new().expect("tempdir");
+    let ledger = Arc::new(open(&dir, Network::Testnet));
+    let shared = append_for(&ledger, None, 1);
+
+    for agent in ["agent-a", "agent-b"] {
+        let events = ledger.agent_view(agent).get_events(0, 10).expect("page");
+        assert_eq!(events.events.len(), 1, "{agent} lost the ownerless event");
+        assert_eq!(events.events[0].seq, shared);
+    }
+}
+
+/// The cursor has to skip rows that were scanned and filtered out. Without it
+/// an agent polling a ledger full of somebody else's events sits at the same
+/// cursor forever and reports itself permanently behind the head.
+#[test]
+fn the_cursor_advances_past_another_agents_events() {
+    let dir = TempDir::new().expect("tempdir");
+    let ledger = Arc::new(open(&dir, Network::Testnet));
+    for n in 0..5 {
+        append_for(&ledger, Some("agent-b"), n);
+    }
+
+    let view = ledger.agent_view("agent-a");
+    let page = view.get_events(0, 10).expect("page");
+    assert!(page.events.is_empty(), "none of those are agent-a's");
+    assert!(!page.resync_required, "a filtered page is not a hole");
+    assert_eq!(
+        page.next_cursor, page.head_seq,
+        "the cursor must reach the head, not stall at 0"
+    );
+
+    // And a later event for this agent is still delivered from that cursor.
+    let mine = append_for(&ledger, Some("agent-a"), 9);
+    let next = view.get_events(page.next_cursor, 10).expect("page");
+    assert_eq!(
+        next.events.iter().map(|e| e.seq).collect::<Vec<_>>(),
+        vec![mine]
+    );
+}
+
+/// A full page stops at the last row returned, because nothing past it was
+/// looked at. Advancing to the head there would skip unread events.
+#[test]
+fn a_full_page_does_not_advance_the_cursor_past_what_it_returned() {
+    let dir = TempDir::new().expect("tempdir");
+    let ledger = Arc::new(open(&dir, Network::Testnet));
+    let seqs: Vec<u64> = (0..5).map(|n| append_for(&ledger, Some("a"), n)).collect();
+
+    let view = ledger.agent_view("a");
+    let page = view.get_events(0, 2).expect("page");
+    assert_eq!(page.events.len(), 2);
+    assert_eq!(page.next_cursor, seqs[1]);
+    assert!(page.next_cursor < page.head_seq);
+
+    let rest = view.get_events(page.next_cursor, 10).expect("page");
+    assert_eq!(
+        rest.events.iter().map(|e| e.seq).collect::<Vec<_>>(),
+        seqs[2..].to_vec(),
+        "no event may be skipped across the page boundary"
+    );
+}
+
+/// Reading one event by seq is scoped the same way, and answers `None` rather
+/// than an error — the two are indistinguishable to a caller who may not know
+/// the row exists, and saying which would leak what the scope withholds.
+#[test]
+fn reading_one_event_by_seq_is_scoped_the_same_way() {
+    let dir = TempDir::new().expect("tempdir");
+    let ledger = Arc::new(open(&dir, Network::Testnet));
+    let mine = append_for(&ledger, Some("agent-a"), 1);
+    let theirs = append_for(&ledger, Some("agent-b"), 2);
+    let shared = append_for(&ledger, None, 3);
+
+    let view = ledger.agent_view("agent-a");
+    assert_eq!(view.event(mine).expect("read").expect("present").seq, mine);
+    assert_eq!(
+        view.event(shared).expect("read").expect("present").seq,
+        shared
+    );
+    assert!(view.event(theirs).expect("read").is_none());
+    // The operator surface is unscoped and still reads it.
+    assert!(ledger.event(theirs).expect("read").is_some());
 }
 
 /// The forged-tail attack the confirmation pass found still open.

@@ -60,7 +60,7 @@ mod verify;
 mod tests;
 
 use std::path::Path;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params};
@@ -720,7 +720,7 @@ impl Ledger {
         Ok(Anchor { seq, hash })
     }
 
-    /// The read-only surface an agent may hold.
+    /// The read-only surface an agent may hold, scoped to that agent.
     ///
     /// `AGENTS.md` invariant 3: no agent-reachable path modifies guardrails, the
     /// approval setting, the kill switch or the agent registry. `docs/spec.md`
@@ -729,8 +729,16 @@ impl Ledger {
     /// [`Ledger::redact`] or [`Ledger::upsert_sub_account`]. Hand `oppen-mcp` an
     /// [`AgentView`] instead and the invariant is a type error rather than a
     /// review finding.
-    pub fn agent_view(&self) -> AgentView<'_> {
-        AgentView(self)
+    ///
+    /// Takes `&Arc<Self>` and the view owns its handle: `oppen-mcp`'s gateway is
+    /// built once and cloned per session, so it cannot hold a borrow, and giving
+    /// it an `Arc<Ledger>` to borrow from per call would put the operator
+    /// surface back within reach — the exact reach this type removes.
+    pub fn agent_view(self: &Arc<Self>, agent_id: impl Into<String>) -> AgentView {
+        AgentView {
+            ledger: Arc::clone(self),
+            agent_id: agent_id.into(),
+        }
     }
 
     /// Append one event and return the seq it was assigned.
@@ -974,6 +982,25 @@ impl Ledger {
     /// mainnet cursor presented to a testnet file looks like, and R4 would
     /// rather refuse than serve it.
     pub fn get_events(&self, since_seq: u64, limit: usize) -> Result<EventPage> {
+        self.page(None, since_seq, limit)
+    }
+
+    /// A page of the events one agent may see (`docs/decisions.md` C6).
+    ///
+    /// The agent's own rows, plus the account-wide ones no agent owns — a kill
+    /// switch, a feed dropping, an alert. Item 18's taxonomy still arrives
+    /// whole; what does not arrive is another agent's intents and reason
+    /// strings.
+    pub(crate) fn get_events_for_agent(
+        &self,
+        agent_id: &str,
+        since_seq: u64,
+        limit: usize,
+    ) -> Result<EventPage> {
+        self.page(Some(agent_id), since_seq, limit)
+    }
+
+    fn page(&self, scope: Option<&str>, since_seq: u64, limit: usize) -> Result<EventPage> {
         let guard = self.lock()?;
         let head_seq = head(&guard)?.0;
 
@@ -998,18 +1025,38 @@ impl Ledger {
         }
 
         let limit = limit.min(MAX_PAGE);
+        let since = i64::try_from(since_seq).map_err(|_| LedgerError::SeqOutOfRange)?;
+        let capped = i64::try_from(limit).map_err(|_| LedgerError::SeqOutOfRange)?;
+
+        // `events_agent (agent_id, seq)` covers the scoped form; the unscoped
+        // one walks the primary key. Neither reads a row it will not return.
         let mut statement = guard.prepare(&format!(
-            "SELECT {SELECT_EVENT_COLUMNS} FROM events WHERE seq > ?1 ORDER BY seq ASC LIMIT ?2"
+            "SELECT {SELECT_EVENT_COLUMNS} FROM events WHERE seq > ?1{} ORDER BY seq ASC LIMIT ?2",
+            match scope {
+                Some(_) => " AND (agent_id = ?3 OR agent_id IS NULL)",
+                None => "",
+            }
         ))?;
-        let mut rows = statement.query(params![
-            i64::try_from(since_seq).map_err(|_| LedgerError::SeqOutOfRange)?,
-            i64::try_from(limit).map_err(|_| LedgerError::SeqOutOfRange)?,
-        ])?;
+        let mut rows = match scope {
+            Some(agent_id) => statement.query(params![since, capped, agent_id])?,
+            None => statement.query(params![since, capped])?,
+        };
         let mut events = Vec::new();
         while let Some(row) = rows.next()? {
             events.push(event_from_row(row)?);
         }
-        let next_cursor = events.last().map_or(since_seq, |event| event.seq);
+
+        // A short page means the scan reached the head, so everything up to it
+        // has been considered and the cursor may skip whatever was filtered
+        // out. Without this an agent polling a ledger of somebody else's events
+        // would sit at the same cursor forever, re-scanning the same rows and
+        // reporting itself permanently behind `head_seq`. A full page stops at
+        // the last row returned, because rows beyond it were never looked at.
+        let next_cursor = if events.len() == limit {
+            events.last().map_or(since_seq, |event| event.seq)
+        } else {
+            head_seq
+        };
         Ok(EventPage {
             events,
             next_cursor,
@@ -1525,18 +1572,39 @@ impl Ledger {
 /// one of these and never a `&Ledger`: reading events is all this type can
 /// express, and the invariant becomes a compile error instead of a thing to
 /// remember in review. Operator-only Tauri commands keep the `&Ledger`.
-#[derive(Debug, Clone, Copy)]
-pub struct AgentView<'a>(&'a Ledger);
+#[derive(Debug, Clone)]
+pub struct AgentView {
+    ledger: Arc<Ledger>,
+    agent_id: String,
+}
 
-impl AgentView<'_> {
-    /// Read a page of events after `since_seq`. See [`Ledger::get_events`].
+impl AgentView {
+    /// Read a page of the events this agent may see, after `since_seq`.
+    ///
+    /// Scoped: this agent's own rows plus the account-wide ones no agent owns.
+    /// See [`Ledger::get_events_for_agent`] and `docs/decisions.md` C6.
     pub fn get_events(&self, since_seq: u64, limit: usize) -> Result<EventPage> {
-        self.0.get_events(since_seq, limit)
+        self.ledger
+            .get_events_for_agent(&self.agent_id, since_seq, limit)
     }
 
-    /// Fetch one event by seq. See [`Ledger::event`].
+    /// Fetch one event by seq, or `None` when it is not this agent's to read.
+    ///
+    /// An event that exists but belongs to another agent is `None` rather than
+    /// an error: the two are indistinguishable to a caller that may not know it
+    /// exists, and saying which would leak the thing the scope withholds.
     pub fn event(&self, seq: u64) -> Result<Option<Event>> {
-        self.0.event(seq)
+        Ok(self.ledger.event(seq)?.filter(|event| {
+            event
+                .agent_id
+                .as_ref()
+                .is_none_or(|owner| *owner == self.agent_id)
+        }))
+    }
+
+    /// The agent this view speaks for.
+    pub fn agent_id(&self) -> &str {
+        &self.agent_id
     }
 }
 

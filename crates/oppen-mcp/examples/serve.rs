@@ -73,7 +73,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("limits   {guardrails:?}");
     println!();
 
-    let gateway = Gateway::new(Network::Testnet, account, agent, engine)?;
+    // The agent's own read-only slice of the ledger (D6, decisions.md C6).
+    let events = ledger.agent_view(agent.to_string());
+    let gateway = Gateway::new(Network::Testnet, account, agent, engine, events)?;
     serve(
         port,
         gateway,
