@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use oppen_core::guardrail::AgentId;
 use oppen_core::guardrail::{Cleared, FeedQuality, GuardrailEngine, MarketRef, OrderIntent};
+use oppen_core::ledger::AgentView;
 use oppen_core::state::{
     AccountState, VenueReadings, assemble, exposure_from, realized_pnl_since, utc_day_start_ms,
 };
@@ -57,6 +58,11 @@ struct GatewayInner {
     engine: Arc<GuardrailEngine>,
     exchange: ExchangeClient,
     nonces: NonceAllocator,
+    /// The agent's read-only slice of the one ledger (`docs/spec.md` D6).
+    /// An [`AgentView`] and never a `Ledger`: `redact`, `upsert_sub_account`
+    /// and the gap surface are not spellable from here, so `AGENTS.md`
+    /// invariant 3 is a compile error rather than a review note.
+    events: AgentView,
 }
 
 /// The inputs `GuardrailEngine::evaluate` needs, gathered once per call.
@@ -130,6 +136,19 @@ pub struct ClosePositionParams {
     pub reason: String,
 }
 
+/// What `get_events` takes.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct GetEventsParams {
+    /// The cursor from the previous call. Absent or 0 starts at the beginning
+    /// of what the ledger still retains.
+    #[serde(default)]
+    pub since_cursor: u64,
+    /// How many events at most. Absent takes the ledger's page cap, and a
+    /// larger value is clamped to it rather than refused.
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
 /// What `get_order_status` takes.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct OrderStatusParams {
@@ -175,6 +194,7 @@ impl Gateway {
         account: Address,
         agent: AgentId,
         engine: Arc<GuardrailEngine>,
+        events: AgentView,
     ) -> Result<Self, oppen_hl::Error> {
         Ok(Self {
             inner: Arc::new(GatewayInner {
@@ -185,6 +205,7 @@ impl Gateway {
                 engine,
                 exchange: ExchangeClient::new(network)?,
                 nonces: NonceAllocator::new(),
+                events,
             }),
         })
     }
@@ -531,6 +552,43 @@ impl Gateway {
         let cloid = intent.cloid.clone();
         let response = self.submit(cleared, cloid.as_ref(), now_ms).await?;
         Ok(order_outcome(response, cloid.map(|c| c.as_str().to_owned()))?.into_result())
+    }
+
+    /// `get_events` — the durable record (`docs/spec.md` item 18, D6).
+    #[tool(
+        description = "Events since a cursor: your orders, fills, refusals and guardrail trips, \
+                       plus account-wide ones like the kill switch and feed drops. Pass \
+                       next_cursor back to continue. If resync_required is true your cursor is \
+                       too old or from another chain — discard local state and re-read from \
+                       get_state, never assume the gap was empty."
+    )]
+    async fn get_events(
+        &self,
+        Parameters(params): Parameters<GetEventsParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        // The ledger clamps to its own page cap, so a caller asking for more
+        // gets the cap rather than a refusal — the cursor makes a short page
+        // correct either way.
+        let limit = params.limit.unwrap_or(oppen_core::ledger::MAX_PAGE);
+        let page = self
+            .inner
+            .events
+            .get_events(params.since_cursor, limit)
+            .map_err(|e| ToolError::unavailable("ledger", e))?;
+
+        // `EventPage` is already the wire shape, in declaration order. The
+        // envelope adds the version and nothing else, so there is one
+        // serialization of one page (`AGENTS.md` invariant 6).
+        let body = serde_json::json!({
+            "contract_version": 0,
+            "events": page.events,
+            "next_cursor": page.next_cursor,
+            "resync_required": page.resync_required,
+            "head_seq": page.head_seq,
+        });
+        Ok(CallToolResult::success(vec![ContentBlock::text(
+            body.to_string(),
+        )]))
     }
 
     /// `get_order_status` — the reconcile after a timeout
@@ -1154,6 +1212,188 @@ mod tests {
             a_cloid(),
         );
         assert_eq!(intent.reason, "risk off");
+    }
+
+    /// A gateway over a throwaway ledger, seeded with `events`.
+    ///
+    /// `get_events` reads only the ledger, so this touches no venue and signs
+    /// nothing — which is what makes the real envelope testable here rather
+    /// than only over a live socket.
+    fn gateway_over(events: &[(Option<&str>, &str)]) -> Gateway {
+        use oppen_core::guardrail::{GuardrailEngine, SqliteGuardrailStore};
+        use oppen_core::keys::KeychainKeyStore;
+        use oppen_core::ledger::{EventKind, Ledger, LedgerAuditSink, NewEvent};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ledger = std::sync::Arc::new(
+            Ledger::open_at(&dir.path().join("testnet.db"), Network::Testnet).expect("ledger"),
+        );
+        for (n, (agent, reason)) in events.iter().enumerate() {
+            ledger
+                .append(&NewEvent {
+                    // `append` refuses OrderIntent and Fill; those have their
+                    // own recording paths.
+                    kind: EventKind::AgentDecision,
+                    ts_ms: 1_756_000_000_000 + n as i64,
+                    agent_id: *agent,
+                    payload: &serde_json::json!({ "reason": reason }),
+                    snapshot: None,
+                })
+                .expect("append");
+        }
+        let engine = std::sync::Arc::new(
+            GuardrailEngine::new(
+                std::sync::Arc::new(
+                    SqliteGuardrailStore::open(dir.path().join("guardrails.db")).expect("store"),
+                ),
+                std::sync::Arc::new(LedgerAuditSink::new(ledger.clone())),
+                std::sync::Arc::new(KeychainKeyStore::new(Network::Testnet)),
+                Network::Testnet,
+            )
+            .expect("engine"),
+        );
+        let view = ledger.agent_view("agent-alpha");
+        // The tempdir must outlive the gateway; leaking the handle is fine in a
+        // test process that is about to exit.
+        std::mem::forget(dir);
+        Gateway::new(
+            Network::Testnet,
+            "0xbf829199c1ae7f0caf21fb6fc45e10edff25b7d2"
+                .parse()
+                .expect("address"),
+            oppen_core::guardrail::AgentId::new("agent-alpha"),
+            engine,
+            view,
+        )
+        .expect("gateway")
+    }
+
+    async fn events_of(gateway: &Gateway, params: GetEventsParams) -> serde_json::Value {
+        let result = gateway
+            .get_events(Parameters(params))
+            .await
+            .expect("get_events");
+        serde_json::from_str(&body(result)).expect("json")
+    }
+
+    /// The envelope an agent actually receives. Invariant 6 is a claim about
+    /// bytes, so the keys and their order are asserted rather than assumed.
+    #[tokio::test]
+    async fn the_event_envelope_is_versioned_and_carries_the_cursor_contract() {
+        let gateway = gateway_over(&[(Some("agent-alpha"), "mine")]);
+        let page = events_of(
+            &gateway,
+            GetEventsParams {
+                since_cursor: 0,
+                limit: None,
+            },
+        )
+        .await;
+
+        assert_eq!(page["contract_version"], 0);
+        assert_eq!(page["resync_required"], false);
+        assert_eq!(page["head_seq"], 1);
+        assert_eq!(page["next_cursor"], 1);
+        assert_eq!(page["events"].as_array().expect("array").len(), 1);
+        assert_eq!(page["events"][0]["kind"], "agent_decision");
+        assert_eq!(page["events"][0]["payload"]["reason"], "mine");
+    }
+
+    /// `docs/decisions.md` C6, at the surface an agent actually calls. The
+    /// scope is enforced in `oppen-core`; this proves the gateway asks for the
+    /// scoped read rather than the operator one.
+    #[tokio::test]
+    async fn an_agent_does_not_receive_another_agents_events() {
+        let gateway = gateway_over(&[
+            (Some("agent-alpha"), "mine"),
+            (Some("agent-beta"), "secret strategy"),
+            (None, "kill switch engaged"),
+        ]);
+        let page = events_of(
+            &gateway,
+            GetEventsParams {
+                since_cursor: 0,
+                limit: None,
+            },
+        )
+        .await;
+
+        let reasons: Vec<&str> = page["events"]
+            .as_array()
+            .expect("array")
+            .iter()
+            .map(|e| e["payload"]["reason"].as_str().expect("reason"))
+            .collect();
+        assert_eq!(reasons, vec!["mine", "kill switch engaged"]);
+        assert!(
+            !body_contains(&page, "secret strategy"),
+            "another agent's reason string reached this agent"
+        );
+    }
+
+    /// Item 18: a cursor the ledger cannot serve is explicit, never a page with
+    /// a hole in it. A cursor past the head is what a mainnet cursor presented
+    /// to a testnet file looks like (R4).
+    #[tokio::test]
+    async fn a_cursor_past_the_head_asks_for_a_resync_rather_than_an_empty_page() {
+        let gateway = gateway_over(&[(Some("agent-alpha"), "mine")]);
+        let page = events_of(
+            &gateway,
+            GetEventsParams {
+                since_cursor: 9_999,
+                limit: None,
+            },
+        )
+        .await;
+
+        assert_eq!(page["resync_required"], true);
+        assert_eq!(page["events"].as_array().expect("array").len(), 0);
+        assert_eq!(page["head_seq"], 1);
+    }
+
+    /// The caller's page size is honoured, and the cursor it returns resumes
+    /// exactly where the page stopped.
+    #[tokio::test]
+    async fn a_limit_bounds_the_page_and_the_cursor_resumes_from_it() {
+        let gateway = gateway_over(&[
+            (Some("agent-alpha"), "one"),
+            (Some("agent-alpha"), "two"),
+            (Some("agent-alpha"), "three"),
+        ]);
+        let first = events_of(
+            &gateway,
+            GetEventsParams {
+                since_cursor: 0,
+                limit: Some(2),
+            },
+        )
+        .await;
+        assert_eq!(first["events"].as_array().expect("array").len(), 2);
+        assert_eq!(first["next_cursor"], 2);
+
+        let rest = events_of(
+            &gateway,
+            GetEventsParams {
+                since_cursor: 2,
+                limit: Some(10),
+            },
+        )
+        .await;
+        let reasons: Vec<&str> = rest["events"]
+            .as_array()
+            .expect("array")
+            .iter()
+            .map(|e| e["payload"]["reason"].as_str().expect("reason"))
+            .collect();
+        assert_eq!(
+            reasons,
+            vec!["three"],
+            "no event may be skipped or repeated"
+        );
+    }
+
+    fn body_contains(page: &serde_json::Value, needle: &str) -> bool {
+        page.to_string().contains(needle)
     }
 
     /// `AGENTS.md` invariant 1, for the crate that now has four tools that

@@ -47,7 +47,7 @@ fn gateway() -> Gateway {
     let engine = Arc::new(
         GuardrailEngine::new(
             Arc::new(SqliteGuardrailStore::open(dir.path().join("guardrails.db")).expect("store")),
-            Arc::new(LedgerAuditSink::new(ledger)),
+            Arc::new(LedgerAuditSink::new(ledger.clone())),
             Arc::new(KeychainKeyStore::new(Network::Testnet)),
             Network::Testnet,
         )
@@ -61,6 +61,7 @@ fn gateway() -> Gateway {
         account(),
         AgentId::new("agent-alpha"),
         engine,
+        ledger.agent_view("agent-alpha"),
     )
     .expect("gateway")
 }
