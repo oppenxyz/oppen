@@ -13,18 +13,30 @@
 //! synthetic events rather than by a live venue. Reconciling a gap is network
 //! work, so [`FeedSession::apply`] does not do it: it *asks* for it by
 //! returning [`Action::Reconcile`], and whoever owns the runtime does the call
-//! and reports back with [`FeedSession::reconciled`]. The half that decides is
+//! and reports back with `FeedSession::reconciled`. The half that decides is
 //! testable; the half that talks is glue.
 //!
 //! **A reconnect does not clear the flag on its own.** The socket coming back
 //! is not the account being caught up: the gap between the last message and
 //! the new session may hold fills nothing has seen. `reconciled` goes true
 //! only when a reconcile over that window has actually returned.
+//!
+//! **A drop is written down before it is acted on.** [`FeedSession::apply`]
+//! opens a `feed_gaps` row per subscription the connection owned and closes it
+//! when that feed resumes, so the window survives a restart and the
+//! reconciler has something to work from. Nothing wrote those rows before —
+//! [`crate::reconcile`] was built against a table only its own tests filled.
+//!
+//! [`pump`] is the runtime half: a live [`oppen_hl::ws::WsPool`]'s events in
+//! one end, [`crate::reconcile::Reconciler`] called at the other.
 
+pub mod pump;
+
+use std::collections::BTreeSet;
 use std::sync::Mutex;
 
 use oppen_hl::types::Fill;
-use oppen_hl::ws::{GapWindow, WsEvent};
+use oppen_hl::ws::{Subscription, WsEvent};
 use serde_json::json;
 
 use crate::ledger::{Ledger, NewFill};
@@ -43,13 +55,21 @@ pub struct FeedState {
 }
 
 /// What [`FeedSession::apply`] wants done that it cannot do itself.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
     /// Nothing to do.
     None,
-    /// A connection came back. Reconcile this window, then call
-    /// [`FeedSession::reconciled`] with the time it completed.
-    Reconcile(GapWindow),
+    /// A connection came back and its gaps are now closed. Work the gap list
+    /// ([`crate::reconcile::Reconciler::reconcile_all`]), then call
+    /// `FeedSession::reconciled` with the time it completed.
+    ///
+    /// It carries no window. The gap rows are the window, and they carry more
+    /// than the socket knows: the chain position the outage opened at, and the
+    /// venue-time anchor read from it. Passing
+    /// [`oppen_hl::ws::Reconnected::gap`] alongside them would be a second,
+    /// weaker statement of which window is being worked — the mistake
+    /// `reconcile.rs` names on [`crate::reconcile::Reconciler`] itself.
+    Reconcile,
 }
 
 #[derive(Debug)]
@@ -92,13 +112,29 @@ impl FeedSession {
     /// Separate from [`Action::Reconcile`] because the call between them can
     /// fail: a reconcile that errored must leave the flag false, and the only
     /// way to express that is for success to be an explicit second step.
-    pub fn reconciled(&self, at_ms: u64) {
+    ///
+    /// Crate-visible: the runtime owner that reports back is [`pump::FeedPump`]
+    /// and nothing outside oppen-core drives the flag.
+    pub(crate) fn reconciled(&self, at_ms: u64) {
         let mut inner = self.lock();
         inner.reconciled = true;
         // A reconcile is itself evidence the venue answered, so it counts as a
         // tick. Without this, an account that reconnects into a quiet market
         // would read as stale until the next trade prints.
         inner.last_tick_ms = Some(inner.last_tick_ms.map_or(at_ms, |last| last.max(at_ms)));
+    }
+
+    /// Record that the account is no longer known to be caught up.
+    ///
+    /// A socket dropping is one way in. The other is a fill that could not be
+    /// written: the chain is then short a row nothing will offer again until
+    /// the window is re-walked, and trading against it would be trading
+    /// against a position oppen has mis-stated.
+    ///
+    /// The tick clock is untouched. Freshness and completeness are different
+    /// questions, and this answers only the second.
+    pub(crate) fn unreconciled(&self) {
+        self.lock().reconciled = false;
     }
 
     /// Fold one event into the session, recording any fills it carried.
@@ -118,22 +154,48 @@ impl FeedSession {
     ) -> Result<Action, crate::ledger::LedgerError> {
         match event {
             WsEvent::Disconnected(dropped) => {
-                let mut inner = self.lock();
                 // The account is no longer known to be caught up. Anything
                 // that filled while the socket was down is unseen, so the
-                // engine must refuse until a reconcile says otherwise.
-                inner.reconciled = false;
+                // engine must refuse until a reconcile says otherwise. Set
+                // before the writes below, so a ledger that refuses the gap
+                // row still leaves the session fail-closed.
+                //
                 // The tick clock is *not* reset: item 34 wants "how stale",
                 // and the last message is what answers that.
-                let _ = dropped;
+                self.unreconciled();
+                // The last message this connection delivered, not the moment
+                // the drop was noticed: if the socket was alive at *t*, every
+                // fill up to *t* was delivered, so that is the tightest
+                // provably-safe start ([`oppen_hl::ws::GapWindow`]).
+                let opened_at = ms(dropped.last_message_ms.unwrap_or(dropped.at_ms));
+                // One gap per subscription the connection owned, including the
+                // market-data ones: `reconcile.rs` answers those with
+                // `GapStatus::NotAnAccountFeed` and leaves them for the
+                // component that owns candle backfill, and a feed whose outage
+                // was never written down is one item 34 cannot report.
+                for sub in &dropped.subscriptions {
+                    ledger.open_gap(&sub.key(), opened_at, Some(&dropped.reason))?;
+                }
                 Ok(Action::None)
             }
 
             WsEvent::Reconnected(back) => {
                 // Deliberately does not set `reconciled`. A socket is back;
-                // the account is not caught up until the gap has been read.
+                // the account is not caught up until the gaps have been read.
                 self.tick(back.at_ms);
-                Ok(Action::Reconcile(back.gap))
+                let resumed: BTreeSet<String> =
+                    back.resubscribed.iter().map(Subscription::key).collect();
+                let closed_at = ms(back.at_ms);
+                // Only the feeds this connection actually resumed. One the
+                // pool quarantined is still down, and closing its window would
+                // hand the reconciler an end instant for an outage that has
+                // not ended.
+                for gap in ledger.unreconciled_gaps()? {
+                    if gap.closed_ts_ms.is_none() && resumed.contains(&gap.scope) {
+                        ledger.close_gap(gap.gap_id, closed_at)?;
+                    }
+                }
+                Ok(Action::Reconcile)
             }
 
             WsEvent::UserFills { user, fills, .. } => {
@@ -246,6 +308,19 @@ impl FeedSession {
     }
 }
 
+/// A pool timestamp as the ledger stores it.
+///
+/// Both of these are the pool's own host clock — `Disconnected::last_message_ms`
+/// is when a frame *arrived*, not when the venue stamped it — which is what
+/// `feed_gaps` holds and what `reconcile::outage_window` treats as a host
+/// reading. The pool counts in unsigned milliseconds and the chain in signed
+/// ones; a value past `i64::MAX` is a clock nearly 300 million years out, and
+/// saturating keeps the outage on record with a wrong timestamp rather than
+/// refusing the row — the same trade `crate::ledger::now_ms` makes.
+fn ms(at_ms: u64) -> i64 {
+    i64::try_from(at_ms).unwrap_or(i64::MAX)
+}
+
 impl Default for FeedSession {
     fn default() -> Self {
         Self::new()
@@ -256,7 +331,7 @@ impl Default for FeedSession {
 mod tests {
     use super::*;
     use oppen_hl::Network;
-    use oppen_hl::ws::{ConnectionId, Disconnected, Reconnected};
+    use oppen_hl::ws::{ConnectionId, Disconnected, GapWindow, Reconnected};
     use tempfile::TempDir;
 
     const NOW: u64 = 1_756_000_000_000;
@@ -415,7 +490,7 @@ mod tests {
                 NOW + 30_000,
             )
             .expect("reconnect");
-        assert_eq!(action, Action::Reconcile(gap));
+        assert_eq!(action, Action::Reconcile);
         assert!(
             !session.state().reconciled,
             "the socket is back; the account is not caught up until the gap is read"
