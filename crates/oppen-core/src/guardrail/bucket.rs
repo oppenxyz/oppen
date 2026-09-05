@@ -129,13 +129,24 @@ impl TokenBucket {
     /// refused order never costs an agent budget it did not use.
     pub(super) fn try_take(&mut self, now_ms: u64) -> Result<(), BucketError> {
         self.refill(now_ms)?;
+        self.peek()?;
+        self.tokens_micro -= MICRO;
+        Ok(())
+    }
+
+    /// The answer [`TokenBucket::try_take`] would give, without taking.
+    ///
+    /// Spec item 20's preflight has to report the order-rate cap it would hit
+    /// while costing nothing — and it must report it in the *same* terms, so
+    /// the two are one expression rather than two that can drift. Assumes the
+    /// caller has already refilled.
+    pub(super) fn peek(&self) -> Result<(), BucketError> {
         if self.tokens_micro < MICRO {
             return Err(BucketError::Empty {
                 tokens_available_micro: self.tokens_micro,
                 retry_after_ms: self.retry_after_ms(),
             });
         }
-        self.tokens_micro -= MICRO;
         Ok(())
     }
 

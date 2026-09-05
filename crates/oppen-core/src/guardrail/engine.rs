@@ -168,6 +168,25 @@ pub struct Utilization {
     pub global_tokens_remaining: Decimal,
 }
 
+/// What a preflight found (`docs/spec.md` item 20).
+///
+/// Deliberately *not* a [`Cleared`]: this says what the guardrails would do,
+/// and carries no authority to do it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Verdict {
+    /// True when every predicate passed. The order may still be refused when
+    /// it is actually sent — the feed moves, and the rate token this did not
+    /// spend may be gone by then.
+    pub would_clear: bool,
+    /// Where the order would sit against each cap. Present only when it would
+    /// clear; a refusal names its own limit.
+    pub utilization: Option<Utilization>,
+    /// The predicate that would refuse it, with the observed value and the
+    /// limit. `approval_required` carries an empty `approval_id` here — no
+    /// proposal was minted, because nothing was asked for.
+    pub refusal: Option<Refusal>,
+}
+
 /// What was cleared, in the terms the guardrails evaluated it in.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "cleared", rename_all = "snake_case")]
@@ -984,6 +1003,53 @@ impl GuardrailEngine {
         outcome
     }
 
+    /// Spec item 20: the same verdict, none of the effects.
+    ///
+    /// Runs every predicate [`GuardrailEngine::evaluate`] runs, in the same
+    /// order, against the same state — and spends no order-rate token, draws
+    /// no global request, mints no proposal and writes no ledger row. What it
+    /// answers is "what would happen", so answering must not be a thing that
+    /// happened.
+    ///
+    /// **It cannot return a [`Cleared`].** That type is the capability to
+    /// sign, and a preflight that produced one would be a path to the signer
+    /// that skipped the rate token — a second route of exactly the kind
+    /// `AGENTS.md` invariant 1 forbids. The clearance is read for its
+    /// utilization numbers and dropped inside this function.
+    pub fn preflight(
+        &self,
+        agent: &AgentId,
+        intent: &OrderIntent,
+        asset: &Asset,
+        market: &MarketRef,
+        exposure: &Exposure,
+        now_ms: u64,
+    ) -> Verdict {
+        match self.decide(
+            agent,
+            intent,
+            asset,
+            market,
+            exposure,
+            now_ms,
+            Mode::Preflight,
+        ) {
+            Ok(cleared) => {
+                let clearance = cleared.clearance();
+                Verdict {
+                    would_clear: true,
+                    utilization: Some(clearance.utilization.clone()),
+                    refusal: None,
+                }
+            }
+            Err(refusal) => Verdict {
+                would_clear: false,
+                utilization: None,
+                refusal: Some(refusal),
+            },
+        }
+    }
+
     /// Writes the verdict to the ledger.
     ///
     /// An **order** that cannot be recorded is downgraded to a refusal: D6
@@ -1329,10 +1395,20 @@ impl GuardrailEngine {
         let rate = config.order_rate;
         let bucket = state.bucket_mut(agent, rate, now_ms);
         let spend = match mode {
-            Mode::Approved => bucket.refill(now_ms),
+            // Refill without taking. Refilling is time-based and idempotent —
+            // it only advances the bucket to the clock it would reach on the
+            // next call either way — so a preflight leaves the agent's budget
+            // exactly where it found it.
+            Mode::Approved | Mode::Preflight => bucket.refill(now_ms),
             Mode::Fresh => bucket.try_take(now_ms),
         };
         spend.map_err(|e| bucket_refusal(e, rate, now_ms))?;
+        // A preflight still answers the question a spend would have: is there
+        // a token? Reported as the refusal the real call would hit, so an
+        // agent is not told "clear" by a check that skipped the cap.
+        if mode == Mode::Preflight {
+            bucket.peek().map_err(|e| bucket_refusal(e, rate, now_ms))?;
+        }
         let tokens_remaining = bucket.tokens();
 
         // Spec item 10 and item 24's "plus the global budget": the venue
@@ -1348,6 +1424,17 @@ impl GuardrailEngine {
         // Spec item 28, checked last: a proposal that would have been refused
         // is refused rather than queued for a human to approve. The engine
         // mints and holds it; the caller gets a receipt, not a credential.
+        // A preflight says approval *would* be required without minting a
+        // proposal for a human to act on: item 20 answers a question, and
+        // queuing work off the back of a question is an effect.
+        if config.approval_required && mode == Mode::Preflight {
+            return Err(Refusal::ApprovalRequired {
+                symbol: intent.symbol.clone(),
+                notional_usd,
+                approval_id: String::new(),
+                expires_at_ms: now_ms.saturating_add(APPROVAL_TTL_MS),
+            });
+        }
         if config.approval_required && mode == Mode::Fresh {
             let approval_id = state.mint_proposal(agent, intent, now_ms);
             let expires_at_ms = now_ms.saturating_add(APPROVAL_TTL_MS);
@@ -1845,10 +1932,18 @@ pub enum SignClearedError {
 /// The only two things `Approved` changes are the order-rate token, which was
 /// spent when the proposal was minted, and the approval requirement itself.
 /// Every other predicate runs again against fresh state.
+///
+/// `Preflight` changes only what an answer must not cost (spec item 20 says
+/// "without executing"): it spends no order-rate token, draws no global
+/// request, and mints no proposal. Every predicate still runs, against the
+/// same state, in the same order — a preflight that evaluated a *restatement*
+/// of the guardrails would be a second copy of them to keep in step, and
+/// `AGENTS.md` invariant 1 exists to stop exactly that.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
     Fresh,
     Approved,
+    Preflight,
 }
 
 impl EngineState {
@@ -1908,8 +2003,9 @@ fn spend_global(
             detail: "must be positive".to_owned(),
         }),
     })?;
-    // An approved proposal already spent its request when it was minted.
-    if mode == Mode::Approved {
+    // An approved proposal already spent its request when it was minted, and a
+    // preflight sends none at all.
+    if mode == Mode::Approved || mode == Mode::Preflight {
         return Ok(bucket.tokens());
     }
     // The reserve is checked before the take, so a refused order never draws
