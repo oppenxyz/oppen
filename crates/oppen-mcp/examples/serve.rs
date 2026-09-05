@@ -8,6 +8,7 @@
 use std::sync::{Arc, RwLock};
 
 use oppen_core::guardrail::{AgentId, GuardrailEngine, SqliteGuardrailStore};
+use oppen_core::journal::Journal;
 use oppen_core::keys::KeychainKeyStore;
 use oppen_core::ledger::{EventViews, Ledger, LedgerAuditSink};
 use oppen_mcp::Network;
@@ -81,7 +82,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // One gateway serves every paired agent; each request resolves its own
     // identity from the token (item 15).
-    let gateway = Gateway::new(Network::Testnet, engine, EventViews::new(ledger))?;
+    // Item 21's scratchpad, per network for the same reason the ledger is.
+    let journal = Arc::new(Journal::open(dir.join("journal-testnet.db"))?);
+    let gateway = Gateway::new(Network::Testnet, engine, EventViews::new(ledger), journal)?;
     serve(
         port,
         gateway,

@@ -15,7 +15,7 @@ This document is the normative reference for every tool the gateway exposes. `do
 
 `get_state` · `get_meta` · `get_events` · `get_features` · `preflight` · `place` · `cancel` · `cancel_all` · `close_position` · `get_order_status` · `remember` · `recall` · `set_alert`
 
-Shipped so far: `get_meta`, `get_state`, `get_events`, `preflight`, `place`, `cancel`, `cancel_all`, `close_position`, `get_order_status`. The rest are unimplemented and are not described below — a schema for a tool that does not exist is a promise nothing keeps.
+Shipped so far: `get_meta`, `get_state`, `get_events`, `preflight`, `remember`, `recall`, `place`, `cancel`, `cancel_all`, `close_position`, `get_order_status`. The rest are unimplemented and are not described below — a schema for a tool that does not exist is a promise nothing keeps.
 
 ## Pairing
 
@@ -112,6 +112,16 @@ Returns `{contract_version, symbol, is_buy, notional_usd, guardrail, book, book_
 **A clear verdict is not a promise.** The book is a snapshot the venue has already moved past, nothing reserves depth, and the rate token this did not spend may be gone by the time the order is sent. `exhausts_book: true` means the resting depth could not cover the size at all.
 
 **Not included: estimated fees.** Item 20 names them; oppen has no fee schedule yet, and guessing a tier would be worse than omitting one. It needs a `userFees` read audited against the live API, which is its own change.
+
+### `remember(key, value)` · `recall(key?)`
+
+The per-agent scratchpad. Agents are amnesiac across sessions; this is what survives.
+
+`remember` replaces whatever was under `key` — the journal holds what is **true now**, and `get_events` holds what happened. `recall` returns `{contract_version, notes[]}` with one note or all of them, newest first; a key never written comes back as an empty list rather than an error, so a caller reads one field either way.
+
+Notes are **yours**: keyed by the agent your token names, like everything else, and no tool returns another agent's. They live in a separate per-network file, not in the ledger — the ledger is append-only and hash-chained, and a rewritable table does not belong in the file whose point is that nothing is rewritten. Per-network because a note reasoned from testnet prices is not a mainnet note.
+
+Bounded: 8 KiB a note, 256 bytes a key, 1000 notes an agent. A write that costs no rate token and is kept forever is unlimited free disk otherwise — the same hole the `reason` length bound closes. A full journal still accepts corrections to keys it already holds; being full must not also mean being stuck.
 
 ### `place(symbol, is_buy, size, reason, order_type…, reduce_only?, cloid?)`
 

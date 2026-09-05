@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use oppen_core::book;
 use oppen_core::guardrail::{Cleared, FeedQuality, GuardrailEngine, MarketRef, OrderIntent};
+use oppen_core::journal::Journal;
 use oppen_core::ledger::EventViews;
 use oppen_core::state::{
     AccountState, VenueReadings, assemble, exposure_from, realized_pnl_since, utc_day_start_ms,
@@ -62,6 +63,9 @@ struct GatewayInner {
     engine: Arc<GuardrailEngine>,
     exchange: ExchangeClient,
     nonces: NonceAllocator,
+    /// The per-agent scratchpad (`docs/spec.md` item 21). Keyed by the agent
+    /// the token names, like everything else here.
+    journal: Arc<Journal>,
     /// Hands out one agent's read-only slice of the one ledger
     /// (`docs/spec.md` D6), built per request for whoever the token names. An
     /// [`EventViews`] and never a `Ledger`: `redact`, `upsert_sub_account` and
@@ -236,6 +240,24 @@ pub struct PreflightParams {
     pub reduce_only: bool,
 }
 
+/// What `remember` takes.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RememberParams {
+    /// A label you will recall it by. Remembering the same key again replaces
+    /// what is under it.
+    pub key: String,
+    /// The note. Plain text; oppen never interprets it.
+    pub value: String,
+}
+
+/// What `recall` takes.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RecallParams {
+    /// One key, or absent for everything you have remembered.
+    #[serde(default)]
+    pub key: Option<String>,
+}
+
 /// What `get_events` takes.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct GetEventsParams {
@@ -293,6 +315,7 @@ impl Gateway {
         network: Network,
         engine: Arc<GuardrailEngine>,
         events: EventViews,
+        journal: Arc<Journal>,
     ) -> Result<Self, oppen_hl::Error> {
         Ok(Self {
             inner: Arc::new(GatewayInner {
@@ -301,6 +324,7 @@ impl Gateway {
                 engine,
                 exchange: ExchangeClient::new(network)?,
                 nonces: NonceAllocator::new(),
+                journal,
                 events,
             }),
         })
@@ -817,6 +841,73 @@ impl Gateway {
         });
         Ok(CallToolResult::success(vec![ContentBlock::text(
             body.to_string(),
+        )]))
+    }
+
+    /// `remember` — the scratchpad (`docs/spec.md` item 21).
+    #[tool(
+        description = "Keep a note for your future self. Agents are amnesiac across sessions; \
+                       this is what survives. Remembering the same key again replaces what is \
+                       under it — the journal holds what is true now, and get_events holds what \
+                       happened. Your notes are yours: no other agent can read them."
+    )]
+    async fn remember(
+        &self,
+        Parameters(params): Parameters<RememberParams>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let bound = Self::bound(&ctx)?;
+        self.inner
+            .journal
+            .remember(
+                bound.agent.as_str(),
+                &params.key,
+                &params.value,
+                now_ms() as i64,
+            )
+            // The bounds are the caller's to fix — a shorter note, or a key it
+            // already keeps — so they are `invalid_params` rather than an
+            // outage, and the message names the limit.
+            .map_err(|e| ToolError::invalid("value", e))?;
+
+        Ok(CallToolResult::success(vec![ContentBlock::text(
+            serde_json::json!({ "contract_version": 0, "remembered": params.key }).to_string(),
+        )]))
+    }
+
+    /// `recall` — reading it back (`docs/spec.md` item 21).
+    #[tool(
+        description = "Read back what you remembered: one key, or everything, newest first. \
+                       A key you never wrote comes back empty rather than as an error."
+    )]
+    async fn recall(
+        &self,
+        Parameters(params): Parameters<RecallParams>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let bound = Self::bound(&ctx)?;
+        let agent = bound.agent.as_str();
+
+        // One shape either way: a caller that asked for one key and a caller
+        // that asked for all of them read the same field, and "not found" is
+        // an empty list rather than a different envelope to branch on.
+        let notes = match &params.key {
+            Some(key) => self
+                .inner
+                .journal
+                .recall(agent, key)
+                .map_err(|e| ToolError::unavailable("journal", e))?
+                .into_iter()
+                .collect(),
+            None => self
+                .inner
+                .journal
+                .recall_all(agent)
+                .map_err(|e| ToolError::unavailable("journal", e))?,
+        };
+
+        Ok(CallToolResult::success(vec![ContentBlock::text(
+            serde_json::json!({ "contract_version": 0, "notes": notes }).to_string(),
         )]))
     }
 
@@ -1576,10 +1667,13 @@ mod tests {
             )
             .expect("engine"),
         );
+        let journal = std::sync::Arc::new(
+            oppen_core::journal::Journal::open(dir.path().join("journal.db")).expect("journal"),
+        );
         // The tempdir must outlive the gateway; leaking the handle is fine in a
         // test process that is about to exit.
         std::mem::forget(dir);
-        Gateway::new(Network::Testnet, engine, EventViews::new(ledger)).expect("gateway")
+        Gateway::new(Network::Testnet, engine, EventViews::new(ledger), journal).expect("gateway")
     }
 
     /// The binding the door would have injected for `agent`.
@@ -1763,6 +1857,31 @@ mod tests {
 
     fn place_params(json: serde_json::Value) -> PlaceParams {
         serde_json::from_value(json).expect("params")
+    }
+
+    /// The journal is the one place an agent's own reasoning accumulates, so
+    /// the scoping that matters for events (C6) matters at least as much here.
+    #[test]
+    fn one_agents_notes_are_not_another_agents() {
+        let gateway = gateway_over(&[]);
+        let journal = &gateway.inner.journal;
+
+        journal
+            .remember("agent-alpha", "edge", "alpha's edge", 1)
+            .expect("alpha writes");
+        journal
+            .remember("agent-beta", "edge", "beta's edge", 1)
+            .expect("beta writes");
+
+        assert_eq!(
+            journal
+                .recall("agent-alpha", "edge")
+                .expect("recall")
+                .expect("note")
+                .value,
+            "alpha's edge"
+        );
+        assert_eq!(journal.recall_all("agent-beta").expect("all").len(), 1);
     }
 
     /// Item 12's three single-order types, as an agent would name them.
