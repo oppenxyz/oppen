@@ -14,6 +14,7 @@
 use std::sync::Arc;
 
 use oppen_core::book;
+use oppen_core::feed::FeedSession;
 use oppen_core::guardrail::{Cleared, FeedQuality, GuardrailEngine, MarketRef, OrderIntent};
 use oppen_core::journal::Journal;
 use oppen_core::ledger::EventViews;
@@ -66,6 +67,11 @@ struct GatewayInner {
     /// The per-agent scratchpad (`docs/spec.md` item 21). Keyed by the agent
     /// the token names, like everything else here.
     journal: Arc<Journal>,
+    /// What the socket knows: how fresh the feed is, and whether the account
+    /// has been reconciled since the last outage. Both were constants until
+    /// this existed, and the second one refused every order (`docs/spec.md`
+    /// items 9 and 34).
+    feed: Arc<FeedSession>,
     /// Hands out one agent's read-only slice of the one ledger
     /// (`docs/spec.md` D6), built per request for whoever the token names. An
     /// [`EventViews`] and never a `Ledger`: `redact`, `upsert_sub_account` and
@@ -316,6 +322,7 @@ impl Gateway {
         engine: Arc<GuardrailEngine>,
         events: EventViews,
         journal: Arc<Journal>,
+        feed: Arc<FeedSession>,
     ) -> Result<Self, oppen_hl::Error> {
         Ok(Self {
             inner: Arc::new(GatewayInner {
@@ -325,6 +332,7 @@ impl Gateway {
                 exchange: ExchangeClient::new(network)?,
                 nonces: NonceAllocator::new(),
                 journal,
+                feed,
                 events,
             }),
         })
@@ -1103,9 +1111,11 @@ impl Gateway {
             &state,
             realized_pnl_since(&fills, day_start_ms),
             portfolio.window("day").and_then(|w| w.peak_account_value()),
-            // No socket yet, so no reconnect-reconcile has run. Reported
-            // honestly; the engine decides what that means, not this gateway.
-            false,
+            // Whether a reconcile has actually returned since the last
+            // outage. The engine decides what that means, not this gateway —
+            // and it refuses while it is false, which is why nothing could
+            // clear before the feed session existed.
+            inner.feed.state().reconciled,
             day_start_ms,
         );
 
@@ -1217,10 +1227,10 @@ impl Gateway {
                 spot: &spot,
                 orders: &orders,
                 mids: &mids,
-                // No socket yet, so nothing has ticked. Reported honestly as
-                // never-connected rather than as live: an agent that reads
-                // this must not believe a feed exists.
-                last_tick_ms: None,
+                // The socket's own answer. `None` still means never
+                // connected, which item 34 keeps distinct from having gone
+                // quiet — but it is now a fact rather than a placeholder.
+                last_tick_ms: inner.feed.state().last_tick_ms,
             },
         ))
     }
@@ -1673,7 +1683,14 @@ mod tests {
         // The tempdir must outlive the gateway; leaking the handle is fine in a
         // test process that is about to exit.
         std::mem::forget(dir);
-        Gateway::new(Network::Testnet, engine, EventViews::new(ledger), journal).expect("gateway")
+        Gateway::new(
+            Network::Testnet,
+            engine,
+            EventViews::new(ledger),
+            journal,
+            std::sync::Arc::new(oppen_core::feed::FeedSession::new()),
+        )
+        .expect("gateway")
     }
 
     /// The binding the door would have injected for `agent`.
