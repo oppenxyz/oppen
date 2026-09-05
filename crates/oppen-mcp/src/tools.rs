@@ -59,6 +59,14 @@ struct GatewayInner {
     nonces: NonceAllocator,
 }
 
+/// The inputs `GuardrailEngine::evaluate` needs, gathered once per call.
+struct EvaluationContext {
+    universe: Universe,
+    state: AccountState,
+    exposure: oppen_core::guardrail::Exposure,
+    market: MarketRef,
+}
+
 /// What `place` takes.
 ///
 /// `reason` is required by spec item 19 and is an untrusted claim (item 30):
@@ -244,59 +252,11 @@ impl Gateway {
         let inner = &self.inner;
         let now_ms = now_ms();
 
-        let meta = inner
-            .info
-            .meta()
-            .await
-            .map_err(|e| ToolError::unavailable("meta", e))?;
-        let universe =
-            Universe::from_meta(&meta).map_err(|e| ToolError::unavailable("universe", e))?;
-        let asset = universe
+        let context = self.evaluation_context(&params.symbol, now_ms).await?;
+        let asset = context
+            .universe
             .get(&params.symbol)
             .map_err(|e| ToolError::invalid("symbol", e))?;
-
-        let state = self.read_state(now_ms).await?;
-
-        // Realised PnL is summed from the venue's own fills for the UTC day,
-        // net of fees: a daily-loss limit that ignores fees is not a limit.
-        let day_start_ms = utc_day_start_ms(now_ms);
-        let fills = inner
-            .info
-            .user_fills_by_time(inner.account, day_start_ms, Some(now_ms))
-            .await
-            .map_err(|e| ToolError::unavailable("fills", e))?;
-        let portfolio = inner
-            .info
-            .portfolio(inner.account)
-            .await
-            .map_err(|e| ToolError::unavailable("portfolio", e))?;
-
-        let exposure = exposure_from(
-            &state,
-            realized_pnl_since(&fills, day_start_ms),
-            portfolio.window("day").and_then(|w| w.peak_account_value()),
-            // No socket yet, so no reconnect-reconcile has run. Reported
-            // honestly; the engine decides what that means, not this gateway.
-            false,
-            day_start_ms,
-        );
-
-        let mids = inner
-            .info
-            .all_mids()
-            .await
-            .map_err(|e| ToolError::unavailable("mids", e))?;
-        let market = MarketRef {
-            symbol: params.symbol.clone(),
-            // A missing price is a refusal, never a fallback: `allMids`
-            // answers for bookless assets with a frozen mark.
-            reference_px: mids.get(&params.symbol).copied(),
-            as_of_ms: now_ms,
-            quality: FeedQuality::Ok,
-            mark_divergence_bps: None,
-            mark_divergent_since_ms: None,
-            snapshot: None,
-        };
 
         let px: Decimal = params
             .limit_px
@@ -332,14 +292,17 @@ impl Gateway {
         };
 
         // The gate. There is no branch around it.
-        let cleared =
-            match inner
-                .engine
-                .evaluate(&inner.agent, &intent, asset, &market, &exposure, now_ms)
-            {
-                Ok(cleared) => cleared,
-                Err(refusal) => return Ok(outcome::refused(refusal).into_result()),
-            };
+        let cleared = match inner.engine.evaluate(
+            &inner.agent,
+            &intent,
+            asset,
+            &context.market,
+            &context.exposure,
+            now_ms,
+        ) {
+            Ok(cleared) => cleared,
+            Err(refusal) => return Ok(outcome::refused(refusal).into_result()),
+        };
 
         let response = self.submit(cleared, Some(&cloid), now_ms).await?;
         Ok(order_outcome(response, Some(cloid.as_str().to_owned()))?.into_result())
@@ -479,6 +442,97 @@ impl Gateway {
         Ok(cancel_outcome(response, named).into_result())
     }
 
+    /// `close_position` — flatten one symbol (`docs/spec.md` item 19).
+    #[tool(
+        description = "Flatten the open position on one symbol with a reduce-only IOC order, \
+                       priced at this agent's configured max slippage. Requires a reason. It \
+                       cannot open or flip a position: the size is the position's own and the \
+                       order is reduce-only, so a fill that would cross through flat is refused \
+                       by the venue rather than reversed."
+    )]
+    async fn close_position(
+        &self,
+        Parameters(params): Parameters<ClosePositionParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let inner = &self.inner;
+        let now_ms = now_ms();
+
+        let context = self.evaluation_context(&params.symbol, now_ms).await?;
+        let asset = context
+            .universe
+            .get(&params.symbol)
+            .map_err(|e| ToolError::invalid("symbol", e))?;
+
+        // Nothing open is not a failure: the caller wanted the symbol flat and
+        // it is flat. Answered as a cancel-shaped no-op rather than as an
+        // error, so an agent unwinding a book can call this per symbol without
+        // branching on which ones it still holds.
+        let Some(position) = context
+            .state
+            .positions
+            .iter()
+            .find(|p| p.symbol == params.symbol)
+            .filter(|p| !p.size.is_zero())
+        else {
+            return Ok(outcome::canceled(0, Vec::new()).into_result());
+        };
+
+        // Without a mid there is no price to send. This is the gateway
+        // failing to build an order, not a guardrail verdict, so it is an
+        // `unavailable` rather than a fabricated zero-price intent handed to
+        // the engine to refuse — that would record an order nobody asked for
+        // in the ledger and would trip the venue's price rule rather than the
+        // engine's missing-reference one, naming the wrong cause.
+        let Some(reference_px) = context.market.reference_px else {
+            return Err(ToolError::Unavailable {
+                what: "reference price",
+                detail: format!("no mid for {}; refusing to price a close", params.symbol),
+            }
+            .into());
+        };
+
+        // The bound is the operator's, read from the engine rather than taken
+        // from the caller: item 24 and D3 make slippage operator-set, and an
+        // agent that could widen it to close could widen it to open.
+        let guardrails =
+            inner
+                .engine
+                .guardrails(&inner.agent)
+                .ok_or_else(|| ToolError::Unavailable {
+                    what: "guardrails",
+                    detail: format!("{} is not a paired agent", inner.agent),
+                })?;
+
+        let intent = close_intent(
+            &params.symbol,
+            &params.reason,
+            position.size,
+            reference_px,
+            guardrails.max_slippage_bps,
+            asset,
+            mint_cloid()?,
+        );
+
+        // The same gate as `place`. A close is not privileged: it is refused
+        // when the account is unreconciled or the feed is stale, exactly as an
+        // opening order is.
+        let cleared = match inner.engine.evaluate(
+            &inner.agent,
+            &intent,
+            asset,
+            &context.market,
+            &context.exposure,
+            now_ms,
+        ) {
+            Ok(cleared) => cleared,
+            Err(refusal) => return Ok(outcome::refused(refusal).into_result()),
+        };
+
+        let cloid = intent.cloid.clone();
+        let response = self.submit(cleared, cloid.as_ref(), now_ms).await?;
+        Ok(order_outcome(response, cloid.map(|c| c.as_str().to_owned()))?.into_result())
+    }
+
     /// `get_order_status` — the reconcile after a timeout
     /// (`docs/spec.md` item 19).
     #[tool(
@@ -577,6 +631,70 @@ impl Gateway {
         })
     }
 
+    /// Everything [`GuardrailEngine::evaluate`] needs, assembled once.
+    ///
+    /// `place` and `close_position` both call it, and they must: two
+    /// assemblies of the same inputs drift, and the one that drifts is the one
+    /// that decides whether an order is refused.
+    async fn evaluation_context(
+        &self,
+        symbol: &str,
+        now_ms: u64,
+    ) -> Result<EvaluationContext, ToolError> {
+        let inner = &self.inner;
+        let universe = self.universe().await?;
+        let state = self.read_state(now_ms).await?;
+
+        // Realised PnL is summed from the venue's own fills for the UTC day,
+        // net of fees: a daily-loss limit that ignores fees is not a limit.
+        let day_start_ms = utc_day_start_ms(now_ms);
+        let fills = inner
+            .info
+            .user_fills_by_time(inner.account, day_start_ms, Some(now_ms))
+            .await
+            .map_err(|e| ToolError::unavailable("fills", e))?;
+        let portfolio = inner
+            .info
+            .portfolio(inner.account)
+            .await
+            .map_err(|e| ToolError::unavailable("portfolio", e))?;
+
+        let exposure = exposure_from(
+            &state,
+            realized_pnl_since(&fills, day_start_ms),
+            portfolio.window("day").and_then(|w| w.peak_account_value()),
+            // No socket yet, so no reconnect-reconcile has run. Reported
+            // honestly; the engine decides what that means, not this gateway.
+            false,
+            day_start_ms,
+        );
+
+        let mids = inner
+            .info
+            .all_mids()
+            .await
+            .map_err(|e| ToolError::unavailable("mids", e))?;
+        // A missing price is a refusal, never a fallback: `allMids` answers
+        // for bookless assets with a frozen mark.
+        let reference_px = mids.get(symbol).copied();
+        let market = MarketRef {
+            symbol: symbol.to_owned(),
+            reference_px,
+            as_of_ms: now_ms,
+            quality: FeedQuality::Ok,
+            mark_divergence_bps: None,
+            mark_divergent_since_ms: None,
+            snapshot: None,
+        };
+
+        Ok(EvaluationContext {
+            universe,
+            state,
+            exposure,
+            market,
+        })
+    }
+
     /// The validated universe, which every tool that names a symbol needs.
     async fn universe(&self) -> Result<Universe, ToolError> {
         let meta = self
@@ -592,7 +710,7 @@ impl Gateway {
     ///
     /// Four and not one: Hyperliquid publishes no single endpoint that answers
     /// this, and spot is load-bearing because margin is unified.
-    async fn read_state(&self, now_ms: u64) -> Result<AccountState, ErrorData> {
+    async fn read_state(&self, now_ms: u64) -> Result<AccountState, ToolError> {
         let inner = &self.inner;
         let account = inner.account;
 
@@ -690,6 +808,51 @@ fn cancel_outcome(response: ExchangeResponse, named: Vec<(Option<u64>, Option<St
         })
         .collect();
     outcome::canceled(requested, failed)
+}
+
+/// The order a close is, decided from the position and the operator's bound.
+///
+/// Free-standing and pure, because the two things that make a close dangerous
+/// are decided here and are testable without a venue: **closing a long by
+/// buying doubles it**, and a size that is not the position's own magnitude can
+/// flip it. `reduce_only` is the venue-side backstop for both, but the venue
+/// refusing a reversed order is a worse way to learn this is wrong than a test.
+///
+/// `position_size` is signed as the venue reports it: negative is short.
+fn close_intent(
+    symbol: &str,
+    reason: &str,
+    position_size: Decimal,
+    reference_px: Decimal,
+    max_slippage_bps: Decimal,
+    asset: &oppen_hl::meta::Asset,
+    cloid: Cloid,
+) -> OrderIntent {
+    // Closing a long is a sell and closing a short is a buy.
+    let is_buy = position_size.is_sign_negative();
+    let slippage = max_slippage_bps / Decimal::from(10_000);
+    OrderIntent {
+        symbol: symbol.to_owned(),
+        is_buy,
+        // Rounded toward the mid, so pricing *at* the operator's limit cannot
+        // be refused *for* that limit by a rounding step nobody chose.
+        px: asset.slippage_price_bounded(reference_px, is_buy, slippage),
+        // The position's own magnitude. This tool cannot be asked for a
+        // different one, which is what stops it opening or flipping.
+        sz: position_size.abs(),
+        // A market order on Hyperliquid is an IOC priced through the book;
+        // there is no market order type to send.
+        kind: OrderKind::Limit { tif: Tif::Ioc },
+        reduce_only: true,
+        cloid: Some(cloid),
+        grouping: Grouping::Na,
+        builder: None,
+        // The agent may not tighten below the operator's bound here: the price
+        // is already computed from that bound, and a second, tighter limit
+        // would refuse the order this function just priced.
+        max_slippage_bps: None,
+        reason: reason.to_owned(),
+    }
 }
 
 /// Mint a client order id from OS entropy.
@@ -882,7 +1045,118 @@ mod tests {
         );
     }
 
-    /// `AGENTS.md` invariant 1, for the crate that now has three tools that
+    fn test_asset(sz_decimals: u32) -> oppen_hl::meta::Asset {
+        oppen_hl::meta::Asset {
+            index: 0,
+            info: oppen_hl::types::AssetInfo {
+                name: "TEST".into(),
+                sz_decimals,
+                max_leverage: 50,
+                margin_table_id: 0,
+                is_delisted: false,
+                only_isolated: false,
+            },
+        }
+    }
+
+    fn a_cloid() -> Cloid {
+        Cloid::from_bytes([7u8; 16])
+    }
+
+    /// The one that doubles a position if it is backwards.
+    #[test]
+    fn closing_a_long_sells_and_closing_a_short_buys() {
+        let asset = test_asset(4);
+        let long = close_intent(
+            "BTC",
+            "flat",
+            d("1.5"),
+            d("100"),
+            d("50"),
+            &asset,
+            a_cloid(),
+        );
+        assert!(!long.is_buy, "closing a long must sell");
+        assert_eq!(long.sz, d("1.5"));
+
+        let short = close_intent(
+            "BTC",
+            "flat",
+            d("-1.5"),
+            d("100"),
+            d("50"),
+            &asset,
+            a_cloid(),
+        );
+        assert!(short.is_buy, "closing a short must buy");
+        assert_eq!(short.sz, d("1.5"), "size is the magnitude, never signed");
+    }
+
+    /// A close carries the venue's reduce-only flag and is an IOC. Without
+    /// reduce-only a close that races a fill becomes an opening order on the
+    /// other side; as a GTC it would rest instead of closing.
+    #[test]
+    fn a_close_is_a_reduce_only_ioc() {
+        let asset = test_asset(4);
+        let intent = close_intent("BTC", "flat", d("2"), d("100"), d("50"), &asset, a_cloid());
+        assert!(intent.reduce_only);
+        assert_eq!(intent.kind, OrderKind::Limit { tif: Tif::Ioc });
+        assert!(intent.cloid.is_some(), "a close must be reconcilable too");
+    }
+
+    /// The whole point of `slippage_price_bounded`. At the operator's bound
+    /// the price must not come back *more* adverse than the bound, or the
+    /// engine refuses the order this function just priced.
+    #[test]
+    fn a_close_priced_at_the_operator_bound_is_never_more_adverse_than_it() {
+        let asset = test_asset(4);
+        // 0.6 bp on a 100 mid is the case where rounding to nearest lands on
+        // 100.01 — 1 bp — and would be refused for exceeding 0.6 bp.
+        let buy = close_intent("T", "flat", d("-1"), d("100"), d("0.6"), &asset, a_cloid());
+        assert!(buy.is_buy);
+        assert!(
+            buy.px <= d("100.006"),
+            "priced at {} against a 0.6 bp bound on a 100 mid",
+            buy.px
+        );
+
+        let sell = close_intent("T", "flat", d("1"), d("100"), d("0.6"), &asset, a_cloid());
+        assert!(!sell.is_buy);
+        assert!(
+            sell.px >= d("99.994"),
+            "priced at {} against a 0.6 bp bound on a 100 mid",
+            sell.px
+        );
+    }
+
+    /// D3 and item 24 make slippage operator-set. The intent carries no
+    /// tightening of its own: the price already encodes the operator's bound,
+    /// and a second limit on top would refuse the order at its own price.
+    #[test]
+    fn a_close_does_not_set_its_own_slippage_limit() {
+        let asset = test_asset(4);
+        let intent = close_intent("BTC", "flat", d("1"), d("100"), d("50"), &asset, a_cloid());
+        assert_eq!(intent.max_slippage_bps, None);
+    }
+
+    /// The reason is the agent's and is carried through untouched — item 19
+    /// requires one and item 30 makes it a claim, not a fact.
+    #[test]
+    fn the_reason_is_carried_verbatim() {
+        let asset = test_asset(4);
+        let intent = close_intent(
+            "BTC",
+            "risk off",
+            d("1"),
+            d("100"),
+            d("50"),
+            &asset,
+            a_cloid(),
+        );
+        assert_eq!(intent.reason, "risk off");
+    }
+
+    /// `AGENTS.md` invariant 1, for the crate that now has four tools that
     /// act.
     ///
     /// The type already carries most of it: [`Gateway::submit`] takes a

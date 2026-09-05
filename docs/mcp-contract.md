@@ -15,7 +15,7 @@ This document is the normative reference for every tool the gateway exposes. `do
 
 `get_state` · `get_meta` · `get_events` · `get_features` · `preflight` · `place` · `cancel` · `cancel_all` · `close_position` · `get_order_status` · `remember` · `recall` · `set_alert`
 
-Shipped so far: `get_meta`, `get_state`, `place`, `cancel`, `cancel_all`, `get_order_status`. The rest are unimplemented and are not described below — a schema for a tool that does not exist is a promise nothing keeps.
+Shipped so far: `get_meta`, `get_state`, `place`, `cancel`, `cancel_all`, `close_position`, `get_order_status`. The rest are unimplemented and are not described below — a schema for a tool that does not exist is a promise nothing keeps.
 
 ## The result envelope
 
@@ -91,6 +91,18 @@ One resting order. Supply `oid` or `cloid`. Cancels are risk-reducing: they clea
 ### `cancel_all(symbol?, reason)`
 
 Every resting order, or every one on a symbol. Partial success is normal, so `failed[]` itemises what the venue would not take, paired positionally with what was sent. Nothing resting answers `canceled` with `requested: 0`.
+
+### `close_position(symbol, reason)`
+
+Flatten the open position on one symbol with a **reduce-only IOC** order, sized at the position's own magnitude and priced at the agent's configured `max_slippage_bps`.
+
+It cannot open or flip a position. The size is the position's, not the caller's, and the order is reduce-only — so a fill that would cross through flat is refused by the venue rather than reversed. Closing a long sells; closing a short buys.
+
+The slippage bound is the **operator's**, read from the guardrail engine rather than taken from the caller: item 24 and D3 make slippage operator-set, and an agent that could widen it to close could widen it to open. The price is rounded *toward the mid*, so pricing at the limit cannot be refused for exceeding that limit by a rounding step nobody chose.
+
+Nothing open answers `canceled` with `requested: 0` — the caller wanted the symbol flat and it is flat. No mid for the symbol answers `unavailable`: there is no price to send, and a close is never sent at a guessed one.
+
+A close is not privileged. It passes the same gate as `place`, and is refused when the account is unreconciled or the feed is stale exactly as an opening order is.
 
 ### `get_order_status(oid? | cloid?)`
 

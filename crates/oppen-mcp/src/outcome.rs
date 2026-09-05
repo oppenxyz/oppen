@@ -44,7 +44,7 @@ pub(crate) struct Reply {
 ///
 /// `canceled` is an addition: item 19's result shape is order-shaped (`oid`,
 /// `filled_sz`, `avg_px`) and a cancel has none of those. Recorded as
-/// `docs/decisions.md` M4.
+/// `docs/decisions.md` C4.
 #[derive(Debug, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub(crate) enum Outcome {
@@ -105,7 +105,7 @@ pub(crate) struct CancelFailure {
 /// documentation already states, with one refinement: the two rate refusals
 /// become `rate_limited` rather than `guardrail_reject`, because they are the
 /// only refusals that clear on their own and the agent needs to know that
-/// from the code rather than by reading the sentence. `docs/decisions.md` M2.
+/// from the code rather than by reading the sentence. `docs/decisions.md` C2.
 #[derive(Debug, Serialize)]
 #[serde(tag = "code", rename_all = "snake_case")]
 pub(crate) enum Rejection {
@@ -247,7 +247,7 @@ pub(crate) enum ToolError {
     /// it (`AGENTS.md` conventions). Split from `venue_reject`, which is
     /// oppen's own pre-sign catch, because the two mean different things to an
     /// agent and only one of them means a nonce was spent
-    /// (`docs/decisions.md` M3).
+    /// (`docs/decisions.md` C3).
     #[error("the venue refused the request (http {http_status}): {venue_message}")]
     VenueError {
         http_status: u16,

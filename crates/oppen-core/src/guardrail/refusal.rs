@@ -33,7 +33,7 @@ use super::snapshot::FeedQuality;
 /// [`Refusal::ApprovalRequired`] and the two rate refusals
 /// ([`Refusal::OrderRate`], [`Refusal::GlobalRateBudget`], which become
 /// `rate_limited`) is a `guardrail_reject`. The rate carve-out is
-/// `docs/decisions.md` M2: they are the only refusals here that clear without
+/// `docs/decisions.md` C2: they are the only refusals here that clear without
 /// the agent changing anything, and they carry the wait that says when.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, thiserror::Error)]
 #[serde(tag = "refusal", rename_all = "snake_case")]

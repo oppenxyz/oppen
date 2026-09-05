@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 
-use rust_decimal::Decimal;
+use rust_decimal::{Decimal, RoundingStrategy};
 
 use crate::types::{AssetInfo, Meta};
 
@@ -84,6 +84,46 @@ impl Asset {
             Decimal::ONE - slippage
         };
         self.round_price(mid * factor)
+    }
+
+    /// `mid × (1 ± slippage)`, rounded **toward the mid** rather than to the
+    /// nearest valid price.
+    ///
+    /// [`Asset::slippage_price`] rounds to nearest, which can land the price
+    /// *further* from the mid than the caller asked for — by up to one tick at
+    /// each of the two rounding steps. That is harmless for a market order
+    /// priced with headroom, and not harmless for one priced at exactly a
+    /// guardrail's `max_slippage_bps`: `oppen-core` refuses when observed
+    /// slippage is `>` the limit, so a close priced at the limit can be
+    /// refused on a rounding step the caller never chose, and the caller has
+    /// no way to ask for "the limit, but valid".
+    ///
+    /// Rounding toward the mid at both steps makes the returned price's
+    /// adverse slippage **never more than `slippage`**, so such an order
+    /// clears by construction rather than by luck. The cost is at most one
+    /// tick of fill probability, which is the right side to be wrong on: an
+    /// unfilled close can be retried, and a refused one cannot be priced at
+    /// all.
+    pub fn slippage_price_bounded(&self, mid: Decimal, is_buy: bool, slippage: Decimal) -> Decimal {
+        // A buy is priced above the mid and a sell below it, so "toward the
+        // mid" is down for a buy and up for a sell.
+        let (factor, toward_mid) = if is_buy {
+            (
+                Decimal::ONE + slippage,
+                RoundingStrategy::ToNegativeInfinity,
+            )
+        } else {
+            (
+                Decimal::ONE - slippage,
+                RoundingStrategy::ToPositiveInfinity,
+            )
+        };
+        let raw = mid * factor;
+        let sf = raw
+            .round_sf_with_strategy(PRICE_SIG_FIGS, toward_mid)
+            .unwrap_or(raw);
+        sf.round_dp_with_strategy(self.max_price_decimals(), toward_mid)
+            .normalize()
     }
 
     /// Doc rules verbatim: integers always pass; otherwise ≤ 5 significant
@@ -256,6 +296,136 @@ mod tests {
         assert!(b.validate_price(d("0.01234")).is_ok());
         assert!(b.validate_price(d("0.012345")).is_err());
         assert!(b.validate_price(d("0")).is_err());
+    }
+
+    /// The whole reason [`Asset::slippage_price_bounded`] exists, as one
+    /// concrete pair. At 0.6 bp on a $100 mid the raw buy price is 100.006,
+    /// which has six significant figures: rounding to nearest lands on
+    /// 100.01 — 1 bp of adverse slippage against a 0.6 bp request, which
+    /// `oppen-core` refuses. Rounding toward the mid lands on 100.
+    #[test]
+    fn rounding_to_nearest_can_exceed_the_requested_slippage_and_bounded_cannot() {
+        let a = asset(4);
+        let mid = d("100");
+        let slip = d("0.00006");
+
+        assert_eq!(a.slippage_price(mid, true, slip), d("100.01"));
+        assert_eq!(a.slippage_price_bounded(mid, true, slip), d("100"));
+
+        assert!(adverse_bps(true, a.slippage_price(mid, true, slip), mid) > d("0.6"));
+        assert!(adverse_bps(true, a.slippage_price_bounded(mid, true, slip), mid) <= d("0.6"));
+    }
+
+    /// The property the type is for: over a spread of assets, mids and
+    /// slippages, the bounded price is always valid **and** never more
+    /// adverse than asked. A single counterexample is a refused close.
+    #[test]
+    fn a_bounded_price_is_always_valid_and_never_more_adverse_than_requested() {
+        let mids = [
+            "0.00012345",
+            "0.4999",
+            "1",
+            "3.14159",
+            "99.995",
+            "100",
+            "100.006",
+            "1234.5",
+            "63999.5",
+            "99999.9",
+        ];
+        let slips = [
+            "0", "0.00001", "0.00006", "0.0001", "0.0005", "0.001", "0.005", "0.01", "0.05",
+        ];
+        for sz_decimals in 0..=5u32 {
+            let a = asset(sz_decimals);
+            for mid in mids {
+                for slip in slips {
+                    let (mid, slip) = (d(mid), d(slip));
+                    for is_buy in [true, false] {
+                        let px = a.slippage_price_bounded(mid, is_buy, slip);
+                        // A mid below this asset's own tick has no valid order
+                        // price at any rounding mode — `slippage_price` returns
+                        // zero there too. The caller's validator refuses it as
+                        // `NonPositivePrice`, which is the fail-closed answer,
+                        // so it is skipped here and pinned by its own test.
+                        if px.is_zero() {
+                            assert!(a.validate_price(px).is_err());
+                            continue;
+                        }
+                        assert!(
+                            a.validate_price(px).is_ok(),
+                            "sz_decimals={sz_decimals} mid={mid} slip={slip} is_buy={is_buy} \
+                             produced invalid px={px}"
+                        );
+                        let observed = adverse_bps(is_buy, px, mid);
+                        let requested = slip * Decimal::from(10_000);
+                        assert!(
+                            observed <= requested,
+                            "sz_decimals={sz_decimals} mid={mid} is_buy={is_buy}: px={px} is \
+                             {observed} bps adverse against a {requested} bps request"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// A mid below the asset's own tick, where the two directions part.
+    ///
+    /// A **buy** rounds down and there is nothing below one tick, so it
+    /// returns zero — which `validate_price` refuses as `NonPositivePrice`.
+    /// That is fail-closed and identical to the round-to-nearest behaviour
+    /// that already shipped: no rounding mode invents a valid price here.
+    /// A **sell** rounds up to one tick, which is above the mid and therefore
+    /// carries no adverse slippage at all — so rounding toward the mid
+    /// rescues the side that round-to-nearest also loses. Pinned because both
+    /// halves are behaviour a future change has to choose deliberately.
+    #[test]
+    fn a_mid_below_the_assets_own_tick_degrades_on_the_buy_side_only() {
+        // sz_decimals 3 puts the tick at 0.001; the mid is four orders below.
+        let a = asset(3);
+        let mid = d("0.00012345");
+        let slip = d("0.001");
+
+        let buy = a.slippage_price_bounded(mid, true, slip);
+        assert_eq!(buy, Decimal::ZERO);
+        assert!(a.validate_price(buy).is_err());
+        // Not a regression this function introduced.
+        assert_eq!(a.slippage_price(mid, true, slip), Decimal::ZERO);
+
+        let sell = a.slippage_price_bounded(mid, false, slip);
+        assert_eq!(sell, d("0.001"));
+        assert!(a.validate_price(sell).is_ok());
+        assert!(sell > mid, "a sell above the mid is not adverse at all");
+        // Round-to-nearest gives up the same price it cannot represent.
+        assert_eq!(a.slippage_price(mid, false, slip), Decimal::ZERO);
+    }
+
+    /// Toward the mid is a direction, not a rounding mode: it is down for a
+    /// buy and up for a sell, and getting that backwards would double the
+    /// slippage instead of bounding it.
+    #[test]
+    fn bounded_rounding_moves_toward_the_mid_on_both_sides() {
+        let a = asset(4);
+        let mid = d("100");
+        let slip = d("0.00006");
+        assert!(a.slippage_price_bounded(mid, true, slip) <= a.slippage_price(mid, true, slip));
+        assert!(a.slippage_price_bounded(mid, false, slip) >= a.slippage_price(mid, false, slip));
+    }
+
+    /// `oppen-core`'s own predicate, duplicated here so this crate's property
+    /// is checked against the comparison that will actually be applied to it
+    /// rather than against a restatement of the rounding.
+    fn adverse_bps(is_buy: bool, px: Decimal, reference_px: Decimal) -> Decimal {
+        let adverse = if is_buy {
+            px - reference_px
+        } else {
+            reference_px - px
+        };
+        if adverse <= Decimal::ZERO {
+            return Decimal::ZERO;
+        }
+        adverse / reference_px * Decimal::from(10_000)
     }
 
     #[test]

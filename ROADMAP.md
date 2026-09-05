@@ -30,7 +30,7 @@ Status as of 2026-09-05: P0 and the P1 code are on `main`; the P1 gate is waitin
 - [x] Exchange envelope + per-signer nonce allocator [7] — PR #1
 - [x] Info client: meta, asset contexts, book with `nSigFigs`, candles, mids, predicted fundings, clearinghouse state, open orders, fills by time, order status by cloid, rate limit, sub-accounts [11] — PR #2
 - [x] Exchange client and typed status parsing (resting / filled / error / success) [12] — PR #2
-- [x] Universe + asset validation: 5 significant figures, `6 − szDecimals`, `szDecimals`, $10 minimum notional, slippage price [8] — PR #2
+- [x] Universe + asset validation: 5 significant figures, `6 − szDecimals`, `szDecimals`, $10 minimum notional, slippage price [8] — PR #2; `slippage_price_bounded`, which rounds toward the mid so a price *at* a slippage limit cannot be refused *for* it — PR #17
 - [x] `OrderSpec` → validated `OrderWire` [8, 12] — PR #2
 - [x] `examples/testnet_order.rs`: place ALO, confirm by cloid, cancel by cloid, `expiresAfter` probe — PR #2
 - [ ] Rate-budget manager: batch orders/cancels, reserve headroom for risk-reducing actions, throttle before the venue does [10]
@@ -65,9 +65,8 @@ Status as of 2026-09-05: P0 and the P1 code are on `main`; the P1 gate is waitin
 - [x] `get_state`: versioned deterministic envelope, staleness flags, positions with liq distance, orders, balances [16] — PR #13. Time-since-last-action, funding, guardrail utilization, pending proposals, kill state and rate budget are not in the envelope yet
 - [x] `get_meta` [17] — PR #12
 - [ ] `get_events(since_cursor)` with `resync_required` [18]
-- [x] `place`, `cancel`, `cancel_all` with required `reason`; synchronous result contract; `get_order_status(cloid|oid)` [19] — PR #14
-- [ ] `close_position` [19] — needs conservative directional price rounding in `oppen-hl` first, so a market close cannot round *into* a slippage refusal
-- [x] Typed error taxonomy with retryability: `guardrail_reject`, `venue_reject{…}`, `venue_error`, `rate_limited`, `timeout_unknown_outcome`, `trading_paused`, `pending_approval` [19] — [decisions.md](docs/decisions.md) M1–M4. `auth_expired` is omitted until something constructs it: the door refuses an unpaired agent before a tool runs, and wallet expiry is a P2 item
+- [x] `place`, `cancel`, `cancel_all`, `close_position` with required `reason`; synchronous result contract; `get_order_status(cloid|oid)` [19] — PR #14, #17
+- [x] Typed error taxonomy with retryability: `guardrail_reject`, `venue_reject{…}`, `venue_error`, `rate_limited`, `timeout_unknown_outcome`, `trading_paused`, `pending_approval` [19] — PR #17, [decisions.md](docs/decisions.md) C1–C5. `auth_expired` is omitted until something constructs it: the door refuses an unpaired agent before a tool runs, and wallet expiry is a P2 item
 - [ ] `preflight(order)`: margin, fees, live book walk, guardrail verdict, post-fill exposure, `max_size_usd_within_{5,10,25}bps` [20]
 - [ ] `remember` / `recall` journal [21], `set_alert(condition)` [22]
 - [ ] Market = slippage-bounded IOC, limit GTC/IOC/ALO, stop-market, attached TP/SL with `positionTpsl`, reduce-only, batched actions, cloid on everything [12]
