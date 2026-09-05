@@ -113,11 +113,27 @@ Returns `{contract_version, symbol, is_buy, notional_usd, guardrail, book, book_
 
 **Not included: estimated fees.** Item 20 names them; oppen has no fee schedule yet, and guessing a tier would be worse than omitting one. It needs a `userFees` read audited against the live API, which is its own change.
 
-### `place(symbol, is_buy, size, limit_px, reason, reduce_only?, cloid?)`
+### `place(symbol, is_buy, size, reason, order_type…, reduce_only?, cloid?)`
 
-A GTC limit order. `reason` is required (item 19) and is untrusted text (item 30). `cloid` is minted when absent and comes back on every result.
+`reason` is required (item 19) and is untrusted text (item 30). `cloid` is minted when absent and comes back on every result.
+
+`order_type` selects one of item 12's three single-order forms, and carries its own fields — a stop with no trigger price, or a market order with a limit price, is not spellable rather than refused one case at a time:
+
+| `order_type` | Fields | Behaviour |
+|---|---|---|
+| `limit` | `limit_px`, `tif?` | Rests at `limit_px`. `tif` is `gtc` (default), `ioc` or `alo` |
+| `market` | — | Crosses now, as an IOC priced from the mid at your configured max slippage |
+| `stop_market` | `trigger_px`, `tpsl?` | Rests off-book until `trigger_px`, then crosses. `tpsl` is `sl` (default) or `tp` |
+
+**Hyperliquid has no market order type.** `market` and `stop_market` are IOCs priced through the book, and the bound is the **operator's** `max_slippage_bps`, not yours (item 24, D3). Prices are rounded toward the reference, so pricing at that bound cannot be refused for exceeding it (C5).
+
+A `stop_market` is priced from its **trigger**, not today's mid — that is where the book will be when it fills, and it is the reference the guardrail engine measures the slippage cap against.
+
+`tif` defaults to `gtc`. An order that silently became `ioc` would be cancelled instead of working, which is the expensive direction to guess wrong in.
 
 The guardrail check runs immediately before signing, in Rust, on the single path to the signer. There is no branch around it.
+
+**Not yet: attached TP/SL and batched actions.** Item 12 names `positionTpsl` and batching; both send several orders in one action, and the guardrail engine clears one intent at a time. A batch that partially clears must not partially send, and deciding what that means is its own change.
 
 ### `cancel(oid? | cloid?, reason)`
 
