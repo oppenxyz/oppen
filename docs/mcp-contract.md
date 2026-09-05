@@ -17,6 +17,12 @@ This document is the normative reference for every tool the gateway exposes. `do
 
 Shipped so far: `get_meta`, `get_state`, `get_events`, `preflight`, `place`, `cancel`, `cancel_all`, `close_position`, `get_order_status`. The rest are unimplemented and are not described below — a schema for a tool that does not exist is a promise nothing keeps.
 
+## Pairing
+
+A token is not an anonymous key to the gateway: it names **one agent bound to one venue account** (D1 as revised, `docs/decisions.md` C9). The operator creates the pairing — naming the agent, binding its container, assigning its guardrails — and the token is minted from that. An agent oppen has not been told about has no credential to present, which is what default-deny means here.
+
+Every tool call resolves its identity from the token presented (C10), so one gateway serves every paired agent and each acts as itself: its own guardrails, its own container, its own events. Revoking a pairing closes its live sessions and leaves every other pairing untouched.
+
 ## The result envelope
 
 Every acting tool answers with one JSON object. `contract_version` first, then `status`, then the fields that status implies.

@@ -106,12 +106,21 @@ async fn guard_middleware(
             // it. Fail closed rather than reason about what it left behind.
             Err(_) => return refuse(Refusal::Auth(crate::auth::AuthError::Unauthenticated)),
         };
-        store.authenticate(&token).map(|session| session.id)
+        store
+            .authenticate(&token)
+            .map(|session| (session.id, session.binding))
     };
 
     match authenticated {
-        Ok(id) => {
-            tracing::debug!(pairing = %id, "authenticated");
+        Ok((id, binding)) => {
+            tracing::debug!(pairing = %id, agent = %binding.agent, "authenticated");
+            // The tools read this back out of `RequestContext::extensions`,
+            // where `rmcp` republishes the request's `http::request::Parts`.
+            // It is the only place a tool learns which agent it is acting as,
+            // so an unauthenticated request cannot reach one: there would be
+            // nothing here to find.
+            let mut request = request;
+            request.extensions_mut().insert(binding);
             next.run(request).await
         }
         Err(error) => refuse(Refusal::Auth(error)),

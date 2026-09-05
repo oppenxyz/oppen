@@ -1608,6 +1608,28 @@ impl AgentView {
     }
 }
 
+/// Hands out one agent's [`AgentView`], and nothing else.
+///
+/// `oppen-mcp` resolves the agent from the pairing token on every request
+/// (`docs/spec.md` item 15), so it needs to build a view *per call* rather than
+/// hold one — and the obvious way to do that, keeping an `Arc<Ledger>`, would
+/// put `redact` and `upsert_sub_account` back within reach of a tool. This owns
+/// the `Arc` privately and exposes exactly one verb, so `AGENTS.md` invariant 3
+/// stays a compile error rather than a review note.
+#[derive(Debug, Clone)]
+pub struct EventViews(Arc<Ledger>);
+
+impl EventViews {
+    pub fn new(ledger: Arc<Ledger>) -> Self {
+        EventViews(ledger)
+    }
+
+    /// The read-only slice belonging to `agent_id`.
+    pub fn for_agent(&self, agent_id: impl Into<String>) -> AgentView {
+        self.0.agent_view(agent_id)
+    }
+}
+
 /// Set the pragmas the durability guarantee depends on.
 ///
 /// WAL so a reader never blocks the writer that is recording a fill, and
