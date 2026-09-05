@@ -1,21 +1,30 @@
 //! The tools an agent may call (`docs/spec.md` section C).
 //!
-//! Every tool here is read-only. The execution tools of item 19 arrive with
-//! the guardrail wiring, because a tool that signs must go through
-//! `oppen_core`'s single pre-sign path and nothing here may offer a second
-//! route to the signer (`AGENTS.md` invariant 1).
+//! Two of them read (`get_meta`, `get_state`, `get_order_status`) and four
+//! act (`place`, `cancel`, `cancel_all`, `close_position`). Every acting tool
+//! reaches the signer through `oppen_core`'s single pre-sign path — `evaluate`
+//! or `clear_cancel`, then `sign_cleared` — and nothing here offers a second
+//! route (`AGENTS.md` invariant 1). There is no `sign_unchecked` in this file
+//! and no branch around a clearance.
+//!
+//! What every tool answers with lives in [`crate::outcome`]: a typed status
+//! on success, a typed code with its retryability on failure, never a
+//! formatted sentence (invariant 8).
 
 use std::sync::Arc;
 
 use oppen_core::guardrail::AgentId;
-use oppen_core::guardrail::{FeedQuality, GuardrailEngine, MarketRef, OrderIntent, Refusal};
+use oppen_core::guardrail::{Cleared, FeedQuality, GuardrailEngine, MarketRef, OrderIntent};
 use oppen_core::state::{
     AccountState, VenueReadings, assemble, exposure_from, realized_pnl_since, utc_day_start_ms,
 };
-use oppen_hl::OrderKind;
-use oppen_hl::wire::{Grouping, Tif};
+use oppen_hl::info::OrderRef;
+use oppen_hl::types::OrderStatusResponse;
+use oppen_hl::wire::{CancelWire, Cloid, Grouping, Tif};
 use oppen_hl::{Address, InfoClient, Network, Universe, meta::MIN_NOTIONAL_USD};
-use oppen_hl::{ExchangeClient, NonceAllocator};
+use oppen_hl::{ExchangeClient, ExchangeResponse, NonceAllocator, OrderKind, Status};
+
+use crate::outcome::{self, CancelFailure, Reply, ToolError};
 use rmcp::{
     ErrorData, ServerHandler,
     handler::server::wrapper::Parameters,
@@ -50,6 +59,14 @@ struct GatewayInner {
     nonces: NonceAllocator,
 }
 
+/// The inputs `GuardrailEngine::evaluate` needs, gathered once per call.
+struct EvaluationContext {
+    universe: Universe,
+    state: AccountState,
+    exposure: oppen_core::guardrail::Exposure,
+    market: MarketRef,
+}
+
 /// What `place` takes.
 ///
 /// `reason` is required by spec item 19 and is an untrusted claim (item 30):
@@ -74,6 +91,52 @@ pub struct PlaceParams {
     pub reason: String,
     #[serde(default)]
     pub reduce_only: bool,
+    /// Optional. One is minted when absent, and either way it comes back on
+    /// the result — item 19's reconcile-by-cloid needs one to exist.
+    #[serde(default)]
+    pub cloid: Option<String>,
+}
+
+/// What `cancel` takes: one order, named the way the agent knows it.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CancelParams {
+    /// The venue's order id. Supply this or `cloid`.
+    #[serde(default)]
+    pub oid: Option<u64>,
+    /// The client order id `place` returned. Supply this or `oid`.
+    #[serde(default)]
+    pub cloid: Option<String>,
+    /// Required by item 19, and untrusted text (item 30).
+    pub reason: String,
+}
+
+/// What `cancel_all` and `close_position` take.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SymbolActionParams {
+    /// Restrict to one symbol. `cancel_all` without one cancels every resting
+    /// order on the account.
+    #[serde(default)]
+    pub symbol: Option<String>,
+    pub reason: String,
+}
+
+/// What `close_position` takes.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ClosePositionParams {
+    /// The symbol to flatten. Required: closing "everything" is a different
+    /// action with a different blast radius, and item 26 keeps flatten
+    /// decoupled from anything that sweeps.
+    pub symbol: String,
+    pub reason: String,
+}
+
+/// What `get_order_status` takes.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct OrderStatusParams {
+    #[serde(default)]
+    pub oid: Option<u64>,
+    #[serde(default)]
+    pub cloid: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -144,17 +207,17 @@ impl Gateway {
             .info
             .meta()
             .await
-            .map_err(|e| ErrorData::internal_error(format!("meta query failed: {e}"), None))?;
-        let universe = Universe::from_meta(&meta)
-            .map_err(|e| ErrorData::internal_error(format!("meta rejected: {e}"), None))?;
+            .map_err(|e| ToolError::unavailable("meta", e))?;
+        let universe =
+            Universe::from_meta(&meta).map_err(|e| ToolError::unavailable("universe", e))?;
 
         let mut out: Vec<SymbolMeta> = Vec::new();
         match symbols {
             Some(wanted) => {
                 for symbol in wanted {
-                    let asset = universe.get(&symbol).map_err(|e| {
-                        ErrorData::invalid_params(format!("unknown symbol {symbol:?}: {e}"), None)
-                    })?;
+                    let asset = universe
+                        .get(&symbol)
+                        .map_err(|e| ToolError::invalid("symbols", e))?;
                     out.push(describe(asset));
                 }
             }
@@ -165,9 +228,9 @@ impl Gateway {
         // bytes, which is what makes a cached response comparable.
         out.sort_by_key(|symbol| symbol.asset_id);
 
-        let json = serde_json::to_string(&out)
-            .map_err(|e| ErrorData::internal_error(format!("serialise: {e}"), None))?;
-        Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(
+            serde_json::to_string(&out).expect("SymbolMeta serializes"),
+        )]))
     }
 
     /// `place` — the only path from an agent to a signature
@@ -189,17 +252,397 @@ impl Gateway {
         let inner = &self.inner;
         let now_ms = now_ms();
 
-        let meta = inner
-            .info
-            .meta()
-            .await
-            .map_err(|e| ErrorData::internal_error(format!("meta: {e}"), None))?;
-        let universe = Universe::from_meta(&meta)
-            .map_err(|e| ErrorData::internal_error(format!("meta rejected: {e}"), None))?;
-        let asset = universe.get(&params.symbol).map_err(|e| {
-            ErrorData::invalid_params(format!("unknown symbol {:?}: {e}", params.symbol), None)
-        })?;
+        let context = self.evaluation_context(&params.symbol, now_ms).await?;
+        let asset = context
+            .universe
+            .get(&params.symbol)
+            .map_err(|e| ToolError::invalid("symbol", e))?;
 
+        let px: Decimal = params
+            .limit_px
+            .parse()
+            .map_err(|e| ToolError::invalid("limit_px", e))?;
+        let sz: Decimal = params
+            .size
+            .parse()
+            .map_err(|e| ToolError::invalid("size", e))?;
+
+        // A cloid is minted when the agent supplies none, and it is minted
+        // *before* signing. Item 19 says the only safe move after
+        // `timeout_unknown_outcome` is a query by cloid — an order sent
+        // without one is unreconcilable by construction, so oppen never sends
+        // one that way.
+        let cloid = match &params.cloid {
+            Some(supplied) => Cloid::parse(supplied).map_err(|e| ToolError::invalid("cloid", e))?,
+            None => mint_cloid()?,
+        };
+
+        let intent = OrderIntent {
+            symbol: params.symbol.clone(),
+            is_buy: params.is_buy,
+            px,
+            sz,
+            kind: OrderKind::Limit { tif: Tif::Gtc },
+            reduce_only: params.reduce_only,
+            cloid: Some(cloid.clone()),
+            grouping: Grouping::Na,
+            builder: None,
+            max_slippage_bps: None,
+            reason: params.reason,
+        };
+
+        // The gate. There is no branch around it.
+        let cleared = match inner.engine.evaluate(
+            &inner.agent,
+            &intent,
+            asset,
+            &context.market,
+            &context.exposure,
+            now_ms,
+        ) {
+            Ok(cleared) => cleared,
+            Err(refusal) => return Ok(outcome::refused(refusal).into_result()),
+        };
+
+        let response = self.submit(cleared, Some(&cloid), now_ms).await?;
+        Ok(order_outcome(response, Some(cloid.as_str().to_owned()))?.into_result())
+    }
+
+    /// `cancel` — one resting order (`docs/spec.md` item 19).
+    #[tool(
+        description = "Cancel one resting order by oid or by the cloid place returned. Requires \
+                       a reason. Cancels are risk-reducing: they are cleared while the kill \
+                       switch is engaged and they cost no order-rate token."
+    )]
+    async fn cancel(
+        &self,
+        Parameters(params): Parameters<CancelParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let inner = &self.inner;
+        let now_ms = now_ms();
+
+        // Which resting order this names, and on which asset. The asset id is
+        // part of both cancel wires, so an oid alone is not enough and the
+        // open-order list is the only place it can come from.
+        let orders = inner
+            .info
+            .frontend_open_orders(inner.account)
+            .await
+            .map_err(|e| ToolError::unavailable("orders", e))?;
+        let universe = self.universe().await?;
+
+        let target = match (&params.oid, &params.cloid) {
+            (Some(oid), _) => orders.iter().find(|o| o.oid == *oid),
+            (None, Some(cloid)) => orders
+                .iter()
+                .find(|o| o.cloid.as_ref().is_some_and(|c| c.as_str() == cloid)),
+            (None, None) => {
+                return Err(ToolError::invalid("oid", "supply either oid or cloid").into());
+            }
+        };
+        // Not an error: an order that is already gone is the state the caller
+        // wanted. Reported as a cancel that the venue did not take, with the
+        // count that says so, rather than as a failure to act on.
+        let Some(order) = target else {
+            return Ok(outcome::canceled(
+                1,
+                vec![CancelFailure {
+                    oid: params.oid,
+                    cloid: params.cloid.clone(),
+                    venue_message: "no such resting order".to_owned(),
+                }],
+            )
+            .into_result());
+        };
+        let asset = universe
+            .get(&order.coin)
+            .map_err(|e| ToolError::unavailable("universe", e))?;
+
+        let cleared = match inner.engine.clear_cancel(
+            &inner.agent,
+            vec![CancelWire {
+                a: asset.index,
+                o: order.oid,
+            }],
+            &params.reason,
+            now_ms,
+        ) {
+            Ok(cleared) => cleared,
+            Err(refusal) => return Ok(outcome::refused(refusal).into_result()),
+        };
+
+        let response = self.submit(cleared, order.cloid.as_ref(), now_ms).await?;
+        Ok(cancel_outcome(
+            response,
+            vec![(
+                Some(order.oid),
+                order.cloid.as_ref().map(|c| c.as_str().to_owned()),
+            )],
+        )
+        .into_result())
+    }
+
+    /// `cancel_all` — every resting order, or every one on a symbol
+    /// (`docs/spec.md` item 19).
+    #[tool(
+        description = "Cancel every resting order, or every one on a symbol. Requires a reason. \
+                       Partial success is normal — an order that filled a moment ago cannot be \
+                       cancelled — so the result itemises what the venue would not take."
+    )]
+    async fn cancel_all(
+        &self,
+        Parameters(params): Parameters<SymbolActionParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let inner = &self.inner;
+        let now_ms = now_ms();
+
+        let orders = inner
+            .info
+            .frontend_open_orders(inner.account)
+            .await
+            .map_err(|e| ToolError::unavailable("orders", e))?;
+        let universe = self.universe().await?;
+
+        let targets: Vec<_> = orders
+            .into_iter()
+            .filter(|o| params.symbol.as_ref().is_none_or(|s| *s == o.coin))
+            .collect();
+        // Nothing resting is the state the caller wanted, and the engine
+        // refuses an empty cancel as an input mismatch — so this answers
+        // without asking it.
+        if targets.is_empty() {
+            return Ok(outcome::canceled(0, Vec::new()).into_result());
+        }
+
+        let mut wires = Vec::with_capacity(targets.len());
+        let mut named = Vec::with_capacity(targets.len());
+        for order in &targets {
+            let asset = universe
+                .get(&order.coin)
+                .map_err(|e| ToolError::unavailable("universe", e))?;
+            wires.push(CancelWire {
+                a: asset.index,
+                o: order.oid,
+            });
+            named.push((
+                Some(order.oid),
+                order.cloid.as_ref().map(|c| c.as_str().to_owned()),
+            ));
+        }
+
+        let cleared = match inner
+            .engine
+            .clear_cancel(&inner.agent, wires, &params.reason, now_ms)
+        {
+            Ok(cleared) => cleared,
+            Err(refusal) => return Ok(outcome::refused(refusal).into_result()),
+        };
+
+        let response = self.submit(cleared, None, now_ms).await?;
+        Ok(cancel_outcome(response, named).into_result())
+    }
+
+    /// `close_position` — flatten one symbol (`docs/spec.md` item 19).
+    #[tool(
+        description = "Flatten the open position on one symbol with a reduce-only IOC order, \
+                       priced at this agent's configured max slippage. Requires a reason. It \
+                       cannot open or flip a position: the size is the position's own and the \
+                       order is reduce-only, so a fill that would cross through flat is refused \
+                       by the venue rather than reversed."
+    )]
+    async fn close_position(
+        &self,
+        Parameters(params): Parameters<ClosePositionParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let inner = &self.inner;
+        let now_ms = now_ms();
+
+        let context = self.evaluation_context(&params.symbol, now_ms).await?;
+        let asset = context
+            .universe
+            .get(&params.symbol)
+            .map_err(|e| ToolError::invalid("symbol", e))?;
+
+        // Nothing open is not a failure: the caller wanted the symbol flat and
+        // it is flat. Answered as a cancel-shaped no-op rather than as an
+        // error, so an agent unwinding a book can call this per symbol without
+        // branching on which ones it still holds.
+        let Some(position) = context
+            .state
+            .positions
+            .iter()
+            .find(|p| p.symbol == params.symbol)
+            .filter(|p| !p.size.is_zero())
+        else {
+            return Ok(outcome::canceled(0, Vec::new()).into_result());
+        };
+
+        // Without a mid there is no price to send. This is the gateway
+        // failing to build an order, not a guardrail verdict, so it is an
+        // `unavailable` rather than a fabricated zero-price intent handed to
+        // the engine to refuse — that would record an order nobody asked for
+        // in the ledger and would trip the venue's price rule rather than the
+        // engine's missing-reference one, naming the wrong cause.
+        let Some(reference_px) = context.market.reference_px else {
+            return Err(ToolError::Unavailable {
+                what: "reference price",
+                detail: format!("no mid for {}; refusing to price a close", params.symbol),
+            }
+            .into());
+        };
+
+        // The bound is the operator's, read from the engine rather than taken
+        // from the caller: item 24 and D3 make slippage operator-set, and an
+        // agent that could widen it to close could widen it to open.
+        let guardrails =
+            inner
+                .engine
+                .guardrails(&inner.agent)
+                .ok_or_else(|| ToolError::Unavailable {
+                    what: "guardrails",
+                    detail: format!("{} is not a paired agent", inner.agent),
+                })?;
+
+        let intent = close_intent(
+            &params.symbol,
+            &params.reason,
+            position.size,
+            reference_px,
+            guardrails.max_slippage_bps,
+            asset,
+            mint_cloid()?,
+        );
+
+        // The same gate as `place`. A close is not privileged: it is refused
+        // when the account is unreconciled or the feed is stale, exactly as an
+        // opening order is.
+        let cleared = match inner.engine.evaluate(
+            &inner.agent,
+            &intent,
+            asset,
+            &context.market,
+            &context.exposure,
+            now_ms,
+        ) {
+            Ok(cleared) => cleared,
+            Err(refusal) => return Ok(outcome::refused(refusal).into_result()),
+        };
+
+        let cloid = intent.cloid.clone();
+        let response = self.submit(cleared, cloid.as_ref(), now_ms).await?;
+        Ok(order_outcome(response, cloid.map(|c| c.as_str().to_owned()))?.into_result())
+    }
+
+    /// `get_order_status` — the reconcile after a timeout
+    /// (`docs/spec.md` item 19).
+    #[tool(
+        description = "The venue's own status for one order, by oid or cloid. This is the only \
+                       safe move after timeout_unknown_outcome: query by the cloid the failed \
+                       call returned, never resend the order."
+    )]
+    async fn get_order_status(
+        &self,
+        Parameters(params): Parameters<OrderStatusParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let reference = match (params.oid, &params.cloid) {
+            (Some(oid), _) => OrderRef::Oid(oid),
+            (None, Some(cloid)) => {
+                OrderRef::Cloid(Cloid::parse(cloid).map_err(|e| ToolError::invalid("cloid", e))?)
+            }
+            (None, None) => {
+                return Err(ToolError::invalid("oid", "supply either oid or cloid").into());
+            }
+        };
+
+        let status = self
+            .inner
+            .info
+            .order_status(self.inner.account, reference)
+            .await
+            .map_err(|e| ToolError::unavailable("order status", e))?;
+
+        // `unknown_oid` is a real answer and the important one after a
+        // timeout: the venue never saw the order, so it is safe to place
+        // again. Anything else means it did, and resending would double it.
+        let body = match status {
+            OrderStatusResponse::UnknownOid => serde_json::json!({
+                "contract_version": 0,
+                "known": false,
+            }),
+            OrderStatusResponse::Order { order } => serde_json::json!({
+                "contract_version": 0,
+                "known": true,
+                "status": order.status,
+                "status_timestamp_ms": order.status_timestamp,
+                "oid": order.order.oid,
+                "cloid": order.order.cloid.as_ref().map(|c| c.as_str()),
+                "symbol": order.order.coin,
+                "is_buy": order.order.side.is_buy(),
+                "limit_px": order.order.limit_px,
+                "sz_remaining": order.order.sz,
+                "sz_original": order.order.orig_sz,
+            }),
+        };
+        Ok(CallToolResult::success(vec![ContentBlock::text(
+            body.to_string(),
+        )]))
+    }
+
+    /// `get_state` — the agent's eyes (`docs/spec.md` item 16).
+    #[tool(
+        description = "The account right now: equity, margin, open positions with distance to \
+                       liquidation, resting orders, and feed freshness. Read this before acting. \
+                       If `feed` is not `live`, the data is stale and execution will fail closed."
+    )]
+    async fn get_state(&self) -> Result<CallToolResult, ErrorData> {
+        let state = self.read_state(now_ms()).await?;
+        Ok(CallToolResult::success(vec![ContentBlock::text(
+            serde_json::to_string(&state).expect("AccountState serializes"),
+        )]))
+    }
+
+    /// The one place a `Cleared` becomes bytes on the wire.
+    ///
+    /// Every acting tool goes through here, so the nonce, the signer and the
+    /// unknown-outcome classification are written once. A transport failure is
+    /// **always** `timeout_unknown_outcome`, never a retryable error: the
+    /// request may have been applied, and the cost of being wrong in that
+    /// direction is a duplicate order against the cost of one cheap
+    /// `orderStatus` query in the other (`docs/spec.md` item 19).
+    async fn submit(
+        &self,
+        cleared: Cleared,
+        cloid: Option<&Cloid>,
+        now_ms: u64,
+    ) -> Result<ExchangeResponse, ToolError> {
+        let inner = &self.inner;
+        let nonce = inner.nonces.next();
+        let (request, _clearance) = inner
+            .engine
+            .sign_cleared(cleared, nonce, None, now_ms)
+            .map_err(|e| ToolError::unavailable("signer", e))?;
+
+        inner.exchange.post(&request).await.map_err(|e| match e {
+            oppen_hl::Error::Venue { status, message } => ToolError::venue(status, message),
+            transport => ToolError::TimeoutUnknownOutcome {
+                cloid: cloid.map(|c| c.as_str().to_owned()),
+                detail: transport.to_string(),
+            },
+        })
+    }
+
+    /// Everything [`GuardrailEngine::evaluate`] needs, assembled once.
+    ///
+    /// `place` and `close_position` both call it, and they must: two
+    /// assemblies of the same inputs drift, and the one that drifts is the one
+    /// that decides whether an order is refused.
+    async fn evaluation_context(
+        &self,
+        symbol: &str,
+        now_ms: u64,
+    ) -> Result<EvaluationContext, ToolError> {
+        let inner = &self.inner;
+        let universe = self.universe().await?;
         let state = self.read_state(now_ms).await?;
 
         // Realised PnL is summed from the venue's own fills for the UTC day,
@@ -209,12 +652,12 @@ impl Gateway {
             .info
             .user_fills_by_time(inner.account, day_start_ms, Some(now_ms))
             .await
-            .map_err(|e| ErrorData::internal_error(format!("fills: {e}"), None))?;
+            .map_err(|e| ToolError::unavailable("fills", e))?;
         let portfolio = inner
             .info
             .portfolio(inner.account)
             .await
-            .map_err(|e| ErrorData::internal_error(format!("portfolio: {e}"), None))?;
+            .map_err(|e| ToolError::unavailable("portfolio", e))?;
 
         let exposure = exposure_from(
             &state,
@@ -230,12 +673,13 @@ impl Gateway {
             .info
             .all_mids()
             .await
-            .map_err(|e| ErrorData::internal_error(format!("mids: {e}"), None))?;
+            .map_err(|e| ToolError::unavailable("mids", e))?;
+        // A missing price is a refusal, never a fallback: `allMids` answers
+        // for bookless assets with a frozen mark.
+        let reference_px = mids.get(symbol).copied();
         let market = MarketRef {
-            symbol: params.symbol.clone(),
-            // A missing price is a refusal, never a fallback: `allMids`
-            // answers for bookless assets with a frozen mark.
-            reference_px: mids.get(&params.symbol).copied(),
+            symbol: symbol.to_owned(),
+            reference_px,
             as_of_ms: now_ms,
             quality: FeedQuality::Ok,
             mark_divergence_bps: None,
@@ -243,81 +687,30 @@ impl Gateway {
             snapshot: None,
         };
 
-        let px: Decimal = params.limit_px.parse().map_err(|e| {
-            ErrorData::invalid_params(
-                format!("limit_px {:?} is not a decimal: {e}", params.limit_px),
-                None,
-            )
-        })?;
-        let sz: Decimal = params.size.parse().map_err(|e| {
-            ErrorData::invalid_params(
-                format!("size {:?} is not a decimal: {e}", params.size),
-                None,
-            )
-        })?;
-
-        let intent = OrderIntent {
-            symbol: params.symbol.clone(),
-            is_buy: params.is_buy,
-            px,
-            sz,
-            kind: OrderKind::Limit { tif: Tif::Gtc },
-            reduce_only: params.reduce_only,
-            cloid: None,
-            grouping: Grouping::Na,
-            builder: None,
-            max_slippage_bps: None,
-            reason: params.reason,
-        };
-
-        // The gate. There is no branch around it.
-        let cleared =
-            match inner
-                .engine
-                .evaluate(&inner.agent, &intent, asset, &market, &exposure, now_ms)
-            {
-                Ok(cleared) => cleared,
-                Err(refusal) => return Ok(refused(&refusal)),
-            };
-
-        let nonce = inner.nonces.next();
-        let (request, _clearance) = inner
-            .engine
-            .sign_cleared(cleared, nonce, None, now_ms)
-            .map_err(|e| ErrorData::internal_error(format!("signing refused: {e}"), None))?;
-
-        let response = inner
-            .exchange
-            .post(&request)
-            .await
-            .map_err(|e| ErrorData::internal_error(format!("venue: {e}"), None))?;
-
-        let json = serde_json::to_string(&serde_json::json!({
-            "status": "submitted",
-            "venue_response": format!("{response:?}"),
-        }))
-        .map_err(|e| ErrorData::internal_error(format!("serialise: {e}"), None))?;
-        Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
+        Ok(EvaluationContext {
+            universe,
+            state,
+            exposure,
+            market,
+        })
     }
 
-    /// `get_state` — the agent's eyes (`docs/spec.md` item 16).
-    #[tool(
-        description = "The account right now: equity, margin, open positions with distance to \
-                       liquidation, resting orders, and feed freshness. Read this before acting. \
-                       If `feed` is not `live`, the data is stale and execution will fail closed."
-    )]
-    async fn get_state(&self) -> Result<CallToolResult, ErrorData> {
-        let state = self.read_state(now_ms()).await?;
-        let json = serde_json::to_string(&state)
-            .map_err(|e| ErrorData::internal_error(format!("serialise: {e}"), None))?;
-        Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
+    /// The validated universe, which every tool that names a symbol needs.
+    async fn universe(&self) -> Result<Universe, ToolError> {
+        let meta = self
+            .inner
+            .info
+            .meta()
+            .await
+            .map_err(|e| ToolError::unavailable("meta", e))?;
+        Universe::from_meta(&meta).map_err(|e| ToolError::unavailable("universe", e))
     }
 
     /// The four venue reads `get_state` and `place` share.
     ///
     /// Four and not one: Hyperliquid publishes no single endpoint that answers
     /// this, and spot is load-bearing because margin is unified.
-    async fn read_state(&self, now_ms: u64) -> Result<AccountState, ErrorData> {
+    async fn read_state(&self, now_ms: u64) -> Result<AccountState, ToolError> {
         let inner = &self.inner;
         let account = inner.account;
 
@@ -325,22 +718,22 @@ impl Gateway {
             .info
             .clearinghouse_state(account)
             .await
-            .map_err(|e| ErrorData::internal_error(format!("clearinghouse: {e}"), None))?;
+            .map_err(|e| ToolError::unavailable("clearinghouse", e))?;
         let spot = inner
             .info
             .spot_clearinghouse_state(account)
             .await
-            .map_err(|e| ErrorData::internal_error(format!("spot: {e}"), None))?;
+            .map_err(|e| ToolError::unavailable("spot", e))?;
         let orders = inner
             .info
             .frontend_open_orders(account)
             .await
-            .map_err(|e| ErrorData::internal_error(format!("orders: {e}"), None))?;
+            .map_err(|e| ToolError::unavailable("orders", e))?;
         let mids = inner
             .info
             .all_mids()
             .await
-            .map_err(|e| ErrorData::internal_error(format!("mids: {e}"), None))?;
+            .map_err(|e| ToolError::unavailable("mids", e))?;
 
         Ok(assemble(
             inner.network,
@@ -360,22 +753,120 @@ impl Gateway {
     }
 }
 
-/// Render a guardrail refusal as data the agent can act on.
+/// Map an order response onto item 19's synchronous result.
 ///
-/// Returned as a **successful** tool call carrying `status: "refused"`, not as
-/// a protocol error. A refusal is a correct, expected outcome of asking — the
-/// system working — and an error would invite a blind retry, which is exactly
-/// the wrong response to a limit.
-fn refused(refusal: &Refusal) -> CallToolResult {
-    let body = serde_json::json!({
-        "status": "refused",
-        "refused_by": "guardrail",
-        // The Display impl names the predicate, the observed value and the
-        // limit; `AGENTS.md` keeps that contract, not this call site.
-        "reason": refusal.to_string(),
-        "retryable": false,
-    });
-    CallToolResult::success(vec![ContentBlock::text(body.to_string())])
+/// A venue `error` status is a `venue_error` rather than a refusal: the nonce
+/// was spent and the request was seen, which is a different fact about the
+/// world than a guardrail saying no.
+fn order_outcome(response: ExchangeResponse, cloid: Option<String>) -> Result<Reply, ToolError> {
+    // One order in, so one status out. A venue that answers a single order
+    // with none of them has not accepted it, and reporting that as success
+    // would invent a fill.
+    let Some(status) = response.statuses.into_iter().next() else {
+        return Err(ToolError::venue(
+            200,
+            "the venue accepted the request but reported no order status".to_owned(),
+        ));
+    };
+    match status {
+        Status::Resting { oid } => Ok(outcome::resting(oid, cloid)),
+        Status::Filled {
+            oid,
+            total_sz,
+            avg_px,
+        } => Ok(outcome::filled(oid, cloid, total_sz, avg_px)),
+        Status::Error(message) => Err(ToolError::venue(200, message)),
+        // A resting trigger order and a `success` on an order action are both
+        // "the venue took it and there is no oid yet". Reported as an unknown
+        // outcome rather than as a fill, because the agent must reconcile.
+        Status::Success | Status::WaitingForTrigger | Status::WaitingForFill => {
+            Err(ToolError::TimeoutUnknownOutcome {
+                cloid,
+                detail: "the venue accepted the order without an id; reconcile by cloid".to_owned(),
+            })
+        }
+    }
+}
+
+/// Map a cancel response onto `status: canceled`, pairing each status with the
+/// order it answers for.
+///
+/// The venue returns statuses positionally, aligned with the cancels sent.
+fn cancel_outcome(response: ExchangeResponse, named: Vec<(Option<u64>, Option<String>)>) -> Reply {
+    let requested = named.len();
+    let failed = response
+        .statuses
+        .into_iter()
+        .zip(named)
+        .filter_map(|(status, (oid, cloid))| match status {
+            Status::Error(venue_message) => Some(CancelFailure {
+                oid,
+                cloid,
+                venue_message,
+            }),
+            _ => None,
+        })
+        .collect();
+    outcome::canceled(requested, failed)
+}
+
+/// The order a close is, decided from the position and the operator's bound.
+///
+/// Free-standing and pure, because the two things that make a close dangerous
+/// are decided here and are testable without a venue: **closing a long by
+/// buying doubles it**, and a size that is not the position's own magnitude can
+/// flip it. `reduce_only` is the venue-side backstop for both, but the venue
+/// refusing a reversed order is a worse way to learn this is wrong than a test.
+///
+/// `position_size` is signed as the venue reports it: negative is short.
+fn close_intent(
+    symbol: &str,
+    reason: &str,
+    position_size: Decimal,
+    reference_px: Decimal,
+    max_slippage_bps: Decimal,
+    asset: &oppen_hl::meta::Asset,
+    cloid: Cloid,
+) -> OrderIntent {
+    // Closing a long is a sell and closing a short is a buy.
+    let is_buy = position_size.is_sign_negative();
+    let slippage = max_slippage_bps / Decimal::from(10_000);
+    OrderIntent {
+        symbol: symbol.to_owned(),
+        is_buy,
+        // Rounded toward the mid, so pricing *at* the operator's limit cannot
+        // be refused *for* that limit by a rounding step nobody chose.
+        px: asset.slippage_price_bounded(reference_px, is_buy, slippage),
+        // The position's own magnitude. This tool cannot be asked for a
+        // different one, which is what stops it opening or flipping.
+        sz: position_size.abs(),
+        // A market order on Hyperliquid is an IOC priced through the book;
+        // there is no market order type to send.
+        kind: OrderKind::Limit { tif: Tif::Ioc },
+        reduce_only: true,
+        cloid: Some(cloid),
+        grouping: Grouping::Na,
+        builder: None,
+        // The agent may not tighten below the operator's bound here: the price
+        // is already computed from that bound, and a second, tighter limit
+        // would refuse the order this function just priced.
+        max_slippage_bps: None,
+        reason: reason.to_owned(),
+    }
+}
+
+/// Mint a client order id from OS entropy.
+///
+/// Fails closed rather than falling back to a counter or a timestamp: a cloid
+/// that another order might share makes item 19's reconcile-by-cloid answer
+/// for the wrong order, which is worse than refusing to place one.
+fn mint_cloid() -> Result<Cloid, ToolError> {
+    let mut bytes = [0u8; 16];
+    getrandom::getrandom(&mut bytes).map_err(|e| ToolError::Unavailable {
+        what: "OS entropy",
+        detail: format!("refusing to place an order with no client order id: {e}"),
+    })?;
+    Ok(Cloid::from_bytes(bytes))
 }
 
 fn now_ms() -> u64 {
@@ -420,5 +911,324 @@ impl ServerHandler for Gateway {
                 .into(),
         );
         info
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rust_decimal::Decimal;
+    use std::str::FromStr;
+
+    fn d(s: &str) -> Decimal {
+        Decimal::from_str(s).expect("decimal")
+    }
+
+    fn response(statuses: Vec<Status>) -> ExchangeResponse {
+        ExchangeResponse { statuses }
+    }
+
+    fn body(result: CallToolResult) -> String {
+        match result.content.into_iter().next() {
+            Some(ContentBlock::Text(text)) => text.text,
+            other => panic!("expected one text block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_resting_order_reports_its_oid_and_the_cloid_it_can_be_reconciled_with() {
+        let reply = order_outcome(
+            response(vec![Status::Resting { oid: 42 }]),
+            Some("0xaa".into()),
+        )
+        .expect("resting is not an error");
+        assert_eq!(
+            body(reply.into_result()),
+            r#"{"contract_version":0,"status":"resting","oid":42,"cloid":"0xaa"}"#
+        );
+    }
+
+    #[test]
+    fn a_filled_order_reports_the_venue_size_and_price() {
+        let reply = order_outcome(
+            response(vec![Status::Filled {
+                total_sz: d("0.25"),
+                avg_px: d("63999.5"),
+                oid: 43,
+            }]),
+            None,
+        )
+        .expect("filled is not an error");
+        assert_eq!(
+            body(reply.into_result()),
+            r#"{"contract_version":0,"status":"filled","oid":43,"cloid":null,"filled_sz":"0.25","avg_px":"63999.5"}"#
+        );
+    }
+
+    /// The venue saw the order and said no. That is a different fact from a
+    /// guardrail refusal — the nonce was spent — so it is a `venue_error` and
+    /// the venue's words are carried verbatim.
+    #[test]
+    fn a_venue_error_status_is_a_venue_error_carrying_the_message_verbatim() {
+        let err = order_outcome(
+            response(vec![Status::Error(
+                "Insufficient margin to place order.".into(),
+            )]),
+            None,
+        )
+        .expect_err("a venue error is not a success");
+        assert_eq!(
+            err,
+            ToolError::VenueError {
+                http_status: 200,
+                venue_message: "Insufficient margin to place order.".to_owned(),
+            }
+        );
+    }
+
+    /// An `ok` envelope with no statuses in it is the venue not answering the
+    /// question. Reporting it as success would invent an outcome.
+    #[test]
+    fn an_empty_status_list_is_never_reported_as_a_fill() {
+        let err = order_outcome(response(vec![]), None).expect_err("no status is not a success");
+        assert!(matches!(err, ToolError::VenueError { .. }), "{err:?}");
+    }
+
+    /// A trigger order rests off-book with no oid. The agent must reconcile
+    /// rather than assume, so it gets the cloid and the unknown-outcome code.
+    #[test]
+    fn an_accepted_order_with_no_id_is_an_unknown_outcome_carrying_the_cloid() {
+        let err = order_outcome(
+            response(vec![Status::WaitingForTrigger]),
+            Some("0xbb".into()),
+        )
+        .expect_err("no oid is not a success");
+        assert!(
+            matches!(&err, ToolError::TimeoutUnknownOutcome { cloid, .. } if cloid.as_deref() == Some("0xbb")),
+            "{err:?}"
+        );
+    }
+
+    /// The venue answers cancels positionally. Pairing them by position is
+    /// what lets a failure name the order it belongs to; getting it wrong
+    /// would attribute one order's refusal to another.
+    #[test]
+    fn cancel_failures_are_paired_with_the_order_each_one_answers_for() {
+        let reply = cancel_outcome(
+            response(vec![
+                Status::Success,
+                Status::Error("Order was never placed, already canceled, or filled.".into()),
+                Status::Success,
+            ]),
+            vec![
+                (Some(1), None),
+                (Some(2), Some("0xcc".to_owned())),
+                (Some(3), None),
+            ],
+        );
+        let body = body(reply.into_result());
+        assert!(body.contains(r#""requested":3,"canceled":2"#), "{body}");
+        assert!(body.contains(r#""oid":2,"cloid":"0xcc""#), "{body}");
+        assert!(!body.contains(r#""oid":1"#), "{body}");
+        assert!(!body.contains(r#""oid":3"#), "{body}");
+    }
+
+    #[test]
+    fn a_cancel_the_venue_took_in_full_reports_no_failures() {
+        let reply = cancel_outcome(
+            response(vec![Status::Success, Status::Success]),
+            vec![(Some(1), None), (Some(2), None)],
+        );
+        assert_eq!(
+            body(reply.into_result()),
+            r#"{"contract_version":0,"status":"canceled","requested":2,"canceled":2,"failed":[]}"#
+        );
+    }
+
+    fn test_asset(sz_decimals: u32) -> oppen_hl::meta::Asset {
+        oppen_hl::meta::Asset {
+            index: 0,
+            info: oppen_hl::types::AssetInfo {
+                name: "TEST".into(),
+                sz_decimals,
+                max_leverage: 50,
+                margin_table_id: 0,
+                is_delisted: false,
+                only_isolated: false,
+            },
+        }
+    }
+
+    fn a_cloid() -> Cloid {
+        Cloid::from_bytes([7u8; 16])
+    }
+
+    /// The one that doubles a position if it is backwards.
+    #[test]
+    fn closing_a_long_sells_and_closing_a_short_buys() {
+        let asset = test_asset(4);
+        let long = close_intent(
+            "BTC",
+            "flat",
+            d("1.5"),
+            d("100"),
+            d("50"),
+            &asset,
+            a_cloid(),
+        );
+        assert!(!long.is_buy, "closing a long must sell");
+        assert_eq!(long.sz, d("1.5"));
+
+        let short = close_intent(
+            "BTC",
+            "flat",
+            d("-1.5"),
+            d("100"),
+            d("50"),
+            &asset,
+            a_cloid(),
+        );
+        assert!(short.is_buy, "closing a short must buy");
+        assert_eq!(short.sz, d("1.5"), "size is the magnitude, never signed");
+    }
+
+    /// A close carries the venue's reduce-only flag and is an IOC. Without
+    /// reduce-only a close that races a fill becomes an opening order on the
+    /// other side; as a GTC it would rest instead of closing.
+    #[test]
+    fn a_close_is_a_reduce_only_ioc() {
+        let asset = test_asset(4);
+        let intent = close_intent("BTC", "flat", d("2"), d("100"), d("50"), &asset, a_cloid());
+        assert!(intent.reduce_only);
+        assert_eq!(intent.kind, OrderKind::Limit { tif: Tif::Ioc });
+        assert!(intent.cloid.is_some(), "a close must be reconcilable too");
+    }
+
+    /// The whole point of `slippage_price_bounded`. At the operator's bound
+    /// the price must not come back *more* adverse than the bound, or the
+    /// engine refuses the order this function just priced.
+    #[test]
+    fn a_close_priced_at_the_operator_bound_is_never_more_adverse_than_it() {
+        let asset = test_asset(4);
+        // 0.6 bp on a 100 mid is the case where rounding to nearest lands on
+        // 100.01 — 1 bp — and would be refused for exceeding 0.6 bp.
+        let buy = close_intent("T", "flat", d("-1"), d("100"), d("0.6"), &asset, a_cloid());
+        assert!(buy.is_buy);
+        assert!(
+            buy.px <= d("100.006"),
+            "priced at {} against a 0.6 bp bound on a 100 mid",
+            buy.px
+        );
+
+        let sell = close_intent("T", "flat", d("1"), d("100"), d("0.6"), &asset, a_cloid());
+        assert!(!sell.is_buy);
+        assert!(
+            sell.px >= d("99.994"),
+            "priced at {} against a 0.6 bp bound on a 100 mid",
+            sell.px
+        );
+    }
+
+    /// D3 and item 24 make slippage operator-set. The intent carries no
+    /// tightening of its own: the price already encodes the operator's bound,
+    /// and a second limit on top would refuse the order at its own price.
+    #[test]
+    fn a_close_does_not_set_its_own_slippage_limit() {
+        let asset = test_asset(4);
+        let intent = close_intent("BTC", "flat", d("1"), d("100"), d("50"), &asset, a_cloid());
+        assert_eq!(intent.max_slippage_bps, None);
+    }
+
+    /// The reason is the agent's and is carried through untouched — item 19
+    /// requires one and item 30 makes it a claim, not a fact.
+    #[test]
+    fn the_reason_is_carried_verbatim() {
+        let asset = test_asset(4);
+        let intent = close_intent(
+            "BTC",
+            "risk off",
+            d("1"),
+            d("100"),
+            d("50"),
+            &asset,
+            a_cloid(),
+        );
+        assert_eq!(intent.reason, "risk off");
+    }
+
+    /// `AGENTS.md` invariant 1, for the crate that now has four tools that
+    /// act.
+    ///
+    /// The type already carries most of it: [`Gateway::submit`] takes a
+    /// `Cleared` by value, `Cleared` is not `Clone`, and only
+    /// `GuardrailEngine::evaluate` and `clear_cancel` produce one — so no tool
+    /// here can sign without a clearance. What no type expresses is the
+    /// residual `oppen-core`'s own module doc names: `sign_unchecked` and
+    /// `AgentKey::sign_l1_action` are `pub` for spec item 33's manual escape
+    /// hatch, and a caller **in another crate** can write its own permissive
+    /// `PreSignCheck`. This crate is that other crate, so all three are
+    /// checked here.
+    ///
+    /// The needles are built at runtime so this file does not match itself,
+    /// and comment lines are skipped so the doc comment above is not read as
+    /// a call site.
+    #[test]
+    fn no_call_site_in_oppen_mcp_reaches_the_signer_unchecked() {
+        fn rust_sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+                .expect("the crate's own src directory is readable")
+                .map(|e| e.expect("directory entry").path())
+                .collect();
+            paths.sort();
+            for path in paths {
+                if path.is_dir() {
+                    rust_sources(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+
+        let needles = [
+            format!("sign_{}", "unchecked"),
+            format!("sign_{}", "l1_action"),
+            format!("Pre{}Check", "Sign"),
+        ];
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        rust_sources(&src, &mut files);
+        assert!(files.len() > 3, "the source walk found almost nothing");
+
+        let mut offenders = Vec::new();
+        for path in &files {
+            let text = std::fs::read_to_string(path).expect("source file is utf-8");
+            for (n, line) in text.lines().enumerate() {
+                let code = line.trim_start();
+                if code.starts_with("//") {
+                    continue;
+                }
+                for needle in &needles {
+                    if code.contains(needle.as_str()) {
+                        offenders.push(format!("{}:{}: {}", path.display(), n + 1, code));
+                    }
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "every signature from oppen-mcp goes through Gateway::submit, which consumes a \
+             Cleared (AGENTS.md invariant 1). Ungated call sites:\n{}",
+            offenders.join("\n")
+        );
+    }
+
+    /// Two mints must not collide: item 19's reconcile-by-cloid answers for
+    /// the wrong order if they do.
+    #[test]
+    fn minted_cloids_are_distinct() {
+        let a = mint_cloid().expect("entropy");
+        let b = mint_cloid().expect("entropy");
+        assert_ne!(a.as_str(), b.as_str());
+        assert_eq!(a.as_str().len(), b.as_str().len());
     }
 }

@@ -12,6 +12,7 @@
 
 pub mod auth;
 pub mod guard;
+pub(crate) mod outcome;
 pub mod server;
 pub mod tools;
 

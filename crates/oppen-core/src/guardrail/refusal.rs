@@ -29,8 +29,12 @@ use super::snapshot::FeedQuality;
 /// Serializes with the variant name in a `refusal` tag and fields in
 /// declaration order, so one refusal has one byte sequence (`AGENTS.md`
 /// invariant 6). `oppen-mcp` maps these onto its wire taxonomy: everything
-/// here except [`Refusal::VenueRule`], [`Refusal::TradingPaused`] and
-/// [`Refusal::ApprovalRequired`] is a `guardrail_reject`.
+/// here except [`Refusal::VenueRule`], [`Refusal::TradingPaused`],
+/// [`Refusal::ApprovalRequired`] and the two rate refusals
+/// ([`Refusal::OrderRate`], [`Refusal::GlobalRateBudget`], which become
+/// `rate_limited`) is a `guardrail_reject`. The rate carve-out is
+/// `docs/decisions.md` C2: they are the only refusals here that clear without
+/// the agent changing anything, and they carry the wait that says when.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, thiserror::Error)]
 #[serde(tag = "refusal", rename_all = "snake_case")]
 #[non_exhaustive]
