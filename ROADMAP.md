@@ -4,7 +4,7 @@ Everything mapped so far, from the v1 MVP through the versions after it. Numbers
 
 Legend: `[x]` shipped on `main` or in an open PR · `[ ]` not started · **gate** = what proves the phase.
 
-Status as of 2026-09-04: P0 and the P1 code are on `main`; the P1 gate is waiting on a funded testnet agent wallet. Six feature specs are written, two more were commissioned by the 2026-09-04 venue audit ([onboarding.md](docs/specs/onboarding.md), [venue-containers.md](docs/specs/venue-containers.md)), and thirty-nine product decisions are recorded in [docs/decisions.md](docs/decisions.md).
+Status as of 2026-09-05: P0 and the P1 code are on `main`; the P1 gate is waiting on a funded testnet agent wallet. P2, P3 and P4 code has been landing since 2026-09-04 (PRs #9–#14), and the P4 boxes below are ticked as each lands. **The P2 and P3 boxes are stale** — the ws pool, the hash-chained ledger, the guardrail engine and the kill switch are on `main` and still read as not started; correcting them needs each bullet checked against the code and is a separate pass. Six feature specs are written, two more were commissioned by the 2026-09-04 venue audit ([onboarding.md](docs/specs/onboarding.md), [venue-containers.md](docs/specs/venue-containers.md)), and forty-three product decisions are recorded in [docs/decisions.md](docs/decisions.md).
 
 **D1 was revised on 2026-09-04.** The unit of isolation is one venue *account* per agent — a sub-account where the venue grants one, a top-level account where it does not. Hyperliquid gates sub-accounts behind $100,000 of protocol-enforced traded volume, on testnet as well as mainnet, so v1 provisions one top-level account per agent. Where this roadmap used "sub-account" to mean the unit of isolation, it now says **container**; where it names the venue's own `subAccounts` endpoint, it still means a sub-account. Reasoning: [decisions.md](docs/decisions.md) V1–V6.
 
@@ -60,12 +60,14 @@ Status as of 2026-09-04: P0 and the P1 code are on `main`; the P1 gate is waitin
 
 ### P4 · MCP gateway
 
-- [ ] Streamable HTTP on loopback only: `Origin`/`Host` validation, bearer on every request, constant-time compare, revocation closes live sessions, on/off toggle [14, D2]
+- [x] Streamable HTTP on loopback only: `Origin`/`Host` validation, bearer on every request, constant-time compare, revocation closes live sessions [14, D2] — PR #11, #12. The on/off toggle is an operator surface and waits on P5
 - [ ] Default-deny pairing: approve dialog names the agent, binds a container, assigns guardrails; new agents start in approval mode with tiny caps [15]
-- [ ] `get_state`: versioned deterministic envelope, staleness flags, time-since-last-action, positions with liq distance, orders, balances, funding, guardrail utilization, pending proposals, kill state, rate budget, network badge [16]
-- [ ] `get_meta` [17], `get_events(since_cursor)` with `resync_required` [18]
-- [ ] `place`, `cancel`, `cancel_all`, `close_position` with required `reason`; synchronous result contract; `get_order_status(cloid|oid)` [19]
-- [ ] Typed error taxonomy with retryability: `guardrail_reject`, `venue_reject{…}`, `rate_limited`, `timeout_unknown_outcome`, `trading_paused`, `auth_expired`, `pending_approval` [19]
+- [x] `get_state`: versioned deterministic envelope, staleness flags, positions with liq distance, orders, balances [16] — PR #13. Time-since-last-action, funding, guardrail utilization, pending proposals, kill state and rate budget are not in the envelope yet
+- [x] `get_meta` [17] — PR #12
+- [ ] `get_events(since_cursor)` with `resync_required` [18]
+- [x] `place`, `cancel`, `cancel_all` with required `reason`; synchronous result contract; `get_order_status(cloid|oid)` [19] — PR #14
+- [ ] `close_position` [19] — needs conservative directional price rounding in `oppen-hl` first, so a market close cannot round *into* a slippage refusal
+- [x] Typed error taxonomy with retryability: `guardrail_reject`, `venue_reject{…}`, `venue_error`, `rate_limited`, `timeout_unknown_outcome`, `trading_paused`, `pending_approval` [19] — [decisions.md](docs/decisions.md) M1–M4. `auth_expired` is omitted until something constructs it: the door refuses an unpaired agent before a tool runs, and wallet expiry is a P2 item
 - [ ] `preflight(order)`: margin, fees, live book walk, guardrail verdict, post-fill exposure, `max_size_usd_within_{5,10,25}bps` [20]
 - [ ] `remember` / `recall` journal [21], `set_alert(condition)` [22]
 - [ ] Market = slippage-bounded IOC, limit GTC/IOC/ALO, stop-market, attached TP/SL with `positionTpsl`, reduce-only, batched actions, cloid on everything [12]

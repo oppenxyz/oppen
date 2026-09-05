@@ -2,7 +2,7 @@
 
 Version: `0` (pre-release, unstable). The contract is versioned from the first public release; the envelope carries `contract_version`.
 
-This document is the normative reference for every tool the gateway exposes. It is written when phase P4 lands; until then, `docs/spec.md` section C is the specification.
+This document is the normative reference for every tool the gateway exposes. `docs/spec.md` section C is the specification it implements; where the two disagree, the spec wins and this file is wrong.
 
 ## Principles
 
@@ -15,4 +15,83 @@ This document is the normative reference for every tool the gateway exposes. It 
 
 `get_state` · `get_meta` · `get_events` · `get_features` · `preflight` · `place` · `cancel` · `cancel_all` · `close_position` · `get_order_status` · `remember` · `recall` · `set_alert`
 
-Schemas, examples and the error taxonomy follow in P4.
+Shipped so far: `get_meta`, `get_state`, `place`, `cancel`, `cancel_all`, `get_order_status`. The rest are unimplemented and are not described below — a schema for a tool that does not exist is a promise nothing keeps.
+
+## The result envelope
+
+Every acting tool answers with one JSON object. `contract_version` first, then `status`, then the fields that status implies.
+
+| `status` | Meaning | Fields |
+|---|---|---|
+| `resting` | On the book until it fills or is cancelled | `oid`, `cloid` |
+| `filled` | Crossed on arrival; `avg_px` is the venue's own | `oid`, `cloid`, `filled_sz`, `avg_px` |
+| `canceled` | A cancel or cancel-all landed | `requested`, `canceled`, `failed[]` |
+| `pending_approval` | Item 28: nothing signed, a human decides | `approval_id`, `symbol`, `notional_usd`, `expires_at_ms` |
+| `rejected` | A predicate refused before signing | `retryable`, `code`, and the code's own fields |
+
+A rejection is a **successful** tool call, not a protocol error. It is the expected outcome of asking for something outside a limit, and returning an error there invites the blind retry that is exactly the wrong response.
+
+```json
+{"contract_version":0,"status":"resting","oid":42,"cloid":"0xaa"}
+{"contract_version":0,"status":"filled","oid":43,"cloid":null,"filled_sz":"0.25","avg_px":"63999.5"}
+{"contract_version":0,"status":"canceled","requested":3,"canceled":2,"failed":[{"oid":2,"cloid":"0xcc","venue_message":"Order was never placed, already canceled, or filled."}]}
+{"contract_version":0,"status":"rejected","retryable":false,"code":"venue_reject","subtype":{"venue_rule":"min_notional","notional_usd":"4","minimum_usd":"10"}}
+```
+
+Decimals are strings, always. A price written as a JSON number is a price a different platform may round differently.
+
+## Rejection codes
+
+Carried on `status: "rejected"`. Nothing was signed and nothing reached the venue.
+
+| `code` | `retryable` | Means | Carries |
+|---|---|---|---|
+| `guardrail_reject` | `false` | A guardrail predicate breached, or the engine could not establish that one was not | `refusal`: the predicate, the observed value and the limit |
+| `venue_reject` | `false` | A rule the venue would have enforced, caught before a nonce was spent | `subtype`: `min_notional`, `price_decimals`, `size_decimals`, `delisted`, … |
+| `rate_limited` | `true` | oppen's own budget, spent before the venue's (item 10) | `retry_after_ms`, `refusal` |
+| `trading_paused` | `false` | The kill switch is engaged (item 26) | `refusal`, naming scope and reason |
+
+`guardrail_reject` covers the fail-closed refusals too — a stale feed, a missing reference price, an unreconciled account. Those are **not** retryable even though the condition may pass on its own: telling an agent to retry into a degraded feed is how a quiet outage becomes a retry storm.
+
+## Error codes
+
+Protocol errors, carrying the taxonomy in the JSON-RPC error's `data` — `{contract_version, code, retryable, detail, cloid}` — rather than only in the message.
+
+| `code` | `retryable` | Means |
+|---|---|---|
+| `venue_error` | `429` and `5xx` only | The venue saw the request and refused it. A nonce was spent. `detail` is the venue's own words, **display-only** — never branch on it |
+| `timeout_unknown_outcome` | never | The request left the process and no answer came back. The order may be live |
+| `unavailable` | `true` | oppen could not read what it needed. Nothing was signed |
+| `invalid_params` | `false` | The caller's own input, refused as sent |
+
+`timeout_unknown_outcome` is never retryable, and that is the whole content of the rule. The only safe move is `get_order_status` by the `cloid` the failed call returned — never a resend, which is how an agent doubles a position. `place` mints a cloid when the caller supplies none precisely so this move always exists.
+
+Not yet constructible, so not yet in the taxonomy: `auth_expired`. The door refuses an unpaired or revoked agent before any tool runs, and agent-wallet expiry is not detected yet (roadmap P2, "wallet expiry warnings").
+
+## Tools
+
+### `get_meta(symbols?)`
+
+Per-symbol trading rules. Read-only. Returns an array sorted by `asset_id`: `symbol`, `asset_id`, `size_decimals`, `price_decimals`, `max_leverage`, `min_notional_usd`, `funding_interval_hours`, `only_isolated`, `is_delisted`.
+
+### `get_state()`
+
+The account now: `contract_version`, `network`, `address`, `as_of_ms`, `feed_age_ms`, `feed`, `balances`, `positions` (with distance to liquidation), `orders`. If `feed` is not `live` the data is stale and execution fails closed.
+
+### `place(symbol, is_buy, size, limit_px, reason, reduce_only?, cloid?)`
+
+A GTC limit order. `reason` is required (item 19) and is untrusted text (item 30). `cloid` is minted when absent and comes back on every result.
+
+The guardrail check runs immediately before signing, in Rust, on the single path to the signer. There is no branch around it.
+
+### `cancel(oid? | cloid?, reason)`
+
+One resting order. Supply `oid` or `cloid`. Cancels are risk-reducing: they clear while the kill switch is engaged and they cost no order-rate token. An order that is already gone is reported as `canceled` with that cancel in `failed[]`, not as an error — the caller wanted it gone and it is gone.
+
+### `cancel_all(symbol?, reason)`
+
+Every resting order, or every one on a symbol. Partial success is normal, so `failed[]` itemises what the venue would not take, paired positionally with what was sent. Nothing resting answers `canceled` with `requested: 0`.
+
+### `get_order_status(oid? | cloid?)`
+
+The venue's own status for one order. `{contract_version, known, ...}`; `known: false` means the venue never saw it, which after a `timeout_unknown_outcome` is the answer that makes it safe to place again. Anything else means it did see it.
