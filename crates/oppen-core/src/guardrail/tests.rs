@@ -311,6 +311,17 @@ impl Fixture {
         self.engine
             .evaluate(&self.agent, intent, asset, market, exposure, NOW_MS)
     }
+
+    fn preflight(
+        &self,
+        intent: &OrderIntent,
+        asset: &Asset,
+        market: &MarketRef,
+        exposure: &Exposure,
+    ) -> Verdict {
+        self.engine
+            .preflight(&self.agent, intent, asset, market, exposure, NOW_MS)
+    }
 }
 
 /// The order the engine actually built, read back off the wire.
@@ -551,6 +562,160 @@ fn the_leverage_cap_uses_the_tighter_of_the_operator_and_the_venue() {
         Refusal::Leverage { limit, .. } => assert_eq!(limit, 1),
         other => panic!("expected the leverage refusal, got {other}"),
     }
+}
+
+// --- preflight: the same verdict, none of the effects (item 20) -------------
+
+/// The property the whole design rests on. An agent that could preflight for
+/// free *and* be told "clear" while paying nothing would have an unmetered
+/// oracle for the guardrails; an agent charged for asking would stop asking.
+/// So: every predicate runs, and the budget does not move.
+#[test]
+fn a_preflight_spends_no_order_rate_token() {
+    let mut config = permissive(&["BTC"]);
+    // Two tokens, refilling slowly enough that nothing accrues during the test.
+    config.order_rate = OrderRate {
+        count: 2,
+        per_ms: 3_600_000,
+    };
+    let f = Fixture::new(config);
+    let btc = asset("BTC", 2, 40);
+    let market = MarketRef::fresh("BTC", d("100"), NOW_MS);
+    let order = intent("BTC", true, d("100"), d("1"));
+
+    for _ in 0..20 {
+        let verdict = f.preflight(&order, &btc, &market, &exposure(d("100000")));
+        assert!(verdict.would_clear, "{:?}", verdict.refusal);
+    }
+
+    // Both real orders still clear: twenty questions cost nothing.
+    f.evaluate(&order, &btc, &market, &exposure(d("100000")))
+        .expect("first order");
+    f.evaluate(&order, &btc, &market, &exposure(d("100000")))
+        .expect("second order");
+    // And the third is refused, so the cap is real rather than absent.
+    let refusal = f
+        .evaluate(&order, &btc, &market, &exposure(d("100000")))
+        .expect_err("the third exceeds a two-token budget");
+    assert!(matches!(refusal, Refusal::OrderRate { .. }), "{refusal}");
+}
+
+/// It reports the cap it did not spend. An agent told "clear" by a check that
+/// skipped the rate predicate would send an order that is refused on arrival.
+#[test]
+fn a_preflight_still_reports_an_exhausted_order_rate() {
+    let mut config = permissive(&["BTC"]);
+    config.order_rate = OrderRate {
+        count: 1,
+        per_ms: 3_600_000,
+    };
+    let f = Fixture::new(config);
+    let btc = asset("BTC", 2, 40);
+    let market = MarketRef::fresh("BTC", d("100"), NOW_MS);
+    let order = intent("BTC", true, d("100"), d("1"));
+
+    f.evaluate(&order, &btc, &market, &exposure(d("100000")))
+        .expect("the one token");
+    let verdict = f.preflight(&order, &btc, &market, &exposure(d("100000")));
+    assert!(!verdict.would_clear);
+    assert!(
+        matches!(verdict.refusal, Some(Refusal::OrderRate { .. })),
+        "{:?}",
+        verdict.refusal
+    );
+}
+
+/// Item 28's queue is for orders somebody asked for. A preflight asks a
+/// question, so it must not leave a human a proposal to approve.
+#[test]
+fn a_preflight_reports_approval_without_minting_a_proposal() {
+    let mut config = permissive(&["BTC"]);
+    config.approval_required = true;
+    let f = Fixture::new(config);
+    let btc = asset("BTC", 2, 40);
+    let market = MarketRef::fresh("BTC", d("100"), NOW_MS);
+    let order = intent("BTC", true, d("100"), d("1"));
+
+    let verdict = f.preflight(&order, &btc, &market, &exposure(d("100000")));
+    match verdict.refusal {
+        Some(Refusal::ApprovalRequired {
+            ref approval_id, ..
+        }) => {
+            assert!(approval_id.is_empty(), "a preflight mints no receipt");
+        }
+        other => panic!("expected approval_required, got {other:?}"),
+    }
+    assert!(
+        f.engine.pending_proposals(NOW_MS).is_empty(),
+        "a preflight left a proposal in the operator's queue"
+    );
+}
+
+/// Every predicate, not a convenient subset. A preflight that answered "clear"
+/// on a symbol the agent may not trade would be worse than no preflight.
+#[test]
+fn a_preflight_refuses_everything_a_real_evaluation_would() {
+    let f = Fixture::new(permissive(&["BTC"]));
+    let btc = asset("BTC", 2, 40);
+    let doge = asset("DOGE", 2, 40);
+    let market = MarketRef::fresh("BTC", d("100"), NOW_MS);
+    let doge_market = MarketRef::fresh("DOGE", d("100"), NOW_MS);
+    let fat = exposure(d("100000"));
+
+    // Off the allowlist.
+    let off = f.preflight(
+        &intent("DOGE", true, d("100"), d("1")),
+        &doge,
+        &doge_market,
+        &fat,
+    );
+    assert!(matches!(
+        off.refusal,
+        Some(Refusal::SymbolNotAllowed { .. })
+    ));
+
+    // Below the venue minimum.
+    let tiny = f.preflight(
+        &intent("BTC", true, d("100"), d("0.01")),
+        &btc,
+        &market,
+        &fat,
+    );
+    assert!(
+        matches!(tiny.refusal, Some(Refusal::VenueRule(_))),
+        "{:?}",
+        tiny.refusal
+    );
+
+    // Missing reference price is fail-closed here too.
+    let blind = MarketRef {
+        reference_px: None,
+        ..MarketRef::fresh("BTC", d("100"), NOW_MS)
+    };
+    let dark = f.preflight(&intent("BTC", true, d("100"), d("1")), &btc, &blind, &fat);
+    assert!(!dark.would_clear, "a preflight must fail closed too");
+}
+
+/// A clearing preflight hands back the utilization, which is the number an
+/// agent sizes against — and no `Cleared`, which is the capability to sign.
+#[test]
+fn a_clearing_preflight_reports_utilization_and_no_authority_to_sign() {
+    let mut config = permissive(&["BTC"]);
+    config.max_order_usd = d("1000");
+    let f = Fixture::new(config);
+    let btc = asset("BTC", 2, 40);
+    let market = MarketRef::fresh("BTC", d("100"), NOW_MS);
+
+    let verdict = f.preflight(
+        &intent("BTC", true, d("100"), d("5")),
+        &btc,
+        &market,
+        &exposure(d("100000")),
+    );
+    assert!(verdict.would_clear);
+    let used = verdict.utilization.expect("utilization on a clear verdict");
+    // $500 of a $1000 cap.
+    assert_eq!(used.order_notional_pct, Some(d("50")));
 }
 
 #[test]

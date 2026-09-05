@@ -15,7 +15,7 @@ This document is the normative reference for every tool the gateway exposes. `do
 
 `get_state` · `get_meta` · `get_events` · `get_features` · `preflight` · `place` · `cancel` · `cancel_all` · `close_position` · `get_order_status` · `remember` · `recall` · `set_alert`
 
-Shipped so far: `get_meta`, `get_state`, `get_events`, `place`, `cancel`, `cancel_all`, `close_position`, `get_order_status`. The rest are unimplemented and are not described below — a schema for a tool that does not exist is a promise nothing keeps.
+Shipped so far: `get_meta`, `get_state`, `get_events`, `preflight`, `place`, `cancel`, `cancel_all`, `close_position`, `get_order_status`. The rest are unimplemented and are not described below — a schema for a tool that does not exist is a promise nothing keeps.
 
 ## The result envelope
 
@@ -89,6 +89,23 @@ Each event carries `seq`, `ts_ms`, `kind`, `agent_id`, `payload`, `payload_hash`
 **Scope.** An agent reads its own events plus the account-wide ones no agent owns — the kill switch, feed drops, alerts. Another agent's intents and `reason` strings are not returned (`docs/decisions.md` C6). `next_cursor` still advances past rows that were filtered out, so a page can be empty without the cursor stalling; compare it against `head_seq` to know how far behind you are.
 
 Operator surfaces read the whole chain unscoped — the activity stream and the audit export are the human's view.
+
+### `preflight(symbol, is_buy, size, limit_px, reduce_only?)`
+
+What the order would do, without doing it. Costs **no order-rate token**, draws no request against the account budget, mints no approval proposal and writes no ledger row — item 20 says "without executing", and answering must not be a thing that happened.
+
+No `reason`. Item 19 requires one on every *action*; this is a question, and requiring a justification for asking only trains an agent to write a placeholder.
+
+Returns `{contract_version, symbol, is_buy, notional_usd, guardrail, book, book_as_of_ms, margin, post_fill, feed}`:
+
+- **`guardrail`** — `{would_clear, utilization, refusal}` from the engine's own predicates, run in the same order against the same state. Not a restatement: a second copy of the guardrails is the thing invariant 1 exists to prevent. `refusal` names the predicate, the observed value and the limit, exactly as `place` would. On `approval_required` the `approval_id` is empty — no proposal was minted, because nothing was asked for.
+- **`book`** — a live walk for this exact size: `top_px`, `avg_px`, `filled_sz`, `exhausts_book`, `slip_bps`, and `max_size_usd_within_bps` for 5/10/25 bps. Slippage is measured from the touch, not the mid, so it is the cost this order causes rather than the spread it pays. The band limits are on the *average* fill, so a level past the band still contributes the part that fits.
+- **`margin`** — `initial_margin_usd` at the asset's own maximum leverage (the least the venue could ask), against `withdrawable_usd`. The operator's leverage cap is lower or equal and is carried by the guardrail verdict.
+- **`post_fill`** — equity and margin used after this order fills.
+
+**A clear verdict is not a promise.** The book is a snapshot the venue has already moved past, nothing reserves depth, and the rate token this did not spend may be gone by the time the order is sent. `exhausts_book: true` means the resting depth could not cover the size at all.
+
+**Not included: estimated fees.** Item 20 names them; oppen has no fee schedule yet, and guessing a tier would be worse than omitting one. It needs a `userFees` read audited against the live API, which is its own change.
 
 ### `place(symbol, is_buy, size, limit_px, reason, reduce_only?, cloid?)`
 

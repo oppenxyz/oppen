@@ -67,7 +67,8 @@ Status as of 2026-09-05: P0 and the P1 code are on `main`; the P1 gate is waitin
 - [x] `get_events(since_cursor)` with `resync_required` [18] — scoped to the calling agent, [decisions.md](docs/decisions.md) C6
 - [x] `place`, `cancel`, `cancel_all`, `close_position` with required `reason`; synchronous result contract; `get_order_status(cloid|oid)` [19] — PR #14, #17
 - [x] Typed error taxonomy with retryability: `guardrail_reject`, `venue_reject{…}`, `venue_error`, `rate_limited`, `timeout_unknown_outcome`, `trading_paused`, `pending_approval` [19] — PR #17, [decisions.md](docs/decisions.md) C1–C5. `auth_expired` is omitted until something constructs it: the door refuses an unpaired agent before a tool runs, and wallet expiry is a P2 item
-- [ ] `preflight(order)`: margin, fees, live book walk, guardrail verdict, post-fill exposure, `max_size_usd_within_{5,10,25}bps` [20]
+- [x] `preflight(order)`: margin, live book walk, guardrail verdict, post-fill exposure, `max_size_usd_within_{5,10,25}bps` [20]
+- [ ] `preflight` estimated fees [20] — needs a `userFees` read audited against the live API; a guessed fee tier is worse than an absent one
 - [ ] `remember` / `recall` journal [21], `set_alert(condition)` [22]
 - [ ] Market = slippage-bounded IOC, limit GTC/IOC/ALO, stop-market, attached TP/SL with `positionTpsl`, reduce-only, batched actions, cloid on everything [12]
 - [ ] Builder code attached by default via `OPPEN_BUILDER_ADDRESS`; missing approval prompts the ceremony, never drops the order path [5, D7]

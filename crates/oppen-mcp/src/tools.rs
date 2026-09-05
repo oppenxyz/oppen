@@ -13,6 +13,7 @@
 
 use std::sync::Arc;
 
+use oppen_core::book;
 use oppen_core::guardrail::AgentId;
 use oppen_core::guardrail::{Cleared, FeedQuality, GuardrailEngine, MarketRef, OrderIntent};
 use oppen_core::ledger::AgentView;
@@ -134,6 +135,21 @@ pub struct ClosePositionParams {
     /// decoupled from anything that sweeps.
     pub symbol: String,
     pub reason: String,
+}
+
+/// What `preflight` takes: the order, without the reason.
+///
+/// No `reason`: item 19 requires one on every *action*, and item 20 is a
+/// question. Requiring an agent to justify asking would train it to write a
+/// placeholder, which is worse than not asking for one.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct PreflightParams {
+    pub symbol: String,
+    pub is_buy: bool,
+    pub size: String,
+    pub limit_px: String,
+    #[serde(default)]
+    pub reduce_only: bool,
 }
 
 /// What `get_events` takes.
@@ -552,6 +568,109 @@ impl Gateway {
         let cloid = intent.cloid.clone();
         let response = self.submit(cleared, cloid.as_ref(), now_ms).await?;
         Ok(order_outcome(response, cloid.map(|c| c.as_str().to_owned()))?.into_result())
+    }
+
+    /// `preflight` — what would happen, without it happening
+    /// (`docs/spec.md` item 20).
+    #[tool(
+        description = "What this order would do, without sending it: the guardrail verdict with \
+                       the predicate that would refuse it, a live book walk giving the average \
+                       fill and slippage, how much size fits within 5/10/25 bps, margin, and \
+                       exposure after the fill. Costs no order-rate token. A clear verdict is \
+                       not a promise — the book moves, and the token it did not spend may be \
+                       gone by the time you send."
+    )]
+    async fn preflight(
+        &self,
+        Parameters(params): Parameters<PreflightParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let inner = &self.inner;
+        let now_ms = now_ms();
+
+        let context = self.evaluation_context(&params.symbol, now_ms).await?;
+        let asset = context
+            .universe
+            .get(&params.symbol)
+            .map_err(|e| ToolError::invalid("symbol", e))?;
+
+        let px: Decimal = params
+            .limit_px
+            .parse()
+            .map_err(|e| ToolError::invalid("limit_px", e))?;
+        let sz: Decimal = params
+            .size
+            .parse()
+            .map_err(|e| ToolError::invalid("size", e))?;
+
+        // The verdict comes from the engine's own predicates, run in the same
+        // order against the same state — never a restatement of them here
+        // (`AGENTS.md` invariant 1). It spends nothing and returns no
+        // authority to sign.
+        let intent = OrderIntent {
+            symbol: params.symbol.clone(),
+            is_buy: params.is_buy,
+            px,
+            sz,
+            kind: OrderKind::Limit { tif: Tif::Gtc },
+            reduce_only: params.reduce_only,
+            cloid: None,
+            grouping: Grouping::Na,
+            builder: None,
+            max_slippage_bps: None,
+            // Item 19 requires a reason on an action; this is a question. The
+            // engine still checks one, so a fixed non-empty marker keeps the
+            // predicate honest without inviting a placeholder from the agent.
+            reason: "preflight".to_owned(),
+        };
+        let verdict = inner.engine.preflight(
+            &inner.agent,
+            &intent,
+            asset,
+            &context.market,
+            &context.exposure,
+            now_ms,
+        );
+
+        // The live book, walked for this exact size.
+        let l2 = inner
+            .info
+            .l2_book(&params.symbol, None)
+            .await
+            .map_err(|e| ToolError::unavailable("book", e))?;
+        let walk = book::walk(&l2, params.is_buy, sz);
+
+        // Margin at the asset's own maximum leverage, which is the least
+        // margin the venue could ask. The operator's leverage cap is lower or
+        // equal, so this understates nothing and the guardrail verdict above
+        // carries the binding limit.
+        let notional_usd = asset.round_price(px) * asset.round_size(sz);
+        let initial_margin_usd = notional_usd
+            .checked_div(Decimal::from(asset.info.max_leverage))
+            .unwrap_or(notional_usd);
+        let balances = &context.state.balances;
+
+        let body = serde_json::json!({
+            "contract_version": 0,
+            "symbol": params.symbol,
+            "is_buy": params.is_buy,
+            "notional_usd": notional_usd,
+            "guardrail": verdict,
+            "book": walk,
+            "book_as_of_ms": l2.time,
+            "margin": {
+                "initial_margin_usd": initial_margin_usd,
+                "withdrawable_usd": balances.withdrawable_usd,
+                "sufficient": balances.withdrawable_usd >= initial_margin_usd,
+            },
+            "post_fill": {
+                "equity_usd": balances.equity_usd,
+                "margin_used_usd": balances.total_margin_used_usd + initial_margin_usd,
+            },
+            "feed": context.state.feed,
+        });
+        Ok(CallToolResult::success(vec![ContentBlock::text(
+            body.to_string(),
+        )]))
     }
 
     /// `get_events` — the durable record (`docs/spec.md` item 18, D6).

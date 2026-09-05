@@ -13,6 +13,7 @@
 //! client.
 
 pub mod accounts;
+pub mod book;
 pub mod candles;
 pub mod guardrail;
 pub mod keys;
