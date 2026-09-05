@@ -8,6 +8,7 @@
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use oppen_core::feed::FeedSession;
 use oppen_core::guardrail::{AgentId, GuardrailEngine, SqliteGuardrailStore};
 use oppen_core::journal::Journal;
 use oppen_core::keys::KeychainKeyStore;
@@ -64,8 +65,16 @@ fn gateway() -> Gateway {
     // The tempdir must outlive the gateway; leaking the handle is fine in a
     // test process that is about to exit.
     let journal = Arc::new(Journal::open(dir.path().join("journal.db")).expect("journal"));
+    let feed = Arc::new(FeedSession::new());
     std::mem::forget(dir);
-    Gateway::new(Network::Testnet, engine, EventViews::new(ledger), journal).expect("gateway")
+    Gateway::new(
+        Network::Testnet,
+        engine,
+        EventViews::new(ledger),
+        journal,
+        feed,
+    )
+    .expect("gateway")
 }
 
 /// A syntactically valid MCP initialize call, so that anything reaching the

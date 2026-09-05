@@ -333,6 +333,18 @@ impl Default for StalenessThresholds {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct ConnectionId(usize);
 
+impl ConnectionId {
+    /// Name a connection by index.
+    ///
+    /// The event structs are public data with public fields, so a consumer can
+    /// build one — to replay a recorded stream, or to drive its own state
+    /// machine in a test — and this is the one field it could not otherwise
+    /// fill in.
+    pub fn new(index: usize) -> Self {
+        ConnectionId(index)
+    }
+}
+
 impl fmt::Display for ConnectionId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "ws{}", self.0)

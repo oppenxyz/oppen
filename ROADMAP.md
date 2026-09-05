@@ -41,7 +41,8 @@ Status as of 2026-09-05: P0 and the P1 code are on `main`; the P1 gate is waitin
 
 - [ ] Shared socket pool per network, client pings, per-IP caps [9]
 - [ ] Subscriptions: book, trades, candles, mark/oracle, user fills, order updates, funding context [9, 11]
-- [ ] Reconnect: re-subscribe, backfill fills via `userFillsByTime`, reconcile orders via `frontendOpenOrders` + `orderStatus(cloid)`, backfill candles [9]
+- [x] Reconnect state machine: a drop un-reconciles, a reconnect asks for the gap, and only a returned reconcile clears the flag; live fills recorded on arrival and deduped by `tid` [9] — `oppen-core::feed`
+- [ ] Pumping a live `WsPool` into that session, and the backfill calls it asks for [9] — the state machine is tested against synthetic events; nothing runs a socket yet
 - [ ] Append-only, hash-chained SQLite ledger: the one source for `get_events`, the activity stream and the audit export [D6, 29]
 - [ ] Event taxonomy: fills, order transitions, rejections, guardrail trips, approvals, kill-switch changes, wallet expiry warnings, WS state, alerts [18]
 - [ ] Keys in the OS keychain, read only from `oppen-hl`; keychain hand-off zeroizes the hex string [2]
