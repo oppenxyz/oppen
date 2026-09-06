@@ -83,6 +83,23 @@ pub struct MarketRef {
     /// against, so an agent must not be able to choose which one its order is
     /// recorded against.
     pub snapshot: Option<MarketSnapshotRef>,
+    /// Daily volatility as a fraction of price — `0.04` is a coin that moves
+    /// 4% a day — for spec F's vol-scaled cap.
+    ///
+    /// **A market fact carried in, never fetched here.** The module doc's rule
+    /// is that an evaluation is a pure function of its inputs, so a refusal
+    /// can be reproduced from the ledger row that recorded it; an engine that
+    /// went and measured its own volatility would make the same order clear
+    /// or refuse depending on when it was asked. So the caller supplies it,
+    /// exactly as it supplies [`MarketRef::reference_px`].
+    ///
+    /// `None` when nobody measured it, and that is **not** the same as
+    /// "volatility is zero". An agent with [`super::RiskSettings::max_risk_usd`]
+    /// set is refused rather than sized against a missing number: a cap that
+    /// cannot be computed is a cap that is not enforced, the treatment
+    /// [`Exposure::fleet`] already gets. Unset costs nothing when no
+    /// vol-scaled cap is configured, which is the default.
+    pub sigma_day: Option<Decimal>,
 }
 
 /// A reference to a stored book snapshot, in the shape the ledger's own
@@ -108,6 +125,7 @@ impl MarketRef {
             mark_divergence_bps: None,
             mark_divergent_since_ms: None,
             snapshot: None,
+            sigma_day: None,
         }
     }
 }

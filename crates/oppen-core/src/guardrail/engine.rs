@@ -55,6 +55,9 @@ use super::store::{GuardrailStore, StoreError};
 /// One basis point is a ten-thousandth.
 const BPS: Decimal = Decimal::from_parts(10_000, 0, 0, false, 0);
 const HUNDRED: Decimal = Decimal::from_parts(100, 0, 0, false, 0);
+/// The two in spec F's `risk_budget / (2 * sigma_day)`: the cap is set so
+/// that a *two*-sigma day, not a one-sigma day, costs the whole budget.
+const TWO: Decimal = Decimal::from_parts(2, 0, 0, false, 0);
 
 /// What an agent is asking to do, in decimals, before anything is rounded.
 ///
@@ -150,6 +153,11 @@ pub struct Utilization {
     /// whose whole job is to say where an order would sit against each cap,
     /// was silent on the cap that was about to stop it.
     pub drawdown_pct: Option<Decimal>,
+    /// Where the post-fill position sits against spec F's vol-scaled cap.
+    /// `None` when no `max_risk_usd` is configured, which is the default —
+    /// the same "absent means unset" the loss percentages use, and the
+    /// reason it is not simply `100` when the option is off.
+    pub vol_scaled_position_pct: Option<Decimal>,
     pub leverage: Decimal,
     pub order_tokens_remaining: Decimal,
     /// What is left of spec item 10's address-wide request budget. Item 16
@@ -1379,6 +1387,39 @@ impl GuardrailEngine {
             });
         }
 
+        // Spec F's vol-scaled cap, checked after the fixed one and never
+        // instead of it. The two compose as a minimum: a fixed cap is the
+        // operator's hard ceiling and this only ever tightens it, so an
+        // unset `max_risk_usd` leaves D-c's default-deny exactly as it was.
+        let vol_scaled = vol_scaled_cap(&config, market, &intent.symbol)?;
+        // **It binds only on orders that grow the position.** Unlike every
+        // other cap here, this one *moves*: volatility doubles and the cap
+        // halves, so a position that was inside it this morning can be over
+        // it by noon without the agent having done anything. If the check
+        // ignored direction, the agent's way out — trimming the position —
+        // would be refused for leaving it still over a cap it is trying to
+        // get under, and only an all-at-once exit would clear. Refusing a
+        // risk-reducing order can only raise risk, which is the same reason
+        // item 26 lets cancels through while the kill switch is engaged.
+        //
+        // Measured against the position *including* working orders, so the
+        // comparison is between two "everything fills" readings and cancelling
+        // into the cap is a reduction like any other.
+        let position_before = checked(position_szi.checked_add(resting_szi), "pre-order position")?;
+        let reduces_position = position_after.abs() < position_before.abs();
+        if let Some(cap) = vol_scaled
+            && !reduces_position
+            && position_after_usd > cap.effective_cap_usd
+        {
+            return Err(Refusal::VolScaledPositionNotional {
+                symbol: intent.symbol.clone(),
+                observed_usd: position_after_usd,
+                effective_cap_usd: cap.effective_cap_usd,
+                risk_budget_usd: cap.risk_budget_usd,
+                sigma_day_pct: cap.sigma_day.saturating_mul(HUNDRED),
+            });
+        }
+
         // Spec item 24, leverage cap. D3: the operator sets it, and the
         // venue's own maximum for the asset is a hard bound below it.
         //
@@ -1537,6 +1578,8 @@ impl GuardrailEngine {
                     config.loss.max_drawdown_usd,
                     account,
                 ),
+                vol_scaled_position_pct: vol_scaled
+                    .and_then(|cap| ratio_pct(position_after_usd, cap.effective_cap_usd)),
                 leverage,
                 order_tokens_remaining: tokens_remaining,
                 global_tokens_remaining,
@@ -2030,6 +2073,7 @@ impl Utilization {
             position_notional_pct: None,
             daily_loss_pct: None,
             drawdown_pct: None,
+            vol_scaled_position_pct: None,
             leverage: Decimal::ZERO,
             order_tokens_remaining: Decimal::ZERO,
             global_tokens_remaining,
@@ -2318,6 +2362,59 @@ fn adverse_slippage_bps(is_buy: bool, px: Decimal, reference_px: Decimal) -> Opt
         return Some(Decimal::ZERO);
     }
     adverse.checked_div(reference_px)?.checked_mul(BPS)
+}
+
+/// A computed vol-scaled cap and the two numbers it came from.
+///
+/// The inputs travel with the result so the refusal is built from the values
+/// the arithmetic actually used, rather than re-read from the config and the
+/// tick at the point of failure. Re-reading would need an `unwrap` on each —
+/// both are `Some` by construction here — and the fallback would print a
+/// refusal claiming a $0 budget at 0% volatility, which is a message that
+/// lies about why the order was refused.
+#[derive(Debug, Clone, Copy)]
+struct VolScaledCap {
+    effective_cap_usd: Decimal,
+    risk_budget_usd: Decimal,
+    sigma_day: Decimal,
+}
+
+/// Spec F's `effective_cap = risk_budget / (2 * sigma_day)`, or `None` when
+/// no vol-scaled cap is configured.
+///
+/// The doubling is the spec's, and it is what makes the number mean
+/// something an operator can hold in their head: at the cap, an ordinary
+/// two-sigma day moves the position by `max_risk_usd` and no more. Halve the
+/// volatility and the same budget buys twice the size.
+///
+/// **Fails closed on a missing or non-positive sigma.** A cap configured and
+/// not computable is a cap not enforced, which is the failure the whole
+/// module exists to prevent — and a zero sigma would divide to an infinite
+/// cap, so the one input that must never be defaulted is the denominator.
+fn vol_scaled_cap(
+    config: &AgentGuardrails,
+    market: &MarketRef,
+    symbol: &str,
+) -> Result<Option<VolScaledCap>, Refusal> {
+    let Some(risk_budget_usd) = config.risk.max_risk_usd else {
+        return Ok(None);
+    };
+    let sigma_day = market
+        .sigma_day
+        .filter(|sigma| *sigma > Decimal::ZERO)
+        .ok_or_else(|| {
+            Refusal::from(Unevaluable::MissingVolatility {
+                symbol: symbol.to_owned(),
+            })
+        })?;
+    let cap = TWO
+        .checked_mul(sigma_day)
+        .and_then(|denominator| risk_budget_usd.checked_div(denominator));
+    Ok(Some(VolScaledCap {
+        effective_cap_usd: checked(cap, "vol-scaled cap")?,
+        risk_budget_usd,
+        sigma_day,
+    }))
 }
 
 /// `None` when the limit is zero (the ratio is undefined) or the arithmetic

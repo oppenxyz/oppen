@@ -177,6 +177,14 @@ Returns `{contract_version, symbol, is_buy, notional_usd, guardrail, book, book_
 
 **A clear verdict is not a promise.** The book is a snapshot the venue has already moved past, nothing reserves depth, and the rate token this did not spend may be gone by the time the order is sent. `exhausts_book: true` means the resting depth could not cover the size at all.
 
+**The vol-scaled cap, if your operator set one.** When `max_risk_usd` is configured, the position is bounded by `max_risk_usd / (2 × σ_day)` as well as by the fixed `max_position_usd` — the tighter of the two binds, and `utilization.vol_scaled_position_pct` says where you sit against it. It is absent when no such cap is set, which is the default.
+
+The point is that one budget means different sizes on different markets: $5 of risk buys $125 of position on something that moves 2% a day and $62.50 on something that moves 4%. So a refusal on a volatile symbol is not the venue being arbitrary — trading something calmer, or asking your operator to raise `max_risk_usd`, are different remedies and the refusal names which knob it was. `vol_scaled_position_notional` and `position_notional` are separate refusals for exactly that reason.
+
+**This cap moves, and trimming into it is always allowed.** Volatility doubles and the cap halves, so a position that was inside it can be over it with you having done nothing. Any order that leaves you holding *less* than before clears regardless — you never have to exit all at once to get back under. Adding to the position is what the cap refuses.
+
+If the volatility cannot be measured, an order on that symbol is **refused**, not sized against a guess: `missing_volatility` names the symbol. A configured cap that cannot be computed is a cap that is not enforced.
+
 **Not included: estimated fees.** Item 20 names them; oppen has no fee schedule yet, and guessing a tier would be worse than omitting one. It needs a `userFees` read audited against the live API, which is its own change.
 
 ### `remember(key, value)` · `recall(key?)`

@@ -130,6 +130,25 @@ pub struct RiskSettings {
     /// number is a hard bound and the operator's may only be tighter.
     pub max_leverage: u32,
     pub margin_mode: MarginMode,
+    /// Spec F's vol-scaled notional cap: the dollars an ordinary two-sigma
+    /// day may move the position, from which the engine derives
+    /// `effective_cap = max_risk_usd / (2 · sigma_day)`.
+    ///
+    /// A fixed cap says the same thing about a stablecoin pair and a coin
+    /// that moves 20% a day, and it is wrong for one of them. This says
+    /// "$5 of daily risk" once and lets the market decide what size that is.
+    ///
+    /// `None` is the default, and spec F calls this a guardrail *option* for
+    /// that reason. It is not a hole in D-c's default-deny: `max_position_usd`
+    /// still caps notional at $100 for a new agent, and this only ever
+    /// tightens — the engine takes the smaller of the two.
+    ///
+    /// Deliberately dollars, like every other limit in this file. It does not
+    /// scale with equity, so an operator who grows the account must raise it;
+    /// a fraction-of-equity form was considered and would have made this the
+    /// only percentage among dollar limits, and would have silently tightened
+    /// every cap during a drawdown.
+    pub max_risk_usd: Option<Decimal>,
 }
 
 impl Default for RiskSettings {
@@ -137,6 +156,7 @@ impl Default for RiskSettings {
         RiskSettings {
             max_leverage: DEFAULT_MAX_LEVERAGE,
             margin_mode: MarginMode::Cross,
+            max_risk_usd: None,
         }
     }
 }
@@ -277,6 +297,20 @@ impl AgentGuardrails {
         }
         if self.risk.max_leverage == 0 {
             return Err(("risk.max_leverage", "must be at least 1".to_owned()));
+        }
+        // Zero is rejected rather than treated as "no risk allowed": the cap
+        // it derives is `budget / 2sigma`, so a zero budget is a zero cap,
+        // and the engine's direction rule then makes it a confusing second
+        // spelling of `reduce_only` — every order that would grow a position
+        // refused, every exit allowed. An operator who means that should set
+        // the flag that says it. Negative is nonsense in either reading.
+        if let Some(budget) = self.risk.max_risk_usd
+            && budget <= Decimal::ZERO
+        {
+            return Err((
+                "risk.max_risk_usd",
+                "must be positive; unset it to disable the vol-scaled cap".to_owned(),
+            ));
         }
         for limit in [self.loss.max_daily_loss_usd, self.loss.max_drawdown_usd]
             .into_iter()

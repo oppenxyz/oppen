@@ -554,7 +554,7 @@ impl Gateway {
         let now_ms = now_ms();
 
         let context = self
-            .evaluation_context(bound.account, &params.symbol, now_ms)
+            .evaluation_context(&bound, &params.symbol, now_ms)
             .await?;
         let asset = context
             .universe
@@ -809,7 +809,7 @@ impl Gateway {
         let now_ms = now_ms();
 
         let context = self
-            .evaluation_context(bound.account, &params.symbol, now_ms)
+            .evaluation_context(&bound, &params.symbol, now_ms)
             .await?;
         let asset = context
             .universe
@@ -895,7 +895,7 @@ impl Gateway {
         let now_ms = now_ms();
 
         let context = self
-            .evaluation_context(bound.account, &params.symbol, now_ms)
+            .evaluation_context(&bound, &params.symbol, now_ms)
             .await?;
         let asset = context
             .universe
@@ -1430,11 +1430,12 @@ impl Gateway {
     /// that decides whether an order is refused.
     async fn evaluation_context(
         &self,
-        account: Address,
+        bound: &Binding,
         symbol: &str,
         now_ms: u64,
     ) -> Result<EvaluationContext, ToolError> {
         let inner = &self.inner;
+        let account = bound.account;
         let universe = self.universe().await?;
         let state = self.read_state(account, now_ms).await?;
 
@@ -1469,6 +1470,21 @@ impl Gateway {
         // print — so the refusal this comment describes never happened and the
         // caps below were measured against a price that could be 9.9× off.
         let reference_px = self.reference_pxs().await?.get(symbol);
+        // Spec F's vol-scaled cap needs a volatility, and this is the one
+        // path that pays for it — but only for an agent that configured one.
+        // K1 kept sigma off the signing path because no predicate read it;
+        // now one does, so the cost is owed, and owed by exactly the agents
+        // whose caps depend on it. The engine refuses rather than sizing
+        // against a `None`, so a fetch that fails is a refusal and never a
+        // silently unenforced cap.
+        let sigma_day = match inner
+            .engine
+            .guardrails(&bound.agent)
+            .and_then(|config| config.risk.max_risk_usd)
+        {
+            Some(_) => self.daily_sigma(symbol, now_ms).await,
+            None => None,
+        };
         let market = MarketRef {
             symbol: symbol.to_owned(),
             reference_px,
@@ -1477,6 +1493,7 @@ impl Gateway {
             mark_divergence_bps: None,
             mark_divergent_since_ms: None,
             snapshot: None,
+            sigma_day,
         };
 
         Ok(EvaluationContext {

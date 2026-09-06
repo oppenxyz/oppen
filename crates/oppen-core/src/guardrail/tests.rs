@@ -166,6 +166,7 @@ fn permissive(symbols: &[&str]) -> AgentGuardrails {
         risk: RiskSettings {
             max_leverage: 50,
             margin_mode: MarginMode::Cross,
+            max_risk_usd: None,
         },
         loss: LossLimits::UNSET,
         approval_required: false,
@@ -1178,6 +1179,240 @@ fn a_preflight_reports_the_drawdown_budget_it_used_to_omit() {
     assert_eq!(used.daily_loss_pct, Some(d("40")));
     // $400 of drawdown against a $500 budget — 80%, and previously silent.
     assert_eq!(used.drawdown_pct, Some(d("80")));
+}
+
+/// Spec F's `effective_cap = risk_budget / (2 * sigma_day)`, hand-computed:
+/// $5 of risk at 2% daily volatility is `5 / 0.04` = $125 of position. The
+/// point of the whole feature is the second half — the *same* budget on a
+/// coin that moves four times as much buys a quarter of the size, with no
+/// second configuration anywhere.
+#[test]
+fn the_same_risk_budget_buys_less_size_on_a_more_volatile_market() {
+    let sized = |sigma: &str, sz: &str| {
+        let mut config = permissive(&["BTC"]);
+        config.risk.max_risk_usd = Some(d("5"));
+        let f = Fixture::new(config);
+        let market = MarketRef {
+            sigma_day: Some(d(sigma)),
+            ..MarketRef::fresh("BTC", d("100"), NOW_MS)
+        };
+        f.engine.evaluate(
+            &f.agent,
+            &intent("BTC", true, d("100"), d(sz)),
+            &asset("BTC", 2, 40),
+            &market,
+            &exposure(d("100000")),
+            NOW_MS,
+        )
+    };
+
+    // 2% a day: $125 of position, so 1.25 units at $100 clears and 1.26 does
+    // not. The cap is a ceiling a value may sit exactly on, like every other
+    // size cap here.
+    assert!(sized("0.02", "1.25").is_ok());
+    assert!(matches!(
+        sized("0.02", "1.26"),
+        Err(Refusal::VolScaledPositionNotional { .. })
+    ));
+
+    // 8% a day, same budget: a quarter of the size, $31.25.
+    assert!(sized("0.08", "0.31").is_ok());
+    assert!(matches!(
+        sized("0.08", "0.32"),
+        Err(Refusal::VolScaledPositionNotional { .. })
+    ));
+}
+
+/// **The fail-closed branch.** A configured cap that cannot be computed is a
+/// cap that is not enforced, which is the failure this module exists to
+/// prevent. A missing sigma refuses; so does a zero one, which is not "an
+/// asset that cannot move" but a measurement that failed — and which would
+/// otherwise divide to an infinite cap.
+#[test]
+fn a_vol_scaled_cap_without_a_volatility_refuses_rather_than_sizing_blind() {
+    let mut config = permissive(&["BTC"]);
+    config.risk.max_risk_usd = Some(d("5"));
+    let f = Fixture::new(config);
+
+    for sigma in [None, Some(Decimal::ZERO), Some(-d("0.02"))] {
+        let market = MarketRef {
+            sigma_day: sigma,
+            ..MarketRef::fresh("BTC", d("100"), NOW_MS)
+        };
+        // Comfortably inside every cap at any sane volatility, and above the
+        // venue's own minimum notional so nothing refuses it first.
+        let verdict = f.engine.evaluate(
+            &f.agent,
+            &intent("BTC", true, d("100"), d("0.2")),
+            &asset("BTC", 2, 40),
+            &market,
+            &exposure(d("100000")),
+            NOW_MS,
+        );
+        assert!(
+            matches!(
+                verdict,
+                Err(Refusal::Unevaluable(Unevaluable::MissingVolatility { .. }))
+            ),
+            "sigma {sigma:?} should refuse, got {verdict:?}"
+        );
+    }
+}
+
+/// An agent that configured no vol-scaled cap is unaffected, and in
+/// particular is **not** refused for a missing volatility. Spec F calls this
+/// an option; an option that fails closed when unset is not optional.
+#[test]
+fn no_vol_scaled_cap_means_no_volatility_is_needed() {
+    let f = Fixture::new(permissive(&["BTC"]));
+    let cleared = f
+        .engine
+        .evaluate(
+            &f.agent,
+            &intent("BTC", true, d("100"), d("50")),
+            &asset("BTC", 2, 40),
+            &MarketRef::fresh("BTC", d("100"), NOW_MS),
+            &exposure(d("100000")),
+            NOW_MS,
+        )
+        .expect("no vol-scaled cap, no volatility needed");
+    assert_eq!(
+        cleared.clearance().utilization.vol_scaled_position_pct,
+        None
+    );
+}
+
+/// The two caps compose as a minimum and the refusal names which one bound.
+/// An agent told only "too big" cannot tell whether to ask for a larger
+/// `max_position_usd` or a larger `max_risk_usd`, and the two are different
+/// conversations with the operator.
+#[test]
+fn the_fixed_cap_still_binds_underneath_the_vol_scaled_one() {
+    let mut config = permissive(&["BTC"]);
+    // A generous risk budget: $50 at 2% would allow $1,250 of position.
+    config.risk.max_risk_usd = Some(d("50"));
+    config.max_position_usd = d("200");
+    let f = Fixture::new(config);
+    let market = MarketRef {
+        sigma_day: Some(d("0.02")),
+        ..MarketRef::fresh("BTC", d("100"), NOW_MS)
+    };
+
+    // $300 of position: inside the vol-scaled cap, past the fixed one.
+    let refusal = f
+        .engine
+        .evaluate(
+            &f.agent,
+            &intent("BTC", true, d("100"), d("3")),
+            &asset("BTC", 2, 40),
+            &market,
+            &exposure(d("100000")),
+            NOW_MS,
+        )
+        .expect_err("the fixed cap binds");
+    assert!(
+        matches!(refusal, Refusal::PositionNotional { limit_usd, .. } if limit_usd == d("200")),
+        "the tighter cap must name itself: {refusal:?}"
+    );
+}
+
+/// **The cap moves, so trimming into it must not be refused.** Volatility
+/// doubles and the cap halves: a position that was inside it this morning is
+/// over it by noon with the agent having done nothing. If the check ignored
+/// direction, the way out — selling some of it — would be refused for leaving
+/// the position still over the cap, and only an all-at-once exit would clear.
+/// Refusing a risk-reducing order can only raise risk.
+///
+/// This is the one place the vol-scaled cap behaves differently from the
+/// fixed one, and the difference is earned: `max_position_usd` does not move
+/// on its own, so an agent cannot be put over it by the market alone.
+#[test]
+fn a_position_the_market_pushed_over_the_cap_can_still_be_trimmed() {
+    let mut config = permissive(&["BTC"]);
+    // $5 of risk at 8% daily volatility: a $31.25 cap.
+    config.risk.max_risk_usd = Some(d("5"));
+    let f = Fixture::new(config);
+    let market = MarketRef {
+        sigma_day: Some(d("0.08")),
+        ..MarketRef::fresh("BTC", d("100"), NOW_MS)
+    };
+
+    // Already holding $200 of it — four times over what the cap now allows,
+    // which is what a volatility repricing looks like from the inside.
+    let mut over = exposure(d("100000"));
+    over.agent
+        .positions
+        .insert("BTC".to_owned(), PositionSnapshot { szi: d("2") });
+
+    let order = |is_buy: bool, sz: &str| {
+        f.engine.evaluate(
+            &f.agent,
+            &intent("BTC", is_buy, d("100"), d(sz)),
+            &asset("BTC", 2, 40),
+            &market,
+            &over,
+            NOW_MS,
+        )
+    };
+
+    // Selling 1 leaves $100 — still far over the $31.25 cap, and allowed,
+    // because it is less exposure than before.
+    assert!(
+        order(false, "1").is_ok(),
+        "trimming an over-cap position must clear"
+    );
+    // Buying more is refused: that is the direction the cap is for.
+    assert!(matches!(
+        order(true, "0.2"),
+        Err(Refusal::VolScaledPositionNotional { .. })
+    ));
+    // And flipping through to a larger short is not a reduction, however it
+    // is dressed: $300 of short exposure is more risk, not less.
+    assert!(matches!(
+        order(false, "5"),
+        Err(Refusal::VolScaledPositionNotional { .. })
+    ));
+}
+
+/// The utilization block reports the vol-scaled cap too — L3's lesson, that
+/// a block which omits a cap the engine fires on is how an agent walks into
+/// a refusal it could have seen coming.
+#[test]
+fn a_preflight_reports_where_the_order_sits_against_the_vol_scaled_cap() {
+    let mut config = permissive(&["BTC"]);
+    config.risk.max_risk_usd = Some(d("5"));
+    let f = Fixture::new(config);
+    let market = MarketRef {
+        sigma_day: Some(d("0.02")),
+        ..MarketRef::fresh("BTC", d("100"), NOW_MS)
+    };
+
+    // $100 of a $125 cap.
+    let verdict = f.preflight(
+        &intent("BTC", true, d("100"), d("1")),
+        &asset("BTC", 2, 40),
+        &market,
+        &exposure(d("100000")),
+    );
+    assert!(verdict.would_clear);
+    let used = verdict.utilization.expect("utilization on a clear verdict");
+    assert_eq!(used.vol_scaled_position_pct, Some(d("80")));
+}
+
+/// A zero budget derives a zero cap, which refuses every order including a
+/// risk-reducing one — so it is rejected where an operator types it rather
+/// than at the moment an order needs a verdict, the same treatment every
+/// other unevaluable setting gets.
+#[test]
+fn a_zero_risk_budget_is_refused_as_configuration_not_as_a_cap() {
+    let f = Fixture::new(permissive(&["BTC"]));
+    let mut config = permissive(&["BTC"]);
+    config.risk.max_risk_usd = Some(Decimal::ZERO);
+    assert!(matches!(
+        f.engine
+            .operator_set_guardrails(&f.agent, config, NOW_MS),
+        Err(GuardrailError::InvalidConfig { field, .. }) if field == "risk.max_risk_usd"
+    ));
 }
 
 #[test]
@@ -2795,6 +3030,15 @@ fn no_input_produces_a_signable_value_without_passing_every_predicate() {
             risk: RiskSettings {
                 max_leverage: *rng.pick(&leverages),
                 margin_mode: MarginMode::Cross,
+                // Mostly unset, because that is the default and the fuzz
+                // should spend most of its budget on the paths every agent
+                // takes. When set, it is paired below with a sigma that is
+                // itself sometimes absent and sometimes zero, so the
+                // fail-closed branch is reached by the search rather than
+                // only by the test written for it.
+                max_risk_usd: rng
+                    .chance(6)
+                    .then(|| d(rng.pick(&["1", "40", "4000", "40000"]))),
             },
             loss: LossLimits {
                 max_daily_loss_usd: rng.chance(2).then(|| d(rng.pick(&["25", "100", "1000"]))),
@@ -2834,6 +3078,11 @@ fn no_input_produces_a_signable_value_without_passing_every_predicate() {
                 .chance(2)
                 .then(|| now_ms.saturating_sub(rng.below(60_000))),
             snapshot: None,
+            sigma_day: if rng.chance(5) {
+                None
+            } else {
+                Some(d(rng.pick(&["0", "0.005", "0.02", "0.08", "0.5"])))
+            },
         };
 
         let mut positions = BTreeMap::new();
@@ -3028,6 +3277,25 @@ fn verify_every_predicate(
         after.abs() * reference_px <= config.max_position_usd,
         "{ctx}: position notional past the cap"
     );
+    // Spec F's vol-scaled cap, re-derived rather than re-read. Unlike every
+    // other cap here it binds only when the order grows the position, so the
+    // direction is part of the property and not an exemption from it.
+    if let Some(budget) = config.risk.max_risk_usd {
+        let sigma = market
+            .sigma_day
+            .expect("a cleared order under a vol-scaled cap has a volatility");
+        assert!(
+            sigma > Decimal::ZERO,
+            "{ctx}: cleared against a non-positive volatility"
+        );
+        let before = position_szi + resting_szi;
+        if after.abs() >= before.abs() {
+            assert!(
+                after.abs() * reference_px <= budget / (Decimal::from(2) * sigma),
+                "{ctx}: position past the vol-scaled cap"
+            );
+        }
+    }
     let symbol_before = position_szi.abs() * reference_px + resting_szi.abs() * reference_px;
     let total_after = (account.total_position_notional_usd + resting.notional_usd - symbol_before
         + after.abs() * reference_px)
