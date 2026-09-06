@@ -32,6 +32,9 @@ use crate::book::{ladder_reach_bps, max_notional_within};
 /// Basis points per unit. A price 1% away is 100 bps.
 const BPS: Decimal = Decimal::from_parts(10_000, 0, 0, false, 0);
 
+/// [`BPS`], for callers converting a bps figure back to a fraction.
+pub const BPS_PER_UNIT: Decimal = BPS;
+
 /// The bands spec F names.
 pub const DEPTH_BANDS_BPS: [u32; 3] = [10, 25, 50];
 
@@ -155,6 +158,94 @@ pub struct VolFeatures {
     /// from four bars is a different claim from one over sixty.
     pub bars_1h: usize,
     pub bars_24h: usize,
+}
+
+/// What a position costs and how close it is to the edge, in the units spec F
+/// asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct PositionRisk {
+    /// Distance to liquidation measured in daily standard deviations.
+    ///
+    /// A 4% gap is a different fact on BTC than on a coin that moves 20% a
+    /// day, and this is the number that makes the two comparable — which is
+    /// the whole reason spec F asks for σ-units. `None` when the venue
+    /// publishes no liquidation price, when no mark is available, or when the
+    /// daily σ is unknown or zero.
+    pub liq_distance_sigma: Option<Decimal>,
+    /// Funding on this position over a day at the current rate, signed: a
+    /// negative number is what the position **pays**.
+    ///
+    /// The rate is the venue's hour-to-date accrual, so early in the hour this
+    /// understates the day the same way `funding.apr_pct` does. `None` when
+    /// there is no mark to value the position at.
+    pub carry_usd_per_day: Option<Decimal>,
+}
+
+/// Hours in a day, for the carry.
+const HOURS_PER_DAY: u32 = 24;
+
+/// Read one position's risk.
+///
+/// `sigma_day_frac` is the daily return σ as a fraction — [`VolFeatures`]'
+/// `rv_24h_bps` divided by [`BPS`]. `funding_hourly` is the venue's rate for
+/// the symbol, as a fraction per hour.
+pub fn position_risk(
+    size: Decimal,
+    mark_px: Option<Decimal>,
+    liquidation_px: Option<Decimal>,
+    sigma_day_frac: Option<Decimal>,
+    funding_hourly: Option<Decimal>,
+) -> PositionRisk {
+    let liq_distance_sigma = match (mark_px, liquidation_px, sigma_day_frac) {
+        (Some(mark), Some(liq), Some(sigma)) if mark > Decimal::ZERO && sigma > Decimal::ZERO => {
+            // Always the move *against* the position, so the figure is
+            // non-negative whichever side it is on — the same convention
+            // `liq_distance_frac` already uses.
+            (mark - liq)
+                .abs()
+                .checked_div(mark)
+                .and_then(|frac| frac.checked_div(sigma))
+        }
+        _ => None,
+    };
+
+    let carry_usd_per_day = match (mark_px, funding_hourly) {
+        (Some(mark), Some(hourly)) => {
+            // A long pays when funding is positive, so the sign flips against
+            // the position's direction: `carry` is what the account receives.
+            let notional = size * mark;
+            notional
+                .checked_mul(hourly)
+                .map(|hourly_cost| -hourly_cost * Decimal::from(HOURS_PER_DAY))
+        }
+        _ => None,
+    };
+
+    PositionRisk {
+        liq_distance_sigma,
+        carry_usd_per_day,
+    }
+}
+
+/// How long free margin lasts against the account's total carry, in hours.
+///
+/// **Account-level rather than per position, because free margin is shared.**
+/// A runway computed per position would divide the same margin among every
+/// position and overstate each one by the number of them — the direction that
+/// makes an account look safer than it is.
+///
+/// `None` when nothing is being paid: a book that receives funding, or one
+/// with no positions, has no runway to run out of rather than an infinite one
+/// worth printing.
+pub fn margin_runway_h(
+    free_margin_usd: Decimal,
+    total_carry_usd_per_day: Decimal,
+) -> Option<Decimal> {
+    if total_carry_usd_per_day >= Decimal::ZERO || free_margin_usd <= Decimal::ZERO {
+        return None;
+    }
+    let per_hour = total_carry_usd_per_day.abs() / Decimal::from(HOURS_PER_DAY);
+    free_margin_usd.checked_div(per_hour)
 }
 
 /// Read one book.
@@ -658,5 +749,113 @@ mod tests {
         let hours: Vec<_> = (0..3).map(|_| candle("101", "100")).collect();
         let features = vol_features(&minutes, &hours);
         assert_eq!((features.bars_1h, features.bars_24h), (7, 3));
+    }
+
+    /// The point of σ-units: the same 4% gap is a different fact on a quiet
+    /// market and a violent one, and this is what makes them comparable.
+    #[test]
+    fn the_same_gap_is_fewer_sigmas_on_a_more_volatile_market() {
+        let quiet = position_risk(
+            Decimal::ONE,
+            Some(d("100")),
+            Some(d("96")),
+            Some(d("0.01")),
+            None,
+        );
+        let violent = position_risk(
+            Decimal::ONE,
+            Some(d("100")),
+            Some(d("96")),
+            Some(d("0.04")),
+            None,
+        );
+        assert_eq!(quiet.liq_distance_sigma, Some(d("4")));
+        assert_eq!(violent.liq_distance_sigma, Some(d("1")));
+    }
+
+    /// Non-negative whichever side the position is on: it is the move against
+    /// the position that liquidates it.
+    #[test]
+    fn liq_distance_is_never_negative_for_a_short() {
+        // A short liquidates upward, so its liquidation price is above the
+        // mark.
+        let short = position_risk(
+            -Decimal::ONE,
+            Some(d("100")),
+            Some(d("104")),
+            Some(d("0.01")),
+            None,
+        );
+        assert_eq!(short.liq_distance_sigma, Some(d("4")));
+    }
+
+    /// A σ of zero would divide by nothing and a market that has not moved
+    /// says nothing about how far four percent is.
+    #[test]
+    fn a_zero_or_absent_sigma_yields_no_sigma_distance() {
+        let zero = position_risk(
+            Decimal::ONE,
+            Some(d("100")),
+            Some(d("96")),
+            Some(Decimal::ZERO),
+            None,
+        );
+        assert_eq!(zero.liq_distance_sigma, None);
+        let absent = position_risk(Decimal::ONE, Some(d("100")), Some(d("96")), None, None);
+        assert_eq!(absent.liq_distance_sigma, None);
+    }
+
+    #[test]
+    fn a_position_the_venue_publishes_no_liquidation_for_has_no_distance() {
+        let risk = position_risk(Decimal::ONE, Some(d("100")), None, Some(d("0.01")), None);
+        assert_eq!(risk.liq_distance_sigma, None);
+    }
+
+    /// Sign convention: `carry` is what the account **receives**, so a long
+    /// paying positive funding reads negative.
+    #[test]
+    fn a_long_paying_funding_has_a_negative_carry() {
+        let risk = position_risk(
+            Decimal::ONE,
+            Some(d("1000")),
+            None,
+            None,
+            // 1 bp an hour on $1,000 is $0.10 an hour, $2.40 a day.
+            Some(d("0.0001")),
+        );
+        assert_eq!(risk.carry_usd_per_day, Some(d("-2.4000")));
+    }
+
+    /// And a short on the same rate receives it.
+    #[test]
+    fn a_short_on_the_same_rate_receives_the_carry() {
+        let risk = position_risk(
+            -Decimal::ONE,
+            Some(d("1000")),
+            None,
+            None,
+            Some(d("0.0001")),
+        );
+        assert_eq!(risk.carry_usd_per_day, Some(d("2.4000")));
+    }
+
+    #[test]
+    fn margin_runway_divides_free_margin_by_the_hourly_bleed() {
+        // $240 of free margin against $2.40 a day is $0.10 an hour: 2,400 h.
+        assert_eq!(margin_runway_h(d("240"), d("-2.4")), Some(d("2400")));
+    }
+
+    /// A book that receives funding has no runway to run out of, and printing
+    /// an infinite one would be a number an agent could sort on.
+    #[test]
+    fn a_book_that_receives_funding_has_no_runway() {
+        assert_eq!(margin_runway_h(d("240"), d("2.4")), None);
+        assert_eq!(margin_runway_h(d("240"), Decimal::ZERO), None);
+    }
+
+    #[test]
+    fn no_free_margin_is_no_runway_rather_than_zero() {
+        assert_eq!(margin_runway_h(Decimal::ZERO, d("-2.4")), None);
+        assert_eq!(margin_runway_h(d("-5"), d("-2.4")), None);
     }
 }

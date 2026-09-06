@@ -15,8 +15,10 @@ use std::sync::Arc;
 
 use oppen_core::alert::{AlertStore, Condition, Direction};
 use oppen_core::book;
-use oppen_core::features::quotes::QuoteCache;
-use oppen_core::features::{book_features, funding_features, vol_features};
+use oppen_core::features::quotes::{QuoteCache, SigmaCache};
+use oppen_core::features::{
+    BPS_PER_UNIT, book_features, funding_features, margin_runway_h, position_risk, vol_features,
+};
 use oppen_core::feed::FeedSession;
 use oppen_core::guardrail::{Cleared, FeedQuality, GuardrailEngine, MarketRef, OrderIntent};
 use oppen_core::journal::Journal;
@@ -83,6 +85,10 @@ struct GatewayInner {
     /// [`QuoteCache`] for why a synchronous read needs a lease rather than the
     /// alert module's armed set.
     quotes: Arc<QuoteCache>,
+    /// Daily σ per symbol, so `get_state`'s risk fields do not re-measure on
+    /// every call. Read only by `get_state`; the guardrail path never touches
+    /// it (`docs/decisions.md` K1).
+    sigmas: SigmaCache,
     /// Hands out one agent's read-only slice of the one ledger
     /// (`docs/spec.md` D6), built per request for whoever the token names. An
     /// [`EventViews`] and never a `Ledger`: `redact`, `upsert_sub_account` and
@@ -456,6 +462,7 @@ impl Gateway {
                 feed,
                 alerts,
                 quotes,
+                sigmas: SigmaCache::new(),
                 events,
             }),
         })
@@ -1377,7 +1384,9 @@ impl Gateway {
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let bound = Self::bound(&ctx)?;
-        let state = self.read_state(bound.account, now_ms()).await?;
+        let now = now_ms();
+        let mut state = self.read_state(bound.account, now).await?;
+        self.add_position_risk(&mut state, now).await;
         Ok(CallToolResult::success(vec![ContentBlock::text(
             serde_json::to_string(&state).expect("AccountState serializes"),
         )]))
@@ -1509,6 +1518,82 @@ impl Gateway {
     ) -> Result<Decimal, ToolError> {
         let slippage = self.operator_slippage_bps(bound)? / BPS;
         Ok(asset.slippage_price_bounded(reference_px, is_buy, slippage))
+    }
+
+    /// Fill spec F's σ-unit risk fields on an assembled state.
+    ///
+    /// **Deliberately here and not in `read_state`.** `evaluation_context`
+    /// calls that on the signing path, and these are numbers an agent reads
+    /// rather than numbers a guardrail evaluates — so `place` never pays for a
+    /// candle fetch it does not use (`docs/decisions.md` K1).
+    ///
+    /// Every input is optional and a missing one leaves its field absent
+    /// rather than failing the call: a state with no σ is still a state worth
+    /// answering with.
+    async fn add_position_risk(&self, state: &mut AccountState, now_ms: u64) {
+        if state.positions.is_empty() {
+            return;
+        }
+        // One call covers funding for every symbol held, so the cost does not
+        // grow with the position count.
+        let contexts = match self.inner.info.meta_and_asset_ctxs().await {
+            Ok(contexts) => contexts,
+            Err(error) => {
+                tracing::warn!(%error, "no asset contexts; position risk omitted");
+                return;
+            }
+        };
+        let funding: std::collections::HashMap<&str, Decimal> = contexts
+            .iter()
+            .map(|(info, ctx)| (info.name.as_str(), ctx.funding.hour_to_date_1h()))
+            .collect();
+        // The same read the order path sizes against, from the same response:
+        // an asset the venue has stopped quoting has no price here either, so
+        // its risk fields stay absent rather than being computed against a
+        // frozen print (`docs/decisions.md` H1).
+        let marks = contexts.reference_pxs();
+
+        let mut total_carry = Decimal::ZERO;
+        for position in &mut state.positions {
+            let sigma = self.daily_sigma(&position.symbol, now_ms).await;
+            let mark = marks.get(&position.symbol);
+            let risk = position_risk(
+                position.size,
+                mark,
+                position.liquidation_px,
+                sigma,
+                funding.get(position.symbol.as_str()).copied(),
+            );
+            if let Some(carry) = risk.carry_usd_per_day {
+                total_carry += carry;
+            }
+            position.liq_distance_sigma = risk.liq_distance_sigma;
+            position.carry_usd_per_day = risk.carry_usd_per_day;
+        }
+        state.margin_runway_h = margin_runway_h(state.balances.withdrawable_usd, total_carry);
+    }
+
+    /// One symbol's daily σ as a fraction, measured at most once per TTL.
+    async fn daily_sigma(&self, symbol: &str, now_ms: u64) -> Option<Decimal> {
+        if let Some(sigma) = self.inner.sigmas.get(symbol, now_ms) {
+            return Some(sigma);
+        }
+        let day_ms = 24 * 60 * 60 * 1_000;
+        let hours = self
+            .inner
+            .info
+            .candles(symbol, "1h", now_ms.saturating_sub(day_ms), now_ms)
+            .await
+            .unwrap_or_else(|error| {
+                tracing::warn!(%error, symbol, "no candles for sigma");
+                Vec::new()
+            });
+        let sigma = vol_features(&[], &hours)
+            .rv_24h_bps
+            .and_then(|bps| bps.checked_div(BPS_PER_UNIT))
+            .filter(|sigma| *sigma > Decimal::ZERO)?;
+        self.inner.sigmas.put(symbol, sigma, now_ms);
+        Some(sigma)
     }
 
     /// The prices oppen will size against, from the venue's own contexts.

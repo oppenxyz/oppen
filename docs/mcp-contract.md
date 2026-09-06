@@ -82,7 +82,13 @@ Per-symbol trading rules. Read-only. Returns an array sorted by `asset_id`: `sym
 
 ### `get_state()`
 
-The account now: `contract_version`, `network`, `address`, `as_of_ms`, `feed_age_ms`, `feed`, `balances`, `positions` (with distance to liquidation), `orders`. If `feed` is not `live` the data is stale and execution fails closed.
+The account now: `contract_version`, `network`, `address`, `as_of_ms`, `feed_age_ms`, `feed`, `balances`, `margin_runway_h`, `positions`, `orders`. If `feed` is not `live` the data is stale and execution fails closed.
+
+**Risk in σ-units.** Each position carries `liq_distance_frac` and `liq_distance_sigma` — the same distance as a fraction of the mark and in daily standard deviations. The second is the one to compare across symbols: a 4% gap is a different fact on BTC than on a coin that moves 20% a day. `carry_usd_per_day` is signed funding on that position over a day, **negative when the position pays**.
+
+`margin_runway_h` is account-level, not per position: free margin is shared, so a per-position runway would divide the same margin among all of them and overstate each. It is absent when the book receives funding on net — there is no runway to run out of.
+
+Any of these is absent when its input is: no liquidation price, no σ yet, or a symbol the venue has stopped quoting (which also cannot be traded — see above).
 
 **An asset the venue has stopped quoting has no price here, and cannot be traded.** `markPx` keeps being published for a dead market — it is the last print, frozen — so oppen reads the venue's asset contexts and treats a null `midPx` as "not quoted", which is what it means. Those assets carry no liquidation distance and every order on them is refused for a missing reference price rather than sized against a number that can be an order of magnitude stale. This is 24% of the main dex, so it is the ordinary case and not an edge one.
 

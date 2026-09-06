@@ -22,6 +22,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use oppen_hl::types::Bbo;
+use rust_decimal::Decimal;
 
 /// How long a symbol stays subscribed after the last request for it.
 ///
@@ -40,6 +41,51 @@ pub const LEASE_TTL: Duration = Duration::from_secs(300);
 /// a bound and expiry is not an error: the tool answers with
 /// `micro_tilt_bps: null` and the lease stays, so the next call has it.
 pub const WARMUP_WAIT: Duration = Duration::from_millis(1_500);
+
+/// How long a symbol's daily σ is reused before it is measured again.
+///
+/// σ over a day of hourly bars barely moves minute to minute, and the fetch
+/// behind it is 24 candles per symbol. Five minutes keeps `get_state` from
+/// paying for a fresh measurement on every call while staying far shorter than
+/// the window it describes.
+pub const SIGMA_TTL: Duration = Duration::from_secs(300);
+
+/// Daily σ per symbol, as a fraction.
+///
+/// Separate from [`QuoteCache`] because it is a different lifecycle: a quote is
+/// worthless the moment it is stale and is pushed by a socket, while a σ is
+/// pulled on demand and stays true for minutes. Nothing subscribes anything for
+/// this — a miss is a fetch by whoever asked.
+#[derive(Debug, Default)]
+pub struct SigmaCache {
+    inner: Mutex<BTreeMap<String, (Decimal, u64)>>,
+}
+
+impl SigmaCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The cached σ for `symbol`, or `None` when there is none or it is stale.
+    pub fn get(&self, symbol: &str, now_ms: u64) -> Option<Decimal> {
+        let ttl_ms = SIGMA_TTL.as_millis() as u64;
+        self.lock()
+            .get(symbol)
+            .filter(|(_, at)| now_ms.saturating_sub(*at) < ttl_ms)
+            .map(|(sigma, _)| *sigma)
+    }
+
+    /// Record a freshly measured σ.
+    pub fn put(&self, symbol: &str, sigma_day_frac: Decimal, now_ms: u64) {
+        self.lock()
+            .insert(symbol.to_owned(), (sigma_day_frac, now_ms));
+    }
+
+    /// See [`QuoteCache::lock`] for why a poisoned lock is taken back.
+    fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, (Decimal, u64)>> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
 
 /// Latest quotes, and the leases that keep them coming.
 #[derive(Debug, Default)]
@@ -266,5 +312,24 @@ mod tests {
         };
         let (warmed, ()) = tokio::join!(waiting, arriving);
         assert!(warmed.is_some(), "the frame landed inside the budget");
+    }
+
+    #[test]
+    fn a_sigma_is_reused_inside_its_ttl_and_refetched_after() {
+        let cache = SigmaCache::new();
+        let ttl = SIGMA_TTL.as_millis() as u64;
+        cache.put("BTC", Decimal::ONE, NOW);
+
+        assert_eq!(cache.get("BTC", NOW + ttl - 1), Some(Decimal::ONE));
+        assert_eq!(
+            cache.get("BTC", NOW + ttl),
+            None,
+            "past the ttl the caller measures again"
+        );
+    }
+
+    #[test]
+    fn a_symbol_never_measured_has_no_sigma() {
+        assert_eq!(SigmaCache::new().get("BTC", NOW), None);
     }
 }
