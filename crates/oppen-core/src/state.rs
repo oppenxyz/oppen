@@ -37,6 +37,17 @@ pub struct PositionView {
     /// non-negative, and it is the move *against* the position that liquidates
     /// it.
     pub liq_distance_frac: Option<Decimal>,
+    /// The same distance in daily standard deviations (`docs/spec.md` spec F).
+    ///
+    /// `None` from [`assemble`], which has no volatility to measure against —
+    /// the `get_state` tool fills it, and deliberately not `read_state`, so the
+    /// guardrail path never pays a candle fetch for a field it does not read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub liq_distance_sigma: Option<Decimal>,
+    /// Funding on this position over a day, signed: negative is what it pays.
+    /// Filled by the same path as [`PositionView::liq_distance_sigma`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub carry_usd_per_day: Option<Decimal>,
     pub max_leverage: u32,
 }
 
@@ -102,6 +113,17 @@ pub struct AccountState {
     pub feed_age_ms: Option<u64>,
     pub feed: Freshness,
     pub balances: Balances,
+    /// Hours of free margin against the account's total funding bleed
+    /// (`docs/spec.md` spec F).
+    ///
+    /// **Account-level, because free margin is shared.** A runway computed per
+    /// position would divide the same margin among all of them and overstate
+    /// each by the position count — the direction that makes an account look
+    /// safer than it is. `None` when nothing is being paid, or from
+    /// [`assemble`], which has no funding rates; see
+    /// [`PositionView::carry_usd_per_day`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub margin_runway_h: Option<Decimal>,
     pub positions: Vec<PositionView>,
     pub orders: Vec<OrderView>,
 }
@@ -171,6 +193,10 @@ pub fn assemble(
                 margin_used_usd: position.margin_used,
                 liquidation_px: position.liquidation_px,
                 liq_distance_frac: liq_distance(position.liquidation_px, mark),
+                // Filled by the caller that has the volatility and funding to
+                // hand; see the field docs.
+                liq_distance_sigma: None,
+                carry_usd_per_day: None,
                 max_leverage: position.max_leverage,
             }
         })
@@ -211,6 +237,8 @@ pub fn assemble(
         feed_age_ms,
         feed,
         balances,
+        // Filled by the caller that has the funding rates; see the field docs.
+        margin_runway_h: None,
         positions,
         orders,
     }
