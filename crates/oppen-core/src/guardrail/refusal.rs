@@ -88,6 +88,28 @@ pub enum Refusal {
         limit_usd: Decimal,
     },
 
+    /// Spec F's vol-scaled notional cap. Separate from
+    /// [`Refusal::PositionNotional`] because the two name different knobs and
+    /// an agent told only "too big" cannot tell which: one is raised by
+    /// changing `max_position_usd`, the other by raising `max_risk_usd` or by
+    /// trading something that moves less.
+    ///
+    /// Every input to the arithmetic is reported — the budget, the volatility
+    /// it was divided by, and the cap that came out — because the cap is
+    /// *derived* and a number an agent cannot reconstruct is one it will
+    /// treat as arbitrary and retry against.
+    #[error(
+        "post-fill position ${observed_usd} on {symbol} exceeds the ${effective_cap_usd} vol-scaled cap \
+         (${risk_budget_usd} of risk at {sigma_day_pct}% daily volatility)"
+    )]
+    VolScaledPositionNotional {
+        symbol: String,
+        observed_usd: Decimal,
+        effective_cap_usd: Decimal,
+        risk_budget_usd: Decimal,
+        sigma_day_pct: Decimal,
+    },
+
     /// Spec item 24, order-rate cap. `retry_after_ms` is how long until one
     /// token has refilled, so an agent can back off exactly rather than poll.
     #[error("order rate exhausted: {limit} per {window_ms}ms, retry in {retry_after_ms}ms")]
@@ -413,6 +435,20 @@ pub enum Unevaluable {
     /// was supplied, so the account-wide half of item 25 cannot be checked.
     #[error("account-wide loss limits are set but no fleet snapshot was supplied")]
     MissingFleetState,
+
+    /// A vol-scaled cap is configured but the market tick carried no daily
+    /// volatility, so `max_risk_usd / (2 · sigma_day)` has no denominator.
+    ///
+    /// Same fail-closed reading as [`Unevaluable::MissingFleetState`]: a cap
+    /// that cannot be computed is a cap that is not enforced, and the whole
+    /// point of an operator setting one is that it binds. Also covers a
+    /// non-positive sigma, which is not "an asset that cannot move" but a
+    /// measurement that failed — the division would yield an infinite cap,
+    /// which is the one number a cap must never be.
+    #[error(
+        "a vol-scaled cap is set for {symbol} but its daily volatility is unavailable, so the cap cannot be computed"
+    )]
+    MissingVolatility { symbol: String },
 
     /// No working-order book was supplied, so the position-notional and
     /// leverage caps would be measuring filled size only — which is
