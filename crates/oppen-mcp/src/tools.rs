@@ -15,6 +15,8 @@ use std::sync::Arc;
 
 use oppen_core::alert::{AlertStore, Condition, Direction};
 use oppen_core::book;
+use oppen_core::features::quotes::QuoteCache;
+use oppen_core::features::{book_features, funding_features, vol_features};
 use oppen_core::feed::FeedSession;
 use oppen_core::guardrail::{Cleared, FeedQuality, GuardrailEngine, MarketRef, OrderIntent};
 use oppen_core::journal::Journal;
@@ -23,7 +25,7 @@ use oppen_core::state::{
     AccountState, VenueReadings, assemble, exposure_from, realized_pnl_since, utc_day_start_ms,
 };
 use oppen_hl::info::OrderRef;
-use oppen_hl::types::{OrderStatusResponse, ReferencePrices};
+use oppen_hl::types::{Candle, OrderStatusResponse, ReferencePrices};
 use oppen_hl::wire::{CancelWire, Cloid, Grouping, Tif, Tpsl};
 use oppen_hl::{Address, InfoClient, Network, Universe, meta::MIN_NOTIONAL_USD};
 use oppen_hl::{ExchangeClient, ExchangeResponse, NonceAllocator, OrderKind, Status};
@@ -76,6 +78,11 @@ struct GatewayInner {
     /// What agents asked to be woken for (`docs/spec.md` item 22). The feed
     /// pump evaluates it; this only arms.
     alerts: Arc<AlertStore>,
+    /// The latest `bbo` per symbol, filled by the pump. `get_features` leases
+    /// a symbol here and the pump subscribes what is leased — see
+    /// [`QuoteCache`] for why a synchronous read needs a lease rather than the
+    /// alert module's armed set.
+    quotes: Arc<QuoteCache>,
     /// Hands out one agent's read-only slice of the one ledger
     /// (`docs/spec.md` D6), built per request for whoever the token names. An
     /// [`EventViews`] and never a `Ledger`: `redact`, `upsert_sub_account` and
@@ -354,6 +361,13 @@ impl SetAlertParams {
     }
 }
 
+/// What `get_features` takes.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct GetFeaturesParams {
+    /// The symbol to read.
+    pub symbol: String,
+}
+
 /// What `cancel_alert` takes.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct CancelAlertParams {
@@ -429,6 +443,7 @@ impl Gateway {
         journal: Arc<Journal>,
         feed: Arc<FeedSession>,
         alerts: Arc<AlertStore>,
+        quotes: Arc<QuoteCache>,
     ) -> Result<Self, oppen_hl::Error> {
         Ok(Self {
             inner: Arc::new(GatewayInner {
@@ -440,6 +455,7 @@ impl Gateway {
                 journal,
                 feed,
                 alerts,
+                quotes,
                 events,
             }),
         })
@@ -1034,6 +1050,117 @@ impl Gateway {
             })
             .to_string(),
         )]))
+    }
+
+    /// `get_features` — the numbers an agent decides from (`docs/spec.md`
+    /// spec F).
+    #[tool(
+        description = "Deterministic market features for one symbol: book (spread_bps, \
+                       book_imbalance, micro_tilt_bps, depth per band), funding (hour-to-date \
+                       bps, APR, the venue's predicted APR, seconds to settlement, basis_bps) \
+                       and realised vol (rv_1h_bps, rv_24h_bps, vol_ratio, with the bar counts \
+                       behind each). READ THE covers_band FLAG on each depth band: false means \
+                       the venue's ladder stopped short of that band, so the figure is the \
+                       whole of that side's book and a floor on the real depth, not the band's \
+                       contents. micro_tilt_bps may be null on the first call for a symbol \
+                       while its quote feed warms up; call again."
+    )]
+    async fn get_features(
+        &self,
+        Parameters(params): Parameters<GetFeaturesParams>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        Self::bound(&ctx)?;
+        let inner = &self.inner;
+        let now = now_ms();
+        let universe = self.universe().await?;
+        let asset = universe
+            .get(&params.symbol)
+            .map_err(|_| ToolError::InvalidParams {
+                field: "symbol",
+                detail: format!("{} is not a symbol on this venue", params.symbol),
+            })?;
+        let symbol = asset.name().to_owned();
+
+        // The quote feed is leased before anything is fetched, so the socket
+        // has the whole of the rest of this call to deliver its first frame.
+        let leased = inner.quotes.lease(&symbol, now);
+
+        let book = inner
+            .info
+            .l2_book(&symbol, None)
+            .await
+            .map_err(|e| ToolError::unavailable("book", e))?;
+        let contexts = inner
+            .info
+            .meta_and_asset_ctxs()
+            .await
+            .map_err(|e| ToolError::unavailable("asset contexts", e))?;
+        let asset_ctx = contexts
+            .iter()
+            .find(|(info, _)| info.name == symbol)
+            .map(|(_, ctx)| ctx)
+            .ok_or_else(|| ToolError::Unavailable {
+                what: "asset context",
+                detail: format!("the venue did not return a context for {symbol}"),
+            })?;
+
+        // A failed prediction is an absent field, not a failed call: it is one
+        // of five funding numbers and the other four are still true.
+        let predicted = match inner.info.predicted_fundings().await {
+            Ok(rows) => rows
+                .iter()
+                .find(|row| row.coin() == symbol)
+                .and_then(|row| row.hyperliquid())
+                .map(|funding| funding.funding_rate),
+            Err(error) => {
+                tracing::warn!(%error, symbol, "no predicted funding");
+                None
+            }
+        };
+
+        let (minutes, hours) = self.vol_bars(&symbol, now).await;
+        let quote = match leased {
+            Some(quote) => Some(quote),
+            // Nothing held, so this is a first look at the symbol. Wait a
+            // bounded moment for the frame the lease just asked for.
+            None => inner.quotes.warm(&symbol).await,
+        };
+
+        let body = serde_json::json!({
+            "contract_version": 0,
+            "symbol": symbol,
+            "as_of_ms": now,
+            "book": book_features(&book, quote.as_ref()),
+            "funding": funding_features(asset_ctx, predicted, now),
+            "vol": vol_features(&minutes, &hours),
+        });
+        Ok(CallToolResult::success(vec![ContentBlock::text(
+            body.to_string(),
+        )]))
+    }
+
+    /// The two bar series the vol pack reads.
+    ///
+    /// A failed fetch is an empty series rather than a failed call: the vol
+    /// pack then reports `bars_1h: 0` and a null σ, which is the honest answer
+    /// and leaves the book and funding packs — which did arrive — readable.
+    async fn vol_bars(&self, symbol: &str, now_ms: u64) -> (Vec<Candle>, Vec<Candle>) {
+        let minute_ms = 60_000;
+        let fetch = |interval: &'static str, span_ms: u64| async move {
+            self.inner
+                .info
+                .candles(symbol, interval, now_ms.saturating_sub(span_ms), now_ms)
+                .await
+                .unwrap_or_else(|error| {
+                    tracing::warn!(%error, symbol, interval, "no candles");
+                    Vec::new()
+                })
+        };
+        (
+            fetch("1m", 60 * minute_ms).await,
+            fetch("1h", 24 * 60 * minute_ms).await,
+        )
     }
 
     /// `get_alerts` — what this agent is watching for (`docs/spec.md` item 22).
@@ -1908,6 +2035,7 @@ mod tests {
             journal,
             std::sync::Arc::new(oppen_core::feed::FeedSession::new()),
             std::sync::Arc::new(oppen_core::alert::AlertStore::open(":memory:").expect("alerts")),
+            std::sync::Arc::new(oppen_core::features::quotes::QuoteCache::new()),
         )
         .expect("gateway")
     }

@@ -74,6 +74,7 @@ fn gateway() -> Gateway {
         journal,
         feed,
         std::sync::Arc::new(oppen_core::alert::AlertStore::open(":memory:").expect("alerts")),
+        std::sync::Arc::new(oppen_core::features::quotes::QuoteCache::new()),
     )
     .expect("gateway")
 }

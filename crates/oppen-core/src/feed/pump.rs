@@ -42,6 +42,7 @@ use oppen_hl::ws::{PoolError, Subscription, WsEvent, WsPool};
 use tokio::sync::mpsc::Receiver;
 
 use crate::alert::{self, AlertStore, Fired, MarketTick};
+use crate::features::quotes::QuoteCache;
 use crate::feed::{Action, FeedSession};
 use crate::ledger::{EventKind, Ledger, NewEvent, now_ms};
 use crate::reconcile::{GapStatus, ReconcileError, ReconcileSource, Reconciler};
@@ -64,6 +65,18 @@ impl FeedSubscriber for WsPool {
 
     fn unsubscribe(&self, sub: &Subscription) -> Result<(), PoolError> {
         WsPool::unsubscribe(self, sub)
+    }
+}
+
+/// The channel `micro_tilt_bps` is answered from.
+///
+/// Separate from [`market_feed`] because they are different questions:
+/// `activeAssetCtx` carries the mark and the funding at ~1 s, and `bbo`
+/// carries the top of book at 0.10–0.13 s. §14.4 correction 4 is explicit that
+/// `micro` sources from this one and not from the depth ladder.
+fn quote_feed(symbol: &str) -> Subscription {
+    Subscription::Bbo {
+        coin: symbol.to_owned(),
     }
 }
 
@@ -123,14 +136,17 @@ pub struct FeedPump<'a, S, F> {
     account_id: String,
     reconciler: Reconciler<'a, S>,
     alerts: &'a AlertStore,
-    /// What the pump subscribes an alert's symbol through. See
-    /// [`FeedSubscriber`].
+    /// The latest `bbo` per symbol, for `get_features`. The pump fills it and
+    /// subscribes what it leases; see [`QuoteCache`] for why the lifecycle is
+    /// a lease rather than the alert module's armed set.
+    quotes: &'a QuoteCache,
+    /// What the pump subscribes a symbol through. See [`FeedSubscriber`].
     feeds: &'a F,
     /// The market feeds this pump has subscribed for alerts, so a fired alert
     /// gives its socket back. Sorted, because everything that reaches a
     /// serialized surface is (`AGENTS.md` invariant 6) and because the diff
     /// against `watched_symbols` is one comparison of two sorted lists.
-    subscribed: std::sync::Mutex<Vec<String>>,
+    subscribed: std::sync::Mutex<Vec<Subscription>>,
 }
 
 impl<'a, S: ReconcileSource, F: FeedSubscriber> FeedPump<'a, S, F> {
@@ -145,6 +161,7 @@ impl<'a, S: ReconcileSource, F: FeedSubscriber> FeedPump<'a, S, F> {
         account: Address,
         source: S,
         alerts: &'a AlertStore,
+        quotes: &'a QuoteCache,
         feeds: &'a F,
     ) -> Result<Self, ReconcileError> {
         Ok(FeedPump {
@@ -154,6 +171,7 @@ impl<'a, S: ReconcileSource, F: FeedSubscriber> FeedPump<'a, S, F> {
             account_id: account.to_string(),
             reconciler: Reconciler::new(ledger, source)?,
             alerts,
+            quotes,
             feeds,
             subscribed: std::sync::Mutex::new(Vec::new()),
         })
@@ -179,7 +197,14 @@ impl<'a, S: ReconcileSource, F: FeedSubscriber> FeedPump<'a, S, F> {
                 // An alert armed while the market is quiet must not wait for a
                 // tick on a feed nothing is subscribed to yet.
                 () = self.alerts.armed_changed() => self.sync_alert_feeds(),
+                // A symbol leased by `get_features` needs its `bbo` now, not
+                // at the next tick on a feed nothing has subscribed.
+                () = self.quotes.leased_changed() => self.sync_alert_feeds(),
                 _ = retry.tick() => {
+                    // Unconditional: a lease expires on a clock, not on an
+                    // event, so a healthy session that reconciles nothing is
+                    // exactly when a swept lease has to give its socket back.
+                    self.sync_alert_feeds();
                     if !self.session.state().reconciled {
                         self.reconcile().await;
                     }
@@ -188,14 +213,19 @@ impl<'a, S: ReconcileSource, F: FeedSubscriber> FeedPump<'a, S, F> {
         }
     }
 
-    /// Subscribe the market feeds the armed alerts need, and drop the ones
-    /// nothing needs any more.
+    /// Subscribe the market feeds the armed alerts and the leased quotes need,
+    /// and drop the ones nothing needs any more.
     ///
     /// The account channels are not touched: they are subscribed for the life
     /// of the pump and a fill alert reads them without asking for anything.
+    ///
+    /// The two demands are kept separate on the wire because they are
+    /// different channels — an alert wants `activeAssetCtx`, a feature call
+    /// wants `bbo` — but they are synced together so one pass reconciles
+    /// everything the pump is holding.
     fn sync_alert_feeds(&self) {
-        let wanted = match self.alerts.watched_symbols() {
-            Ok(wanted) => wanted,
+        let armed = match self.alerts.watched_symbols() {
+            Ok(armed) => armed,
             Err(error) => {
                 // Left as it is rather than torn down: an unreadable store is
                 // a reason to keep the feeds already flowing, not to stop
@@ -204,27 +234,38 @@ impl<'a, S: ReconcileSource, F: FeedSubscriber> FeedPump<'a, S, F> {
                 return;
             }
         };
+        let mut wanted: Vec<Subscription> = armed.iter().map(|s| market_feed(s)).collect();
+        wanted.extend(
+            self.quotes
+                .leased(now_ms_u64())
+                .iter()
+                .map(|s| quote_feed(s)),
+        );
+        wanted.sort();
+
         let mut held = self.subscribed.lock().unwrap_or_else(|e| e.into_inner());
-        let missing: Vec<String> = wanted
+        let missing: Vec<Subscription> = wanted
             .iter()
-            .filter(|symbol| !held.contains(symbol))
+            .filter(|sub| !held.contains(sub))
             .cloned()
             .collect();
-        for symbol in &missing {
-            match self.feeds.subscribe(market_feed(symbol)) {
+        for sub in missing {
+            match self.feeds.subscribe(sub.clone()) {
                 // Recorded only once the pool took it, so a refused
                 // subscription is retried on the next change rather than
                 // remembered as held.
-                Ok(()) => held.push(symbol.clone()),
-                Err(error) => tracing::error!(%error, symbol, "no feed for this alert"),
+                Ok(()) => held.push(sub),
+                Err(error) => {
+                    tracing::error!(%error, feed = %sub.key(), "no feed for this demand");
+                }
             }
         }
-        held.retain(|symbol| {
-            if wanted.contains(symbol) {
+        held.retain(|sub| {
+            if wanted.contains(sub) {
                 return true;
             }
-            if let Err(error) = self.feeds.unsubscribe(&market_feed(symbol)) {
-                tracing::warn!(%error, symbol, "could not drop an alert feed");
+            if let Err(error) = self.feeds.unsubscribe(sub) {
+                tracing::warn!(%error, feed = %sub.key(), "could not drop a feed");
             }
             false
         });
@@ -308,6 +349,22 @@ impl<'a, S: ReconcileSource, F: FeedSubscriber> FeedPump<'a, S, F> {
     fn evaluate_alerts(&self, event: &WsEvent) {
         let now = now_ms();
         let fired = match event {
+            // Not an alert condition: the quote cache is what `get_features`
+            // reads `micro_tilt_bps` from, and this is the only place a frame
+            // reaches it.
+            WsEvent::Bbo {
+                coin,
+                venue_time_ms,
+                bid,
+                ask,
+            } => {
+                self.quotes.observe(oppen_hl::types::Bbo {
+                    coin: coin.clone(),
+                    time: *venue_time_ms,
+                    bbo: [bid.clone(), ask.clone()],
+                });
+                return;
+            }
             WsEvent::ActiveAssetCtx { coin, ctx, .. } => {
                 let tick = MarketTick {
                     symbol: coin,
@@ -703,6 +760,7 @@ mod tests {
         let ledger = ledger(&dir);
         let session = FeedSession::new();
         let alerts = alerts();
+        let quotes = QuoteCache::new();
         let feeds = Feeds::default();
         let pump = FeedPump::new(
             &session,
@@ -710,6 +768,7 @@ mod tests {
             account(),
             FakeVenue::holding(Vec::new()),
             &alerts,
+            &quotes,
             &feeds,
         )
         .expect("pump");
@@ -733,11 +792,20 @@ mod tests {
         let ledger = ledger(&dir);
         let session = FeedSession::new();
         let alerts = alerts();
+        let quotes = QuoteCache::new();
         let feeds = Feeds::default();
         let missed = now_ms_u64() - 60_000;
         let venue = FakeVenue::holding(vec![fill(11, missed), fill(12, missed + 10)]);
-        let pump =
-            FeedPump::new(&session, &ledger, account(), venue, &alerts, &feeds).expect("pump");
+        let pump = FeedPump::new(
+            &session,
+            &ledger,
+            account(),
+            venue,
+            &alerts,
+            &quotes,
+            &feeds,
+        )
+        .expect("pump");
 
         drive(&pump, Vec::new()).await;
 
@@ -761,13 +829,22 @@ mod tests {
         let ledger = ledger(&dir);
         let session = FeedSession::new();
         let alerts = alerts();
+        let quotes = QuoteCache::new();
         let feeds = Feeds::default();
         let dropped_at = now_ms_u64();
         let venue = FakeVenue::holding(vec![fill(20, dropped_at - 60_000)]);
         let controls = venue.controls.clone();
         let user_fills = Subscription::UserFills { user: account() };
-        let pump =
-            FeedPump::new(&session, &ledger, account(), venue, &alerts, &feeds).expect("pump");
+        let pump = FeedPump::new(
+            &session,
+            &ledger,
+            account(),
+            venue,
+            &alerts,
+            &quotes,
+            &feeds,
+        )
+        .expect("pump");
 
         drive(&pump, Vec::new()).await;
         assert_eq!(fill_rows(&ledger), 1, "the chain now has an anchor");
@@ -798,6 +875,7 @@ mod tests {
         let ledger = ledger(&dir);
         let session = FeedSession::new();
         let alerts = alerts();
+        let quotes = QuoteCache::new();
         let feeds = Feeds::default();
         let at = now_ms_u64();
         let user_fills = Subscription::UserFills { user: account() };
@@ -808,6 +886,7 @@ mod tests {
             account(),
             FakeVenue::holding(Vec::new()),
             &alerts,
+            &quotes,
             &feeds,
         )
         .expect("pump");
@@ -848,10 +927,19 @@ mod tests {
         let ledger = ledger(&dir);
         let session = FeedSession::new();
         let alerts = alerts();
+        let quotes = QuoteCache::new();
         let feeds = Feeds::default();
         let venue = FakeVenue::refusing(Controls::new(true));
-        let pump =
-            FeedPump::new(&session, &ledger, account(), venue, &alerts, &feeds).expect("pump");
+        let pump = FeedPump::new(
+            &session,
+            &ledger,
+            account(),
+            venue,
+            &alerts,
+            &quotes,
+            &feeds,
+        )
+        .expect("pump");
 
         drive(&pump, Vec::new()).await;
 
@@ -871,11 +959,20 @@ mod tests {
         let ledger = ledger(&dir);
         let session = FeedSession::new();
         let alerts = alerts();
+        let quotes = QuoteCache::new();
         let feeds = Feeds::default();
         let controls = Controls::new(true);
         let venue = FakeVenue::refusing(controls.clone());
-        let pump =
-            FeedPump::new(&session, &ledger, account(), venue, &alerts, &feeds).expect("pump");
+        let pump = FeedPump::new(
+            &session,
+            &ledger,
+            account(),
+            venue,
+            &alerts,
+            &quotes,
+            &feeds,
+        )
+        .expect("pump");
 
         let (tx, mut rx) = mpsc::channel::<WsEvent>(1);
         let driver = async {
@@ -904,6 +1001,7 @@ mod tests {
         let ledger = ledger(&dir);
         let session = FeedSession::new();
         let alerts = alerts();
+        let quotes = QuoteCache::new();
         let feeds = Feeds::default();
         alerts
             .arm(
@@ -922,6 +1020,7 @@ mod tests {
             account(),
             FakeVenue::holding(Vec::new()),
             &alerts,
+            &quotes,
             &feeds,
         )
         .expect("pump");
@@ -950,6 +1049,7 @@ mod tests {
         let ledger = ledger(&dir);
         let session = FeedSession::new();
         let alerts = alerts();
+        let quotes = QuoteCache::new();
         let feeds = Feeds::default();
         alerts
             .arm(
@@ -968,6 +1068,7 @@ mod tests {
             account(),
             FakeVenue::holding(Vec::new()),
             &alerts,
+            &quotes,
             &feeds,
         )
         .expect("pump");
@@ -990,6 +1091,7 @@ mod tests {
         let ledger = ledger(&dir);
         let session = FeedSession::new();
         let alerts = alerts();
+        let quotes = QuoteCache::new();
         let feeds = Feeds::default();
         alerts
             .arm(
@@ -1008,6 +1110,7 @@ mod tests {
             account(),
             FakeVenue::holding(Vec::new()),
             &alerts,
+            &quotes,
             &feeds,
         )
         .expect("pump");
@@ -1031,6 +1134,7 @@ mod tests {
         let ledger = ledger(&dir);
         let session = FeedSession::new();
         let alerts = alerts();
+        let quotes = QuoteCache::new();
         let feeds = Feeds::default();
         alerts
             .arm(
@@ -1049,6 +1153,7 @@ mod tests {
             account(),
             FakeVenue::holding(Vec::new()),
             &alerts,
+            &quotes,
             &feeds,
         )
         .expect("pump");
@@ -1067,6 +1172,7 @@ mod tests {
         let ledger = ledger(&dir);
         let session = FeedSession::new();
         let alerts = alerts();
+        let quotes = QuoteCache::new();
         let feeds = Feeds::default();
         alerts
             .arm("agent-a", &Condition::Fill { symbol: None }, now_ms())
@@ -1077,6 +1183,7 @@ mod tests {
             account(),
             FakeVenue::holding(Vec::new()),
             &alerts,
+            &quotes,
             &feeds,
         )
         .expect("pump");
@@ -1107,6 +1214,7 @@ mod tests {
         let ledger = ledger(&dir);
         let session = FeedSession::new();
         let alerts = alerts();
+        let quotes = QuoteCache::new();
         let feeds = Feeds::default();
         let pump = FeedPump::new(
             &session,
@@ -1114,6 +1222,7 @@ mod tests {
             account(),
             FakeVenue::holding(Vec::new()),
             &alerts,
+            &quotes,
             &feeds,
         )
         .expect("pump");
@@ -1158,6 +1267,7 @@ mod tests {
         let ledger = ledger(&dir);
         let session = FeedSession::new();
         let alerts = alerts();
+        let quotes = QuoteCache::new();
         let feeds = Feeds::default();
         let armed = alerts
             .arm(
@@ -1176,6 +1286,7 @@ mod tests {
             account(),
             FakeVenue::holding(Vec::new()),
             &alerts,
+            &quotes,
             &feeds,
         )
         .expect("pump");
@@ -1194,6 +1305,187 @@ mod tests {
                 feeds.keys().is_empty(),
                 "cancelling woke the pump and it dropped the feed"
             );
+            drop(tx);
+        };
+        tokio::join!(pump.run(&mut rx), driver);
+    }
+
+    fn bbo_frame(coin: &str, bid: &str, ask: &str) -> WsEvent {
+        let d = |v: &str| Decimal::from_str(v).expect("decimal");
+        let level = |px: &str| oppen_hl::types::Level {
+            px: d(px),
+            sz: Decimal::ONE,
+            n: 1,
+        };
+        WsEvent::Bbo {
+            coin: coin.into(),
+            venue_time_ms: now_ms_u64(),
+            bid: Some(level(bid)),
+            ask: Some(level(ask)),
+        }
+    }
+
+    /// The only path a `bbo` frame takes into `get_features`.
+    #[tokio::test]
+    async fn a_quote_frame_reaches_the_cache() {
+        let dir = TempDir::new().expect("tempdir");
+        let ledger = ledger(&dir);
+        let session = FeedSession::new();
+        let alerts = alerts();
+        let quotes = QuoteCache::new();
+        let feeds = Feeds::default();
+        let pump = FeedPump::new(
+            &session,
+            &ledger,
+            account(),
+            FakeVenue::holding(Vec::new()),
+            &alerts,
+            &quotes,
+            &feeds,
+        )
+        .expect("pump");
+
+        drive(&pump, vec![bbo_frame("BTC", "99", "101")]).await;
+
+        assert!(quotes.peek("BTC").is_some(), "the frame is readable");
+    }
+
+    /// A `bbo` frame is not an alert condition. It must not fire a price
+    /// cross, which reads `activeAssetCtx`'s mark and its liveness gate.
+    #[tokio::test]
+    async fn a_quote_frame_does_not_fire_a_price_alert() {
+        let dir = TempDir::new().expect("tempdir");
+        let ledger = ledger(&dir);
+        let session = FeedSession::new();
+        let alerts = alerts();
+        let quotes = QuoteCache::new();
+        let feeds = Feeds::default();
+        alerts
+            .arm(
+                "agent-a",
+                &Condition::PriceCross {
+                    symbol: "BTC".into(),
+                    direction: Direction::Above,
+                    px: Decimal::from_str("1").expect("decimal"),
+                },
+                now_ms(),
+            )
+            .expect("arm");
+        let pump = FeedPump::new(
+            &session,
+            &ledger,
+            account(),
+            FakeVenue::holding(Vec::new()),
+            &alerts,
+            &quotes,
+            &feeds,
+        )
+        .expect("pump");
+
+        drive(&pump, vec![bbo_frame("BTC", "99", "101")]).await;
+
+        assert!(
+            alert_rows(&ledger).is_empty(),
+            "a quote is not the mark a price cross is defined against"
+        );
+    }
+
+    /// Leasing a symbol has to reach the pool, and it has to reach it as
+    /// `bbo` — the alert path's `activeAssetCtx` carries no top of book.
+    #[tokio::test(start_paused = true)]
+    async fn leasing_a_quote_subscribes_bbo_and_expiry_gives_it_back() {
+        let dir = TempDir::new().expect("tempdir");
+        let ledger = ledger(&dir);
+        let session = FeedSession::new();
+        let alerts = alerts();
+        let quotes = QuoteCache::new();
+        let feeds = Feeds::default();
+        let pump = FeedPump::new(
+            &session,
+            &ledger,
+            account(),
+            FakeVenue::holding(Vec::new()),
+            &alerts,
+            &quotes,
+            &feeds,
+        )
+        .expect("pump");
+
+        let (tx, mut rx) = mpsc::channel::<WsEvent>(1);
+        let driver = async {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            assert!(
+                feeds.keys().is_empty(),
+                "nothing leased, nothing subscribed"
+            );
+
+            quotes.lease("SOL", now_ms_u64());
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            assert_eq!(
+                feeds.keys(),
+                ["bbo:SOL"],
+                "bbo, not activeAssetCtx: only bbo carries the top of book"
+            );
+
+            // Nobody renews it, so the lease expires. The expiry is stamped
+            // on the system clock while `start_paused` only moves tokio's, so
+            // the sweep is asked for directly here rather than waited out —
+            // `QuoteCache::leased` is what expires an entry, and
+            // `a_lease_nobody_renews_expires` covers the clock arithmetic.
+            let ttl_ms = crate::features::quotes::LEASE_TTL.as_millis() as u64;
+            assert!(
+                quotes.leased(now_ms_u64() + ttl_ms).is_empty(),
+                "the lease is past its ttl"
+            );
+
+            // The pump's own pass is what turns that into an unsubscribe, and
+            // it runs on the retry tick whether or not anything needs
+            // reconciling.
+            tokio::time::sleep(RETRY_INTERVAL * 2).await;
+            assert!(feeds.keys().is_empty(), "an expired lease drops its feed");
+            drop(tx);
+        };
+        tokio::join!(pump.run(&mut rx), driver);
+    }
+
+    /// An alert and a feature call on the same symbol want different channels,
+    /// and holding one must not be read as holding the other.
+    #[tokio::test(start_paused = true)]
+    async fn an_alert_and_a_lease_on_one_symbol_hold_both_feeds() {
+        let dir = TempDir::new().expect("tempdir");
+        let ledger = ledger(&dir);
+        let session = FeedSession::new();
+        let alerts = alerts();
+        let quotes = QuoteCache::new();
+        let feeds = Feeds::default();
+        alerts
+            .arm(
+                "agent-a",
+                &Condition::PriceCross {
+                    symbol: "BTC".into(),
+                    direction: Direction::Above,
+                    px: Decimal::from_str("999999").expect("decimal"),
+                },
+                now_ms(),
+            )
+            .expect("arm");
+        let pump = FeedPump::new(
+            &session,
+            &ledger,
+            account(),
+            FakeVenue::holding(Vec::new()),
+            &alerts,
+            &quotes,
+            &feeds,
+        )
+        .expect("pump");
+
+        let (tx, mut rx) = mpsc::channel::<WsEvent>(1);
+        let driver = async {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            quotes.lease("BTC", now_ms_u64());
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            assert_eq!(feeds.keys(), ["activeAssetCtx:BTC", "bbo:BTC"]);
             drop(tx);
         };
         tokio::join!(pump.run(&mut rx), driver);

@@ -8,6 +8,7 @@
 use std::sync::{Arc, RwLock};
 
 use oppen_core::alert::AlertStore;
+use oppen_core::features::quotes::QuoteCache;
 use oppen_core::feed::FeedSession;
 use oppen_core::feed::pump::FeedPump;
 use oppen_core::guardrail::{AgentId, GuardrailEngine, SqliteGuardrailStore};
@@ -96,6 +97,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let feed = Arc::new(FeedSession::new());
     // Item 22's alerts, per network for the reason everything is (R4).
     let alerts = Arc::new(AlertStore::open(dir.join("alerts-testnet.db"))?);
+    // In memory on purpose: a quote is only useful while it is fresh, so
+    // nothing here survives a restart and nothing should.
+    let quotes = Arc::new(QuoteCache::new());
     let (pool, mut events) = WsPool::new(WsPoolConfig {
         network: Network::Testnet,
         ..WsPoolConfig::default()
@@ -107,6 +111,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pump_ledger = Arc::clone(&ledger);
     let pump_feed = Arc::clone(&feed);
     let pump_alerts = Arc::clone(&alerts);
+    let pump_quotes = Arc::clone(&quotes);
     // The pump subscribes an alert's own market feed through the pool, so the
     // two are handed to it together.
     let pump_pool = Arc::new(pool);
@@ -122,6 +127,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             account,
             source,
             &pump_alerts,
+            &pump_quotes,
             feeds.as_ref(),
         ) {
             Ok(pump) => pump.run(&mut events).await,
@@ -135,6 +141,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         journal,
         feed,
         alerts,
+        quotes,
     )?;
     // Held to the end of `main`: the pool's `Drop` stops every connection.
     let _pool = pump_pool;
