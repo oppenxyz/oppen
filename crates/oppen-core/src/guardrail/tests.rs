@@ -1037,6 +1037,149 @@ fn the_daily_loss_breaker_trips_the_kill_switch_and_the_next_order_is_paused() {
     ));
 }
 
+/// Spec F's gauge, read through the engine: both scopes, because the
+/// account-wide budget of item 25 is shared and a refusal an agent has never
+/// received is the only other place it would have heard about it.
+///
+/// The numbers here are the shape of the failure the gauge exists to prevent:
+/// the agent is at 20% of its own budget and would read that as room, while
+/// the fleet is one dollar from a kill that stops it too.
+#[test]
+fn the_gauge_shows_the_shared_budget_an_agent_would_otherwise_never_see() {
+    let mut config = permissive(&["BTC"]);
+    config.loss = LossLimits {
+        max_daily_loss_usd: Some(d("100")),
+        max_drawdown_usd: None,
+    };
+    let f = Fixture::new(config);
+    f.engine
+        .operator_set_account_limits(
+            LossLimits {
+                max_daily_loss_usd: Some(d("400")),
+                max_drawdown_usd: None,
+            },
+            NOW_MS,
+        )
+        .expect("set account limits");
+
+    let mut agent_account = account(d("980"));
+    agent_account.realized_pnl_today_usd = d("-20");
+    let mut fleet = account(d("4601"));
+    fleet.realized_pnl_today_usd = d("-399");
+    let rows = f.engine.loss_budget(
+        &f.agent,
+        &Exposure {
+            agent: agent_account,
+            fleet: Some(fleet),
+        },
+        NOW_MS,
+    );
+
+    assert_eq!(rows.len(), 2, "one row per configured budget: {rows:?}");
+    assert_eq!(rows[0].scope, BudgetScope::Agent, "own budget first");
+    assert_eq!(rows[0].utilization_pct, Some(d("20")));
+    assert_eq!(rows[1].scope, BudgetScope::Account);
+    assert_eq!(rows[1].utilization_pct, Some(d("99.75")));
+    assert_eq!(rows[1].remaining_usd, d("1"));
+    assert!(rows.iter().all(|row| !row.tripped));
+}
+
+/// The gauge is a read: it takes no intent, spends no rate token and cannot
+/// hand back anything that signs. Without this, "put the breaker on the read
+/// path" is one refactor away from being a second way to reach the signer
+/// (`AGENTS.md` invariant 1).
+#[test]
+fn reading_the_gauge_spends_no_rate_budget_and_mints_no_proposal() {
+    let mut budgeted = permissive(&["BTC"]);
+    budgeted.loss = LossLimits {
+        max_daily_loss_usd: Some(d("100")),
+        max_drawdown_usd: None,
+    };
+    let exposure = exposure(d("1000"));
+
+    // The rate cap is 1,000 orders per second. Fifty reads first; a token
+    // spent by one of them would leave fewer than 999 for the order.
+    let f = Fixture::new(budgeted.clone());
+    for _ in 0..50 {
+        assert_eq!(f.engine.loss_budget(&f.agent, &exposure, NOW_MS).len(), 1);
+    }
+    let cleared = f
+        .engine
+        .evaluate(
+            &f.agent,
+            &intent("BTC", true, d("100"), d("1")),
+            &asset("BTC", 2, 40),
+            &MarketRef::fresh("BTC", d("100"), NOW_MS),
+            &exposure,
+            NOW_MS,
+        )
+        .expect("an order still clears");
+    assert_eq!(
+        cleared.clearance().utilization.order_tokens_remaining,
+        d("999")
+    );
+
+    // In approval mode an evaluation mints a proposal for an operator. Fifty
+    // gauge reads mint none, which is what "this is a read" has to mean for
+    // the one engine call on the read path.
+    budgeted.approval_required = true;
+    let gated = Fixture::new(budgeted);
+    for _ in 0..50 {
+        assert_eq!(
+            gated
+                .engine
+                .loss_budget(&gated.agent, &exposure, NOW_MS)
+                .len(),
+            1
+        );
+    }
+    assert!(gated.engine.pending_proposals(NOW_MS).is_empty());
+}
+
+/// An agent nobody registered has no guardrails, so it has no budget to
+/// gauge — and no way to place an order either. An empty gauge is the honest
+/// answer; a zero-limit one would read as "you have used all of nothing".
+#[test]
+fn an_unregistered_agent_has_no_gauge() {
+    let f = Fixture::new(permissive(&["BTC"]));
+    let rows = f
+        .engine
+        .loss_budget(&AgentId::new("nobody"), &exposure(d("1000")), NOW_MS);
+    assert!(rows.is_empty(), "{rows:?}");
+}
+
+/// `preflight` says where an order would sit against each cap. The breaker
+/// has fired on two budgets since it was written and this block reported one,
+/// so the cap about to stop the account was the one it did not mention.
+#[test]
+fn a_preflight_reports_the_drawdown_budget_it_used_to_omit() {
+    let mut config = permissive(&["BTC"]);
+    config.loss = LossLimits {
+        max_daily_loss_usd: Some(d("100")),
+        max_drawdown_usd: Some(d("500")),
+    };
+    let f = Fixture::new(config);
+
+    let mut down = account(d("600"));
+    down.peak_equity_usd = d("1000");
+    down.realized_pnl_today_usd = d("-40");
+    let verdict = f.preflight(
+        &intent("BTC", true, d("100"), d("1")),
+        &asset("BTC", 2, 40),
+        &MarketRef::fresh("BTC", d("100"), NOW_MS),
+        &Exposure {
+            agent: down,
+            fleet: None,
+        },
+    );
+
+    assert!(verdict.would_clear);
+    let used = verdict.utilization.expect("utilization on a clear verdict");
+    assert_eq!(used.daily_loss_pct, Some(d("40")));
+    // $400 of drawdown against a $500 budget — 80%, and previously silent.
+    assert_eq!(used.drawdown_pct, Some(d("80")));
+}
+
 #[test]
 fn an_account_wide_breach_stops_every_agent() {
     let f = Fixture::new(permissive(&["BTC"]));

@@ -9,10 +9,13 @@
 //! without a network, and so the equity arithmetic below is checkable rather
 //! than merely asserted.
 
-use oppen_hl::types::{ClearinghouseState, OpenOrder, ReferencePrices, SpotClearinghouseState};
-use oppen_hl::{Address, Network};
 use rust_decimal::Decimal;
 use serde::Serialize;
+
+use oppen_hl::types::{ClearinghouseState, OpenOrder, ReferencePrices, SpotClearinghouseState};
+use oppen_hl::{Address, Network};
+
+use crate::guardrail::LossBudget;
 
 /// How stale a feed may be before the console covers it and execution fails
 /// closed (`docs/spec.md` item 34).
@@ -124,6 +127,16 @@ pub struct AccountState {
     /// [`PositionView::carry_usd_per_day`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub margin_runway_h: Option<Decimal>,
+    /// Every loss budget the account is measured against, as a dial rather
+    /// than as the step function the breaker is (`docs/spec.md` spec F).
+    ///
+    /// Empty from [`assemble`], which has no engine to ask; the gateway fills
+    /// it in `get_state` for the same reason as [`AccountState::margin_runway_h`]
+    /// (`docs/decisions.md` K1). Empty also when no budget is configured — an
+    /// operator who set none has no gauge, and a zero row would say the
+    /// opposite of what that means.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub loss_budget: Vec<LossBudget>,
     pub positions: Vec<PositionView>,
     pub orders: Vec<OrderView>,
 }
@@ -239,6 +252,7 @@ pub fn assemble(
         balances,
         // Filled by the caller that has the funding rates; see the field docs.
         margin_runway_h: None,
+        loss_budget: Vec::new(),
         positions,
         orders,
     }
