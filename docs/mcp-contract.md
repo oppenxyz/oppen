@@ -15,7 +15,7 @@ This document is the normative reference for every tool the gateway exposes. `do
 
 `get_state` · `get_meta` · `get_events` · `get_features` · `preflight` · `place` · `cancel` · `cancel_all` · `close_position` · `get_order_status` · `remember` · `recall` · `set_alert` · `get_alerts` · `cancel_alert`
 
-Shipped so far: `get_meta`, `get_state`, `get_events`, `preflight`, `remember`, `recall`, `place`, `cancel`, `cancel_all`, `close_position`, `get_order_status`, `set_alert`, `get_alerts`, `cancel_alert`. `get_features` is unimplemented and is not described below — a schema for a tool that does not exist is a promise nothing keeps.
+Every tool in that list is implemented.
 
 ## Pairing
 
@@ -107,6 +107,22 @@ Ask to be woken when a condition holds, instead of holding a session open and po
 **Not available yet:** liquidation distance and feature thresholds, the other two conditions spec item 22 names. The first needs a position poll on a cadence nobody has chosen, the second needs `get_features`. They are absent rather than approximated, because an alert that cannot fire is worse than one that was refused — you would stop watching and wait for a wakeup nothing will send.
 
 An alert on an asset the venue has stopped quoting never fires, for the reason such an asset cannot be traded (see `get_state` above).
+
+### `get_features(symbol)`
+
+Deterministic market features. Returns `{contract_version, symbol, as_of_ms, book, funding, vol}`.
+
+**`book`** — `spread_bps`, `book_imbalance` (touch notional, positive means more resting on the bid), `micro_tilt_bps`, `bid_reach_bps`, `ask_reach_bps`, and `depth`: one entry per band in 10/25/50 bp, each `{band_bps, bid_usd, ask_usd, covers_band}`.
+
+> **Read `covers_band` before using a depth figure.** The venue's default ladder does not reach these bands on most symbols — measured at a median of 13.18 bp across the top 50, and **2.40 bp on BTC**. When `covers_band` is false the figure is that side's *whole book*: a floor on the real depth, not the band's contents. `bid_reach_bps` and `ask_reach_bps` say how far the ladder actually went. On testnet the thin book does span the bands, so a test there will not show you this.
+
+`micro_tilt_bps` is the Stoikov microprice's distance from the mid, sourced from the `bbo` channel and never from the depth ladder, which pushes too slowly to define it. It may be `null` on the first call for a symbol while its quote feed warms — call again. A one-sided quote yields `null` rather than zero.
+
+**`funding`** — `hour_to_date_bps` is what has accrued **so far this hour**, not the hour's finished rate; `apr_pct` compounds it hourly, so it **reads low early in the hour** and `next_funding_s` tells you how far through you are. `predicted_apr_pct` is the venue's own forward number, annualised the same way, and `null` when the venue does not carry one. `next_funding_s` is derived from the clock: the venue's own `nextFundingTime` points into the past. `basis_bps` is the mark's distance from the oracle.
+
+**`vol`** — `rv_1h_bps` (EWMA-Parkinson over the last hour of 1 m bars, as an hour's σ), `rv_24h_bps` (over the last day of 1 h bars, as a day's σ), and `vol_ratio` — the hour against what the day implies for one hour, so **1.0 means the last hour moved like a normal hour of this day**. `bars_1h` and `bars_24h` carry the sample behind each: a σ from four bars is a different claim from one over sixty. Any of the three is `null` when no bar carried a usable range.
+
+A pack whose venue read failed comes back with its fields `null` rather than failing the call — the packs that did arrive are still true.
 
 ### `get_alerts()`
 

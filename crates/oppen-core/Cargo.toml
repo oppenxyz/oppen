@@ -18,7 +18,7 @@ hex = "0.4"
 hmac = "0.13"
 keyring = "4.2"
 rusqlite = { version = "0.32", features = ["bundled"] }
-rust_decimal = { version = "1.43", default-features = false, features = ["std", "serde-with-str"] }
+rust_decimal = { version = "1.43", default-features = false, features = ["std", "serde-with-str", "maths"] }
 sha3 = { version = "0.11", default-features = false }
 tokio.workspace = true
 

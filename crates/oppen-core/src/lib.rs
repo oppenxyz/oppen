@@ -16,6 +16,7 @@ pub mod accounts;
 pub mod alert;
 pub mod book;
 pub mod candles;
+pub mod features;
 pub mod feed;
 pub mod guardrail;
 pub mod journal;

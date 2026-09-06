@@ -103,13 +103,32 @@ fn take(levels: &[Level], want: Decimal) -> (Decimal, Decimal) {
     (filled, notional)
 }
 
+/// How far the returned ladder spans from the touch, in basis points.
+///
+/// `None` when the side is empty or its touch is not a usable price. **This is
+/// the number that keeps a depth band honest**: `docs/specs/fair-value.md`
+/// §14.5 measured a default `l2Book` spanning a median of 13.18 bp across the
+/// top 50 mainnet symbols and only **2.40 bp on BTC**, so a figure labelled
+/// "within 25 bp" is, for most symbols, the whole book wearing a label it did
+/// not earn. Publishing the reach next to the figure is what §14.5 asks for.
+pub(crate) fn ladder_reach_bps(levels: &[Level], is_buy: bool) -> Option<Decimal> {
+    let top = levels.first()?.px;
+    let last = levels.last()?.px;
+    if top <= Decimal::ZERO {
+        return None;
+    }
+    // Away from the touch is the only direction a ladder runs.
+    let span = if is_buy { last - top } else { top - last };
+    span.max(Decimal::ZERO).checked_div(top).map(|r| r * BPS)
+}
+
 /// The largest notional whose *average* fill stays within `bps` of the touch.
 ///
 /// The average, not the last level: an order does not pay the worst price it
 /// reaches, it pays the mean of what it crossed. Measuring the limit at the
 /// last level would understate the size by roughly half a band, which is the
 /// difference between a usable number and a conservative-looking wrong one.
-fn max_notional_within(levels: &[Level], is_buy: bool, bps: u32) -> Decimal {
+pub(crate) fn max_notional_within(levels: &[Level], is_buy: bool, bps: u32) -> Decimal {
     let Some(top) = levels.first().map(|level| level.px) else {
         return Decimal::ZERO;
     };
