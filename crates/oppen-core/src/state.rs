@@ -9,9 +9,7 @@
 //! without a network, and so the equity arithmetic below is checkable rather
 //! than merely asserted.
 
-use std::collections::HashMap;
-
-use oppen_hl::types::{ClearinghouseState, OpenOrder, SpotClearinghouseState};
+use oppen_hl::types::{ClearinghouseState, OpenOrder, ReferencePrices, SpotClearinghouseState};
 use oppen_hl::{Address, Network};
 use rust_decimal::Decimal;
 use serde::Serialize;
@@ -117,9 +115,12 @@ pub struct VenueReadings<'a> {
     pub perps: &'a ClearinghouseState,
     pub spot: &'a SpotClearinghouseState,
     pub orders: &'a [OpenOrder],
-    /// Marks by symbol. A symbol absent here yields no liquidation distance
-    /// rather than a guessed one.
-    pub mids: &'a HashMap<String, Decimal>,
+    /// The venue's marks, for the assets it is actually quoting. A symbol
+    /// absent here yields no liquidation distance rather than a guessed one —
+    /// and [`ReferencePrices`] is what makes absence reachable: the map this
+    /// used to take was `allMids`, which answers for an unquoted asset with a
+    /// frozen last print, so the guess this comment forbids was being made.
+    pub mids: &'a ReferencePrices,
     /// Newest tick across subscribed feeds, `None` if nothing ever arrived.
     pub last_tick_ms: Option<u64>,
 }
@@ -160,7 +161,7 @@ pub fn assemble(
         .iter()
         .map(|held| {
             let position = &held.position;
-            let mark = mids.get(&position.coin).copied();
+            let mark = mids.get(&position.coin);
             PositionView {
                 symbol: position.coin.clone(),
                 size: position.szi,
@@ -276,7 +277,7 @@ mod tests {
                 perps,
                 spot,
                 orders: &[],
-                mids: &HashMap::new(),
+                mids: &ReferencePrices::default(),
                 last_tick_ms: Some(1_788_544_666_000),
             },
         )
@@ -339,7 +340,7 @@ mod tests {
                     perps: &perps,
                     spot: &spot,
                     orders: &[],
-                    mids: &HashMap::new(),
+                    mids: &ReferencePrices::default(),
                     last_tick_ms: tick,
                 },
             )
@@ -366,7 +367,7 @@ mod tests {
                 perps: &perps,
                 spot: &spot,
                 orders: &[],
-                mids: &HashMap::new(),
+                mids: &ReferencePrices::default(),
                 last_tick_ms: Some(1_000_500),
             },
         );
@@ -413,7 +414,7 @@ mod tests {
                     perps: &perps,
                     spot: &spot,
                     orders: &[],
-                    mids: &HashMap::new(),
+                    mids: &ReferencePrices::default(),
                     last_tick_ms: None,
                 },
             )
@@ -538,7 +539,7 @@ mod tests {
                 perps: &perps,
                 spot: &spot,
                 orders: &orders,
-                mids: &HashMap::new(),
+                mids: &ReferencePrices::default(),
                 last_tick_ms: None,
             },
         );
@@ -681,7 +682,13 @@ mod live {
         let perps = info.clearinghouse_state(address).await.expect("perps");
         let spot = info.spot_clearinghouse_state(address).await.expect("spot");
         let orders = info.frontend_open_orders(address).await.expect("orders");
-        let mids = info.all_mids().await.expect("mids");
+        // The same source the gateway uses: `allMids` would answer for an
+        // asset the venue has stopped quoting, with a frozen last print.
+        let mids = info
+            .meta_and_asset_ctxs()
+            .await
+            .expect("asset contexts")
+            .reference_pxs();
 
         let state = assemble(
             Network::Testnet,

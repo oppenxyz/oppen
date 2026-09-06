@@ -22,7 +22,7 @@ use oppen_core::state::{
     AccountState, VenueReadings, assemble, exposure_from, realized_pnl_since, utc_day_start_ms,
 };
 use oppen_hl::info::OrderRef;
-use oppen_hl::types::OrderStatusResponse;
+use oppen_hl::types::{OrderStatusResponse, ReferencePrices};
 use oppen_hl::wire::{CancelWire, Cloid, Grouping, Tif, Tpsl};
 use oppen_hl::{Address, InfoClient, Network, Universe, meta::MIN_NOTIONAL_USD};
 use oppen_hl::{ExchangeClient, ExchangeResponse, NonceAllocator, OrderKind, Status};
@@ -1119,14 +1119,11 @@ impl Gateway {
             day_start_ms,
         );
 
-        let mids = inner
-            .info
-            .all_mids()
-            .await
-            .map_err(|e| ToolError::unavailable("mids", e))?;
-        // A missing price is a refusal, never a fallback: `allMids` answers
-        // for bookless assets with a frozen mark.
-        let reference_px = mids.get(symbol).copied();
+        // A missing price is a refusal, never a fallback. This used to read
+        // `allMids`, which answers for an unquoted asset with a frozen last
+        // print — so the refusal this comment describes never happened and the
+        // caps below were measured against a price that could be 9.9× off.
+        let reference_px = self.reference_pxs().await?.get(symbol);
         let market = MarketRef {
             symbol: symbol.to_owned(),
             reference_px,
@@ -1179,6 +1176,23 @@ impl Gateway {
         Ok(asset.slippage_price_bounded(reference_px, is_buy, slippage))
     }
 
+    /// The prices oppen will size against, from the venue's own contexts.
+    ///
+    /// One reader for both `get_state` and the guardrail path, so a liquidation
+    /// distance and a notional cap can never disagree about what an asset is
+    /// worth. `metaAndAssetCtxs` rather than `allMids`: see
+    /// [`oppen_hl::types::ReferencePrices`] for what that map does to an asset
+    /// the venue has stopped quoting.
+    async fn reference_pxs(&self) -> Result<ReferencePrices, ToolError> {
+        Ok(self
+            .inner
+            .info
+            .meta_and_asset_ctxs()
+            .await
+            .map_err(|e| ToolError::unavailable("asset contexts", e))?
+            .reference_pxs())
+    }
+
     /// The validated universe, which every tool that names a symbol needs.
     async fn universe(&self) -> Result<Universe, ToolError> {
         let meta = self
@@ -1212,11 +1226,7 @@ impl Gateway {
             .frontend_open_orders(account)
             .await
             .map_err(|e| ToolError::unavailable("orders", e))?;
-        let mids = inner
-            .info
-            .all_mids()
-            .await
-            .map_err(|e| ToolError::unavailable("mids", e))?;
+        let mids = self.reference_pxs().await?;
 
         Ok(assemble(
             inner.network,

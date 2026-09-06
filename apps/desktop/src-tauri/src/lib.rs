@@ -6,8 +6,6 @@
 //! The MCP `get_state` tool reads the same [`oppen_core::state::assemble`], so
 //! the operator and the agent cannot be shown different accounts (A3).
 
-use std::collections::HashMap;
-
 use oppen_core::state::{AccountState, VenueReadings, assemble};
 use oppen_hl::{Address, InfoClient, Network};
 
@@ -75,10 +73,14 @@ async fn account_state(network: String) -> Result<AccountState, ConsoleError> {
         .frontend_open_orders(account)
         .await
         .map_err(|e| ConsoleError::Venue(format!("open orders: {e}")))?;
-    let mids: HashMap<_, _> = info
-        .all_mids()
+    // Not `allMids`: it answers for an asset the venue has stopped quoting
+    // with a frozen last print, and a liquidation distance computed from one
+    // is the fabrication `VenueReadings::mids` exists to refuse.
+    let mids = info
+        .meta_and_asset_ctxs()
         .await
-        .map_err(|e| ConsoleError::Venue(format!("marks: {e}")))?;
+        .map_err(|e| ConsoleError::Venue(format!("marks: {e}")))?
+        .reference_pxs();
 
     Ok(assemble(
         network,
