@@ -93,7 +93,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-pub use breaker::LossKind;
+pub use breaker::{BudgetScope, LossBudget, LossKind};
 pub use config::{
     AgentGuardrails, Freshness, GlobalRateBudget, LossLimits, MarginMode, OrderRate, RiskSettings,
 };

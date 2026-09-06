@@ -1387,6 +1387,7 @@ impl Gateway {
         let now = now_ms();
         let mut state = self.read_state(bound.account, now).await?;
         self.add_position_risk(&mut state, now).await;
+        self.add_loss_budget(&mut state, &bound, now).await;
         Ok(CallToolResult::success(vec![ContentBlock::text(
             serde_json::to_string(&state).expect("AccountState serializes"),
         )]))
@@ -1571,6 +1572,66 @@ impl Gateway {
             position.carry_usd_per_day = risk.carry_usd_per_day;
         }
         state.margin_runway_h = margin_runway_h(state.balances.withdrawable_usd, total_carry);
+    }
+
+    /// Fills the loss-budget gauge (`docs/spec.md` spec F).
+    ///
+    /// **Here rather than in `read_state`, for the K1 reason again**, but with
+    /// a sharper edge: `evaluation_context` already assembles this exposure on
+    /// the signing path, and the engine already runs the breaker over it
+    /// there. Computing the gauge in `read_state` would make `place` pay to
+    /// *display* a number it is about to enforce anyway.
+    ///
+    /// The two venue reads are the ones the exposure needs and no more: the
+    /// day's fills for realised PnL and the portfolio for the equity
+    /// high-water mark. Both are the same calls `evaluation_context` makes,
+    /// so the gauge an agent reads and the budget its next order is measured
+    /// against are built from the same two responses — a gauge assembled from
+    /// a cheaper approximation would be a second, quieter definition of the
+    /// number that decides whether the account keeps trading.
+    ///
+    /// A failed read leaves the gauge empty rather than failing `get_state`:
+    /// an account state without a gauge is still worth answering with, and the
+    /// breaker itself is unaffected — it runs on the order path from its own
+    /// fetch, so nothing here can make a budget go unenforced.
+    ///
+    /// **Reported while the account is unreconciled, unlike the breaker.** The
+    /// engine refuses an *order* on an unreconciled snapshot because its caps
+    /// are measured against position sizes it may have mis-stated. The gauge
+    /// is measured against equity and the day's fills, both read from the
+    /// venue in this same call — and an agent that sized up on a stale gauge
+    /// would still be refused when it tried, by the very predicate it was
+    /// looking at. Withholding the number in the one state where an agent most
+    /// wants to know how much room it has left would buy nothing.
+    async fn add_loss_budget(&self, state: &mut AccountState, bound: &Binding, now_ms: u64) {
+        let inner = &self.inner;
+        let day_start_ms = utc_day_start_ms(now_ms);
+        let fills = match inner
+            .info
+            .user_fills_by_time(bound.account, day_start_ms, Some(now_ms))
+            .await
+        {
+            Ok(fills) => fills,
+            Err(error) => {
+                tracing::warn!(%error, "no fills; loss budget omitted");
+                return;
+            }
+        };
+        let portfolio = match inner.info.portfolio(bound.account).await {
+            Ok(portfolio) => portfolio,
+            Err(error) => {
+                tracing::warn!(%error, "no portfolio; loss budget omitted");
+                return;
+            }
+        };
+        let exposure = exposure_from(
+            state,
+            realized_pnl_since(&fills, day_start_ms),
+            portfolio.window("day").and_then(|w| w.peak_account_value()),
+            inner.feed.state().reconciled,
+            day_start_ms,
+        );
+        state.loss_budget = inner.engine.loss_budget(&bound.agent, &exposure, now_ms);
     }
 
     /// One symbol's daily σ as a fraction, measured at most once per TTL.

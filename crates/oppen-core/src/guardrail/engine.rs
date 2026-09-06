@@ -41,7 +41,7 @@ use oppen_hl::{Action, Address, AgentKey, ExchangeRequest, Network};
 use crate::keys::{KeyStore, KeyStoreError};
 
 use super::AgentId;
-use super::breaker;
+use super::breaker::{self, BudgetScope, LossBudget, LossKind};
 use super::bucket::{BucketError, TokenBucket};
 use super::config::{
     APPROVAL_TTL_MS, AgentGuardrails, GlobalRateBudget, LossLimits, MAX_REASON_BYTES, OrderRate,
@@ -144,6 +144,12 @@ pub struct Utilization {
     pub order_notional_pct: Option<Decimal>,
     pub position_notional_pct: Option<Decimal>,
     pub daily_loss_pct: Option<Decimal>,
+    /// The other half of the breaker. It fires on two budgets and this block
+    /// reported one, so an agent one dollar from a drawdown kill read a
+    /// utilization block with nothing in it about drawdown — and `preflight`,
+    /// whose whole job is to say where an order would sit against each cap,
+    /// was silent on the cap that was about to stop it.
+    pub drawdown_pct: Option<Decimal>,
     pub leverage: Decimal,
     pub order_tokens_remaining: Decimal,
     /// What is left of spec item 10's address-wide request budget. Item 16
@@ -856,6 +862,50 @@ impl GuardrailEngine {
         self.state().kill.clone()
     }
 
+    /// Every loss budget this agent is measured against, as a gauge rather
+    /// than as a verdict (`docs/spec.md` spec F, "loss-budget utilization %
+    /// as a continuous gauge before the breaker").
+    ///
+    /// **A read, on the read path.** It takes no [`OrderIntent`], mints no
+    /// proposal, spends no rate token and touches no mutable state — so
+    /// `get_state` can call it on every poll, and so it cannot become a
+    /// second way to reach the signer (`AGENTS.md` invariant 1). What it
+    /// reports is [`breaker::check_all`]'s own arithmetic, which is why an
+    /// agent watching this dial and an operator reading the kill switch can
+    /// never be looking at different numbers.
+    ///
+    /// Both scopes, always: the account-wide budget of item 25 is shared with
+    /// every other container, so an agent at 30% of its own daily budget can
+    /// be one bad hour from a fleet-wide kill it had no way to see. Rows come
+    /// out agent-before-account and daily-before-drawdown, the order
+    /// [`breaker::check_all`] evaluates them in, so the first row that reads
+    /// `tripped` is the one that would refuse.
+    pub fn loss_budget(
+        &self,
+        agent: &AgentId,
+        exposure: &Exposure,
+        now_ms: u64,
+    ) -> Vec<LossBudget> {
+        let state = self.state();
+        let mut rows = match state.guardrails.get(agent) {
+            Some(config) => {
+                breaker::gauge(BudgetScope::Agent, &config.loss, &exposure.agent, now_ms)
+            }
+            // An unregistered agent has no guardrails to be measured against.
+            // It also cannot place an order, so there is no budget to gauge.
+            None => Vec::new(),
+        };
+        if let Some(fleet) = exposure.fleet.as_ref() {
+            rows.extend(breaker::gauge(
+                BudgetScope::Account,
+                &state.account_limits,
+                fleet,
+                now_ms,
+            ));
+        }
+        rows
+    }
+
     // ---- item 28: the approval queue -------------------------------------
 
     /// Proposals still waiting on an operator, for item 16's `get_state`.
@@ -1477,14 +1527,16 @@ impl GuardrailEngine {
             utilization: Utilization {
                 order_notional_pct: ratio_pct(notional_usd, config.max_order_usd),
                 position_notional_pct: ratio_pct(position_after_usd, config.max_position_usd),
-                daily_loss_pct: config.loss.max_daily_loss_usd.and_then(|limit| {
-                    ratio_pct(
-                        Decimal::ZERO
-                            .saturating_sub(account.day_pnl_usd())
-                            .max(Decimal::ZERO),
-                        limit,
-                    )
-                }),
+                daily_loss_pct: breaker::utilization_pct(
+                    LossKind::Daily,
+                    config.loss.max_daily_loss_usd,
+                    account,
+                ),
+                drawdown_pct: breaker::utilization_pct(
+                    LossKind::Drawdown,
+                    config.loss.max_drawdown_usd,
+                    account,
+                ),
                 leverage,
                 order_tokens_remaining: tokens_remaining,
                 global_tokens_remaining,
@@ -1977,6 +2029,7 @@ impl Utilization {
             order_notional_pct: None,
             position_notional_pct: None,
             daily_loss_pct: None,
+            drawdown_pct: None,
             leverage: Decimal::ZERO,
             order_tokens_remaining: Decimal::ZERO,
             global_tokens_remaining,
@@ -2270,7 +2323,7 @@ fn adverse_slippage_bps(is_buy: bool, px: Decimal, reference_px: Decimal) -> Opt
 /// `None` when the limit is zero (the ratio is undefined) or the arithmetic
 /// overflows. Utilization is a display number, so an unrepresentable one is
 /// simply absent rather than a refusal.
-fn ratio_pct(observed: Decimal, limit: Decimal) -> Option<Decimal> {
+pub(super) fn ratio_pct(observed: Decimal, limit: Decimal) -> Option<Decimal> {
     if limit.is_zero() {
         return None;
     }

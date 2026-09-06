@@ -82,11 +82,17 @@ Per-symbol trading rules. Read-only. Returns an array sorted by `asset_id`: `sym
 
 ### `get_state()`
 
-The account now: `contract_version`, `network`, `address`, `as_of_ms`, `feed_age_ms`, `feed`, `balances`, `margin_runway_h`, `positions`, `orders`. If `feed` is not `live` the data is stale and execution fails closed.
+The account now: `contract_version`, `network`, `address`, `as_of_ms`, `feed_age_ms`, `feed`, `balances`, `margin_runway_h`, `loss_budget`, `positions`, `orders`. If `feed` is not `live` the data is stale and execution fails closed.
 
 **Risk in σ-units.** Each position carries `liq_distance_frac` and `liq_distance_sigma` — the same distance as a fraction of the mark and in daily standard deviations. The second is the one to compare across symbols: a 4% gap is a different fact on BTC than on a coin that moves 20% a day. `carry_usd_per_day` is signed funding on that position over a day, **negative when the position pays**.
 
 `margin_runway_h` is account-level, not per position: free margin is shared, so a per-position runway would divide the same margin among all of them and overstate each. It is absent when the book receives funding on net — there is no runway to run out of.
+
+**The loss budget, before it fires.** `loss_budget` is one row per configured budget — `scope` (`agent` or `account`), `kind` (`daily` or `drawdown`), `consumed_usd`, `limit_usd`, `utilization_pct`, `remaining_usd`, `tripped`. It is the circuit breaker's own predicate read as a dial rather than as the step function it is on the order path, so you can slow down at 80% instead of finding the limit by hitting it. `remaining_usd` is the actionable number: dollars of loss left, and **zero is the trip** — a budget is exhausted at its limit, not past it.
+
+Read the `account` rows. That budget is shared with every other container under the same operator, and a breach there stops **you**, not just the agent that spent it — so you can sit at 20% of your own daily budget and be one bad hour from a kill nothing you have been refused would have mentioned.
+
+Absent rows mean the budget is not configured. `utilization_pct` is absent only when the limit is zero, where a ratio has no meaning; `tripped` answers for that case. On a profitable day `utilization_pct` is `0` while `consumed_usd` goes negative — that is the dollars you are up, and it does not buy extra budget: `remaining_usd` never exceeds `limit_usd`.
 
 Any of these is absent when its input is: no liquidation price, no σ yet, or a symbol the venue has stopped quoting (which also cannot be traded — see above).
 
