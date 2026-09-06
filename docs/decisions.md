@@ -11,6 +11,19 @@ decisions" section until then.
 
 ---
 
+## 2026-09-06 · The price an order is measured against
+
+A review of the pricing path found the gateway sourcing every reference price
+from `allMids`, whose own doc comment forbids exactly that in bold, three
+paragraphs deep, with the measurement attached. The comment directly above the
+call site described the hazard correctly and the line below it walked into it.
+This is what was decided in fixing it.
+
+| # | Decision | Choice | Why |
+|---|---|---|---|
+| H1 | Where a reference price comes from | **`metaAndAssetCtxs`' `markPx`, gated on `midPx` being present** | `allMids` answers for all 56 of 233 mainnet assets whose `midPx` is `null`, and the value it answers with is `markPx` — a frozen last print. Measured 2026-09-03: FRIEND reads 4.72 there against an `oraclePx` of 0.47734, a **9.9× stale price**, and `mids.get(symbol)` returns `Some` of it. So the guardrail's notional caps and `get_state`'s liquidation distances were being measured against a number that looked exactly like a live quote, on 24% of the main dex and 38.6% of the full universe. The value stays `markPx`, which §14.1 says to consume rather than replicate and which the venue itself liquidates against. What changes is the gate: `markPx` is never null, so its presence says nothing about whether the venue is still quoting the asset, while `midPx` is null on exactly the assets whose book-derived fields it has stopped maintaining (correction 2, co-null with `premium` and `impactPxs` on 233/233). An asset without a live mid is **absent from the map**, and every consumer already treats absence as a refusal or an omitted field — so the fix is the source, not the call sites. **What this gives up:** orders on an unquoted asset are now refused rather than priced. That is the intended direction: `MarketRef`'s own doc already said "a missing price is a refusal", and a refusal an agent can read beats a cap silently measured 9.9× wrong. |
+| H2 | How the substitution is prevented from coming back | **A newtype, [`ReferencePrices`], not a corrected line and a firmer comment** | The prohibition was already written down in three places — `allMids`'s doc, `mid_px_no_fallback`'s ("the name is the prohibition"), and `MarketRef::reference_px`'s — and all three were prose against a `HashMap<String, Decimal>` that any price map satisfies. `docs/specs/fair-value.md` §14.4 correction 1 solved the same shape of problem for funding by newtyping it (`HourToDateRate1h`) "so the substitution cannot be made by accident", and that is the precedent followed here: `ReferencePrices` is constructible only by `MetaAndAssetCtxs::reference_pxs`, so handing `allMids`' map to a guardrail or a liquidation distance stops compiling. It is not hypothetical — switching the type turned the second, undiscovered call site in `state.rs` into a compile error on the first build. **What this costs:** one wrapper type and a `get` that returns `Option<Decimal>` by value rather than a bare map. |
+
 ## 2026-09-05 · Running the feed
 
 `reconcile.rs` and `feed.rs` were both complete and neither was connected to a

@@ -84,6 +84,8 @@ Per-symbol trading rules. Read-only. Returns an array sorted by `asset_id`: `sym
 
 The account now: `contract_version`, `network`, `address`, `as_of_ms`, `feed_age_ms`, `feed`, `balances`, `positions` (with distance to liquidation), `orders`. If `feed` is not `live` the data is stale and execution fails closed.
 
+**An asset the venue has stopped quoting has no price here, and cannot be traded.** `markPx` keeps being published for a dead market — it is the last print, frozen — so oppen reads the venue's asset contexts and treats a null `midPx` as "not quoted", which is what it means. Those assets carry no liquidation distance and every order on them is refused for a missing reference price rather than sized against a number that can be an order of magnitude stale. This is 24% of the main dex, so it is the ordinary case and not an edge one.
+
 **Two moments where that is expected rather than broken.** oppen walks a catch-up window at startup and again after every socket drop, and until that window returns the account is unreconciled and every order is refused — the window may hold fills nothing has seen, and sizing against a position oppen has mis-stated is the failure this exists to prevent. Both are seconds, not minutes. Poll `get_state` rather than retrying the order: the refusal names the condition, and it clears on its own.
 
 ### `get_events(since_cursor?, limit?)`

@@ -11,6 +11,7 @@
 //! [`Option`] with a `#[serde(default)]` so an absent field degrades the
 //! same way a null one does.
 
+use std::collections::HashMap;
 use std::fmt;
 
 use rust_decimal::Decimal;
@@ -312,6 +313,45 @@ impl AssetCtx {
     }
 }
 
+/// The prices oppen is willing to size an order against, by coin.
+///
+/// A newtype for the reason [`HourToDateRate1h`] is one: the substitution it
+/// prevents was actually made. A plain `HashMap<String, Decimal>` of prices is
+/// exactly what [`crate::InfoClient::all_mids`] returns, and `allMids` answers
+/// for the 56 of 233 mainnet assets whose `midPx` is `null` with a frozen
+/// `markPx` — FRIEND reads `4.72` against an `oraclePx` of `0.47734`, a 9.9×
+/// stale price (`docs/specs/fair-value.md` §14.4 correction 3). Handed to a
+/// guardrail measuring a notional cap, or to a liquidation distance, that
+/// number looks exactly like a live quote.
+///
+/// Built only by [`MetaAndAssetCtxs::reference_pxs`], so the two maps are
+/// different types and the wrong one stops compiling rather than being caught
+/// by a comment.
+///
+/// **An absent coin is the answer, not a lookup failure.** Every consumer
+/// already treats `None` as a refusal or an omitted field, which is what makes
+/// carrying only the live assets the whole of the fix.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReferencePrices(HashMap<String, Decimal>);
+
+impl ReferencePrices {
+    /// The reference price for `coin`, or `None` when the venue is not
+    /// quoting it.
+    pub fn get(&self, coin: &str) -> Option<Decimal> {
+        self.0.get(coin).copied()
+    }
+
+    /// How many assets the venue is quoting. For the console's own reporting;
+    /// nothing branches on it.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
 /// `metaAndAssetCtxs` response: a two-element array.
 ///
 /// The response does **not** say which dex it describes.
@@ -375,6 +415,34 @@ impl MetaAndAssetCtxs {
     /// [`AssetCtx::can_build_carry`].
     pub fn with_book(&self) -> impl Iterator<Item = (&AssetInfo, &AssetCtx)> {
         self.iter().filter(|(_, ctx)| ctx.has_book())
+    }
+
+    /// The price to measure an order against, per coin, for the assets the
+    /// venue is actually quoting.
+    ///
+    /// **The value is `markPx`.** §14.1 says to consume the venue's mark
+    /// rather than replicate it, and it is the number the venue itself
+    /// liquidates against — so it is what a notional cap and a liquidation
+    /// distance should be measured with.
+    ///
+    /// **The gate is `midPx`.** `markPx` is never null, so its presence says
+    /// nothing: on a bookless asset the venue keeps publishing the last one it
+    /// had. `midPx` is null on exactly the assets whose book-derived fields
+    /// the venue has stopped maintaining (correction 2, co-null with `premium`
+    /// and `impactPxs` on 233/233 mainnet), which makes it the liveness signal
+    /// that `markPx` does not carry about itself. An asset without one is
+    /// omitted, and [`ReferencePrices`] says why absence is the right answer.
+    ///
+    /// Not [`AssetCtx::has_book`]: that reads open interest, which measures
+    /// positions rather than quotes, and its own documentation gives both
+    /// directions it gets wrong.
+    pub fn reference_pxs(&self) -> ReferencePrices {
+        ReferencePrices(
+            self.iter()
+                .filter(|(_, ctx)| ctx.mid_px_no_fallback().is_some())
+                .map(|(info, ctx)| (info.name.clone(), ctx.mark_px))
+                .collect(),
+        )
     }
 }
 
@@ -1304,5 +1372,100 @@ mod tests {
 
         let short = FundingHistoryPage::Rows(vec![row(1), row(2)]);
         assert_eq!(short.next_start_ms(), None);
+    }
+
+    /// `(name, mark_px, mid_px)` into the response shape.
+    fn ctxs(rows: &[(&str, &str, Option<&str>)]) -> MetaAndAssetCtxs {
+        let d = |s: &str| Decimal::from_str(s).expect("decimal");
+        let universe = rows
+            .iter()
+            .map(|(name, ..)| AssetInfo {
+                name: (*name).to_owned(),
+                sz_decimals: 2,
+                max_leverage: 20,
+                margin_table_id: 1,
+                is_delisted: false,
+                only_isolated: false,
+            })
+            .collect();
+        let ctxs = rows
+            .iter()
+            .map(|(_, mark, mid)| AssetCtx {
+                funding: HourToDateRate1h::from_hour_to_date_1h(Decimal::ZERO),
+                // Co-null with `mid_px` on 233/233 mainnet, so the fixture
+                // keeps them co-null too.
+                open_interest: if mid.is_some() {
+                    d("1000")
+                } else {
+                    Decimal::ZERO
+                },
+                prev_day_px: d(mark),
+                day_ntl_vlm: d("1"),
+                premium: mid.map(|_| Decimal::ZERO),
+                oracle_px: d(mark),
+                mark_px: d(mark),
+                mid_px: mid.map(d),
+                impact_pxs: None,
+            })
+            .collect();
+        MetaAndAssetCtxs(Meta { universe }, ctxs)
+    }
+
+    /// A quoted asset is measured against the venue's own mark, which is what
+    /// it liquidates against.
+    #[test]
+    fn a_quoted_asset_carries_its_mark_price() {
+        let response = ctxs(&[("BTC", "64000.5", Some("64000.0"))]);
+        assert_eq!(
+            response.reference_pxs().get("BTC"),
+            Some(Decimal::from_str("64000.5").expect("decimal")),
+            "the mark, not the mid: §14.1 says consume markPx"
+        );
+    }
+
+    /// **The measured case this type exists for.** FRIEND's `midPx` is null,
+    /// so the venue is not quoting it — and `allMids` would answer for it
+    /// anyway, with a `markPx` of 4.72 against an oracle of 0.47734. Sizing a
+    /// notional cap against that is wrong by 9.9×, so the asset is absent and
+    /// every consumer refuses.
+    #[test]
+    fn an_asset_the_venue_stopped_quoting_is_absent_however_live_its_mark_looks() {
+        let response = ctxs(&[("FRIEND", "4.72", None)]);
+        assert_eq!(
+            response.reference_pxs().get("FRIEND"),
+            None,
+            "a frozen last print is not a price to trade against"
+        );
+    }
+
+    /// Degradation is per asset: one dead market does not blind the others.
+    /// 24% of the main dex has no book, so this is the common case.
+    #[test]
+    fn one_unquoted_asset_does_not_remove_the_quoted_ones() {
+        let response = ctxs(&[
+            ("BTC", "64000", Some("64000")),
+            ("FRIEND", "4.72", None),
+            ("ETH", "3200", Some("3200")),
+        ]);
+        let pxs = response.reference_pxs();
+        assert_eq!(pxs.len(), 2);
+        assert!(pxs.get("BTC").is_some() && pxs.get("ETH").is_some());
+        assert_eq!(pxs.get("FRIEND"), None);
+    }
+
+    /// `has_book` reads open interest, which measures positions rather than
+    /// quotes — its own documentation gives both directions it gets wrong.
+    /// A market with a live mid and no open interest is quotable, and gating
+    /// on open interest would refuse every perp listed today.
+    #[test]
+    fn a_quoted_market_with_no_open_interest_is_still_quoted() {
+        let mut response = ctxs(&[("NEW", "12.5", Some("12.5"))]);
+        response.1[0].open_interest = Decimal::ZERO;
+        assert!(!response.1[0].has_book());
+        assert_eq!(
+            response.reference_pxs().get("NEW"),
+            Some(Decimal::from_str("12.5").expect("decimal")),
+            "open interest is not the liveness signal; midPx is"
+        );
     }
 }
