@@ -13,6 +13,7 @@
 //! client.
 
 pub mod accounts;
+pub mod alert;
 pub mod book;
 pub mod candles;
 pub mod feed;

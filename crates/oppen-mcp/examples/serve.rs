@@ -7,6 +7,7 @@
 
 use std::sync::{Arc, RwLock};
 
+use oppen_core::alert::AlertStore;
 use oppen_core::feed::FeedSession;
 use oppen_core::feed::pump::FeedPump;
 use oppen_core::guardrail::{AgentId, GuardrailEngine, SqliteGuardrailStore};
@@ -93,6 +94,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // pool must outlive the pump: dropping it closes every connection, which
     // ends the event stream and returns `FeedPump::run`.
     let feed = Arc::new(FeedSession::new());
+    // Item 22's alerts, per network for the reason everything is (R4).
+    let alerts = Arc::new(AlertStore::open(dir.join("alerts-testnet.db"))?);
     let (pool, mut events) = WsPool::new(WsPoolConfig {
         network: Network::Testnet,
         ..WsPoolConfig::default()
@@ -103,12 +106,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     pool.subscribe(Subscription::OrderUpdates { user: account })?;
     let pump_ledger = Arc::clone(&ledger);
     let pump_feed = Arc::clone(&feed);
+    let pump_alerts = Arc::clone(&alerts);
+    // The pump subscribes an alert's own market feed through the pool, so the
+    // two are handed to it together.
+    let pump_pool = Arc::new(pool);
+    let feeds = Arc::clone(&pump_pool);
     tokio::spawn(async move {
         let source = match VenueSource::new(Network::Testnet) {
             Ok(source) => source,
             Err(error) => return tracing::error!(%error, "no venue source; feed not pumped"),
         };
-        match FeedPump::new(&pump_feed, &pump_ledger, account, source) {
+        match FeedPump::new(
+            &pump_feed,
+            &pump_ledger,
+            account,
+            source,
+            &pump_alerts,
+            feeds.as_ref(),
+        ) {
             Ok(pump) => pump.run(&mut events).await,
             Err(error) => tracing::error!(%error, "no feed pump"),
         }
@@ -119,9 +134,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         EventViews::new(ledger),
         journal,
         feed,
+        alerts,
     )?;
     // Held to the end of `main`: the pool's `Drop` stops every connection.
-    let _pool = pool;
+    let _pool = pump_pool;
     serve(
         port,
         gateway,
