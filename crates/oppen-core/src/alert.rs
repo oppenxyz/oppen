@@ -23,6 +23,13 @@
 //! tick that is still above the level, which is what "wakeup" means and what
 //! a repeating alert would drown. Re-arming is the agent's to do, and it costs
 //! one call.
+//!
+//! **Three states, and cancelling is a deletion.** An alert is armed
+//! (`fired_at_ms` null), fired, or gone. Cancelling removes the row rather
+//! than marking it, because nothing chains an *arming* in the first place —
+//! only firings reach the ledger — so a kept cancellation would be the one
+//! piece of alert history stored somewhere the audit surface cannot see. An
+//! agent that cancels asked for it to stop existing, and it does.
 
 use std::path::Path;
 use std::sync::Mutex;
@@ -258,6 +265,26 @@ impl AlertStore {
             armed_at_ms: now_ms,
             fired_at_ms: None,
         })
+    }
+
+    /// Cancel one armed alert this agent owns.
+    ///
+    /// `false` when this agent has no armed alert with that id. That covers an
+    /// id that never existed, one another agent owns, and one that has already
+    /// fired — **the same answer on purpose**, so an agent cannot probe for
+    /// another's alert ids by watching which cancels are refused. C6 keeps one
+    /// agent's events out of another's; this keeps its alert ids out too.
+    pub fn cancel(&self, agent: &str, alert_id: i64) -> Result<bool, AlertError> {
+        let removed = self.lock().execute(
+            "DELETE FROM alerts WHERE alert_id = ?1 AND agent = ?2 AND fired_at_ms IS NULL",
+            params![alert_id, agent],
+        )?;
+        if removed == 1 {
+            // The armed set shrank, so a feed nothing watches any more is
+            // given back on the pump's next pass.
+            self.armed_changed.notify_one();
+        }
+        Ok(removed == 1)
     }
 
     /// Everything this agent has armed or fired, newest first.
@@ -805,5 +832,101 @@ mod tests {
         assert_eq!(payload["observed"]["matched"], "price_cross");
         assert_eq!(payload["observed"]["mark_px"], "70123.5");
         assert_eq!(payload["condition"]["type"], "price_cross");
+    }
+
+    #[test]
+    fn a_cancelled_alert_stops_watching_and_leaves_the_list() {
+        let store = store();
+        let armed = store
+            .arm("agent-a", &cross("BTC", Direction::Above, "70000"), NOW)
+            .expect("arm");
+        assert_eq!(store.watched_symbols().expect("symbols"), ["BTC"]);
+
+        assert!(store.cancel("agent-a", armed.alert_id).expect("cancel"));
+
+        assert!(
+            store.watched_symbols().expect("symbols").is_empty(),
+            "the pump can give the feed back"
+        );
+        assert!(store.for_agent("agent-a").expect("mine").is_empty());
+        assert!(
+            on_market_tick(&store, &tick("BTC", Some("80000")), NOW + 1)
+                .expect("tick")
+                .is_empty(),
+            "a cancelled alert does not fire"
+        );
+    }
+
+    /// One agent must not be able to cancel — or probe for — another's alerts.
+    /// The refusal is indistinguishable from an id that never existed, so
+    /// nothing leaks by trying.
+    #[test]
+    fn one_agent_cannot_cancel_anothers_alert() {
+        let store = store();
+        let theirs = store
+            .arm("agent-b", &cross("BTC", Direction::Above, "70000"), NOW)
+            .expect("arm");
+
+        assert!(
+            !store.cancel("agent-a", theirs.alert_id).expect("cancel"),
+            "not yours"
+        );
+        assert!(
+            !store.cancel("agent-a", 9_999).expect("cancel"),
+            "and an id that never existed answers the same way"
+        );
+        assert_eq!(
+            store.for_agent("agent-b").expect("theirs").len(),
+            1,
+            "still armed"
+        );
+    }
+
+    /// A fired alert is history, not something to cancel. Answering the same
+    /// way as "not yours" keeps the ids opaque.
+    #[test]
+    fn a_fired_alert_cannot_be_cancelled() {
+        let store = store();
+        let armed = store
+            .arm("agent-a", &cross("BTC", Direction::Above, "1"), NOW)
+            .expect("arm");
+        on_market_tick(&store, &tick("BTC", Some("2")), NOW).expect("tick");
+
+        assert!(!store.cancel("agent-a", armed.alert_id).expect("cancel"));
+        assert_eq!(
+            store.for_agent("agent-a").expect("mine")[0].fired_at_ms,
+            Some(NOW),
+            "the firing is still on the record"
+        );
+    }
+
+    /// Cancelling gives the room back the same way a firing does.
+    #[test]
+    fn cancelling_frees_a_slot_under_the_cap() {
+        let store = store();
+        let mut first = None;
+        for i in 0..MAX_ARMED_PER_AGENT {
+            let armed = store
+                .arm(
+                    "agent-a",
+                    &cross("BTC", Direction::Above, &format!("{}", i + 1)),
+                    NOW,
+                )
+                .expect("arm");
+            first.get_or_insert(armed.alert_id);
+        }
+        assert!(matches!(
+            store.arm("agent-a", &cross("BTC", Direction::Above, "1"), NOW),
+            Err(AlertError::Full)
+        ));
+
+        assert!(
+            store
+                .cancel("agent-a", first.expect("an id"))
+                .expect("cancel")
+        );
+        store
+            .arm("agent-a", &cross("BTC", Direction::Above, "1"), NOW)
+            .expect("the cancel gave the room back");
     }
 }
