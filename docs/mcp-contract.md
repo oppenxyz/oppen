@@ -15,7 +15,7 @@ This document is the normative reference for every tool the gateway exposes. `do
 
 `get_state` · `get_meta` · `get_events` · `get_features` · `preflight` · `place` · `cancel` · `cancel_all` · `close_position` · `get_order_status` · `remember` · `recall` · `set_alert`
 
-Shipped so far: `get_meta`, `get_state`, `get_events`, `preflight`, `remember`, `recall`, `place`, `cancel`, `cancel_all`, `close_position`, `get_order_status`. The rest are unimplemented and are not described below — a schema for a tool that does not exist is a promise nothing keeps.
+Shipped so far: `get_meta`, `get_state`, `get_events`, `preflight`, `remember`, `recall`, `place`, `cancel`, `cancel_all`, `close_position`, `get_order_status`, `set_alert`. `get_features` is unimplemented and is not described below — a schema for a tool that does not exist is a promise nothing keeps.
 
 ## Pairing
 
@@ -87,6 +87,26 @@ The account now: `contract_version`, `network`, `address`, `as_of_ms`, `feed_age
 **An asset the venue has stopped quoting has no price here, and cannot be traded.** `markPx` keeps being published for a dead market — it is the last print, frozen — so oppen reads the venue's asset contexts and treats a null `midPx` as "not quoted", which is what it means. Those assets carry no liquidation distance and every order on them is refused for a missing reference price rather than sized against a number that can be an order of magnitude stale. This is 24% of the main dex, so it is the ordinary case and not an edge one.
 
 **Two moments where that is expected rather than broken.** oppen walks a catch-up window at startup and again after every socket drop, and until that window returns the account is unreconciled and every order is refused — the window may hold fills nothing has seen, and sizing against a position oppen has mis-stated is the failure this exists to prevent. Both are seconds, not minutes. Poll `get_state` rather than retrying the order: the refusal names the condition, and it clears on its own.
+
+### `set_alert(condition)`
+
+Ask to be woken when a condition holds, instead of holding a session open and polling. Takes `{kind, symbol?, direction?, px?, hour_to_date_bps?}` and returns `{contract_version, alert_id, condition, armed_at_ms}`.
+
+| `kind` | Fires when | Needs |
+|---|---|---|
+| `price_cross` | the venue's mark for `symbol` reaches `px` | `symbol`, `direction`, `px` |
+| `fill` | a fill prints on this account | `symbol` optional; absent means any |
+| `funding_rate` | the hour-to-date funding rate reaches `hour_to_date_bps` | `symbol`, `direction`, `hour_to_date_bps` |
+
+`direction` is `above` or `below`, and both are inclusive at the level. `px` and `hour_to_date_bps` are decimal strings. **`hour_to_date_bps` is the rate for one hour in basis points, never an annualised APR.**
+
+**It fires once.** A crossing that fired does not fire again on the next tick still past the level; re-arm it if you want it again. The firing arrives as an `alert` event in `get_events`, carrying both the condition you set and the value observed — so an agent reading it later does not have to re-read a feed that has moved.
+
+**A wakeup is an event, not a push.** oppen cannot start your turn: nothing in the transport can. What this replaces is the session held open polling `get_state`, not the act of reading.
+
+**Not available yet:** liquidation distance and feature thresholds, the other two conditions spec item 22 names. The first needs a position poll on a cadence nobody has chosen, the second needs `get_features`. They are absent rather than approximated, because an alert that cannot fire is worse than one that was refused — you would stop watching and wait for a wakeup nothing will send.
+
+An alert on an asset the venue has stopped quoting never fires, for the reason such an asset cannot be traded (see `get_state` above).
 
 ### `get_events(since_cursor?, limit?)`
 

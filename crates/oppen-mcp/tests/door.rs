@@ -73,6 +73,7 @@ fn gateway() -> Gateway {
         EventViews::new(ledger),
         journal,
         feed,
+        std::sync::Arc::new(oppen_core::alert::AlertStore::open(":memory:").expect("alerts")),
     )
     .expect("gateway")
 }

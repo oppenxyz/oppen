@@ -11,6 +11,20 @@ decisions" section until then.
 
 ---
 
+## 2026-09-06 · Condition alerts
+
+Item 22 names five conditions and one sentence of intent — "agents do not
+experience time; wakeups replace polling" — and settles nothing about what a
+wakeup is when the transport is request/response. These are the four calls that
+took.
+
+| # | Decision | Choice | Why |
+|---|---|---|---|
+| G1 | What a wakeup actually is | **A chained `alert` event attributed to the agent that armed it** | MCP is request/response: nothing can push a turn into an agent that is not asking, and inventing a channel that could would be a second way into the gateway that item 14 and D2 exist to not have. So a firing writes an `EventKind::Alert` row carrying the agent id, and C6's scoping delivers it to that agent's `get_events` and to nobody else's. The agent reads it on its next turn. That is still a read — but it is one read whenever the agent happens to wake, instead of a session held open polling `get_state` against the address's shared rate budget (item 10), which is the cost the sentence is actually about. The OS notification item 22 also names is the operator's half and belongs to the console (P5). **What this gives up:** oppen cannot start an agent's turn. Nothing in the architecture can, and pretending otherwise in the tool description would be the worst version of this. |
+| G2 | Which of the five conditions ship | **Price cross, fill and funding rate; liquidation distance and feature thresholds deferred with named blockers** | The three that ship are answerable from feeds the pump already runs or can subscribe. Liquidation distance needs the account's positions, which the pump does not hold and which would mean a `clearinghouseState` poll on a cadence nobody has chosen; feature thresholds need `get_features`, which is not built. Both are named on the tool and in the contract rather than half-answered — the same handling C8 gave `preflight`'s fees, and for the same reason: an alert that silently cannot fire is worse than one that was refused, because the agent stops watching and waits for a wakeup nothing will send. |
+| G3 | Where the market reading comes from | **`activeAssetCtx`, and the mark is gated on `midPx` exactly as the order path is** | One ~1 s frame carries both the mark a price cross reads and the funding a rate threshold reads, so two condition kinds cost one subscription; `bbo` is the microprice source and carries neither. The gate matters more than the channel: the venue keeps publishing `markPx` for an asset it has stopped quoting, and H1 established that such a print is a frozen last trade that can be an order of magnitude stale. An alert firing on it would wake an agent for a market that has gone away — the same fault, one layer up — so a tick with no live mid answers no price condition. **What this gives up:** an alert on an unquoted asset never fires. It also cannot be traded (H1), so a wakeup for it would be a wakeup to do nothing. |
+| G4 | Who subscribes an alert's feed, and when | **The pump, from the armed set, woken immediately by arming** | A price alert on a symbol nobody subscribed is the silent failure this module exists to avoid, and the pump is the only thing holding the pool. So the armed set is the subscription set: the pump diffs it on startup, on every firing, and on a `Notify` the store raises when an alert is armed. Without that signal an alert on a quiet symbol would wait for a tick on a feed nothing had subscribed — a deadlock made of two things each waiting for the other. A firing runs the same diff in reverse, so a session that armed a hundred levels over a day does not end it holding a hundred sockets. **What this costs:** the pump now takes the pool behind a two-method trait, because `WsPool::subscribe` spawns a connection task and a test holding a real pool would reach the venue. |
+
 ## 2026-09-06 · The price an order is measured against
 
 A review of the pricing path found the gateway sourcing every reference price

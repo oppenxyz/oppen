@@ -38,12 +38,46 @@
 use std::time::Duration;
 
 use oppen_hl::Address;
-use oppen_hl::ws::{Subscription, WsEvent};
+use oppen_hl::ws::{PoolError, Subscription, WsEvent, WsPool};
 use tokio::sync::mpsc::Receiver;
 
+use crate::alert::{self, AlertStore, Fired, MarketTick};
 use crate::feed::{Action, FeedSession};
-use crate::ledger::{Ledger, now_ms};
+use crate::ledger::{EventKind, Ledger, NewEvent, now_ms};
 use crate::reconcile::{GapStatus, ReconcileError, ReconcileSource, Reconciler};
+
+/// What the pump needs from the socket pool to answer an alert.
+///
+/// A trait because the tests must not open a socket: [`WsPool::subscribe`]
+/// spawns a connection task on the first subscription for a shard, so a pump
+/// test holding a real pool would reach the venue. Two methods, both of which
+/// [`WsPool`] already has.
+pub trait FeedSubscriber {
+    fn subscribe(&self, sub: Subscription) -> Result<(), PoolError>;
+    fn unsubscribe(&self, sub: &Subscription) -> Result<(), PoolError>;
+}
+
+impl FeedSubscriber for WsPool {
+    fn subscribe(&self, sub: Subscription) -> Result<(), PoolError> {
+        WsPool::subscribe(self, sub)
+    }
+
+    fn unsubscribe(&self, sub: &Subscription) -> Result<(), PoolError> {
+        WsPool::unsubscribe(self, sub)
+    }
+}
+
+/// The channel an alert's market condition is answered from.
+///
+/// `activeAssetCtx` rather than `bbo`: one ~1 s frame carries both the mark a
+/// price cross reads and the funding a rate threshold reads, so the two
+/// conditions cost one subscription rather than two. `bbo` is the microprice
+/// source and carries neither.
+fn market_feed(symbol: &str) -> Subscription {
+    Subscription::ActiveAssetCtx {
+        coin: symbol.to_owned(),
+    }
+}
 
 /// How often an unreconciled account retries its open windows.
 ///
@@ -80,7 +114,7 @@ fn account_scopes(account: Address) -> [String; 2] {
 /// be self-referential. The caller holds them and calls [`FeedPump::run`] in
 /// that scope, which is what `examples/serve.rs` does.
 #[derive(Debug)]
-pub struct FeedPump<'a, S> {
+pub struct FeedPump<'a, S, F> {
     session: &'a FeedSession,
     ledger: &'a Ledger,
     account: Address,
@@ -88,9 +122,18 @@ pub struct FeedPump<'a, S> {
     /// than formatted per event, which would allocate on every tick.
     account_id: String,
     reconciler: Reconciler<'a, S>,
+    alerts: &'a AlertStore,
+    /// What the pump subscribes an alert's symbol through. See
+    /// [`FeedSubscriber`].
+    feeds: &'a F,
+    /// The market feeds this pump has subscribed for alerts, so a fired alert
+    /// gives its socket back. Sorted, because everything that reaches a
+    /// serialized surface is (`AGENTS.md` invariant 6) and because the diff
+    /// against `watched_symbols` is one comparison of two sorted lists.
+    subscribed: std::sync::Mutex<Vec<String>>,
 }
 
-impl<'a, S: ReconcileSource> FeedPump<'a, S> {
+impl<'a, S: ReconcileSource, F: FeedSubscriber> FeedPump<'a, S, F> {
     /// Build a pump.
     ///
     /// Refuses a source that is not on the ledger's own network — that is
@@ -101,6 +144,8 @@ impl<'a, S: ReconcileSource> FeedPump<'a, S> {
         ledger: &'a Ledger,
         account: Address,
         source: S,
+        alerts: &'a AlertStore,
+        feeds: &'a F,
     ) -> Result<Self, ReconcileError> {
         Ok(FeedPump {
             session,
@@ -108,6 +153,9 @@ impl<'a, S: ReconcileSource> FeedPump<'a, S> {
             account,
             account_id: account.to_string(),
             reconciler: Reconciler::new(ledger, source)?,
+            alerts,
+            feeds,
+            subscribed: std::sync::Mutex::new(Vec::new()),
         })
     }
 
@@ -117,6 +165,7 @@ impl<'a, S: ReconcileSource> FeedPump<'a, S> {
     /// [`oppen_hl::ws::WsPool`] or calling its `shutdown` does.
     pub async fn run(&self, events: &mut Receiver<WsEvent>) {
         self.catch_up().await;
+        self.sync_alert_feeds();
         let mut retry = tokio::time::interval(RETRY_INTERVAL);
         // The first tick of a tokio interval is immediate, and `catch_up` has
         // just done that work.
@@ -127,6 +176,9 @@ impl<'a, S: ReconcileSource> FeedPump<'a, S> {
                     Some(event) => self.handle(&event).await,
                     None => return,
                 },
+                // An alert armed while the market is quiet must not wait for a
+                // tick on a feed nothing is subscribed to yet.
+                () = self.alerts.armed_changed() => self.sync_alert_feeds(),
                 _ = retry.tick() => {
                     if !self.session.state().reconciled {
                         self.reconcile().await;
@@ -134,6 +186,75 @@ impl<'a, S: ReconcileSource> FeedPump<'a, S> {
                 }
             }
         }
+    }
+
+    /// Subscribe the market feeds the armed alerts need, and drop the ones
+    /// nothing needs any more.
+    ///
+    /// The account channels are not touched: they are subscribed for the life
+    /// of the pump and a fill alert reads them without asking for anything.
+    fn sync_alert_feeds(&self) {
+        let wanted = match self.alerts.watched_symbols() {
+            Ok(wanted) => wanted,
+            Err(error) => {
+                // Left as it is rather than torn down: an unreadable store is
+                // a reason to keep the feeds already flowing, not to stop
+                // watching what is still armed.
+                tracing::error!(%error, "could not read the alert watch list");
+                return;
+            }
+        };
+        let mut held = self.subscribed.lock().unwrap_or_else(|e| e.into_inner());
+        let missing: Vec<String> = wanted
+            .iter()
+            .filter(|symbol| !held.contains(symbol))
+            .cloned()
+            .collect();
+        for symbol in &missing {
+            match self.feeds.subscribe(market_feed(symbol)) {
+                // Recorded only once the pool took it, so a refused
+                // subscription is retried on the next change rather than
+                // remembered as held.
+                Ok(()) => held.push(symbol.clone()),
+                Err(error) => tracing::error!(%error, symbol, "no feed for this alert"),
+            }
+        }
+        held.retain(|symbol| {
+            if wanted.contains(symbol) {
+                return true;
+            }
+            if let Err(error) = self.feeds.unsubscribe(&market_feed(symbol)) {
+                tracing::warn!(%error, symbol, "could not drop an alert feed");
+            }
+            false
+        });
+        held.sort();
+    }
+
+    /// Chain what fired, so the agent reads it on its next `get_events`.
+    ///
+    /// One row per alert, attributed to the agent that armed it — which is
+    /// what makes `docs/decisions.md` C6 deliver it to that agent and to
+    /// nobody else. A row that cannot be written is reported and the others
+    /// still go: the alert has already been marked fired, so dropping the
+    /// batch would lose the rest of the wakeups too.
+    fn chain(&self, fired: Vec<Fired>, now: i64) {
+        for alert in fired {
+            let payload = alert.payload();
+            let event = NewEvent {
+                kind: EventKind::Alert,
+                ts_ms: now,
+                agent_id: Some(&alert.agent),
+                payload: &payload,
+                snapshot: None,
+            };
+            if let Err(error) = self.ledger.append(&event) {
+                tracing::error!(%error, alert_id = alert.alert_id, "alert fired unrecorded");
+            }
+        }
+        // A firing changes the armed set, so a feed nothing watches any more
+        // is given back.
+        self.sync_alert_feeds();
     }
 
     /// Open and immediately close a window for everything before now, then
@@ -160,6 +281,7 @@ impl<'a, S: ReconcileSource> FeedPump<'a, S> {
     }
 
     async fn handle(&self, event: &WsEvent) {
+        self.evaluate_alerts(event);
         match self
             .session
             .apply(self.ledger, &self.account_id, event, now_ms_u64())
@@ -174,6 +296,44 @@ impl<'a, S: ReconcileSource> FeedPump<'a, S> {
                 tracing::error!(%error, "feed event not recorded; the account is not caught up");
                 self.session.unreconciled();
             }
+        }
+    }
+
+    /// Answer the alerts this event can answer.
+    ///
+    /// Only two kinds of event carry a condition's reading, and they are
+    /// matched by name rather than by a wildcard for the reason
+    /// `FeedSession::apply` matches that way: a feed oppen starts consuming
+    /// should be a decision about what it can answer.
+    fn evaluate_alerts(&self, event: &WsEvent) {
+        let now = now_ms();
+        let fired = match event {
+            WsEvent::ActiveAssetCtx { coin, ctx, .. } => {
+                let tick = MarketTick {
+                    symbol: coin,
+                    // The same liveness rule the order path uses: a published
+                    // `markPx` on an asset the venue has stopped quoting is a
+                    // frozen last print, and `ReferencePrices` refuses it
+                    // there for the reason an alert must not fire on it here.
+                    mark_px: ctx.mid_px_no_fallback().map(|_| ctx.mark_px),
+                    funding_hour_to_date_bps: alert::funding_bps(ctx.funding),
+                };
+                alert::on_market_tick(self.alerts, &tick, now)
+            }
+            // A snapshot fill is the backlog the venue replays on subscribe.
+            // Waking an agent for a fill it was already told about is a false
+            // wakeup, and the alert would be spent on it.
+            WsEvent::UserFills {
+                is_snapshot: false,
+                fills,
+                ..
+            } => alert::on_fills(self.alerts, fills, now),
+            _ => return,
+        };
+        match fired {
+            Ok(fired) if fired.is_empty() => {}
+            Ok(fired) => self.chain(fired, now),
+            Err(error) => tracing::error!(%error, "could not evaluate alerts"),
         }
     }
 
@@ -244,7 +404,76 @@ mod tests {
     use tokio::sync::mpsc;
 
     use super::*;
+    use crate::alert::{Condition, Direction};
     use crate::ledger::EventKind;
+
+    /// Records what the pump asked for instead of opening a socket.
+    #[derive(Debug, Default)]
+    struct Feeds {
+        subscribed: Mutex<Vec<String>>,
+    }
+
+    impl Feeds {
+        fn keys(&self) -> Vec<String> {
+            let mut keys = self.subscribed.lock().expect("feeds").clone();
+            keys.sort();
+            keys
+        }
+    }
+
+    impl FeedSubscriber for Feeds {
+        fn subscribe(&self, sub: Subscription) -> Result<(), PoolError> {
+            self.subscribed.lock().expect("feeds").push(sub.key());
+            Ok(())
+        }
+
+        fn unsubscribe(&self, sub: &Subscription) -> Result<(), PoolError> {
+            self.subscribed
+                .lock()
+                .expect("feeds")
+                .retain(|key| key != &sub.key());
+            Ok(())
+        }
+    }
+
+    fn alerts() -> AlertStore {
+        AlertStore::open(":memory:").expect("alerts")
+    }
+
+    fn asset_ctx(coin: &str, mark: &str, mid: Option<&str>) -> WsEvent {
+        let d = |s: &str| Decimal::from_str(s).expect("decimal");
+        WsEvent::ActiveAssetCtx {
+            coin: coin.into(),
+            ctx: Box::new(oppen_hl::types::AssetCtx {
+                funding: oppen_hl::types::HourToDateRate1h::from_hour_to_date_1h(Decimal::ZERO),
+                open_interest: d("1000"),
+                prev_day_px: d(mark),
+                day_ntl_vlm: d("1"),
+                premium: mid.map(|_| Decimal::ZERO),
+                oracle_px: d(mark),
+                mark_px: d(mark),
+                mid_px: mid.map(d),
+                impact_pxs: None,
+            }),
+            received_at_ms: now_ms_u64(),
+        }
+    }
+
+    fn alert_rows(ledger: &Ledger) -> Vec<(String, serde_json::Value)> {
+        ledger
+            .get_events(0, 1_000)
+            .expect("page")
+            .events
+            .into_iter()
+            .filter(|event| event.kind == EventKind::Alert)
+            .map(|event| {
+                (
+                    event.agent_id.unwrap_or_default(),
+                    event.payload.unwrap_or_default(),
+                )
+            })
+            .collect()
+    }
 
     const ACCOUNT: &str = "0xbf829199c1ae7f0caf21fb6fc45e10edff25b7d2";
 
@@ -454,7 +683,7 @@ mod tests {
     ///
     /// The channel is closed after the last one, which is what ends
     /// [`FeedPump::run`] — the same thing dropping the pool does.
-    async fn drive(pump: &FeedPump<'_, FakeVenue>, script: Vec<WsEvent>) {
+    async fn drive(pump: &FeedPump<'_, FakeVenue, Feeds>, script: Vec<WsEvent>) {
         let (tx, mut rx) = mpsc::channel(16);
         for event in script {
             tx.send(event).await.expect("send");
@@ -473,8 +702,17 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let ledger = ledger(&dir);
         let session = FeedSession::new();
-        let pump = FeedPump::new(&session, &ledger, account(), FakeVenue::holding(Vec::new()))
-            .expect("pump");
+        let alerts = alerts();
+        let feeds = Feeds::default();
+        let pump = FeedPump::new(
+            &session,
+            &ledger,
+            account(),
+            FakeVenue::holding(Vec::new()),
+            &alerts,
+            &feeds,
+        )
+        .expect("pump");
 
         assert!(!session.state().reconciled, "nothing has been checked yet");
         drive(&pump, Vec::new()).await;
@@ -494,9 +732,12 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let ledger = ledger(&dir);
         let session = FeedSession::new();
+        let alerts = alerts();
+        let feeds = Feeds::default();
         let missed = now_ms_u64() - 60_000;
         let venue = FakeVenue::holding(vec![fill(11, missed), fill(12, missed + 10)]);
-        let pump = FeedPump::new(&session, &ledger, account(), venue).expect("pump");
+        let pump =
+            FeedPump::new(&session, &ledger, account(), venue, &alerts, &feeds).expect("pump");
 
         drive(&pump, Vec::new()).await;
 
@@ -519,11 +760,14 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let ledger = ledger(&dir);
         let session = FeedSession::new();
+        let alerts = alerts();
+        let feeds = Feeds::default();
         let dropped_at = now_ms_u64();
         let venue = FakeVenue::holding(vec![fill(20, dropped_at - 60_000)]);
         let controls = venue.controls.clone();
         let user_fills = Subscription::UserFills { user: account() };
-        let pump = FeedPump::new(&session, &ledger, account(), venue).expect("pump");
+        let pump =
+            FeedPump::new(&session, &ledger, account(), venue, &alerts, &feeds).expect("pump");
 
         drive(&pump, Vec::new()).await;
         assert_eq!(fill_rows(&ledger), 1, "the chain now has an anchor");
@@ -553,11 +797,20 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let ledger = ledger(&dir);
         let session = FeedSession::new();
+        let alerts = alerts();
+        let feeds = Feeds::default();
         let at = now_ms_u64();
         let user_fills = Subscription::UserFills { user: account() };
         let book = Subscription::L2Book { coin: "BTC".into() };
-        let pump = FeedPump::new(&session, &ledger, account(), FakeVenue::holding(Vec::new()))
-            .expect("pump");
+        let pump = FeedPump::new(
+            &session,
+            &ledger,
+            account(),
+            FakeVenue::holding(Vec::new()),
+            &alerts,
+            &feeds,
+        )
+        .expect("pump");
 
         drive(
             &pump,
@@ -594,8 +847,11 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let ledger = ledger(&dir);
         let session = FeedSession::new();
+        let alerts = alerts();
+        let feeds = Feeds::default();
         let venue = FakeVenue::refusing(Controls::new(true));
-        let pump = FeedPump::new(&session, &ledger, account(), venue).expect("pump");
+        let pump =
+            FeedPump::new(&session, &ledger, account(), venue, &alerts, &feeds).expect("pump");
 
         drive(&pump, Vec::new()).await;
 
@@ -614,9 +870,12 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let ledger = ledger(&dir);
         let session = FeedSession::new();
+        let alerts = alerts();
+        let feeds = Feeds::default();
         let controls = Controls::new(true);
         let venue = FakeVenue::refusing(controls.clone());
-        let pump = FeedPump::new(&session, &ledger, account(), venue).expect("pump");
+        let pump =
+            FeedPump::new(&session, &ledger, account(), venue, &alerts, &feeds).expect("pump");
 
         let (tx, mut rx) = mpsc::channel::<WsEvent>(1);
         let driver = async {
@@ -635,5 +894,257 @@ mod tests {
             "the retry actually walked the window"
         );
         assert!(gaps(&ledger).is_empty());
+    }
+
+    /// The end-to-end shape of item 22: an agent arms a level, the market
+    /// reaches it, and the agent has a row waiting on its next `get_events`.
+    #[tokio::test]
+    async fn a_price_cross_wakes_the_agent_that_armed_it() {
+        let dir = TempDir::new().expect("tempdir");
+        let ledger = ledger(&dir);
+        let session = FeedSession::new();
+        let alerts = alerts();
+        let feeds = Feeds::default();
+        alerts
+            .arm(
+                "agent-a",
+                &Condition::PriceCross {
+                    symbol: "BTC".into(),
+                    direction: Direction::Above,
+                    px: Decimal::from_str("70000").expect("decimal"),
+                },
+                now_ms(),
+            )
+            .expect("arm");
+        let pump = FeedPump::new(
+            &session,
+            &ledger,
+            account(),
+            FakeVenue::holding(Vec::new()),
+            &alerts,
+            &feeds,
+        )
+        .expect("pump");
+
+        drive(
+            &pump,
+            vec![
+                asset_ctx("BTC", "69999", Some("69999")),
+                asset_ctx("BTC", "70001", Some("70001")),
+            ],
+        )
+        .await;
+
+        let rows = alert_rows(&ledger);
+        assert_eq!(rows.len(), 1, "one wakeup, on the tick that reached it");
+        assert_eq!(rows[0].0, "agent-a", "attributed, so C6 delivers it");
+        assert_eq!(rows[0].1["observed"]["mark_px"], "70001");
+    }
+
+    /// A price alert on a symbol nothing is watching is an alert that never
+    /// fires. The pump is the only thing that can subscribe it, so arming has
+    /// to reach the pool.
+    #[tokio::test]
+    async fn arming_a_price_alert_subscribes_its_market_feed() {
+        let dir = TempDir::new().expect("tempdir");
+        let ledger = ledger(&dir);
+        let session = FeedSession::new();
+        let alerts = alerts();
+        let feeds = Feeds::default();
+        alerts
+            .arm(
+                "agent-a",
+                &Condition::PriceCross {
+                    symbol: "ETH".into(),
+                    direction: Direction::Above,
+                    px: Decimal::from_str("4000").expect("decimal"),
+                },
+                now_ms(),
+            )
+            .expect("arm");
+        let pump = FeedPump::new(
+            &session,
+            &ledger,
+            account(),
+            FakeVenue::holding(Vec::new()),
+            &alerts,
+            &feeds,
+        )
+        .expect("pump");
+
+        drive(&pump, Vec::new()).await;
+
+        assert_eq!(
+            feeds.keys(),
+            ["activeAssetCtx:ETH"],
+            "activeAssetCtx, which carries both the mark and the funding"
+        );
+    }
+
+    /// A fired alert is the last thing holding its feed, so the socket goes
+    /// back. Otherwise a session that armed a hundred levels over a day ends
+    /// it subscribed to a hundred symbols nothing is watching.
+    #[tokio::test]
+    async fn a_fired_alert_gives_its_feed_back() {
+        let dir = TempDir::new().expect("tempdir");
+        let ledger = ledger(&dir);
+        let session = FeedSession::new();
+        let alerts = alerts();
+        let feeds = Feeds::default();
+        alerts
+            .arm(
+                "agent-a",
+                &Condition::PriceCross {
+                    symbol: "BTC".into(),
+                    direction: Direction::Above,
+                    px: Decimal::from_str("1").expect("decimal"),
+                },
+                now_ms(),
+            )
+            .expect("arm");
+        let pump = FeedPump::new(
+            &session,
+            &ledger,
+            account(),
+            FakeVenue::holding(Vec::new()),
+            &alerts,
+            &feeds,
+        )
+        .expect("pump");
+
+        drive(&pump, vec![asset_ctx("BTC", "64000", Some("64000"))]).await;
+
+        assert_eq!(alert_rows(&ledger).len(), 1);
+        assert!(
+            feeds.keys().is_empty(),
+            "nothing is watching BTC any more, so the feed is dropped"
+        );
+    }
+
+    /// The venue keeps publishing a `markPx` for an asset it has stopped
+    /// quoting. Waking an agent on that frozen print is the fault
+    /// `ReferencePrices` refuses on the order path, and it is refused here for
+    /// the same reason.
+    #[tokio::test]
+    async fn an_unquoted_market_does_not_wake_anyone() {
+        let dir = TempDir::new().expect("tempdir");
+        let ledger = ledger(&dir);
+        let session = FeedSession::new();
+        let alerts = alerts();
+        let feeds = Feeds::default();
+        alerts
+            .arm(
+                "agent-a",
+                &Condition::PriceCross {
+                    symbol: "FRIEND".into(),
+                    direction: Direction::Above,
+                    px: Decimal::from_str("1").expect("decimal"),
+                },
+                now_ms(),
+            )
+            .expect("arm");
+        let pump = FeedPump::new(
+            &session,
+            &ledger,
+            account(),
+            FakeVenue::holding(Vec::new()),
+            &alerts,
+            &feeds,
+        )
+        .expect("pump");
+
+        // markPx 4.72 with a null mid: the measured FRIEND case.
+        drive(&pump, vec![asset_ctx("FRIEND", "4.72", None)]).await;
+
+        assert!(alert_rows(&ledger).is_empty());
+    }
+
+    /// The venue replays a backlog of fills on subscribe. An agent woken for a
+    /// fill it was already told about has spent its alert on nothing.
+    #[tokio::test]
+    async fn the_subscribe_backlog_does_not_wake_a_fill_alert() {
+        let dir = TempDir::new().expect("tempdir");
+        let ledger = ledger(&dir);
+        let session = FeedSession::new();
+        let alerts = alerts();
+        let feeds = Feeds::default();
+        alerts
+            .arm("agent-a", &Condition::Fill { symbol: None }, now_ms())
+            .expect("arm");
+        let pump = FeedPump::new(
+            &session,
+            &ledger,
+            account(),
+            FakeVenue::holding(Vec::new()),
+            &alerts,
+            &feeds,
+        )
+        .expect("pump");
+
+        let backlog = WsEvent::UserFills {
+            user: account(),
+            is_snapshot: true,
+            fills: vec![fill(1, now_ms_u64())],
+        };
+        let live = WsEvent::UserFills {
+            user: account(),
+            is_snapshot: false,
+            fills: vec![fill(2, now_ms_u64())],
+        };
+        drive(&pump, vec![backlog, live]).await;
+
+        let rows = alert_rows(&ledger);
+        assert_eq!(rows.len(), 1, "the live fill, not the replayed one");
+        assert_eq!(rows[0].1["observed"]["tid"], 2);
+    }
+
+    /// The deadlock G4 exists to break: an alert armed while the market is
+    /// quiet must not wait for a tick on a feed nothing has subscribed, on a
+    /// symbol nothing will subscribe until something ticks.
+    #[tokio::test(start_paused = true)]
+    async fn an_alert_armed_while_running_gets_its_feed_without_a_tick() {
+        let dir = TempDir::new().expect("tempdir");
+        let ledger = ledger(&dir);
+        let session = FeedSession::new();
+        let alerts = alerts();
+        let feeds = Feeds::default();
+        let pump = FeedPump::new(
+            &session,
+            &ledger,
+            account(),
+            FakeVenue::holding(Vec::new()),
+            &alerts,
+            &feeds,
+        )
+        .expect("pump");
+
+        let (tx, mut rx) = mpsc::channel::<WsEvent>(1);
+        let driver = async {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            assert!(feeds.keys().is_empty(), "nothing armed, nothing subscribed");
+
+            alerts
+                .arm(
+                    "agent-a",
+                    &Condition::PriceCross {
+                        symbol: "SOL".into(),
+                        direction: Direction::Above,
+                        px: Decimal::from_str("200").expect("decimal"),
+                    },
+                    now_ms(),
+                )
+                .expect("arm");
+
+            // No event is ever sent on the channel. The only thing that can
+            // subscribe the feed is the arming itself.
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            assert_eq!(
+                feeds.keys(),
+                ["activeAssetCtx:SOL"],
+                "arming woke the pump and it subscribed the feed"
+            );
+            drop(tx);
+        };
+        tokio::join!(pump.run(&mut rx), driver);
     }
 }

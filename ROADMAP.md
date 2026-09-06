@@ -4,7 +4,7 @@ Everything mapped so far, from the v1 MVP through the versions after it. Numbers
 
 Legend: `[x]` shipped on `main` or in an open PR · `[ ]` not started · **gate** = what proves the phase.
 
-Status as of 2026-09-05: P0 and the P1 code are on `main`; the P1 gate is waiting on a funded testnet agent wallet. P2, P3 and P4 code has been landing since 2026-09-04 (PRs #9–#14), and the P4 boxes below are ticked as each lands. **The P2 and P3 boxes are stale** — the ws pool, the hash-chained ledger, the guardrail engine and the kill switch are on `main` and still read as not started; correcting them needs each bullet checked against the code and is a separate pass. Six feature specs are written, two more were commissioned by the 2026-09-04 venue audit ([onboarding.md](docs/specs/onboarding.md), [venue-containers.md](docs/specs/venue-containers.md)), and seventy-six product decisions are recorded in [docs/decisions.md](docs/decisions.md).
+Status as of 2026-09-05: P0 and the P1 code are on `main`; the P1 gate is waiting on a funded testnet agent wallet. P2, P3 and P4 code has been landing since 2026-09-04 (PRs #9–#14), and the P4 boxes below are ticked as each lands. **The P2 and P3 boxes are stale** — the ws pool, the hash-chained ledger, the guardrail engine and the kill switch are on `main` and still read as not started; correcting them needs each bullet checked against the code and is a separate pass. Six feature specs are written, two more were commissioned by the 2026-09-04 venue audit ([onboarding.md](docs/specs/onboarding.md), [venue-containers.md](docs/specs/venue-containers.md)), and eighty product decisions are recorded in [docs/decisions.md](docs/decisions.md).
 
 **D1 was revised on 2026-09-04.** The unit of isolation is one venue *account* per agent — a sub-account where the venue grants one, a top-level account where it does not. Hyperliquid gates sub-accounts behind $100,000 of protocol-enforced traded volume, on testnet as well as mainnet, so v1 provisions one top-level account per agent. Where this roadmap used "sub-account" to mean the unit of isolation, it now says **container**; where it names the venue's own `subAccounts` endpoint, it still means a sub-account. Reasoning: [decisions.md](docs/decisions.md) V1–V6.
 
@@ -72,7 +72,7 @@ Status as of 2026-09-05: P0 and the P1 code are on `main`; the P1 gate is waitin
 - [x] `preflight(order)`: margin, live book walk, guardrail verdict, post-fill exposure, `max_size_usd_within_{5,10,25}bps` [20]
 - [ ] `preflight` estimated fees [20] — needs a `userFees` read audited against the live API; a guessed fee tier is worse than an absent one
 - [x] `remember` / `recall` journal [21]
-- [ ] `set_alert(condition)` [22]
+- [x] `set_alert(condition)` [22] — `oppen-core::alert`, [decisions.md](docs/decisions.md) G1–G4. Price cross, fill and funding rate; liquidation distance and feature thresholds deferred with named blockers, and the OS-notification half is P5
 - [x] Market = slippage-bounded IOC, limit GTC/IOC/ALO, stop-market, reduce-only, cloid on everything [12]
 - [ ] Attached TP/SL with `positionTpsl`, and batched actions [12] — several orders in one action, and the engine clears one intent at a time; a batch that partially clears must not partially send
 - [ ] Builder code attached by default via `OPPEN_BUILDER_ADDRESS`; missing approval prompts the ceremony, never drops the order path [5, D7]

@@ -13,6 +13,7 @@
 
 use std::sync::Arc;
 
+use oppen_core::alert::{AlertStore, Condition, Direction};
 use oppen_core::book;
 use oppen_core::feed::FeedSession;
 use oppen_core::guardrail::{Cleared, FeedQuality, GuardrailEngine, MarketRef, OrderIntent};
@@ -72,6 +73,9 @@ struct GatewayInner {
     /// this existed, and the second one refused every order (`docs/spec.md`
     /// items 9 and 34).
     feed: Arc<FeedSession>,
+    /// What agents asked to be woken for (`docs/spec.md` item 22). The feed
+    /// pump evaluates it; this only arms.
+    alerts: Arc<AlertStore>,
     /// Hands out one agent's read-only slice of the one ledger
     /// (`docs/spec.md` D6), built per request for whoever the token names. An
     /// [`EventViews`] and never a `Ledger`: `redact`, `upsert_sub_account` and
@@ -256,6 +260,100 @@ pub struct RememberParams {
     pub value: String,
 }
 
+/// What `set_alert` takes.
+///
+/// A flat shape rather than `alert::Condition`'s tagged one: an agent writes
+/// this by hand from a schema, and `{"kind": "price_cross", "symbol": "BTC",
+/// "direction": "above", "px": "70000"}` is easier to get right than a nested
+/// tag. The mapping onto the core type is [`SetAlertParams::condition`], and
+/// it is where a field belonging to another kind is refused.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SetAlertParams {
+    /// `price_cross`, `fill`, or `funding_rate`.
+    pub kind: AlertKind,
+    /// The symbol to watch. Required for `price_cross` and `funding_rate`;
+    /// optional for `fill`, where absent means any symbol.
+    #[serde(default)]
+    pub symbol: Option<String>,
+    /// `above` or `below`. Required for `price_cross` and `funding_rate`.
+    #[serde(default)]
+    pub direction: Option<AlertDirection>,
+    /// The mark price to cross, as a decimal string. `price_cross` only.
+    #[serde(default)]
+    pub px: Option<String>,
+    /// The hour-to-date funding rate in basis points, as a decimal string.
+    /// `funding_rate` only — and it is the rate for one hour, never an
+    /// annualised APR.
+    #[serde(default)]
+    pub hour_to_date_bps: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AlertKind {
+    PriceCross,
+    Fill,
+    FundingRate,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AlertDirection {
+    Above,
+    Below,
+}
+
+impl From<AlertDirection> for Direction {
+    fn from(direction: AlertDirection) -> Self {
+        match direction {
+            AlertDirection::Above => Direction::Above,
+            AlertDirection::Below => Direction::Below,
+        }
+    }
+}
+
+impl SetAlertParams {
+    /// Map onto the stored condition, naming the missing field rather than
+    /// defaulting it.
+    ///
+    /// A defaulted level is the worst outcome available here: the agent stops
+    /// watching, believing it will be woken, and the alert either never fires
+    /// or fires immediately on a level nobody chose.
+    fn condition(self) -> Result<Condition, ToolError> {
+        let missing = |field: &'static str| ToolError::InvalidParams {
+            field,
+            detail: "required for this alert kind".into(),
+        };
+        let symbol = |symbol: Option<String>| symbol.ok_or_else(|| missing("symbol"));
+        // Decimal strings, never JSON numbers: `AGENTS.md` invariant 6, and a
+        // level that lost precision to a float is a level nobody chose.
+        let decimal = |value: Option<String>, field: &'static str| {
+            value
+                .ok_or_else(|| missing(field))?
+                .parse::<Decimal>()
+                .map_err(|e| ToolError::InvalidParams {
+                    field,
+                    detail: e.to_string(),
+                })
+        };
+        Ok(match self.kind {
+            AlertKind::PriceCross => Condition::PriceCross {
+                symbol: symbol(self.symbol)?,
+                direction: self.direction.ok_or_else(|| missing("direction"))?.into(),
+                px: decimal(self.px, "px")?,
+            },
+            AlertKind::Fill => Condition::Fill {
+                symbol: self.symbol,
+            },
+            AlertKind::FundingRate => Condition::FundingRate {
+                symbol: symbol(self.symbol)?,
+                direction: self.direction.ok_or_else(|| missing("direction"))?.into(),
+                hour_to_date_bps: decimal(self.hour_to_date_bps, "hour_to_date_bps")?,
+            },
+        })
+    }
+}
+
 /// What `recall` takes.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct RecallParams {
@@ -323,6 +421,7 @@ impl Gateway {
         events: EventViews,
         journal: Arc<Journal>,
         feed: Arc<FeedSession>,
+        alerts: Arc<AlertStore>,
     ) -> Result<Self, oppen_hl::Error> {
         Ok(Self {
             inner: Arc::new(GatewayInner {
@@ -333,6 +432,7 @@ impl Gateway {
                 nonces: NonceAllocator::new(),
                 journal,
                 feed,
+                alerts,
                 events,
             }),
         })
@@ -880,6 +980,52 @@ impl Gateway {
 
         Ok(CallToolResult::success(vec![ContentBlock::text(
             serde_json::json!({ "contract_version": 0, "remembered": params.key }).to_string(),
+        )]))
+    }
+
+    /// `set_alert` — wakeups instead of polling (`docs/spec.md` item 22).
+    #[tool(
+        description = "Ask to be woken when a condition holds, instead of holding a session \
+                       open and polling. Three kinds: price_cross (the venue's mark reaches a \
+                       level), fill (an order on this account trades), funding_rate (the \
+                       hour-to-date rate reaches a level in basis points). It fires once — \
+                       re-arm it if you want it again — and arrives as an `alert` event in \
+                       get_events, carrying what you asked for and what was observed. \
+                       Liquidation distance and feature thresholds are not available yet."
+    )]
+    async fn set_alert(
+        &self,
+        Parameters(params): Parameters<SetAlertParams>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let bound = Self::bound(&ctx)?;
+        let condition = params.condition()?;
+        // A symbol that is not on this venue can never tick, so the alert
+        // would wait forever. Checked here rather than in the store, which
+        // holds no universe and should not learn one.
+        if let Some(symbol) = condition.watched_symbol() {
+            let universe = self.universe().await?;
+            universe.get(symbol).map_err(|_| ToolError::InvalidParams {
+                field: "symbol",
+                detail: format!("{symbol} is not a symbol on this venue"),
+            })?;
+        }
+        let armed = self
+            .inner
+            .alerts
+            .arm(bound.agent.as_str(), &condition, now_ms() as i64)
+            // The ceiling and the unusable conditions are the caller's to fix,
+            // so they are `invalid_params` and the message names the limit.
+            .map_err(|e| ToolError::invalid("condition", e))?;
+
+        Ok(CallToolResult::success(vec![ContentBlock::text(
+            serde_json::json!({
+                "contract_version": 0,
+                "alert_id": armed.alert_id,
+                "condition": armed.condition,
+                "armed_at_ms": armed.armed_at_ms,
+            })
+            .to_string(),
         )]))
     }
 
@@ -1699,6 +1845,7 @@ mod tests {
             EventViews::new(ledger),
             journal,
             std::sync::Arc::new(oppen_core::feed::FeedSession::new()),
+            std::sync::Arc::new(oppen_core::alert::AlertStore::open(":memory:").expect("alerts")),
         )
         .expect("gateway")
     }
