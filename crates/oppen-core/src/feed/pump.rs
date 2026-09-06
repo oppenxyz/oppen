@@ -1147,4 +1147,55 @@ mod tests {
         };
         tokio::join!(pump.run(&mut rx), driver);
     }
+
+    /// Cancelling releases the feed the alert was holding, and does it without
+    /// waiting for a tick — the same wake path arming uses, in reverse.
+    /// Without it a cancelled symbol keeps a socket open until something else
+    /// happens to move the armed set.
+    #[tokio::test(start_paused = true)]
+    async fn cancelling_an_alert_releases_its_feed_without_a_tick() {
+        let dir = TempDir::new().expect("tempdir");
+        let ledger = ledger(&dir);
+        let session = FeedSession::new();
+        let alerts = alerts();
+        let feeds = Feeds::default();
+        let armed = alerts
+            .arm(
+                "agent-a",
+                &Condition::PriceCross {
+                    symbol: "SOL".into(),
+                    direction: Direction::Above,
+                    px: Decimal::from_str("200").expect("decimal"),
+                },
+                now_ms(),
+            )
+            .expect("arm");
+        let pump = FeedPump::new(
+            &session,
+            &ledger,
+            account(),
+            FakeVenue::holding(Vec::new()),
+            &alerts,
+            &feeds,
+        )
+        .expect("pump");
+
+        let (tx, mut rx) = mpsc::channel::<WsEvent>(1);
+        let driver = async {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            assert_eq!(feeds.keys(), ["activeAssetCtx:SOL"], "armed, so subscribed");
+
+            assert!(alerts.cancel("agent-a", armed.alert_id).expect("cancel"));
+
+            // No event is ever sent. The cancel is the only thing that can
+            // release the feed.
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            assert!(
+                feeds.keys().is_empty(),
+                "cancelling woke the pump and it dropped the feed"
+            );
+            drop(tx);
+        };
+        tokio::join!(pump.run(&mut rx), driver);
+    }
 }

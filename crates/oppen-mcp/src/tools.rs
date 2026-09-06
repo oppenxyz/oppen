@@ -354,6 +354,13 @@ impl SetAlertParams {
     }
 }
 
+/// What `cancel_alert` takes.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CancelAlertParams {
+    /// The `alert_id` `set_alert` returned, or one from `get_alerts`.
+    pub alert_id: i64,
+}
+
 /// What `recall` takes.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct RecallParams {
@@ -1024,6 +1031,61 @@ impl Gateway {
                 "alert_id": armed.alert_id,
                 "condition": armed.condition,
                 "armed_at_ms": armed.armed_at_ms,
+            })
+            .to_string(),
+        )]))
+    }
+
+    /// `get_alerts` — what this agent is watching for (`docs/spec.md` item 22).
+    #[tool(
+        description = "Everything you have armed or that has fired, newest first. An alert with \
+                       no fired_at_ms is still watching. You are amnesiac across sessions, so \
+                       this is how you find out what a previous you asked to be woken for — and \
+                       where the alert_id to cancel one comes from. Only your own alerts."
+    )]
+    async fn get_alerts(
+        &self,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let bound = Self::bound(&ctx)?;
+        let alerts = self
+            .inner
+            .alerts
+            .for_agent(bound.agent.as_str())
+            .map_err(|e| ToolError::unavailable("alerts", e))?;
+
+        Ok(CallToolResult::success(vec![ContentBlock::text(
+            serde_json::json!({ "contract_version": 0, "alerts": alerts }).to_string(),
+        )]))
+    }
+
+    /// `cancel_alert` — disarming one (`docs/spec.md` item 22).
+    #[tool(
+        description = "Stop watching for a condition you armed. Cancelling frees a slot and \
+                       releases the market feed the alert was holding. An alert that has \
+                       already fired cannot be cancelled — it is history — and answers the \
+                       same way as an id you do not own: cancelled false, no error."
+    )]
+    async fn cancel_alert(
+        &self,
+        Parameters(params): Parameters<CancelAlertParams>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let bound = Self::bound(&ctx)?;
+        // `false` rather than an error: the caller wanted the alert not to be
+        // watching, and it is not watching. Reporting an id it does not own as
+        // a distinct failure would let it probe for another agent's ids.
+        let cancelled = self
+            .inner
+            .alerts
+            .cancel(bound.agent.as_str(), params.alert_id)
+            .map_err(|e| ToolError::unavailable("alerts", e))?;
+
+        Ok(CallToolResult::success(vec![ContentBlock::text(
+            serde_json::json!({
+                "contract_version": 0,
+                "alert_id": params.alert_id,
+                "cancelled": cancelled,
             })
             .to_string(),
         )]))

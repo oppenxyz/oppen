@@ -13,9 +13,9 @@ This document is the normative reference for every tool the gateway exposes. `do
 
 ## Tools (v1)
 
-`get_state` · `get_meta` · `get_events` · `get_features` · `preflight` · `place` · `cancel` · `cancel_all` · `close_position` · `get_order_status` · `remember` · `recall` · `set_alert`
+`get_state` · `get_meta` · `get_events` · `get_features` · `preflight` · `place` · `cancel` · `cancel_all` · `close_position` · `get_order_status` · `remember` · `recall` · `set_alert` · `get_alerts` · `cancel_alert`
 
-Shipped so far: `get_meta`, `get_state`, `get_events`, `preflight`, `remember`, `recall`, `place`, `cancel`, `cancel_all`, `close_position`, `get_order_status`, `set_alert`. `get_features` is unimplemented and is not described below — a schema for a tool that does not exist is a promise nothing keeps.
+Shipped so far: `get_meta`, `get_state`, `get_events`, `preflight`, `remember`, `recall`, `place`, `cancel`, `cancel_all`, `close_position`, `get_order_status`, `set_alert`, `get_alerts`, `cancel_alert`. `get_features` is unimplemented and is not described below — a schema for a tool that does not exist is a promise nothing keeps.
 
 ## Pairing
 
@@ -107,6 +107,20 @@ Ask to be woken when a condition holds, instead of holding a session open and po
 **Not available yet:** liquidation distance and feature thresholds, the other two conditions spec item 22 names. The first needs a position poll on a cadence nobody has chosen, the second needs `get_features`. They are absent rather than approximated, because an alert that cannot fire is worse than one that was refused — you would stop watching and wait for a wakeup nothing will send.
 
 An alert on an asset the venue has stopped quoting never fires, for the reason such an asset cannot be traded (see `get_state` above).
+
+### `get_alerts()`
+
+Everything you have armed or that has fired, newest first: `{contract_version, alerts[]}`, each `{alert_id, condition, armed_at_ms, fired_at_ms}`. A null `fired_at_ms` is still watching.
+
+You are amnesiac across sessions, so this is how you find out what a previous you asked to be woken for, and where the `alert_id` for `cancel_alert` comes from. Only your own alerts; another agent's are not returned and their ids are not discoverable.
+
+### `cancel_alert(alert_id)`
+
+Stop watching for a condition you armed. Returns `{contract_version, alert_id, cancelled}`.
+
+`cancelled: false` means the alert is not watching on your behalf — an id you do not own, one that never existed, or one that has already fired. **These are deliberately indistinguishable**, so nothing can probe for another agent's alert ids. It is not an error: you wanted the alert not to be watching, and it is not. Use `get_alerts` when you need to know which case you are in.
+
+Cancelling frees a slot against the per-agent cap and releases the market feed the alert was holding. A cancelled alert is gone rather than kept as history — nothing records an arming in the first place, only a firing.
 
 ### `get_events(since_cursor?, limit?)`
 
