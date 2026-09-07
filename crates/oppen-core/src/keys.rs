@@ -127,7 +127,7 @@ pub fn default_valid_until_ms(now_ms: u64) -> u64 {
 /// approval, so nothing legitimate reaches it, and 1,026 deletes is bounded
 /// work on a path an operator takes once per revoked agent. Past it,
 /// [`KeyStoreError::RotationLimit`] rather than silence.
-const MAX_GENERATION: u32 = 1_024;
+pub(crate) const MAX_GENERATION: u32 = 1_024;
 
 /// Secret text held only as long as it is needed, overwritten on drop.
 ///
@@ -753,6 +753,16 @@ pub trait KeyStore: Send + Sync {
     /// to hold the guarantee: a key that derives some other address signs
     /// actions the master never approved.
     fn load_agent_key(&self, agent: &AgentId) -> Result<AgentKey, KeyStoreError> {
+        self.load_agent_key_with_wallet(agent).map(|(key, _)| key)
+    }
+
+    /// Return the wallet record used to select this exact key generation.
+    /// Signing authority must compare this record, not a separate read of the
+    /// current wallet that could observe a concurrent rotation.
+    fn load_agent_key_with_wallet(
+        &self,
+        agent: &AgentId,
+    ) -> Result<(AgentKey, AgentWallet), KeyStoreError> {
         let record = require_wallet(self, agent)?;
         let entry = EntryName::agent_key(self.network(), agent, record.generation)?;
         let stored = self.read(&entry)?.ok_or_else(|| KeyStoreError::Missing {
@@ -766,7 +776,7 @@ pub trait KeyStore: Send + Sync {
                 derived,
             });
         }
-        Ok(key)
+        Ok((key, record))
     }
 
     /// Removes every one of an agent's keys and its record, and **keeps its
@@ -1243,6 +1253,62 @@ mod tests {
             store.agent_wallet(&a).expect("read").as_ref(),
             Some(&record)
         );
+    }
+
+    #[test]
+    fn loaded_wallet_identifies_the_key_generation_even_if_current_record_rotates() {
+        struct RotatingRead {
+            inner: MemoryKeyStore,
+            agent: AgentId,
+            key_entry: EntryName,
+            armed: std::sync::atomic::AtomicBool,
+        }
+
+        impl KeyStore for RotatingRead {
+            fn network(&self) -> Network {
+                self.inner.network()
+            }
+
+            fn write(&self, entry: &EntryName, value: &str) -> Result<(), KeyStoreError> {
+                self.inner.write(entry, value)
+            }
+
+            fn remove(&self, entry: &EntryName) -> Result<(), KeyStoreError> {
+                self.inner.remove(entry)
+            }
+
+            fn read(&self, entry: &EntryName) -> Result<Option<SecretText>, KeyStoreError> {
+                if entry.account() == self.key_entry.account()
+                    && self.armed.swap(false, std::sync::atomic::Ordering::SeqCst)
+                {
+                    self.inner.rotate_agent_key(
+                        &self.agent,
+                        secret(KEY_B),
+                        default_valid_until_ms(T0 + 1),
+                        T0 + 1,
+                    )?;
+                }
+                self.inner.read(entry)
+            }
+        }
+
+        let inner = MemoryKeyStore::new(Network::Testnet);
+        let agent = agent("alpha");
+        let original = inner
+            .create_agent_key(&agent, secret(KEY_A), default_valid_until_ms(T0), T0)
+            .unwrap();
+        let store = RotatingRead {
+            key_entry: EntryName::agent_key(Network::Testnet, &agent, 0).unwrap(),
+            inner,
+            agent: agent.clone(),
+            armed: std::sync::atomic::AtomicBool::new(true),
+        };
+        let (key, loaded_wallet) = store.load_agent_key_with_wallet(&agent).unwrap();
+        assert_eq!(loaded_wallet, original);
+        assert_eq!(key.address(), original.address);
+        let current = store.agent_wallet(&agent).unwrap().unwrap();
+        assert_eq!(current.generation, 1);
+        assert_ne!(current.address, key.address());
     }
 
     #[test]

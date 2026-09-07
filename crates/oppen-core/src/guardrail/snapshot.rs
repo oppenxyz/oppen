@@ -294,6 +294,8 @@ impl AccountSnapshot {
 /// enforced, which is the failure this whole module exists to prevent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Exposure {
+    /// Account whose positions, orders and balances were measured.
+    pub account: oppen_hl::Address,
     pub agent: AccountSnapshot,
     pub fleet: Option<AccountSnapshot>,
 }

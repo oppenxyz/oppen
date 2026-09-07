@@ -14,7 +14,6 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Mutex;
 
-use oppen_hl::Address;
 use rusqlite::Connection;
 
 use super::AgentId;
@@ -32,10 +31,6 @@ pub enum StoreError {
     /// connection has an unknown transaction state.
     #[error("the store lock was poisoned")]
     Poisoned,
-    /// A stored row that does not parse back into the type it was written
-    /// from. Reachable only from a hand-edited or corrupted database.
-    #[error("stored row in {table} is invalid: {detail}")]
-    InvalidRow { table: &'static str, detail: String },
 }
 
 /// Everything the engine loads at startup.
@@ -44,12 +39,6 @@ pub struct PersistedState {
     pub guardrails: BTreeMap<AgentId, AgentGuardrails>,
     pub kill: KillSwitch,
     pub account_limits: LossLimits,
-    /// The sub-account each agent trades (D1: the roster is 1:1 with
-    /// sub-accounts). Persisted with the guardrails because a clearance is
-    /// bound to it: an engine that forgot the binding on restart would sign
-    /// against the master account instead of the agent's sub-account, which
-    /// is a silent capital-segregation failure rather than an error.
-    pub vaults: BTreeMap<AgentId, Address>,
 }
 
 impl Default for PersistedState {
@@ -64,7 +53,6 @@ impl Default for PersistedState {
             guardrails: BTreeMap::new(),
             kill: KillSwitch::new(),
             account_limits: LossLimits::UNSET,
-            vaults: BTreeMap::new(),
         }
     }
 }
@@ -80,8 +68,6 @@ pub trait GuardrailStore: Send + Sync {
     fn save_guardrails(&self, agent: &AgentId, config: &AgentGuardrails) -> Result<(), StoreError>;
     fn save_kill_switch(&self, kill: &KillSwitch) -> Result<(), StoreError>;
     fn save_account_limits(&self, limits: &LossLimits) -> Result<(), StoreError>;
-    /// Binds an agent to the sub-account it trades (D1).
-    fn save_vault(&self, agent: &AgentId, vault: &Address) -> Result<(), StoreError>;
 }
 
 /// An in-memory store, so the engine can be exercised without a filesystem.
@@ -125,11 +111,6 @@ impl GuardrailStore for MemoryStore {
 
     fn save_account_limits(&self, limits: &LossLimits) -> Result<(), StoreError> {
         self.with_state(|s| s.account_limits = *limits);
-        Ok(())
-    }
-
-    fn save_vault(&self, agent: &AgentId, vault: &Address) -> Result<(), StoreError> {
-        self.with_state(|s| s.vaults.insert(agent.clone(), *vault));
         Ok(())
     }
 }
@@ -177,10 +158,6 @@ impl SqliteGuardrailStore {
              CREATE TABLE IF NOT EXISTS guardrail_state (
                  key TEXT PRIMARY KEY,
                  state_json TEXT NOT NULL
-             );
-             CREATE TABLE IF NOT EXISTS guardrail_vault (
-                 agent TEXT PRIMARY KEY,
-                 vault_address TEXT NOT NULL
              );",
         )?;
         Ok(SqliteGuardrailStore {
@@ -234,27 +211,10 @@ impl GuardrailStore for SqliteGuardrailStore {
             Some(json) => serde_json::from_str(&json)?,
             None => LossLimits::UNSET,
         };
-        let vaults = {
-            let conn = self.conn()?;
-            let mut stmt = conn.prepare("SELECT agent, vault_address FROM guardrail_vault")?;
-            let mut rows = stmt.query([])?;
-            let mut out = BTreeMap::new();
-            while let Some(row) = rows.next()? {
-                let agent: String = row.get(0)?;
-                let vault: String = row.get(1)?;
-                let vault = Address::parse(&vault).map_err(|e| StoreError::InvalidRow {
-                    table: "guardrail_vault",
-                    detail: e.to_string(),
-                })?;
-                out.insert(AgentId::new(agent), vault);
-            }
-            out
-        };
         Ok(PersistedState {
             guardrails,
             kill,
             account_limits,
-            vaults,
         })
     }
 
@@ -275,15 +235,6 @@ impl GuardrailStore for SqliteGuardrailStore {
     fn save_account_limits(&self, limits: &LossLimits) -> Result<(), StoreError> {
         self.put_state(ACCOUNT_LIMITS_KEY, serde_json::to_string(limits)?)
     }
-
-    fn save_vault(&self, agent: &AgentId, vault: &Address) -> Result<(), StoreError> {
-        self.conn()?.execute(
-            "INSERT INTO guardrail_vault (agent, vault_address) VALUES (?1, ?2)
-             ON CONFLICT(agent) DO UPDATE SET vault_address = excluded.vault_address",
-            (agent.as_str(), vault.to_string()),
-        )?;
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -291,20 +242,18 @@ mod tests {
     use super::*;
     use crate::guardrail::kill::{Engagement, KillReason, KillScope};
 
-    /// A vault binding that does not survive a restart would silently sign a
-    /// sub-account's order against the master account.
     #[test]
-    fn a_round_trip_through_sqlite_preserves_the_vault_binding() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("testnet.db");
-        let agent = AgentId::new("alpha");
-        let vault = Address::parse("0x0d1d9635d0640821d15e323ac8adadfa9c111414").expect("address");
-        {
-            let store = SqliteGuardrailStore::open(&path).expect("open");
-            store.save_vault(&agent, &vault).expect("save vault");
-        }
-        let store = SqliteGuardrailStore::open(&path).expect("reopen");
-        assert_eq!(store.load().expect("load").vaults.get(&agent), Some(&vault));
+    fn obsolete_vault_rows_are_not_loaded_as_authority() {
+        let store = SqliteGuardrailStore::in_memory().unwrap();
+        store
+            .conn()
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE guardrail_vault (agent TEXT PRIMARY KEY, vault_address TEXT);
+             INSERT INTO guardrail_vault VALUES ('alpha', 'not-even-an-address');",
+            )
+            .unwrap();
+        assert_eq!(store.load().unwrap(), PersistedState::default());
     }
 
     #[test]
@@ -351,7 +300,6 @@ mod tests {
         let loaded = store.load().expect("load");
         assert!(loaded.guardrails.is_empty());
         assert!(loaded.kill.global().is_none());
-        assert!(loaded.vaults.is_empty());
         assert_eq!(loaded.account_limits, LossLimits::UNSET);
     }
 }

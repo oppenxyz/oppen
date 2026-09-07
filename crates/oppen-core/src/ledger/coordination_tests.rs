@@ -19,6 +19,7 @@ use super::*;
 use crate::guardrail::{
     AgentId, AuditEntry, AuditOutcome, AuditSink, Clearance, ClearedKind, Utilization,
 };
+use crate::ledger::tests::{audit_route, audit_sink};
 
 const BLOCKED_WINDOW: Duration = Duration::from_millis(300);
 const COMPLETION_TIMEOUT: Duration = Duration::from_secs(10);
@@ -76,8 +77,9 @@ fn alternate_path(path: &Path) -> PathBuf {
     }
 }
 
-fn order(ledger: &Arc<Ledger>, id: u8) -> Clearance {
+fn order(ledger: &Arc<Ledger>, id: u8, account: Address) -> Clearance {
     let clearance = Clearance {
+        route: audit_route(AgentId::new("coordination-agent"), account, 100),
         agent: AgentId::new("coordination-agent"),
         vault_address: None,
         network: crate::Network::Testnet,
@@ -107,7 +109,7 @@ fn order(ledger: &Arc<Ledger>, id: u8) -> Clearance {
             global_tokens_remaining: Decimal::from(100),
         },
     };
-    LedgerAuditSink::new(ledger.clone())
+    audit_sink(ledger.clone())
         .record(&AuditEntry {
             agent: Some(&clearance.agent),
             at_ms: 100,
@@ -116,6 +118,263 @@ fn order(ledger: &Arc<Ledger>, id: u8) -> Clearance {
         })
         .unwrap();
     clearance
+}
+
+fn signing_fixture() -> (TempDir, Arc<Ledger>, RegistryJournal, Clearance) {
+    let dir = TempDir::new().unwrap();
+    let ledger = Arc::new(Ledger::open(dir.path(), crate::Network::Testnet).unwrap());
+    let registry = RegistryJournal::open(
+        ledger.clone(),
+        Arc::new(crate::keys::HmacKey::from_bytes([31; 32])),
+    )
+    .unwrap();
+    let account = Address::from_bytes([1; 20]);
+    let route = registry
+        .grant(
+            audit_route(AgentId::new("coordination-agent"), account, 100).binding,
+            100,
+        )
+        .unwrap();
+    let clearance = order(&ledger, 1, account);
+    assert_eq!(clearance.route, route);
+    (dir, ledger, registry, clearance)
+}
+
+#[test]
+fn signing_snapshot_stays_stable_while_an_independent_raw_wal_writer_commits() {
+    let (dir, ledger, registry, clearance) = signing_fixture();
+    let raw = Connection::open(
+        dir.path()
+            .join(crate::db_file_name(crate::Network::Testnet)),
+    )
+    .unwrap();
+    raw.busy_timeout(COMPLETION_TIMEOUT).unwrap();
+    let journal_mode: String = raw
+        .pragma_query_value(None, "journal_mode", |row| row.get(0))
+        .unwrap();
+    assert_eq!(journal_mode, "wal");
+    let permit = LedgerSigningPermit::new(ledger.lock().unwrap()).unwrap();
+    assert!(!permit.is_autocommit());
+    let route = &clearance.route;
+    registry
+        .verify_route_in(&permit, route, route.binding.wallet.address)
+        .unwrap();
+    let payload = |connection: &Connection| -> String {
+        connection
+            .query_row(
+                "SELECT payload FROM events WHERE seq = ?1",
+                params![route.binding_seq],
+                |row| row.get(0),
+            )
+            .unwrap()
+    };
+    let original = payload(&permit);
+
+    // Raw writers ignore the coordination file. WAL permits this commit;
+    // the signing transaction must continue validating its earlier snapshot.
+    assert_eq!(
+        raw.execute(
+            "UPDATE events SET payload = '{}' WHERE seq = ?1",
+            params![route.binding_seq]
+        )
+        .unwrap(),
+        1
+    );
+    assert_eq!(payload(&raw), "{}");
+    assert_eq!(payload(&permit), original);
+    registry
+        .verify_route_in(&permit, route, route.binding.wallet.address)
+        .unwrap();
+    drop(permit);
+    assert!(ledger.connection.lock().unwrap().is_autocommit());
+    assert!(
+        registry.route_for_agent(&clearance.agent).is_err(),
+        "a new reader must see the raw mutation"
+    );
+
+    raw.execute(
+        "UPDATE events SET payload = ?1 WHERE seq = ?2",
+        params![original, route.binding_seq],
+    )
+    .unwrap();
+    let before = ledger.chain_head().unwrap();
+    let appended = ledger
+        .append(&NewEvent {
+            kind: EventKind::AgentDecision,
+            ts_ms: 101,
+            agent_id: Some(clearance.agent.as_str()),
+            payload: &json!({"reason": "after signing snapshot drop"}),
+            snapshot: None,
+        })
+        .unwrap();
+    assert_eq!(appended.seq, before.seq + 1);
+    assert!(ledger.verify().unwrap().is_intact());
+}
+
+#[test]
+fn combined_signing_permit_rolls_back_on_identity_registry_and_pilot_errors() {
+    for failure in ["identity", "registry", "pilot"] {
+        let (_dir, ledger, registry, clearance) = signing_fixture();
+        let mut actual_wallet = clearance.route.binding.wallet.clone();
+        match failure {
+            "identity" => actual_wallet.generation += 1,
+            "registry" => {
+                registry.retire(&clearance.route, 101).unwrap();
+            }
+            "pilot" => {
+                pilot::PilotJournal::new(ledger.clone())
+                    .authorize(
+                        clearance.agent.clone(),
+                        clearance.route.binding.container,
+                        100,
+                    )
+                    .unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let sink = LedgerAuditSink::new(registry);
+        let before = ledger.chain_head().unwrap();
+        let refusal = sink
+            .before_sign(&clearance, &actual_wallet, actual_wallet.address)
+            .err()
+            .expect("invalid signing authority must fail");
+        assert!(
+            matches!(refusal, crate::guardrail::Refusal::Unevaluable(_)),
+            "{failure}: {refusal:?}"
+        );
+        assert!(
+            ledger.connection.lock().unwrap().is_autocommit(),
+            "{failure} leaked its read transaction"
+        );
+        assert_eq!(ledger.chain_head().unwrap(), before);
+        let appended = ledger
+            .append(&NewEvent {
+                kind: EventKind::AgentDecision,
+                ts_ms: 102,
+                agent_id: Some(clearance.agent.as_str()),
+                payload: &json!({"reason": "after refused signing"}),
+                snapshot: None,
+            })
+            .unwrap();
+        assert_eq!(appended.seq, before.seq + 1, "{failure}");
+        assert!(ledger.verify().unwrap().is_intact());
+    }
+}
+
+#[test]
+fn valid_route_cleanup_survives_redacted_pilot_evidence_but_still_checks_signer_and_registry() {
+    use crate::guardrail::{Refusal, Unevaluable};
+    for target in ["authorization", "submission"] {
+        let (_dir, ledger, registry, mut clearance) = signing_fixture();
+        let account = clearance.route.binding.container;
+        pilot::PilotJournal::new(ledger.clone())
+            .authorize(clearance.agent.clone(), account, 100)
+            .unwrap();
+        let authorization = ledger.chain_head().unwrap().seq;
+        if let ClearedKind::Order {
+            sz, notional_usd, ..
+        } = &mut clearance.kind
+        {
+            *sz = Decimal::new(1, 1);
+            *notional_usd = Decimal::from(10);
+        }
+        let sink = LedgerAuditSink::new(registry);
+        sink.record(&AuditEntry {
+            agent: Some(&clearance.agent),
+            at_ms: 100,
+            reason: "within pilot order limit",
+            outcome: AuditOutcome::Cleared(&clearance),
+        })
+        .unwrap();
+        EventViews::new(ledger.clone())
+            .submissions()
+            .begin(account, &clearance, 0, 101)
+            .unwrap();
+        let submission = ledger.chain_head().unwrap().seq;
+        let wallet = clearance.route.binding.wallet.clone();
+        drop(
+            sink.before_sign(&clearance, &wallet, wallet.address)
+                .unwrap(),
+        );
+        ledger
+            .redact(
+                if target == "authorization" {
+                    authorization
+                } else {
+                    submission
+                },
+                "synthetic redaction",
+                102,
+            )
+            .unwrap();
+        assert!(ledger.verify().unwrap().is_intact());
+        assert!(
+            matches!(
+                sink.before_sign(&clearance, &wallet, wallet.address),
+                Err(Refusal::Unevaluable(
+                    Unevaluable::PilotBudgetUnavailable { .. }
+                ))
+            ),
+            "{target}"
+        );
+
+        for kind in [
+            ClearedKind::Cancel { count: 1 },
+            ClearedKind::ScheduleCancel { cancel_at_ms: None },
+        ] {
+            clearance.kind = kind;
+            drop(
+                sink.before_sign(&clearance, &wallet, wallet.address)
+                    .unwrap(),
+            );
+            assert!(matches!(
+                sink.before_sign(&clearance, &wallet, Address::from_bytes([9; 20])),
+                Err(Refusal::Unevaluable(Unevaluable::RouteAuthority { .. }))
+            ));
+            assert!(ledger.connection.lock().unwrap().is_autocommit());
+        }
+        sink.registry.retire(&clearance.route, 103).unwrap();
+        assert!(matches!(
+            sink.before_sign(&clearance, &wallet, wallet.address),
+            Err(Refusal::Unevaluable(Unevaluable::RouteAuthority { .. }))
+        ));
+    }
+}
+
+#[test]
+fn an_unfinished_connection_transaction_is_refused_without_implicit_cleanup() {
+    let dir = TempDir::new().unwrap();
+    let ledger = Ledger::open(dir.path(), crate::Network::Testnet).unwrap();
+    let before = ledger.chain_head().unwrap();
+    ledger
+        .connection
+        .lock()
+        .unwrap()
+        .execute_batch("BEGIN DEFERRED")
+        .unwrap();
+    assert!(matches!(
+        ledger.lock(),
+        Err(LedgerError::UnfinishedTransaction)
+    ));
+    let marker = NewEvent {
+        kind: EventKind::AgentDecision,
+        ts_ms: 100,
+        agent_id: None,
+        payload: &json!({"reason": "after explicit cleanup"}),
+        snapshot: None,
+    };
+    assert!(matches!(
+        ledger.append(&marker),
+        Err(LedgerError::UnfinishedTransaction)
+    ));
+    {
+        let connection = ledger.connection.lock().unwrap();
+        assert!(!connection.is_autocommit());
+        assert_eq!(head(&connection).unwrap(), (before.seq, before.hash));
+        connection.execute_batch("ROLLBACK").unwrap();
+    }
+    assert_eq!(ledger.append(&marker).unwrap().seq, before.seq + 1);
+    assert!(ledger.verify().unwrap().is_intact());
 }
 
 #[derive(Debug)]
@@ -175,15 +434,15 @@ fn independent_handles_serialize_commit_through_anchor_publication() {
         )
         .unwrap(),
     );
-    let first_order = order(&first, 1);
-    let second_order = order(&first, 2);
-    let third_order = order(&first, 3);
+    let account_a = Address::from_bytes([1; 20]);
+    let account_b = Address::from_bytes([2; 20]);
+    let first_order = order(&first, 1, account_a);
+    let second_order = order(&first, 2, account_b);
+    let third_order = order(&first, 3, account_b);
     // A file symlink must share both the coordination lock and default anchor.
     let alias = alternate_path(&path);
     let second = Arc::new(Ledger::open_at(&alias, crate::Network::Testnet).unwrap());
     let before = first.chain_head().unwrap();
-    let account_a = Address::from_bytes([1; 20]);
-    let account_b = Address::from_bytes([2; 20]);
 
     armed.store(true, Ordering::SeqCst);
     let first_writer = {

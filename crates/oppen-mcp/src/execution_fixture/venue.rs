@@ -67,6 +67,16 @@ impl Venue {
         self.state.lock().expect("fixture lock").submissions.clone()
     }
 
+    pub(super) fn info_count(&self) -> usize {
+        self.state.lock().expect("fixture lock").info_count
+    }
+
+    pub(super) fn hold_info(&self, kind: &str) -> Arc<InfoGate> {
+        let gate = Arc::new(InfoGate::default());
+        self.state.lock().unwrap().info_gate = Some((kind.to_owned(), gate.clone()));
+        gate
+    }
+
     pub(super) fn next_response(&self, behavior: Behavior) {
         self.state
             .lock()
@@ -127,6 +137,8 @@ impl Drop for Venue {
 
 #[derive(Default)]
 struct Book {
+    info_count: usize,
+    info_gate: Option<(String, Arc<InfoGate>)>,
     orders: BTreeMap<u64, Order>,
     position: Decimal,
     fees_paid: Decimal,
@@ -135,6 +147,12 @@ struct Book {
     behaviors: VecDeque<Behavior>,
     failures: Vec<String>,
     account: Option<String>,
+}
+
+#[derive(Default)]
+pub(super) struct InfoGate {
+    pub(super) entered: tokio::sync::Notify,
+    pub(super) release: tokio::sync::Notify,
 }
 
 struct Order {
@@ -192,6 +210,7 @@ impl Book {
     }
 
     fn info(&mut self, request: &Value) -> Result<Value, String> {
+        self.info_count += 1;
         let kind = required(request, "type")?;
         if !matches!(kind, "meta" | "metaAndAssetCtxs") {
             let user = required(request, "user")?.to_ascii_lowercase();
@@ -469,11 +488,28 @@ fn failure(book: &mut Book, message: String) -> Response {
 }
 
 async fn info(State(state): State<Arc<Mutex<Book>>>, Json(request): Json<Value>) -> Response {
-    let mut book = state.lock().expect("fixture lock");
-    match book.info(&request) {
-        Ok(value) => Json(value).into_response(),
-        Err(message) => failure(&mut book, message),
+    let (response, gate) = {
+        let mut book = state.lock().expect("fixture lock");
+        let response = match book.info(&request) {
+            Ok(value) => Json(value).into_response(),
+            Err(message) => failure(&mut book, message),
+        };
+        let gate = if book
+            .info_gate
+            .as_ref()
+            .is_some_and(|(kind, _)| request["type"] == *kind)
+        {
+            book.info_gate.take().map(|(_, gate)| gate)
+        } else {
+            None
+        };
+        (response, gate)
+    };
+    if let Some(gate) = gate {
+        gate.entered.notify_one();
+        gate.release.notified().await;
     }
+    response
 }
 
 async fn exchange(State(state): State<Arc<Mutex<Book>>>, Json(request): Json<Value>) -> Response {

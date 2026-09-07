@@ -55,6 +55,15 @@ before expanding features:
    mismatch and stalled durable writes without blocking HTTP or shutdown.
    Desktop lifecycle controls, verified registry/policy setup and operator
    activation remain open. See decision ES16.
+   Registry-to-signing authority is in progress on
+   `feat/registry-signing-authority` (ES17), not merged or an activation gate
+   passed. Review fixes now have local regressions for cancellation with
+   unavailable pilot evidence, idempotent anchor-publication retries, legacy
+   address aliases, expiry crossed during signing waits, and asynchronous
+   decision-worker shutdown/owner retention. The workspace run passed 822 tests
+   with 15 live-gated tests ignored; formatting and clippy passed. Final
+   independent review and exact-head CI remain required before merge.
+   Authenticated policy storage and desktop ownership remain subsequent work.
 4. **Recovery:** PR #44 merged as `06fc0e3` after green CI and separate automated
    review. The durable submission journal has SQLite reopen, independent
    handle, stale-revision, corruption and dropped-request regressions. Starts and
@@ -188,6 +197,8 @@ a test, and an ungated judgement resolves as schedule drift.
 - [x] **The console can see the keychain** [2, 4] — [decisions.md](docs/decisions.md) X1–X5. `KeyStore::reachable`, a read-only probe, behind one Tauri command: whether the store answers, never what is in it. Turns the tracker's first milestone into a real check and makes a locked keychain visible instead of surfacing as an unrelated failure three steps later
 - [x] **Guided walkthrough and setup tracker** [4] — [decisions.md](docs/decisions.md) W1–W4. A spotlight pass over every screen that points at the live controls and names what each is for, plus a milestone tracker toward a first paired agent. The tracker reports a step it cannot check as **unverifiable** with the missing read named, never as merely pending, and counts only the checkable ones
 - [ ] First-run onboarding: testnet default → one container + agent wallet per agent (`usdSend` to fund it, `approveAgent` to authorise the agent wallet, `approveBuilderFee` for the builder code — every signature in the user's own wallet, never a container key in the app) → pair first agent with the `claude mcp add` snippet and a connection test [4, D5, decisions.md V2, O7] — [onboarding.md](docs/specs/onboarding.md)
+- [ ] **MVP Connect Agent and broad MCP-client setup**, after the current safety work: in-app account/permission assignment, read-only connection test, factual status and durable revocation; an initial verified client matrix, generic compatible-client configuration and external local-model runners. Compatible is not verified; all clients retain identical server-side safeguards. See [agent-connections.md](docs/specs/agent-connections.md).
+- [ ] **Beta client expansion:** more verified clients, permission-based one-click configuration, and separately security-reviewed connectivity for cloud clients such as ChatGPT. No automatic public endpoint, tunnel or relay; existing approval gates remain unchanged. See [agent-connections.md](docs/specs/agent-connections.md).
 - [ ] Sub-account path offered as an attempt, never as a precondition: `userRateLimit` returns `cumVlm`, so oppen may show distance to the gate as a labelled estimate, but nothing documents that the gate reads that counter or whether it is lifetime or windowed — so oppen still tries `createSubAccount` and classifies the refusal, and `Required:` / `Traded:` are displayed, never branched on [decisions.md V5, O3]
 - [ ] `AGENTS.md` and the `skills/oppen` Claude Code skill written for real [23]
 - [ ] Threat model finalized against the shipped code [2]

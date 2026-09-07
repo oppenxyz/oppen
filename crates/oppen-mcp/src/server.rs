@@ -46,6 +46,42 @@ pub const MCP_PATH: &str = "/mcp";
 /// request and pairing or revoking is a rare write.
 pub type Pairings = Arc<RwLock<TokenStore>>;
 
+// Decision workers may outlive the request waiting for them. Their lifetime
+// remains part of serve's drain, and retains the pairing journal's owner.
+#[derive(Clone)]
+pub(crate) struct ExecutionTracker {
+    _execution: watch::Receiver<()>,
+    _owner: ExecutionOwner,
+}
+
+#[derive(Clone)]
+enum ExecutionOwner {
+    Session { _authority: SessionAuthority },
+    Supervision { _pairings: Pairings },
+}
+
+impl ExecutionTracker {
+    pub(crate) fn supervision(execution: &watch::Sender<()>, pairings: Pairings) -> Self {
+        Self {
+            _execution: execution.subscribe(),
+            _owner: ExecutionOwner::Supervision {
+                _pairings: pairings,
+            },
+        }
+    }
+
+    pub(crate) fn from_context(
+        context: &RequestContext<RoleServer>,
+    ) -> Result<Self, crate::outcome::ToolError> {
+        context.extensions.get::<Self>().cloned().ok_or_else(|| {
+            crate::outcome::ToolError::unavailable(
+                "execution tracker",
+                "decision requires an authenticated, tracked method task",
+            )
+        })
+    }
+}
+
 /// The runtime's gateway, with a substitutable MCP handler for lifecycle tests.
 /// Pause enforcement always uses the real gateway; the test handler never signs.
 pub trait GatewayHandler: rmcp::ServerHandler + Clone {
@@ -108,7 +144,7 @@ impl<H: ServerHandler> ServerHandler for ShutdownHandler<H> {
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
-        context: RequestContext<RoleServer>,
+        mut context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
         // Receivers count active tool futures. Register before checking
         // shutdown: a late rmcp task cannot enter the tool after closed().
@@ -122,6 +158,12 @@ impl<H: ServerHandler> ServerHandler for ShutdownHandler<H> {
                 what: "pairing authority",
                 detail: "this method task carries no authenticated pairing authority".into(),
             })?;
+        context.extensions.insert(ExecutionTracker {
+            _execution: self.execution.subscribe(),
+            _owner: ExecutionOwner::Session {
+                _authority: authority.clone(),
+            },
+        });
         // Keep authority outside the selected inner future: HTTP disconnects
         // and cancellation must not release the owner lease before it drains.
         tokio::select! {
@@ -198,6 +240,7 @@ pub async fn serve(
     let enforcement_gateway = gateway.gateway().clone();
     let enforcement_pairings = pairings.clone();
     let enforcement_shutdown = shutdown.child_token();
+    let enforcement_execution = execution.clone();
     // Also stop enforcement if the caller drops the serve future.
     let _enforcement_guard = enforcement_shutdown.clone().drop_guard();
     let enforcement = tokio::spawn(async move {
@@ -216,7 +259,8 @@ pub async fn serve(
                             return;
                         }
                     };
-                    if let Err(error) = enforcement_gateway.enforce_pauses(&bindings).await {
+                    let tracker = ExecutionTracker::supervision(&enforcement_execution, enforcement_pairings.clone());
+                    if let Err(error) = enforcement_gateway.enforce_pauses(&bindings, tracker).await {
                         tracing::warn!(%error, "pause enforcement failed; will retry");
                     }
                 } => {}

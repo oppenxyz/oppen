@@ -163,7 +163,8 @@ CREATE INDEX events_submission_account
 // Reader barrier: a V3 runtime cannot enforce the cumulative pilot budget.
 // No row rewrite or new table is needed for these additional chained events.
 // V5 also excludes readers that cannot enforce durable pairing revocation.
-const MIGRATIONS: &[&str] = &[V1, V2, V3, "", ""];
+// V6 requires authenticated registry authority at the signing boundary.
+const MIGRATIONS: &[&str] = &[V1, V2, V3, "", "", ""];
 
 /// Bring the database up to the schema this build expects.
 ///

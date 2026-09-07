@@ -38,7 +38,8 @@ use oppen_hl::order::{OrderKind, OrderSpec};
 use oppen_hl::wire::{BuilderInfo, CancelByCloidWire, CancelWire, Cloid, Grouping};
 use oppen_hl::{Action, Address, AgentKey, ExchangeRequest, Network};
 
-use crate::keys::{KeyStore, KeyStoreError};
+use crate::keys::{AgentWallet, KeyStore, KeyStoreError};
+use crate::ledger::AuthorizedRoute;
 
 use super::AgentId;
 use super::breaker::{self, BudgetScope, LossBudget, LossKind};
@@ -253,13 +254,14 @@ pub struct Clearance {
     /// master account spoke for the fleet.
     ///
     /// It is also the identity [`GuardrailEngine::sign_cleared`] loads the
-    /// signing key from, which is why it is not an `Option`: under the revised
-    /// D1 (V2) a Hyperliquid container is a *top-level* account carrying no
-    /// `vaultAddress`, so the agent key **is** the container, and a clearance
-    /// that cannot name its agent cannot name the key that may sign it.
+    /// signing key from. The route separately identifies the container and
+    /// the API wallet approved to sign for it; those addresses are not equal
+    /// merely because a top-level account omits `vaultAddress`.
     pub agent: AgentId,
+    /// Complete evaluated authority, revalidated under the signing permit.
+    pub route: AuthorizedRoute,
     /// The container's `vaultAddress` where the venue granted a sub-account
-    /// (D1), taken from the engine's own registry rather than from the caller.
+    /// (D1), copied from the authenticated route rather than from the caller.
     /// `None` is D1 V2's top-level container, which sends no `vaultAddress`
     /// at all. A clearance measured against agent X's positions and caps must
     /// not be signable with agent Y's `vaultAddress`, and the only way to
@@ -352,6 +354,7 @@ pub enum OperatorAction {
     /// A newly paired agent got D-c's near-zero defaults.
     AgentRegistered {
         config: Box<AgentGuardrails>,
+        /// Historical field; policy registration grants no route and emits None.
         vault_address: Option<Address>,
     },
     /// `before` is `None` when the agent had no stored configuration.
@@ -417,27 +420,13 @@ impl SigningPermit for () {}
 pub trait AuditSink: Send + Sync {
     fn record(&self, entry: &AuditEntry<'_>) -> Result<(), AuditError>;
     /// Revalidate durable execution authority inside the final signing gate.
-    fn before_sign(&self, clearance: &Clearance) -> Result<Box<dyn SigningPermit + '_>, Refusal>;
-}
-
-/// Records nothing and always succeeds.
-///
-/// Test-only, and deliberately unreachable from outside this module:
-/// shipping it would make every clearance unexplainable after the fact,
-/// which D6 exists to prevent.
-#[cfg(test)]
-#[derive(Debug, Default)]
-pub(super) struct NullAuditSink;
-
-#[cfg(test)]
-impl AuditSink for NullAuditSink {
-    fn before_sign(&self, _clearance: &Clearance) -> Result<Box<dyn SigningPermit + '_>, Refusal> {
-        Ok(Box::new(()))
-    }
-
-    fn record(&self, _entry: &AuditEntry<'_>) -> Result<(), AuditError> {
-        Ok(())
-    }
+    fn route_for_agent(&self, agent: &AgentId) -> Result<AuthorizedRoute, Refusal>;
+    fn before_sign(
+        &self,
+        clearance: &Clearance,
+        actual_wallet: &AgentWallet,
+        actual_signer: Address,
+    ) -> Result<Box<dyn SigningPermit + '_>, Refusal>;
 }
 
 /// Operator-side failures. Distinct from [`Refusal`], which is what an agent
@@ -448,43 +437,12 @@ pub enum GuardrailError {
     Store(#[from] StoreError),
     #[error("guardrail config field {field} is invalid: {detail}")]
     InvalidConfig { field: String, detail: String },
-    /// D1: one container, one agent. The operator console names the agent
-    /// already holding the address rather than silently re-pointing it, so
-    /// the fix — a different container, or de-registering the other agent —
-    /// is the operator's to make.
-    #[error("{vault_address} is already the container bound to {bound_to}")]
-    ContainerAlreadyBound {
-        vault_address: Address,
-        bound_to: AgentId,
-    },
-    /// D1 binds an agent to one container for its life, and pairing calls
-    /// [`GuardrailEngine::register_agent`] on **every reconnect** — so an
-    /// address that disagrees with the stored binding is a re-point, not a
-    /// re-registration. Accepting it would move which capital an agent's
-    /// caps, loss budget and ledger history describe, silently, from the
-    /// reconnect path. `docs/decisions.md` V5 makes the container migration
-    /// an explicit operator gesture that does not exist yet; until it does,
-    /// this is refused and the operator de-registers the agent.
-    ///
-    /// `bound_to` is an `Option` because a top-level container — D1 V2's
-    /// Hyperliquid default, and every container v1 provisions — is bound to
-    /// `None`. Naming it takes a `None` binding as seriously as an address,
-    /// which is the whole point: it is the shape the re-point guard used to
-    /// read as "never bound".
-    #[error("{agent} is already bound to container {bound_to:?}; {supplied:?} would move it")]
-    ContainerChanged {
-        agent: AgentId,
-        bound_to: Option<Address>,
-        supplied: Option<Address>,
-    },
 }
 
 #[derive(Debug)]
 struct EngineState {
     policy_revision: u64,
     guardrails: BTreeMap<AgentId, AgentGuardrails>,
-    /// D1: each agent's sub-account, bound into every clearance it produces.
-    vaults: BTreeMap<AgentId, Address>,
     account_limits: LossLimits,
     kill: KillSwitch,
     buckets: BTreeMap<AgentId, TokenBucket>,
@@ -551,8 +509,8 @@ pub struct GuardrailEngine {
     /// Where the agent wallets live. Held by the engine rather than passed to
     /// [`GuardrailEngine::sign_cleared`] for the same reason the network is:
     /// a key supplied per call is a key the caller can get wrong, and on a
-    /// top-level container (D1 V2) the key *is* the account, so the wrong one
-    /// signs a cleared order onto another agent's capital.
+    /// top-level container (D1 V2) the approved API wallet determines the
+    /// account at the venue. Its address must match the registry grant.
     keys: Arc<dyn KeyStore>,
     /// R4: one engine per network, and every clearance it produces carries
     /// this. Fixed at construction because there is no operator gesture that
@@ -571,7 +529,7 @@ impl std::fmt::Debug for GuardrailEngine {
 }
 
 impl GuardrailEngine {
-    /// Loads persisted guardrails, sub-account bindings and kill-switch state
+    /// Loads persisted guardrails and kill-switch state
     /// (spec item 26: the switch survives a restart).
     pub fn new(
         store: Arc<dyn GuardrailStore>,
@@ -589,7 +547,6 @@ impl GuardrailEngine {
             });
         }
         let persisted = store.load()?;
-        check_containers_unique(&persisted.vaults)?;
         let global_budget = GlobalRateBudget::default();
         Ok(GuardrailEngine {
             store,
@@ -599,7 +556,6 @@ impl GuardrailEngine {
             state: Mutex::new(EngineState {
                 policy_revision: 0,
                 guardrails: persisted.guardrails,
-                vaults: persisted.vaults,
                 account_limits: persisted.account_limits,
                 kill: persisted.kill,
                 buckets: BTreeMap::new(),
@@ -628,70 +584,13 @@ impl GuardrailEngine {
     // console. The naming is deliberate so a review of the MCP surface can
     // grep for it.
 
-    /// Registers a newly paired agent with D-c's near-zero defaults if it has
-    /// no stored configuration, and returns the configuration in force.
-    ///
-    /// `vault_address` is the container D1 pairs the agent with, when the
-    /// venue grants a sub-account. It is recorded here and stamped onto every
-    /// clearance the agent ever gets, so no later caller can supply a
-    /// different one. `None` is the top-level container the revised D1 (V2)
-    /// makes the Hyperliquid default — its own venue account, addressed by
-    /// the agent key rather than by a `vaultAddress`.
-    ///
-    /// **A sub-account address binds to exactly one agent.** D1's isolation
-    /// is one position book, one margin pool and one loss budget per agent;
-    /// two agents on one address is two sets of caps measured against one
-    /// pool of capital, and a roster that displays a segregation that does
-    /// not exist. It is refused here, where the binding is made, so that no
-    /// lookup downstream has to pick a winner among several. Two top-level
-    /// containers do not collide with *each other* — `None` is the absence of
-    /// a vault address on the wire, and the agent key is the account — but
-    /// `None` is still a binding, and it binds as hard as an address does.
-    ///
-    /// **The registered agent is the bound agent, not the one with a vault
-    /// row.** Reading the binding out of `vaults` alone treats a top-level
-    /// container as "never bound", and under the revised D1 (V2) that is
-    /// *every* container v1 provisions on Hyperliquid — so the re-point this
-    /// refuses would have been reachable from the reconnect path on the only
-    /// shape that actually ships, moving a funded agent onto a sub-account
-    /// address the caller chose and writing no ledger row on the way.
-    ///
-    /// The defaults include an empty symbol allowlist, so the agent's first
-    /// order is refused with [`Refusal::SymbolNotAllowed`] naming the limit
-    /// to raise. That refusal is the onboarding.
+    /// Register policy defaults only. Route authority is granted separately.
     pub fn register_agent(
         &self,
         agent: &AgentId,
-        vault_address: Option<Address>,
         now_ms: u64,
     ) -> Result<AgentGuardrails, GuardrailError> {
         let mut state = self.state();
-        // An agent this engine has already registered is already bound, and
-        // its container is whatever `vaults` says — including the `None` of a
-        // top-level account. `vaults` is checked too, so a first registration
-        // whose guardrail write failed after the vault write is still bound
-        // on the retry rather than re-pointable.
-        if state.guardrails.contains_key(agent) || state.vaults.contains_key(agent) {
-            // Re-pairing with the same container is the ordinary reconnect and
-            // is a no-op; anything else is a move.
-            let bound_to = state.vaults.get(agent).copied();
-            if vault_address != bound_to {
-                return Err(GuardrailError::ContainerChanged {
-                    agent: agent.clone(),
-                    bound_to,
-                    supplied: vault_address,
-                });
-            }
-        } else if let Some(vault) = vault_address {
-            if let Some((bound_to, _)) = state.vaults.iter().find(|(_, bound)| **bound == vault) {
-                return Err(GuardrailError::ContainerAlreadyBound {
-                    vault_address: vault,
-                    bound_to: bound_to.clone(),
-                });
-            }
-            self.store.save_vault(agent, &vault)?;
-            state.vaults.insert(agent.clone(), vault);
-        }
         if let Some(existing) = state.guardrails.get(agent) {
             return Ok(existing.clone());
         }
@@ -704,7 +603,7 @@ impl GuardrailEngine {
             now_ms,
             &OperatorAction::AgentRegistered {
                 config: Box::new(config.clone()),
-                vault_address,
+                vault_address: None,
             },
         );
         Ok(config)
@@ -898,9 +797,21 @@ impl GuardrailEngine {
         self.state().guardrails.get(agent).cloned()
     }
 
-    /// The sub-account bound to an agent (D1).
-    pub fn vault_address(&self, agent: &AgentId) -> Option<Address> {
-        self.state().vaults.get(agent).copied()
+    /// Resolve current registry authority, never a cached policy binding.
+    pub fn route_for_agent(&self, agent: &AgentId) -> Result<AuthorizedRoute, Refusal> {
+        let route = self.sink.route_for_agent(agent)?;
+        validate_route(&route, agent, self.network)?;
+        Ok(route)
+    }
+
+    fn decision_route(&self, agent: &AgentId) -> Result<AuthorizedRoute, Refusal> {
+        if self.guardrails(agent).is_none() {
+            return Err(Unevaluable::UnknownAgent {
+                agent: agent.clone(),
+            }
+            .into());
+        }
+        self.route_for_agent(agent)
     }
 
     /// Read back after a restart, so a limit the operator set is one the
@@ -1238,6 +1149,13 @@ impl GuardrailEngine {
         mode: Mode,
     ) -> Result<Cleared, Refusal> {
         check_reason(&intent.reason)?;
+        let route = self.decision_route(agent)?;
+        check_order_approval_window(&route, now_ms)?;
+        if exposure.account != route.binding.container {
+            return Err(route_refusal(
+                "exposure account does not match authorized container",
+            ));
+        }
 
         let mut state = self.state();
 
@@ -1671,7 +1589,8 @@ impl GuardrailEngine {
         };
         let clearance = Clearance {
             agent: agent.clone(),
-            vault_address: state.vaults.get(agent).copied(),
+            vault_address: route.binding.vault_address,
+            route,
             network: self.network,
             evaluated_at_ms: now_ms,
             kind: ClearedKind::Order {
@@ -1774,6 +1693,7 @@ impl GuardrailEngine {
         action: Action,
     ) -> Result<Cleared, Refusal> {
         check_reason(reason)?;
+        let route = self.decision_route(agent)?;
         if count == 0 {
             return Err(Unevaluable::InputMismatch {
                 field: "cancels".to_owned(),
@@ -1797,7 +1717,8 @@ impl GuardrailEngine {
             action,
             Clearance {
                 agent: agent.clone(),
-                vault_address: state.vaults.get(agent).copied(),
+                vault_address: route.binding.vault_address,
+                route,
                 network: self.network,
                 evaluated_at_ms: now_ms,
                 kind: ClearedKind::Cancel { count },
@@ -1847,6 +1768,7 @@ impl GuardrailEngine {
         cancel_at_ms: Option<u64>,
         now_ms: u64,
     ) -> Result<Cleared, Refusal> {
+        let route = self.decision_route(agent)?;
         if let Some(at) = cancel_at_ms {
             let earliest_ms = now_ms.saturating_add(DEAD_MAN_MIN_LEAD_MS);
             if at < earliest_ms {
@@ -1869,7 +1791,8 @@ impl GuardrailEngine {
             Action::ScheduleCancel { time: cancel_at_ms },
             Clearance {
                 agent: agent.clone(),
-                vault_address: state.vaults.get(agent).copied(),
+                vault_address: route.binding.vault_address,
+                route,
                 network: self.network,
                 evaluated_at_ms: now_ms,
                 kind: ClearedKind::ScheduleCancel { cancel_at_ms },
@@ -1912,25 +1835,31 @@ impl GuardrailEngine {
     ///
     /// The gate re-runs at the signer rather than trusting the clearance, so
     /// a kill switch engaged in the gap between evaluating and signing still
-    /// stops the order — see [`PreSignGate`] below. `now_ms` is that gap
-    /// measured: the gate refuses a clearance the queue held past the agent's
-    /// own freshness budget, and the refusal lands in the ledger with that
-    /// timestamp. `oppen-core` reads no clock of its own (R1), so it comes in
-    /// from the caller exactly as it does for [`GuardrailEngine::evaluate`].
+    /// stops the order — see [`PreSignGate`] below. The caller supplies a live
+    /// millisecond clock, not a timestamp captured before calling: the gate
+    /// samples it after key loading and authority/state lock acquisition.
+    /// That observation checks approval expiry and clearance freshness and
+    /// timestamps any resulting refusal. Tests may supply a synthetic clock;
+    /// production callers must read current time on each invocation (R1).
     pub fn sign_cleared(
         &self,
         cleared: Cleared,
         nonce: u64,
         expires_after: Option<u64>,
-        now_ms: u64,
+        clock: impl Fn() -> u64,
     ) -> Result<(ExchangeRequest, Clearance), SignClearedError> {
         let (action, clearance, policy_revision) = cleared.into_parts();
-        let key: AgentKey = self.keys.load_agent_key(&clearance.agent)?;
+        let (key, wallet): (AgentKey, AgentWallet) =
+            self.keys.load_agent_key_with_wallet(&clearance.agent)?;
+        let actual_signer = key.address();
         let gate = PreSignGate {
             engine: self,
             clearance: &clearance,
             policy_revision,
-            now_ms,
+            clock: &clock,
+            observed_at_ms: std::cell::Cell::new(None),
+            actual_signer,
+            wallet,
             held_authority: std::cell::RefCell::new(None),
         };
         let signed = ExchangeRequest::sign_checked(
@@ -1944,10 +1873,15 @@ impl GuardrailEngine {
         );
         // Release durable authority only after signing, and before refusal
         // auditing (which needs the same ledger lock).
+        let observed_at_ms = gate.observed_at_ms.get();
         drop(gate);
         let request = signed.map_err(|e| match e {
             SignError::Refused(refusal) => {
-                self.record_pre_sign_refusal(&clearance.agent, now_ms, &refusal);
+                self.record_pre_sign_refusal(
+                    &clearance.agent,
+                    observed_at_ms.unwrap_or_else(&clock),
+                    &refusal,
+                );
                 SignClearedError::Refused(refusal)
             }
             SignError::Signing(e) => SignClearedError::Signing(e),
@@ -2041,7 +1975,10 @@ struct PreSignGate<'a> {
     /// gate reads an identity from.
     clearance: &'a Clearance,
     policy_revision: u64,
-    now_ms: u64,
+    clock: &'a dyn Fn() -> u64,
+    observed_at_ms: std::cell::Cell<Option<u64>>,
+    actual_signer: Address,
+    wallet: AgentWallet,
     held_authority: std::cell::RefCell<Option<Box<dyn SigningPermit + 'a>>>,
 }
 
@@ -2060,8 +1997,32 @@ impl PreSignCheck for PreSignGate<'_> {
             }
             .into());
         }
-        let state = engine.state();
         let agent = &self.clearance.agent;
+        if engine.guardrails(agent).is_none() {
+            return Err(Unevaluable::UnknownAgent {
+                agent: agent.clone(),
+            }
+            .into());
+        }
+        validate_route(&self.clearance.route, agent, self.clearance.network)?;
+        if self.clearance.vault_address != self.clearance.route.binding.vault_address
+            || request.vault_address != self.clearance.vault_address
+            || self.wallet != self.clearance.route.binding.wallet
+            || self.actual_signer != self.clearance.route.binding.wallet.address
+        {
+            return Err(route_refusal(
+                "clearance, wallet or signer does not match route authority",
+            ));
+        }
+        *self.held_authority.borrow_mut() = Some(engine.sink.before_sign(
+            self.clearance,
+            &self.wallet,
+            self.actual_signer,
+        )?);
+        let state = engine.state();
+        // Sample only after every potentially blocking admission dependency.
+        let now_ms = (self.clock)();
+        self.observed_at_ms.set(Some(now_ms));
         let Some(config) = state.guardrails.get(agent) else {
             return Err(Unevaluable::UnknownAgent {
                 agent: agent.clone(),
@@ -2073,19 +2034,19 @@ impl PreSignCheck for PreSignGate<'_> {
         // answer here to "what does this clearance's age make untrue?".
         match &self.clearance.kind {
             ClearedKind::Order { .. } => {
-                *self.held_authority.borrow_mut() = Some(engine.sink.before_sign(self.clearance)?);
+                check_order_approval_window(&self.clearance.route, now_ms)?;
                 if self.policy_revision != state.policy_revision {
                     return Err(Unevaluable::PolicyChanged.into());
                 }
                 let evaluated_at_ms = self.clearance.evaluated_at_ms;
-                if self.now_ms < evaluated_at_ms {
+                if now_ms < evaluated_at_ms {
                     return Err(Unevaluable::ClockWentBackwards {
-                        now_ms: self.now_ms,
+                        now_ms,
                         last_ms: evaluated_at_ms,
                     }
                     .into());
                 }
-                let age_ms = self.now_ms.saturating_sub(evaluated_at_ms);
+                let age_ms = now_ms.saturating_sub(evaluated_at_ms);
                 let max_age_ms = config.freshness.max_market_age_ms;
                 if age_ms > max_age_ms {
                     return Err(Unevaluable::StaleClearance { age_ms, max_age_ms }.into());
@@ -2094,7 +2055,7 @@ impl PreSignCheck for PreSignGate<'_> {
             ClearedKind::ScheduleCancel {
                 cancel_at_ms: Some(at),
             } => {
-                let earliest_ms = self.now_ms.saturating_add(DEAD_MAN_MIN_LEAD_MS);
+                let earliest_ms = now_ms.saturating_add(DEAD_MAN_MIN_LEAD_MS);
                 if *at < earliest_ms {
                     return Err(VenueRule::ScheduleCancelTooSoon {
                         cancel_at_ms: *at,
@@ -2287,27 +2248,39 @@ fn check_reason(reason: &str) -> Result<(), Refusal> {
     Ok(())
 }
 
-/// D1 is 1:1, and [`GuardrailEngine::register_agent`] is only one of the doors
-/// into the registry. [`GuardrailStore`] is a public trait whose `save_vault`
-/// any holder of the store can call, and a restart reads back whatever is on
-/// disk — so a guard that lives only at registration is a guard on one door.
-/// Two agents on one container is two sets of caps measured against one pool
-/// of capital and a roster showing a segregation the venue does not enforce,
-/// and no lookup downstream can pick a winner. The engine refuses to start
-/// rather than start ambiguous.
-///
-/// Deterministic: `vaults` is a `BTreeMap`, so the agent named as the holder
-/// is the same one on every run (`AGENTS.md` invariant 6).
-fn check_containers_unique(vaults: &BTreeMap<AgentId, Address>) -> Result<(), GuardrailError> {
-    let mut seen: Vec<(&Address, &AgentId)> = Vec::with_capacity(vaults.len());
-    for (agent, vault) in vaults {
-        if let Some((_, bound_to)) = seen.iter().find(|(held, _)| *held == vault) {
-            return Err(GuardrailError::ContainerAlreadyBound {
-                vault_address: *vault,
-                bound_to: (*bound_to).clone(),
-            });
-        }
-        seen.push((vault, agent));
+fn route_refusal(detail: &str) -> Refusal {
+    Unevaluable::RouteAuthority {
+        detail: detail.to_owned(),
+    }
+    .into()
+}
+
+// Admission only: automatic expiry latching and cancellation delivery remain
+// runtime activation work. Cleanup actions still require live route authority.
+fn check_order_approval_window(route: &AuthorizedRoute, now_ms: u64) -> Result<(), Refusal> {
+    let wallet = &route.binding.wallet;
+    if now_ms < wallet.approved_at_ms || now_ms >= wallet.valid_until_ms {
+        return Err(route_refusal(
+            "order is outside the approved wallet validity window",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_route(
+    route: &AuthorizedRoute,
+    agent: &AgentId,
+    network: Network,
+) -> Result<(), Refusal> {
+    if route.network != network
+        || route.binding.agent != *agent
+        || route.binding_seq == 0
+        || route
+            .binding
+            .vault_address
+            .is_some_and(|vault| vault != route.binding.container)
+    {
+        return Err(route_refusal("registry route identity is inconsistent"));
     }
     Ok(())
 }

@@ -50,6 +50,38 @@ blocking the server's async workers or reporting delivery during contention.
 Operator commands must run synchronous pairing persistence off async workers
 and await its result; abandoning a waiter does not roll back a durable mutation.
 
+## Signing Authority
+
+A valid pairing does not itself authorize signing. The operator must separately
+grant the agent's account route in the authenticated registry (ES17). Execution
+requires agreement between the pairing's network/account, the verified route
+and the exposure snapshot; orders additionally require a matching durable
+reservation. Missing, retired, tampered or mismatched authority fails closed.
+Engine route refusals use `guardrail_reject`; pairing/container mismatches may
+return `unavailable`, and network mismatch may fail during authentication.
+Creating a policy or importing legacy account metadata does not grant a route.
+
+Every clearance carries the complete route and its grant revision. Immediately
+before signing, Rust verifies that revision again and compares the actual loaded
+key and wallet generation with the grant. The shared ledger guard and database
+snapshot remain held through cryptographic signing. Cancellation and dead-man
+cleanup also require route authority; retirement is not a cancel-only grant.
+Cancel before retirement or use a separately approved operator recovery path.
+
+Route records express local operator authorization, not proof of venue approval
+or trading readiness. Account confirmation, wallet approval, authenticated policy
+and pilot activation remain separate gates. Existing unresolved submissions keep
+their historical payloads and reservations; migration never fabricates route
+evidence to release them. Schema V6 requires a compatible reader on rollback.
+
+Decision replay runs on a bounded worker that retains execution tracking and
+pairing ownership until completion. Canceling or timing out its waiter cannot
+resume that decision into signing, but does not undo evaluation audit, rate or
+approval effects. HTTP shutdown remains responsive while a stalled decision
+drains; the runtime is not fully stopped and cannot hand off ownership until
+that drain completes. Existing synchronous signing is not made interruptible by
+this mechanism. An interrupted submission still requires reconciliation.
+
 ## The result envelope
 
 Every acting tool answers with one JSON object. `contract_version` first, then `status`, then the fields that status implies.

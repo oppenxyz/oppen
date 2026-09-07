@@ -524,8 +524,10 @@ mod tests {
 
     #[test]
     fn unreconciled_is_carried_through_rather_than_softened() {
-        let state = state_of(&perps("0.0", "0.0", "0.0"), &spot("999.0", "0.0"));
+        let mut state = state_of(&perps("0.0", "0.0", "0.0"), &spot("999.0", "0.0"));
+        state.address = Address::from_bytes([8; 20]);
         let exposure = exposure_from(&state, Decimal::ZERO, None, false, 0);
+        assert_eq!(exposure.account, state.address);
         assert!(
             !exposure.agent.reconciled,
             "the engine must see the account as unreconciled"
@@ -640,7 +642,7 @@ mod tests {
             AgentGuardrails, AgentId, FeedQuality, GuardrailEngine, MarketRef, OrderIntent,
             Refusal, SqliteGuardrailStore, Unevaluable,
         };
-        use crate::ledger::{Ledger, LedgerAuditSink};
+        use crate::ledger::{Ledger, LedgerAuditSink, RegistryBinding, RegistryJournal};
         use oppen_hl::wire::{Grouping, Tif};
         use std::sync::Arc;
 
@@ -649,15 +651,34 @@ mod tests {
         let ledger = Arc::new(
             Ledger::open_at(&dir.path().join("ledger.db"), Network::Testnet).expect("ledger"),
         );
+        let agent = AgentId::new("mark-test");
+        let registry =
+            RegistryJournal::open(ledger, Arc::new(crate::keys::HmacKey::from_bytes([42; 32])))
+                .unwrap();
+        registry
+            .grant(
+                RegistryBinding {
+                    agent: agent.clone(),
+                    container: addr(),
+                    vault_address: None,
+                    wallet: crate::keys::AgentWallet {
+                        generation: 0,
+                        address: Address::from_bytes([7; 20]),
+                        approved_at_ms: now,
+                        valid_until_ms: now + 86_400_000,
+                    },
+                },
+                now,
+            )
+            .unwrap();
         let engine = GuardrailEngine::new(
             Arc::new(SqliteGuardrailStore::open(dir.path().join("policy.db")).expect("policy")),
-            Arc::new(LedgerAuditSink::new(ledger)),
+            Arc::new(LedgerAuditSink::new(registry)),
             Arc::new(crate::keys::MemoryKeyStore::new(Network::Testnet)),
             Network::Testnet,
         )
         .expect("engine");
-        let agent = AgentId::new("mark-test");
-        engine.register_agent(&agent, None, now).expect("register");
+        engine.register_agent(&agent, now).expect("register");
         let mut config = AgentGuardrails {
             symbols: ["BTC".to_owned()].into(),
             max_order_usd: d("100"),
@@ -792,7 +813,7 @@ mod tests {
         use crate::guardrail::{
             AgentId, FeedQuality, GuardrailEngine, MarketRef, OrderIntent, SqliteGuardrailStore,
         };
-        use crate::ledger::{Ledger, LedgerAuditSink};
+        use crate::ledger::{Ledger, LedgerAuditSink, RegistryBinding, RegistryJournal};
         use oppen_hl::OrderKind;
         use oppen_hl::wire::{Grouping, Tif};
         use std::sync::Arc;
@@ -800,18 +821,35 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let ledger =
             Arc::new(Ledger::open_at(&dir.path().join("t.db"), Network::Testnet).expect("ledger"));
+        let agent = AgentId::new("agent-alpha");
+        let registry =
+            RegistryJournal::open(ledger, Arc::new(crate::keys::HmacKey::from_bytes([42; 32])))
+                .unwrap();
+        registry
+            .grant(
+                RegistryBinding {
+                    agent: agent.clone(),
+                    container: addr(),
+                    vault_address: None,
+                    wallet: crate::keys::AgentWallet {
+                        generation: 0,
+                        address: Address::from_bytes([7; 20]),
+                        approved_at_ms: 1_000,
+                        valid_until_ms: 1_788_544_667_000 + 86_400_000,
+                    },
+                },
+                1_000,
+            )
+            .unwrap();
         let engine = GuardrailEngine::new(
             Arc::new(SqliteGuardrailStore::open(dir.path().join("g.db")).expect("store")),
-            Arc::new(LedgerAuditSink::new(ledger)),
-            Arc::new(crate::keys::KeychainKeyStore::new(Network::Testnet)),
+            Arc::new(LedgerAuditSink::new(registry)),
+            Arc::new(crate::keys::MemoryKeyStore::new(Network::Testnet)),
             Network::Testnet,
         )
         .expect("engine");
 
-        let agent = AgentId::new("agent-alpha");
-        engine
-            .register_agent(&agent, None, 1_000)
-            .expect("register");
+        engine.register_agent(&agent, 1_000).expect("register");
 
         let meta: oppen_hl::types::Meta = serde_json::from_str(
             r#"{"universe":[{"name":"BTC","szDecimals":5,"maxLeverage":40}]}"#,
@@ -1052,6 +1090,7 @@ pub fn exposure_from(
     // One container per agent (D1 as revised), so the fleet aggregate is the
     // same account. A second container would make these differ.
     Exposure {
+        account: state.address,
         agent: agent.clone(),
         fleet: Some(agent),
     }

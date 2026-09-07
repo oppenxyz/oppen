@@ -372,6 +372,9 @@ impl From<OrderError> for VenueRule {
 #[serde(tag = "unevaluable", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum Unevaluable {
+    /// Missing, inconsistent or revoked account and wallet routing authority.
+    #[error("route authority unavailable: {detail}")]
+    RouteAuthority { detail: String },
     #[error("pilot accounting is unavailable: {detail}")]
     PilotBudgetUnavailable { detail: String },
     #[error("{agent} is not a paired agent")]

@@ -17,8 +17,14 @@ use std::sync::{RwLock, Weak};
 use std::time::Duration;
 use tower::ServiceExt;
 
+#[path = "execution_fixture/decision.rs"]
+mod decision;
 #[path = "execution_fixture/pilot.rs"]
 mod pilot;
+#[path = "execution_fixture/registry.rs"]
+mod registry;
+#[path = "execution_fixture/http.rs"]
+mod transport;
 #[path = "execution_fixture/venue.rs"]
 mod venue;
 use venue::{Behavior, Venue};
@@ -104,6 +110,7 @@ struct Runtime {
     ledger: Arc<Ledger>,
     app: Router,
     pairings: crate::server::Pairings,
+    registry: oppen_core::ledger::RegistryJournal,
     token: String,
     session: String,
     account: Address,
@@ -111,7 +118,20 @@ struct Runtime {
 }
 
 impl Runtime {
+    fn tracker(&self) -> ExecutionTracker {
+        ExecutionTracker::supervision(&tokio::sync::watch::channel(()).0, self.pairings.clone())
+    }
+
     async fn open(path: &Path, port: u16, keys: Arc<FixtureKeys>) -> Self {
+        Self::open_with_anchor(path, port, keys, None).await
+    }
+
+    async fn open_with_anchor(
+        path: &Path,
+        port: u16,
+        keys: Arc<FixtureKeys>,
+        anchor: Option<Box<dyn oppen_core::ledger::HeadAnchor>>,
+    ) -> Self {
         let account = Address::from_bytes([9; 20]);
         let agent = AgentId::new("fixture-agent");
         // This constant is a disposable test vector, never a machine credential.
@@ -124,18 +144,50 @@ impl Runtime {
             )
             .unwrap();
         }
-        let ledger = Arc::new(Ledger::open_at(&path.join("ledger.db"), Network::Testnet).unwrap());
+        let first_open = !path.join("ledger.db").exists();
+        let ledger = Arc::new(
+            match anchor {
+                Some(anchor) => {
+                    Ledger::open_anchored(&path.join("ledger.db"), Network::Testnet, Some(anchor))
+                }
+                None => Ledger::open_at(&path.join("ledger.db"), Network::Testnet),
+            }
+            .unwrap(),
+        );
+        let hmac = Arc::new(oppen_core::keys::HmacKey::from_bytes([77; 32]));
+        let registry =
+            oppen_core::ledger::RegistryJournal::open(ledger.clone(), hmac.clone()).unwrap();
+        if first_open {
+            registry
+                .grant(
+                    oppen_core::ledger::RegistryBinding {
+                        agent: agent.clone(),
+                        container: account,
+                        vault_address: None,
+                        wallet: keys.agent_wallet(&agent).unwrap().unwrap(),
+                    },
+                    now_ms(),
+                )
+                .unwrap();
+        }
+        let route = registry
+            .route_for_agent(&agent)
+            .expect("restart must replay an existing active route");
+        assert_eq!(route.binding.container, account);
         let engine = Arc::new(
             GuardrailEngine::new(
                 Arc::new(SqliteGuardrailStore::open(path.join("policy.db")).unwrap()),
-                Arc::new(LedgerAuditSink::new(ledger.clone())),
+                Arc::new(LedgerAuditSink::new(
+                    oppen_core::ledger::RegistryJournal::open(ledger.clone(), hmac.clone())
+                        .unwrap(),
+                )),
                 keys.clone(),
                 Network::Testnet,
             )
             .unwrap(),
         );
         if engine.guardrails(&agent).is_none() {
-            let mut policy = engine.register_agent(&agent, None, now_ms()).unwrap();
+            let mut policy = engine.register_agent(&agent, now_ms()).unwrap();
             policy.symbols.insert("TEST".into());
             policy.approval_required = false;
             policy.max_order_usd = Decimal::from(15);
@@ -162,11 +214,7 @@ impl Runtime {
         inner.exchange = ExchangeClient::loopback_fixture(port).unwrap();
         *keys.ledger.lock().unwrap() = Arc::downgrade(&ledger);
         let mut pairings = crate::auth::TokenStore::open(
-            oppen_core::ledger::PairingJournal::open(
-                ledger.clone(),
-                Arc::new(oppen_core::keys::HmacKey::from_bytes([77; 32])),
-            )
-            .unwrap(),
+            oppen_core::ledger::PairingJournal::open(ledger.clone(), hmac).unwrap(),
         )
         .unwrap();
         let token = pairings
@@ -181,6 +229,7 @@ impl Runtime {
             ledger,
             app,
             pairings,
+            registry,
             token,
             session: String::new(),
             account,

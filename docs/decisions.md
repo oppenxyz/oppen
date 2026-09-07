@@ -169,6 +169,94 @@ canonicalization code without new dependencies. Pairing does not prove registry
 ownership, assign guardrails, read a trading key or authorize a pilot; verified
 operator identity and activation remain separate gates.
 
+### Registry authority at signing (ES17)
+
+D1, R7 and items 3, 24, 26 and 29 require the evaluated account and the
+actual signer to belong to the same current authorization. A fresh lookup in
+the mutable legacy registry is not sufficient: that table is outside the
+authenticated event chain and its read/check/write lifecycle can race.
+
+Record explicit operator grants and retirements in the existing anchored
+ledger, authenticated with the existing HMAC key and a distinct registry
+domain. Bind network, sequence, previous hash, operation time, agent, container,
+the exact optional wire vault, wallet identity/generation/approval metadata,
+and retirement linkage. A grant's sequence is its binding revision. Verify
+all required history and its projection under one database snapshot; no
+unsigned or redacted fallback, automatic key provisioning, or second journal.
+Registry authority rows are operator-only and excluded from agent event pages
+and single-event reads; ordinary global events keep their existing visibility.
+An operator-supplied grant records local authority, not independently verified
+venue approval. Account confirmation and venue approval remain activation gates.
+
+`None` explicitly authorizes top-level routing. An explicitly supplied vault
+must equal the nonzero container; preserving this existing wire capability
+does not claim that the venue granted a subaccount. A missing route field is
+not a top-level default. Never infer routing from provisioning flags, a pairing,
+the environment, the API-wallet address or the retired guardrail vault cache.
+
+Keep discovery and display metadata in `sub_accounts`, with authenticated
+authority fields treated as a checked projection. Make metadata lifecycle
+operations atomic. Discovery may rename a known account but cannot grant,
+restore or transfer execution authority. Generic metadata writes cannot change
+authenticated ownership or retirement. Preserve unsigned legacy rows for
+inspection; only an explicit reviewed grant can adopt a live account. A
+retirement is not reversible, and old account history remains attributable.
+Enforce one live grant per agent, container and signer identity. Retiring the
+exact grant revision/hash permanently tombstones its container, including
+against replacement grants. Grant/retirement and projection commit together in
+one transaction with one chained row and anchor publication under the guard.
+An idempotent grant/retirement retry must publish the verified current head
+before reporting success; a continuing publication failure remains an error.
+Legacy address comparisons use parsed identity, not address-text casing, and
+conflicting or duplicate aliases cannot bypass adoption or projection checks.
+
+Carry the complete authorized route in every clearance. Require the exposure
+account, authenticated pairing account and durable reservation account to match
+its container. Policy registration grants no route. Replace the engine's
+independent vault authority with the existing ledger-backed authority capability.
+Inside the final signing gate, compare the wallet record used to load the exact
+key generation and the actual key address, not a separate current-record read,
+then revalidate the exact route and revision under the shared ledger guard.
+Hold that guard through cryptographic signing and release it before refusal
+auditing. All action kinds require route authority; only order-specific pilot
+and kill checks have cancellation exemptions. Internal checks borrow the held
+connection instead of recursively acquiring the ledger lock.
+The permit also retains one SQLite read transaction through signing, preventing
+verification and replay from mixing database snapshots. The coordination lock
+excludes cooperating lifecycle writers; a raw WAL writer may still commit, but
+cannot change the snapshot being verified. Rollback precedes guard release, and
+a connection left inside a failed transaction is refused until reopened.
+Order evaluation and final signing must be inside the authenticated wallet's
+approval window. The signer receives a clock callback, not an already sampled
+timestamp, and samples it after key loading and authority/state lock acquisition
+for its time-sensitive checks. A wait cannot extend a wallet's approval window.
+Expiry does not itself retire the route: cancellation and
+dead-man cleanup may still attempt to use the same authorized key, subject to
+venue acceptance. Automatic expiry halt/cleanup supervision remains an explicit
+desktop activation requirement, not a property of route lookup alone.
+
+New synchronous decision replay runs on a bounded blocking worker, not a
+server async worker. The worker retains method execution tracking and pairing
+ownership until it actually finishes, even if its response waiter times out or
+is canceled. It never signs or submits. Shutdown/revocation takes precedence
+over a simultaneously ready decision result. Cancellation does not roll back
+evaluation audit, rate or approval effects. HTTP cancellation stays responsive,
+but completed shutdown and owner handoff must await worker drain; a stalled
+worker may leave the runtime stopping indefinitely. This does not claim that
+existing synchronous signing or keychain work is interruptible.
+
+Retirement disables automated signing, including cleanup. Cancel before retiring,
+or use a separately approved operator recovery path; no implicit cancel-only
+grant. Rotation/deletion integration must retire the old route before changing
+wallet material. This slice does not implement that ceremony or retract already
+completed signatures and admitted exchange requests. Preserve old submission
+payloads and unresolved reservations without inventing missing route evidence.
+
+Advance the additive reader barrier to V6. Stop old runtimes before migration;
+rollback requires a compatible reader, never a lowered schema version or erased
+authority history. Authenticated policy storage and supervised desktop activation
+remain separate required work, not consequences of a successful route lookup.
+
 ## 2026-09-07 · The console's own socket
 
 Item 34 asks for per-feed status, last-tick timestamps and a stale overlay. The

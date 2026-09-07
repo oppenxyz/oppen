@@ -1,44 +1,22 @@
-//! The sub-account registry: which Hyperliquid accounts oppen knows about,
-//! whether it records each one, who owns it, and where an order for it routes.
+//! Account metadata: which Hyperliquid accounts oppen knows about,
+//! whether it records each one, and their projected ownership and routing.
 //!
-//! `docs/spec.md` D1 maps the agent roster 1:1 onto accounts, so this is also
-//! the answer to "which address does this agent trade in". `AGENTS.md`
-//! invariant 7 forbids a second event store and the same reasoning applies to
-//! the roster: the ledger's `sub_accounts` table is the only store, and this
-//! module is a typed surface over it rather than a cache beside it. Every
-//! method here reads or writes that table through [`crate::ledger::Ledger`].
+//! `docs/spec.md` D1 maps the agent roster 1:1 onto accounts. This module is a
+//! typed surface over the ledger's `sub_accounts` projection, not a second
+//! event store or a source of signing authority. Every method here reads or
+//! writes that table through [`crate::ledger::Ledger`].
 //!
-//! **Nothing this module refuses is refused at the signer.**
-//! `crate::guardrail`'s engine stamps every `Clearance` with a `vault_address`
-//! taken from its own `AgentId -> Address` map, persisted in the
-//! `guardrail_vault` table, written from an argument its caller supplies when
-//! an agent is registered and never re-read from here; `sign_cleared` is the
-//! signing path. This table is authoritative for the roster and is not
-//! consulted there.
+//! **This is a non-authoritative registry projection.** Discovery and legacy
+//! provisioning metadata never grant trading authority. Authenticated
+//! `RegistryGranted` and `RegistryRetired` facts belong to
+//! [`crate::ledger::RegistryJournal`]; its verified route, not
+//! [`Registry::route_for_agent`], is the authority the engine must consume.
+//! This module does not establish that the engine has enforced that contract.
 //!
-//! **The gap is wider than a stale copy**, and the difference decides what
-//! closes it. Under `docs/decisions.md` V2 every Hyperliquid v1 container is
-//! top-level, so `register_agent` is called with `None`, that map stays
-//! **empty**, and the container is implied by whichever agent key signs rather
-//! than named anywhere. Deleting `guardrail_vault` would therefore end a
-//! disagreement without restoring a revocation: a retired agent is still
-//! cleared and still signed for, in both container shapes, on an engine
-//! reopened from the same database file. Only the engine asking this module per
-//! decision closes it.
-//!
-//! `docs/decisions.md` R7 settles which store owns the binding: "oppen's SQLite
-//! registry is the only place the agent → container → agent-wallet binding
-//! lives", because a top-level container is undiscoverable and nothing at the
-//! venue can rebuild the list. The guardrail copy is therefore a cache, and the
-//! obligation on it is exactly this: delete `guardrail_vault` and the engine's
-//! `vaults` map, and have every decision resolve the binding by calling
-//! [`Registry::route_for_agent`], carrying the whole [`Route`] rather than an
-//! `Option<Address>` — the `Option` collapses a top-level container, which is
-//! every Hyperliquid v1 container (`docs/decisions.md` V2), into the same
-//! `None` as "no binding" — and treating this module's errors as fail-closed
-//! refusals rather than as a missing cache entry. Stated here rather than
-//! implied, because a doc comment asserting a safety property the code does not
-//! have is worse than none.
+//! Metadata lifecycle mutations hold one shared ledger guard and SQL
+//! transaction across their reads, checks and writes. Observation cannot
+//! resurrect retirement, and authenticated lifecycle changes cannot be
+//! performed through metadata retirement or generic upserts.
 //!
 //! The product rules it makes structural are cited where they bite:
 //! `docs/decisions.md` R3 on [`Standing`] and [`Registry::observe`], R2 on
@@ -51,20 +29,19 @@
 //! hands agents an `AgentView` instead. Do not expose one of these through an
 //! MCP tool.
 //!
-//! **What this module does not do.** It writes no chained event. Opting an
-//! account in and retiring one are operator actions and belong in the record,
-//! but the operator command that calls these already owns that write through
-//! the guardrail engine's audit sink, and a second row appended here would put
-//! the same act in the chain twice.
+//! This module writes no chained event. Operator callers own metadata audit
+//! logging; authenticated grants and retirements belong to RegistryJournal.
 
 use std::collections::BTreeMap;
 
 use oppen_hl::Address;
 use oppen_hl::types::SubAccount as VenueSubAccount;
+use rusqlite::Connection;
 use serde::Serialize;
 
 use crate::guardrail::AgentId;
 use crate::ledger::{Ledger, LedgerError, Owner, OwnerType, SubAccount};
+use crate::ledger::{registry_managed_on, sub_account_on, sub_accounts_on, upsert_sub_account_on};
 
 /// What oppen is doing with an account right now.
 ///
@@ -361,6 +338,9 @@ pub enum AccountsError {
     /// wants to *change* one gets this.
     #[error("no sub-account is registered at {0}")]
     UnknownAccount(Address),
+    /// Authenticated lifecycle changes belong to the registry journal.
+    #[error("account {0} is journal-managed; metadata cannot retire it or disable recording")]
+    UseRegistryJournal(Address),
     /// No account is bound to that agent. Never resolved to the master account:
     /// silently routing an agent's order to the master would put its position in
     /// the operator's own account, which is the failure D1 exists to prevent.
@@ -370,15 +350,9 @@ pub enum AccountsError {
     /// and there is no single right answer for `vaultAddress` — which is why the
     /// route lookup checks rather than taking the first row.
     ///
-    /// Three ways in, all reproduced. Editing the database file. Calling
-    /// `crate::ledger::Ledger::upsert_sub_account` directly, which is `pub` and
-    /// takes a bare `String`. And two concurrent [`Registry::provision`] calls
-    /// for one owner — this module's own public API — because the bound-owner
-    /// check and the insert are separate ledger statements with nothing making
-    /// the pair atomic. The third is closed by a partial unique index over the
-    /// live rows, which is the move the ledger already makes for
-    /// `events.idem_key` and `feed_gaps`, and not by a lock here: a
-    /// [`Registry`] is a borrow with no state of its own to guard.
+    /// Legacy data or generic metadata writes may contain duplicate owners.
+    /// Provisioning prevents this race by checking and writing in one ledger
+    /// transaction, but reads still refuse an already ambiguous projection.
     #[error("agent {agent} maps to more than one sub-account: {first} and {second}")]
     AmbiguousAgent {
         agent: AgentId,
@@ -475,41 +449,43 @@ impl<'l> Registry<'l> {
         owner: Owner,
         now_ms: i64,
     ) -> Result<Account, AccountsError> {
-        let key = address.to_string();
-        let existing = self.ledger.sub_account(&key)?;
-        if let Some(row) = &existing {
-            if !row.active {
-                return Err(AccountsError::Retired(address));
+        self.ledger.registry_transaction(|conn| {
+            let key = address.to_string();
+            let existing = sub_account_on(conn, &key)?;
+            if let Some(row) = &existing {
+                if !row.active {
+                    return Err(AccountsError::Retired(address));
+                }
+                if let Some(current) = &row.owner
+                    && *current != owner
+                {
+                    return Err(AccountsError::OwnerConflict {
+                        address,
+                        current: owner_label(current),
+                        offered: owner_label(&owner),
+                    });
+                }
             }
-            if let Some(current) = &row.owner
-                && *current != owner
+            if let Some(bound) = Self::bound_to(conn, &owner)?
+                && bound != address
             {
-                return Err(AccountsError::OwnerConflict {
-                    address,
-                    current: owner_label(current),
-                    offered: owner_label(&owner),
+                return Err(AccountsError::OwnerAlreadyBound {
+                    owner: owner_label(&owner),
+                    address: bound,
                 });
             }
-        }
-        if let Some(bound) = self.bound_to(&owner)?
-            && bound != address
-        {
-            return Err(AccountsError::OwnerAlreadyBound {
-                owner: owner_label(&owner),
-                address: bound,
-            });
-        }
-        let row = SubAccount {
-            address: key,
-            name: name.to_owned(),
-            owner: Some(owner),
-            recorded: true,
-            provisioned_by_oppen: true,
-            active: true,
-            created_ts_ms: existing.map_or(now_ms, |row| row.created_ts_ms),
-        };
-        self.ledger.upsert_sub_account(&row)?;
-        Account::from_row(&row)
+            let row = SubAccount {
+                address: key,
+                name: name.to_owned(),
+                owner: Some(owner),
+                recorded: true,
+                provisioned_by_oppen: true,
+                active: true,
+                created_ts_ms: existing.map_or(now_ms, |row| row.created_ts_ms),
+            };
+            upsert_sub_account_on(conn, &row)?;
+            Account::from_row(&row)
+        })
     }
 
     /// Fold one discovery sweep into the registry (R3, "discover all").
@@ -544,32 +520,40 @@ impl<'l> Registry<'l> {
                 (entry.address, entry.name.as_str()),
             );
         }
-        let mut report = DiscoveryReport::default();
-        for (key, (address, name)) in wanted {
-            match self.ledger.sub_account(&key)? {
-                Some(row) if row.name == name => report.unchanged += 1,
-                Some(row) => {
-                    self.ledger.upsert_sub_account(&SubAccount {
-                        name: name.to_owned(),
-                        ..row
-                    })?;
-                    report.renamed.push(address);
-                }
-                None => {
-                    self.ledger.upsert_sub_account(&SubAccount {
-                        address: key,
-                        name: name.to_owned(),
-                        owner: None,
-                        recorded: false,
-                        provisioned_by_oppen: false,
-                        active: true,
-                        created_ts_ms: now_ms,
-                    })?;
-                    report.added.push(address);
+        self.ledger.registry_transaction(|conn| {
+            let mut report = DiscoveryReport::default();
+            for (key, (address, name)) in wanted {
+                match sub_account_on(conn, &key)? {
+                    Some(row) if row.name == name => report.unchanged += 1,
+                    Some(row) => {
+                        upsert_sub_account_on(
+                            conn,
+                            &SubAccount {
+                                name: name.to_owned(),
+                                ..row
+                            },
+                        )?;
+                        report.renamed.push(address);
+                    }
+                    None => {
+                        upsert_sub_account_on(
+                            conn,
+                            &SubAccount {
+                                address: key,
+                                name: name.to_owned(),
+                                owner: None,
+                                recorded: false,
+                                provisioned_by_oppen: false,
+                                active: true,
+                                created_ts_ms: now_ms,
+                            },
+                        )?;
+                        report.added.push(address);
+                    }
                 }
             }
-        }
-        Ok(report)
+            Ok(report)
+        })
     }
 
     /// Start recording an account the operator ticked (R3, "opt in per
@@ -585,7 +569,9 @@ impl<'l> Registry<'l> {
     /// Stop recording an account the operator had ticked.
     ///
     /// Only for an account oppen did not provision; see
-    /// [`AccountsError::ProvisionedCannotOptOut`]. Idempotent otherwise.
+    /// [`AccountsError::ProvisionedCannotOptOut`]. Any authenticated grant,
+    /// live or retired, instead returns [`AccountsError::UseRegistryJournal`]:
+    /// its recording must continue for late fills. Idempotent otherwise.
     pub fn opt_out(&self, address: Address) -> Result<Account, AccountsError> {
         self.set_recorded(address, false)
     }
@@ -593,19 +579,24 @@ impl<'l> Registry<'l> {
     /// The one write behind [`Registry::opt_in`] and [`Registry::opt_out`], so
     /// the retired refusal and the idempotent return cannot drift apart.
     fn set_recorded(&self, address: Address, recorded: bool) -> Result<Account, AccountsError> {
-        let row = self.row(address)?;
-        if !row.active {
-            return Err(AccountsError::Retired(address));
-        }
-        if !recorded && row.provisioned_by_oppen {
-            return Err(AccountsError::ProvisionedCannotOptOut(address));
-        }
-        if row.recorded == recorded {
-            return Account::from_row(&row);
-        }
-        let updated = SubAccount { recorded, ..row };
-        self.ledger.upsert_sub_account(&updated)?;
-        Account::from_row(&updated)
+        self.ledger.registry_transaction(|conn| {
+            if !recorded && registry_managed_on(conn, &address.to_string())? {
+                return Err(AccountsError::UseRegistryJournal(address));
+            }
+            let row = Self::row(conn, address)?;
+            if !row.active {
+                return Err(AccountsError::Retired(address));
+            }
+            if !recorded && row.provisioned_by_oppen {
+                return Err(AccountsError::ProvisionedCannotOptOut(address));
+            }
+            if row.recorded == recorded {
+                return Account::from_row(&row);
+            }
+            let updated = SubAccount { recorded, ..row };
+            upsert_sub_account_on(conn, &updated)?;
+            Account::from_row(&updated)
+        })
     }
 
     /// Retire an account: mark it inactive, delete nothing.
@@ -615,33 +606,28 @@ impl<'l> Registry<'l> {
     /// attributed, keeps its `recorded` bit so [`Scope::Recorded`] goes on
     /// polling it, drops out of [`Scope::Live`] and stays in [`Scope::All`].
     ///
-    /// **What this closes, and what it does not.** It closes every route this
-    /// registry hands out: [`Registry::route_for_agent`] answers
-    /// [`AccountsError::Retired`], and it is the only accessor here that yields
-    /// a [`Route`]. It does **not** close the signing path, because the signing
-    /// path does not read this table — `crate::guardrail`'s engine stamps each
-    /// `Clearance` with a `vault_address` from its own `guardrail_vault` copy of
-    /// the binding, written when the agent was registered, and retiring here
-    /// leaves that copy untouched. So an agent retired precisely because the
-    /// operator stopped trusting it can still be cleared and signed for. What
-    /// does stop it today is the kill switch, which the engine checks on every
-    /// decision; what would make this method stop it is the obligation in the
-    /// module doc — the engine resolving the binding through
-    /// [`Registry::route_for_agent`] per decision rather than caching it.
+    /// This retires legacy metadata only, not trading authority. Any address
+    /// with an authenticated grant, including an already retired grant, returns
+    /// [`AccountsError::UseRegistryJournal`] instead of pretending to revoke it.
     ///
     /// Idempotent. There is no un-retire: an operator who retires the wrong
     /// account has lost nothing, and a revival would silently re-arm a route.
     pub fn retire(&self, address: Address) -> Result<Account, AccountsError> {
-        let row = self.row(address)?;
-        if !row.active {
-            return Account::from_row(&row);
-        }
-        let updated = SubAccount {
-            active: false,
-            ..row
-        };
-        self.ledger.upsert_sub_account(&updated)?;
-        Account::from_row(&updated)
+        self.ledger.registry_transaction(|conn| {
+            if registry_managed_on(conn, &address.to_string())? {
+                return Err(AccountsError::UseRegistryJournal(address));
+            }
+            let row = Self::row(conn, address)?;
+            if !row.active {
+                return Account::from_row(&row);
+            }
+            let updated = SubAccount {
+                active: false,
+                ..row
+            };
+            upsert_sub_account_on(conn, &updated)?;
+            Account::from_row(&updated)
+        })
     }
 
     /// Every account in `scope`, ascending by address.
@@ -676,26 +662,14 @@ impl<'l> Registry<'l> {
             .map_or(Classification::ManualExternal, Classification::of))
     }
 
-    /// The route for one agent's orders (D1).
+    /// The non-authoritative route described by the metadata projection.
     ///
-    /// The caller hands over an [`AgentId`] and gets a [`Route`] whose
-    /// [`Route::vault_address`] goes straight into `oppen_hl::ExchangeRequest`,
-    /// following the agent's container kind rather than a call-site guess.
-    ///
-    /// **This is the owning store for the binding.** `docs/decisions.md` R7:
-    /// "oppen's SQLite registry is the only place the agent → container →
-    /// agent-wallet binding lives", because a top-level container is
-    /// undiscoverable and nothing at the venue can rebuild the list. Any other
-    /// copy is a cache, and a cache of this must be resolved from here at the
-    /// moment it is used rather than filled once from its own caller —
-    /// otherwise every refusal below is a refusal the signer never sees.
-    /// `crate::guardrail`'s `guardrail_vault` is such a copy today and does not
-    /// yet do this; the module doc states the obligation in full.
+    /// For roster inspection only. Neither provisioning nor this lookup grants
+    /// trading authority; the engine must use the authenticated journal route.
     ///
     /// Refuses rather than guessing in all three ways it can be uncertain: an
-    /// unknown agent, a retired one, and an agent bound to two accounts. Each of
-    /// them, resolved to a plausible answer, signs an order into an account that
-    /// is not the agent's.
+    /// unknown agent, a retired one, and an agent bound to two accounts. None
+    /// yields a guessed metadata route.
     pub fn route_for_agent(&self, agent: &AgentId) -> Result<Route, AccountsError> {
         let mut live: Option<Account> = None;
         let mut retired: Option<Address> = None;
@@ -748,8 +722,8 @@ impl<'l> Registry<'l> {
     /// Scans the table rather than indexing it: D1's 1:1 mapping over a
     /// human-kept roster means tens of rows, so an index here would be a schema
     /// change for no measurable gain.
-    fn bound_to(&self, owner: &Owner) -> Result<Option<Address>, AccountsError> {
-        for row in self.ledger.sub_accounts()? {
+    fn bound_to(conn: &Connection, owner: &Owner) -> Result<Option<Address>, AccountsError> {
+        for row in sub_accounts_on(conn)? {
             if row.active && owned_by(&row, owner.owner_type, &owner.owner_id) {
                 return Ok(Some(Account::from_row(&row)?.address));
             }
@@ -773,10 +747,8 @@ impl<'l> Registry<'l> {
     /// — after which the agent is [`AccountsError::AmbiguousAgent`] between two
     /// copies of one address. The fix is normalization at the ledger boundary,
     /// where the text is written; doing it here would only move the split.
-    fn row(&self, address: Address) -> Result<SubAccount, AccountsError> {
-        self.ledger
-            .sub_account(&address.to_string())?
-            .ok_or(AccountsError::UnknownAccount(address))
+    fn row(conn: &Connection, address: Address) -> Result<SubAccount, AccountsError> {
+        sub_account_on(conn, &address.to_string())?.ok_or(AccountsError::UnknownAccount(address))
     }
 }
 
@@ -794,6 +766,8 @@ fn owner_label(owner: &Owner) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Barrier};
+
     use tempfile::TempDir;
 
     use super::*;
@@ -825,6 +799,241 @@ mod tests {
             address: address(text),
             name: name.to_owned(),
         }
+    }
+
+    #[test]
+    fn concurrent_provisioning_cannot_bind_one_owner_twice() {
+        let dir = TempDir::new().expect("tempdir");
+        let first = ledger(&dir);
+        let second = ledger(&dir);
+        let barrier = Arc::new(Barrier::new(2));
+        let results = std::thread::scope(|scope| {
+            let spawn = |ledger: Ledger, target: &'static str| {
+                let barrier = barrier.clone();
+                scope.spawn(move || {
+                    barrier.wait();
+                    Registry::new(&ledger).provision(
+                        address(target),
+                        "race",
+                        agent_owner("race"),
+                        1,
+                    )
+                })
+            };
+            let a = spawn(first, AGENT_A);
+            let b = spawn(second, AGENT_B);
+            [
+                a.join().expect("first thread"),
+                b.join().expect("second thread"),
+            ]
+        });
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, Err(AccountsError::OwnerAlreadyBound { .. })))
+                .count(),
+            1
+        );
+        assert_eq!(ledger(&dir).sub_accounts().expect("rows").len(), 1);
+    }
+
+    #[test]
+    fn concurrent_observation_and_retirement_preserve_both_changes() {
+        let dir = TempDir::new().expect("tempdir");
+        let first = ledger(&dir);
+        Registry::new(&first)
+            .observe(&[discovered(AGENT_A, "before")], 1)
+            .expect("observe");
+        Registry::new(&first)
+            .opt_in(address(AGENT_A))
+            .expect("opt in");
+        let second = ledger(&dir);
+        let barrier = Barrier::new(2);
+        std::thread::scope(|scope| {
+            let observe = scope.spawn(|| {
+                barrier.wait();
+                Registry::new(&first)
+                    .observe(&[discovered(AGENT_A, "after")], 2)
+                    .expect("rename");
+            });
+            let retire = scope.spawn(|| {
+                barrier.wait();
+                Registry::new(&second)
+                    .retire(address(AGENT_A))
+                    .expect("retire");
+            });
+            observe.join().expect("observe thread");
+            retire.join().expect("retire thread");
+        });
+        let row = first.sub_account(AGENT_A).expect("read").expect("row");
+        assert!(!row.active);
+        assert!(row.recorded);
+        assert_eq!(row.name, "after");
+        assert_eq!(row.created_ts_ms, 1);
+        Registry::new(&first)
+            .observe(&[discovered(AGENT_A, "later")], 3)
+            .expect("late observation");
+        assert!(
+            !first
+                .sub_account(AGENT_A)
+                .expect("read")
+                .expect("row")
+                .active
+        );
+    }
+
+    #[test]
+    fn recording_changes_racing_retirement_never_reactivate_metadata() {
+        for recorded in [false, true] {
+            let dir = TempDir::new().expect("tempdir");
+            let first = ledger(&dir);
+            let registry = Registry::new(&first);
+            registry
+                .observe(&[discovered(AGENT_A, "legacy")], 1)
+                .expect("observe");
+            if !recorded {
+                registry
+                    .opt_in(address(AGENT_A))
+                    .expect("initial recording");
+            }
+            let second = ledger(&dir);
+            let barrier = Barrier::new(2);
+            let change = std::thread::scope(|scope| {
+                let change = scope.spawn(|| {
+                    barrier.wait();
+                    if recorded {
+                        Registry::new(&first).opt_in(address(AGENT_A))
+                    } else {
+                        Registry::new(&first).opt_out(address(AGENT_A))
+                    }
+                });
+                let retire = scope.spawn(|| {
+                    barrier.wait();
+                    Registry::new(&second)
+                        .retire(address(AGENT_A))
+                        .expect("retire");
+                });
+                let result = change.join().expect("recording thread");
+                retire.join().expect("retirement thread");
+                result
+            });
+            let row = first.sub_account(AGENT_A).expect("read").expect("row");
+            assert!(!row.active);
+            match change {
+                Ok(_) => assert_eq!(row.recorded, recorded),
+                Err(AccountsError::Retired(found)) => {
+                    assert_eq!(found, address(AGENT_A));
+                    assert_eq!(row.recorded, !recorded);
+                }
+                Err(error) => panic!("unexpected recording failure: {error}"),
+            }
+        }
+    }
+
+    #[test]
+    fn failed_discovery_sweep_rolls_back_earlier_renames() {
+        let dir = TempDir::new().expect("tempdir");
+        let ledger = ledger(&dir);
+        let registry = Registry::new(&ledger);
+        registry
+            .observe(&[discovered(AGENT_A, "before")], 1)
+            .expect("observe");
+        ledger
+            .registry_transaction(|conn| {
+                conn.execute_batch(
+                    "CREATE TRIGGER reject_discovery BEFORE INSERT ON sub_accounts
+                 WHEN NEW.name = 'reject' BEGIN SELECT RAISE(ABORT, 'injected'); END;",
+                )
+                .map_err(LedgerError::from)?;
+                Ok(())
+            })
+            .expect("failure fixture");
+        assert!(
+            registry
+                .observe(
+                    &[discovered(AGENT_A, "after"), discovered(AGENT_B, "reject")],
+                    2
+                )
+                .is_err()
+        );
+        let rows = ledger.sub_accounts().expect("rows");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "before");
+        assert_eq!(rows[0].created_ts_ms, 1);
+    }
+
+    #[test]
+    fn authenticated_lifecycle_and_recording_cannot_be_changed_as_metadata() {
+        use crate::keys::{AgentWallet, HmacKey};
+        use crate::ledger::{RegistryBinding, RegistryJournal};
+
+        let dir = TempDir::new().expect("tempdir");
+        let ledger = Arc::new(ledger(&dir));
+        let registry = Registry::new(&ledger);
+        let journal = RegistryJournal::open(ledger.clone(), Arc::new(HmacKey::from_bytes([7; 32])))
+            .expect("journal");
+        let route = journal
+            .grant(
+                RegistryBinding {
+                    agent: AgentId::new("carry"),
+                    container: address(AGENT_A),
+                    vault_address: None,
+                    wallet: AgentWallet {
+                        generation: 0,
+                        address: address(STRANGER),
+                        approved_at_ms: 1,
+                        valid_until_ms: 10_000,
+                    },
+                },
+                2,
+            )
+            .expect("grant");
+        for retired in [false, true] {
+            if retired {
+                assert!(journal.retire(&route, 3).expect("authorized retirement"));
+            }
+            for result in [
+                registry.retire(address(AGENT_A)),
+                registry.opt_out(address(AGENT_A)),
+            ] {
+                assert!(
+                    matches!(result, Err(AccountsError::UseRegistryJournal(found))
+                    if found == address(AGENT_A))
+                );
+            }
+            registry
+                .observe(&[discovered(AGENT_A, "observed")], 4)
+                .expect("rename");
+            let row = ledger
+                .sub_account(AGENT_A)
+                .expect("read")
+                .expect("projection");
+            assert_eq!(row.active, !retired);
+            assert!(row.recorded);
+            assert_eq!(row.name, "observed");
+            let mut changed = row.clone();
+            changed.recorded = false;
+            assert!(ledger.upsert_sub_account(&changed).is_err());
+            changed = row.clone();
+            changed.owner = Some(agent_owner("replacement"));
+            assert!(ledger.upsert_sub_account(&changed).is_err());
+            changed = row.clone();
+            changed.active = !row.active;
+            assert!(ledger.upsert_sub_account(&changed).is_err());
+            assert_eq!(
+                ledger.sub_account(AGENT_A).expect("read").expect("row"),
+                row
+            );
+        }
+        assert!(
+            registry
+                .list(Scope::Recorded)
+                .expect("recorded")
+                .iter()
+                .any(|account| account.address == address(AGENT_A))
+        );
+        assert!(ledger.verify().expect("chain").first_break.is_none());
     }
 
     /// The stored row at `address`, retired ones included.
@@ -1368,16 +1577,17 @@ mod tests {
         let ledger = ledger(&dir);
         let registry = Registry::new(&ledger);
         ledger
-            .upsert_sub_account(&SubAccount {
-                address: "not-an-address".to_owned(),
-                name: "hand edited".to_owned(),
-                owner: None,
-                recorded: false,
-                provisioned_by_oppen: false,
-                active: true,
-                created_ts_ms: 1,
+            .registry_transaction(|conn| {
+                // Simulate disk corruption, bypassing the validated public writer.
+                conn.execute(
+                    "INSERT INTO sub_accounts (address, name, created_ts_ms)
+                     VALUES ('not-an-address', 'hand edited', 1)",
+                    [],
+                )
+                .map_err(LedgerError::from)?;
+                Ok(())
             })
-            .expect("upsert");
+            .expect("corrupt stored row fixture");
         assert!(matches!(
             registry.list(Scope::All),
             Err(AccountsError::MalformedAddress { .. })
