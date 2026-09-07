@@ -4,6 +4,7 @@ import AppHeader from "./components/shell/AppHeader.vue";
 import AppStatusBar from "./components/shell/AppStatusBar.vue";
 import { isOpen as tourOpen } from "./stores/tour";
 import PilotStatusBanner from "./components/shell/PilotStatusBanner.vue";
+import DesktopRuntimeBanner from "./components/shell/DesktopRuntimeBanner.vue";
 import TourSpotlight from "./components/tour/TourSpotlight.vue";
 import {
   refreshKeychain,
@@ -15,6 +16,7 @@ import {
 import { startMarketFeed, stopMarketFeed } from "./stores/market";
 import { startOperatorPolling, stopOperatorPolling } from "./stores/operator";
 import { startPilotPolling, stopPilotPolling } from "./stores/pilot";
+import { startRuntimePolling, stopRuntimePolling } from "./stores/runtime";
 import AgentsView from "./views/AgentsView.vue";
 import BuilderView from "./views/BuilderView.vue";
 import OnboardingView from "./views/OnboardingView.vue";
@@ -37,6 +39,7 @@ onMounted(() => {
   startAccountPolling();
   startOperatorPolling();
   startPilotPolling();
+  startRuntimePolling();
   // The socket, the rail poll and the staleness clock (items 31, 34). Started
   // here rather than in TradeView: the status bar reads the feed from every
   // view, so it must not stop when the operator opens Agents.
@@ -48,6 +51,7 @@ onUnmounted(() => {
   stopAccountPolling();
   stopOperatorPolling();
   stopPilotPolling();
+  stopRuntimePolling();
   stopMarketFeed();
 });
 </script>
@@ -56,6 +60,7 @@ onUnmounted(() => {
   <div class="app">
     <AppHeader :inert="tourOpen" />
     <PilotStatusBanner :inert="tourOpen" />
+    <DesktopRuntimeBanner :inert="tourOpen" />
     <main class="app__main" :inert="tourOpen">
       <component :is="current" />
     </main>

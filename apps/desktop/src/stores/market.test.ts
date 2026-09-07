@@ -12,7 +12,9 @@
  * runs unchanged under `bun test` and keeps `vue-tsc --noEmit` green.
  */
 
-import { foldForming, foldTrade, mergeTop, parseBar } from "./market";
+import { reactive } from "vue";
+import type { FeedBinding, FeedEnvelope, FeedUpdate } from "../lib/bridge";
+import { createMarketFeed, foldForming, foldTrade, mergeTop, parseBar } from "./market";
 
 interface Assertions {
   toBe(expected: unknown): void;
@@ -24,7 +26,7 @@ interface Matchers extends Assertions {
 }
 
 declare const describe: (name: string, body: () => void) => void;
-declare const it: (name: string, body: () => void) => void;
+declare const it: (name: string, body: () => void | Promise<void>) => void;
 declare const expect: (actual: unknown) => Matchers;
 
 const GOOD = {
@@ -35,6 +37,247 @@ const GOOD = {
   close: "101.75",
   volume: "7.5",
 };
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<T>((yes, no) => { resolve = yes; reject = no; });
+  return { promise, resolve, reject };
+}
+
+async function settle(): Promise<void> {
+  for (let step = 0; step < 8; step += 1) await Promise.resolve();
+}
+
+function feedFixture() {
+  const scope = reactive({ network: "testnet" as FeedBinding["network"], coin: "BTC", interval: "1h" });
+  const calls: Array<{ network: FeedBinding["network"]; coin: string; interval: string; reply: ReturnType<typeof deferred<FeedBinding>> }> = [];
+  const listeners: Array<{ emit: (event: FeedEnvelope) => void; ready: ReturnType<typeof deferred<() => void>>; cleaned: number }> = [];
+  const updates: FeedUpdate[] = [];
+  const failures: Array<string | undefined> = [];
+  let healthy = false;
+  let error: string | null = null;
+  const controller = createMarketFeed(
+    () => ({ ...scope }),
+    {
+      watch: (network, coin, interval) => {
+        const reply = deferred<FeedBinding>();
+        calls.push({ network, coin, interval, reply });
+        return reply.promise;
+      },
+      listen: (emit) => {
+        const ready = deferred<() => void>();
+        listeners.push({ emit, ready, cleaned: 0 });
+        return ready.promise;
+      },
+    },
+    {
+      invalidate: () => { healthy = false; },
+      failure: () => { healthy = false; },
+      error: (detail) => { error = detail; },
+      update: (update, failure) => {
+        healthy = failure === undefined && (update.kind !== "status" || update.connected);
+        updates.push(update);
+        failures.push(failure);
+      },
+    },
+  );
+  function listen(index: number): void {
+    const listener = listeners[index]!;
+    listener.ready.resolve(() => { listener.cleaned += 1; });
+  }
+  function emit(generation: string, network: FeedBinding["network"] = "testnet", index = 0, update: FeedUpdate = { kind: "status", connected: true }): void {
+    listeners[index]!.emit({ network, generation, update });
+  }
+  return { scope, calls, listeners, updates, failures, controller, listen, emit, get healthy() { return healthy; }, get error() { return error; } };
+}
+
+describe("scoped market feed ownership", () => {
+  it("keeps the first owner failure through later payloads and same-owner watches until a new binding", async () => {
+    const f = feedFixture();
+    try {
+      const started = f.controller.start();
+      f.listen(0);
+      await started;
+      f.calls[0]!.reply.resolve({ network: "testnet", generation: "9007199254740993" });
+      await settle();
+      const payload: FeedUpdate = { kind: "book", coin: "BTC", at_ms: 100, bids: [], asks: [] };
+      f.listeners[0]!.emit({ network: "testnet", generation: "9007199254740993", update: payload, failure: "ledger append failed" });
+      expect(f.updates[0]).toEqual(payload);
+      expect(f.healthy).toBe(false);
+      f.emit("9007199254740993", "testnet", 0, payload);
+      f.emit("9007199254740993");
+      f.listeners[0]!.emit({ network: "testnet", generation: "9007199254740993", update: payload, failure: "later failure" });
+      expect(f.failures).toEqual(Array(4).fill("ledger append failed"));
+      expect(f.healthy).toBe(false);
+      f.scope.interval = "5m";
+      f.calls[1]!.reply.resolve({ network: "testnet", generation: "9007199254740993" });
+      await settle();
+      f.emit("9007199254740993");
+      expect(f.healthy).toBe(false);
+      expect(f.failures[4]).toBe("ledger append failed");
+      f.scope.network = "mainnet";
+      f.calls[2]!.reply.resolve({ network: "mainnet", generation: "9007199254740994" });
+      await settle();
+      expect(f.healthy).toBe(false);
+      f.emit("9007199254740994", "mainnet");
+      expect(f.healthy).toBe(true);
+      expect(f.failures[5]).toBe(undefined);
+    } finally { f.controller.stop(); }
+  });
+
+  it("serializes A-B-A and coalesces to the latest symbol and interval without accepting the first A", async () => {
+    const f = feedFixture();
+    try {
+      const started = f.controller.start();
+      f.listen(0);
+      await started;
+      f.scope.network = "mainnet";
+      f.scope.network = "testnet";
+      f.scope.coin = "ETH";
+      f.scope.coin = "SOL";
+      f.scope.interval = "5m";
+      expect(f.calls.length).toBe(1);
+      f.calls[0]!.reply.resolve({ network: "testnet", generation: "1" });
+      await settle();
+      expect(f.calls.length).toBe(2);
+      expect([f.calls[1]!.network, f.calls[1]!.coin, f.calls[1]!.interval]).toEqual(["testnet", "SOL", "5m"]);
+      f.emit("1");
+      expect(f.healthy).toBe(false);
+      // The intermediate network never reached IPC, so the owner may be reused.
+      f.calls[1]!.reply.resolve({ network: "testnet", generation: "1" });
+      await settle();
+      expect(f.healthy).toBe(false);
+      f.emit("0");
+      f.emit("1", "mainnet");
+      f.emit("1", "testnet", 0, { kind: "book", coin: "BTC", at_ms: 100, bids: [], asks: [] });
+      expect(f.updates.length).toBe(0);
+      f.emit("1");
+      expect(f.healthy).toBe(true);
+      expect(f.updates.length).toBe(1);
+    } finally { f.controller.stop(); }
+  });
+
+  it("discards off-selection payloads without discarding an accepted owner's failure", async () => {
+    const f = feedFixture();
+    try {
+      const started = f.controller.start();
+      f.listen(0);
+      await started;
+      f.calls[0]!.reply.resolve({ network: "testnet", generation: "50" });
+      await settle();
+      f.emit("50");
+      expect(f.healthy).toBe(true);
+      f.listeners[0]!.emit({
+        network: "testnet", generation: "50", failure: "owner ledger failed",
+        update: { kind: "book", coin: "ETH", at_ms: 100, bids: [], asks: [] },
+      });
+      expect(f.updates.length).toBe(1);
+      expect(f.healthy).toBe(false);
+      f.emit("50");
+      expect(f.failures[1]).toBe("owner ledger failed");
+      expect(f.healthy).toBe(false);
+    } finally { f.controller.stop(); }
+  });
+
+  it("invalidates synchronously and refuses old events before the replacement IPC acknowledges", async () => {
+    const f = feedFixture();
+    try {
+      const started = f.controller.start();
+      f.listen(0);
+      await started;
+      f.calls[0]!.reply.resolve({ network: "testnet", generation: "10" });
+      await settle();
+      f.emit("10");
+      expect(f.healthy).toBe(true);
+      f.scope.network = "mainnet";
+      expect(f.healthy).toBe(false);
+      f.emit("10");
+      expect(f.healthy).toBe(false);
+      f.scope.network = "testnet";
+      f.calls[1]!.reply.resolve({ network: "mainnet", generation: "11" });
+      await settle();
+      expect(f.calls.length).toBe(3);
+      f.calls[2]!.reply.resolve({ network: "testnet", generation: "12" });
+      await settle();
+      f.emit("10");
+      f.emit("11", "mainnet");
+      expect(f.healthy).toBe(false);
+      f.emit("12");
+      expect(f.healthy).toBe(true);
+    } finally { f.controller.stop(); }
+  });
+
+  it("ignores a late failed acknowledgment and validates the current acknowledgment network", async () => {
+    const f = feedFixture();
+    try {
+      const started = f.controller.start();
+      f.listen(0);
+      await started;
+      f.scope.network = "mainnet";
+      f.calls[0]!.reply.reject(new Error("old watch failed"));
+      await settle();
+      expect(f.error).toBe(null);
+      f.calls[1]!.reply.resolve({ network: "testnet", generation: "20" });
+      await settle();
+      expect(f.error).toBe("Error: Market feed acknowledgment does not match the requested scope.");
+      f.emit("20");
+      expect(f.healthy).toBe(false);
+      const retry = f.controller.request();
+      f.calls[2]!.reply.resolve({ network: "mainnet", generation: "21" });
+      await retry;
+      expect(f.error).toBe(null);
+      expect(f.healthy).toBe(false);
+      f.emit("21", "mainnet");
+      expect(f.healthy).toBe(true);
+    } finally { f.controller.stop(); }
+  });
+
+  it("cleans up a late listener after remount while retaining the actual outstanding watch", async () => {
+    const f = feedFixture();
+    try {
+      const oldStart = f.controller.start();
+      f.controller.stop();
+      f.scope.network = "mainnet";
+      const newStart = f.controller.start();
+      expect(f.calls.length).toBe(1);
+      f.listen(0);
+      await oldStart;
+      expect(f.listeners[0]!.cleaned).toBe(1);
+      f.listen(1);
+      await newStart;
+      f.calls[0]!.reply.reject(new Error("stopped watch"));
+      await settle();
+      expect(f.calls.length).toBe(2);
+      expect(f.calls[1]!.network).toBe("mainnet");
+      expect(f.error).toBe(null);
+      f.calls[1]!.reply.resolve({ network: "mainnet", generation: "31" });
+      await settle();
+      f.emit("31", "mainnet", 0);
+      expect(f.healthy).toBe(false);
+      f.emit("31", "mainnet", 1);
+      expect(f.healthy).toBe(true);
+      f.controller.stop();
+      expect(f.listeners[1]!.cleaned).toBe(1);
+      f.emit("31", "mainnet", 1);
+      expect(f.healthy).toBe(false);
+    } finally { f.controller.stop(); }
+  });
+
+  it("drops stopped pending desires and ignores late listener failure", async () => {
+    const f = feedFixture();
+    const started = f.controller.start();
+    f.scope.network = "mainnet";
+    f.controller.stop();
+    f.listeners[0]!.ready.reject(new Error("stopped listener"));
+    await started;
+    f.calls[0]!.reply.resolve({ network: "testnet", generation: "40" });
+    await settle();
+    expect(f.calls.length).toBe(1);
+    expect(f.error).toBe(null);
+    expect(f.healthy).toBe(false);
+  });
+});
 
 describe("parseBar", () => {
   it("carries every field across, timestamp included", () => {

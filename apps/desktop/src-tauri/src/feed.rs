@@ -21,7 +21,7 @@
 //! will need the pump's `reconciled` flag too, and that is the point to move
 //! this onto the pump rather than now.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use oppen_core::feed::FeedSession;
@@ -31,6 +31,8 @@ use oppen_hl::Network;
 use oppen_hl::types::Level;
 use oppen_hl::ws::{Subscription, WsEvent, WsPool, WsPoolConfig};
 use tauri::{AppHandle, Emitter, Manager};
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 
 /// The single channel the console listens on.
 ///
@@ -39,6 +41,31 @@ use tauri::{AppHandle, Emitter, Manager};
 /// silently stopped drawing because a new variant went to a channel nobody
 /// subscribed is the failure this shape rules out.
 const CHANNEL: &str = "feed://update";
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct FeedEnvelope {
+    pub network: Network,
+    pub generation: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure: Option<String>,
+    pub update: FeedUpdate,
+}
+
+impl FeedEnvelope {
+    fn new(
+        network: Network,
+        generation: &str,
+        update: FeedUpdate,
+        failure: &Mutex<Option<String>>,
+    ) -> Self {
+        Self {
+            network,
+            generation: generation.to_owned(),
+            failure: failure_detail(failure),
+            update,
+        }
+    }
+}
 
 /// What the console draws, as it arrives.
 ///
@@ -134,10 +161,13 @@ fn level(from: &Level) -> BookLevel {
 }
 
 /// One network's live feeds, and the subscriptions the console is holding.
-pub struct ConsoleFeed {
+pub(crate) struct ConsoleFeed {
     network: Network,
     session: Arc<FeedSession>,
-    pool: WsPool,
+    pool: Option<WsPool>,
+    event_task: Option<JoinHandle<Result<(), String>>>,
+    failure: Arc<Mutex<Option<String>>>,
+    drained: Option<Result<(), String>>,
     /// What the operator is looking at. Swapped whole on every selection, so
     /// the console never holds a feed for a symbol it stopped drawing.
     watching: Mutex<Vec<Subscription>>,
@@ -149,79 +179,158 @@ impl ConsoleFeed {
     /// The account channels are subscribed only when an account is configured.
     /// Market data does not need one, and a console with no account still has
     /// a chart to draw — item 34's status is about the socket, not the wallet.
-    pub fn start(
+    /// Runtime supplies its immutable resolved directory and owns this local
+    /// blocking startup through completion. A Tokio runtime context is required.
+    pub(crate) fn start(
         app: &AppHandle,
+        dir: &Path,
         network: Network,
+        generation: String,
         account: Option<String>,
     ) -> Result<Self, String> {
-        let dir = data_dir(app)?;
-        std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        let user = account
+            .as_deref()
+            .map(str::parse)
+            .transpose()
+            .map_err(|error| format!("feed account: {error}"))?;
+        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         let ledger = Arc::new(
             Ledger::open_at(&dir.join(oppen_core::db_file_name(network)), network)
                 .map_err(|e| format!("ledger: {e}"))?,
         );
         let session = Arc::new(FeedSession::new());
-        let (pool, mut events) = WsPool::new(WsPoolConfig {
+        let (pool, events) = WsPool::new(WsPoolConfig {
             network,
             ..WsPoolConfig::default()
         })
         .map_err(|e| format!("socket pool: {e}"))?;
 
-        if let Some(user) = account.as_deref().and_then(|a| a.parse().ok()) {
-            // Fills and order transitions, so the activity stream and the
-            // ledger see what the account did while the console was open.
-            let _ = pool.subscribe(Subscription::UserFills { user });
-            let _ = pool.subscribe(Subscription::OrderUpdates { user });
-        }
-
         let handle = app.clone();
         let loop_session = Arc::clone(&session);
         let loop_account = account.unwrap_or_default();
-        tauri::async_runtime::spawn(async move {
-            while let Some(event) = events.recv().await {
-                // The session first: it is what decides, and a payload emitted
-                // before the fold would let the screen lead the state the
-                // guardrails read.
-                //
-                // The error is surfaced, never discarded. `FeedSession::apply`
-                // reports a fill it could not write precisely so the caller can
-                // decide, and the ledger is append-only and hash-chained
-                // (invariant 7): a row that did not land is a chain missing a
-                // fill, and an operator watching a console that says nothing
-                // would go on trading against a position oppen has mis-stated.
-                // The console cannot mark the session unreconciled itself —
-                // that is the pump's — so the least it must do is say so.
-                if let Err(error) = loop_session.apply(&ledger, &loop_account, &event, now_ms()) {
-                    let _ = handle.emit(
-                        CHANNEL,
-                        FeedUpdate::Status {
-                            last_tick_ms: loop_session.state().last_tick_ms,
-                            connected: true,
-                            detail: Some(format!("a fill could not be recorded: {error}")),
-                        },
-                    );
-                }
-                if let Some(update) = translate(&event, loop_session.state().last_tick_ms) {
-                    let _ = handle.emit(CHANNEL, update);
+        let failure = Arc::new(Mutex::new(None));
+        let loop_failure = failure.clone();
+        let event_task = spawn_event_consumer(events, failure.clone(), move |event| {
+            // One blocking consumer preserves application order and owns every
+            // ledger write through completion, without occupying an async worker.
+            let apply_error = loop_session
+                .apply(&ledger, &loop_account, &event, now_ms())
+                .err()
+                .map(|error| format!("feed ledger application failed: {error}"));
+            if let Some(error) = &apply_error {
+                remember_failure(&loop_failure, error.clone());
+            }
+            let last_tick_ms = loop_session.state().last_tick_ms;
+            let mut update = translate(&event, last_tick_ms);
+            if let Some(error) = failure_detail(&loop_failure) {
+                match &mut update {
+                    Some(FeedUpdate::Status { detail, .. }) => {
+                        *detail = Some(match detail.take() {
+                            Some(status) => format!("{error}; {status}"),
+                            None => error,
+                        });
+                    }
+                    _ if apply_error.is_some() => {
+                        handle
+                            .emit(
+                                CHANNEL,
+                                FeedEnvelope::new(
+                                    network,
+                                    &generation,
+                                    FeedUpdate::Status {
+                                        last_tick_ms,
+                                        connected: false,
+                                        detail: Some(error),
+                                    },
+                                    &loop_failure,
+                                ),
+                            )
+                            .map_err(|error| format!("feed event emission failed: {error}"))?;
+                    }
+                    _ => {}
                 }
             }
+            if let Some(update) = update {
+                handle
+                    .emit(
+                        CHANNEL,
+                        FeedEnvelope::new(network, &generation, update, &loop_failure),
+                    )
+                    .map_err(|error| format!("feed event emission failed: {error}"))?;
+            }
+            apply_error.map_or(Ok(()), Err)
         });
-
-        Ok(ConsoleFeed {
+        // Nothing below can return an ownerless construction error. Partial
+        // subscriptions are retained as degraded work and drained by Runtime.
+        if let Some(user) = user {
+            for sub in [
+                Subscription::UserFills { user },
+                Subscription::OrderUpdates { user },
+            ] {
+                if let Err(error) = pool.subscribe(sub) {
+                    remember_failure(&failure, format!("feed subscription failed: {error}"));
+                }
+            }
+        }
+        Ok(Self {
             network,
             session,
-            pool,
+            pool: Some(pool),
+            event_task: Some(event_task),
+            failure,
+            drained: None,
             watching: Mutex::new(Vec::new()),
         })
     }
 
+    /// Cancellation-safe while Runtime retains this object. Pool shutdown can
+    /// discard an in-flight frame; this drains queued events, not venue history.
+    /// A later connection still needs reconciliation before trading.
+    pub(crate) async fn shutdown_and_drain(&mut self) -> Result<(), String> {
+        if let Some(result) = &self.drained {
+            return result.clone();
+        }
+        if let Some(pool) = &self.pool
+            && let Err(error) = pool.shutdown_and_drain().await
+        {
+            remember_failure(&self.failure, format!("socket drain failed: {error}"));
+        }
+        // The consumer must remain alive through socket drain. Dropping this
+        // final sender now lets it finish the queue and then observe EOF.
+        drop(self.pool.take());
+        if let Some(task) = &mut self.event_task {
+            match task.await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => remember_failure(&self.failure, error),
+                Err(error) => {
+                    remember_failure(&self.failure, format!("feed event task failed: {error}"))
+                }
+            }
+        }
+        self.event_task = None;
+        let result = self.failure().map_or(Ok(()), Err);
+        self.drained = Some(result.clone());
+        result
+    }
+
+    pub(crate) fn failure(&self) -> Option<String> {
+        failure_detail(&self.failure).or_else(|| {
+            (self.pool.is_some()
+                && self
+                    .event_task
+                    .as_ref()
+                    .is_some_and(JoinHandle::is_finished))
+            .then(|| "feed event task terminated before shutdown".to_owned())
+        })
+    }
+
     /// Whether this feed already serves the network being asked about.
-    pub fn serves(&self, network: Network) -> bool {
+    pub(crate) fn serves(&self, network: Network) -> bool {
         self.network == network
     }
 
     /// The freshness `account_state` reports (item 34).
-    pub fn last_tick_ms(&self) -> Option<u64> {
+    pub(crate) fn last_tick_ms(&self) -> Option<u64> {
         self.session.state().last_tick_ms
     }
 
@@ -234,7 +343,8 @@ impl ConsoleFeed {
     /// venue's own aggregation. Everything held for the previous symbol is given
     /// back in the same pass — a console that accumulated subscriptions as the
     /// operator browsed would walk into the venue's per-IP ceiling.
-    pub fn watch(&self, coin: &str, interval: &str) -> Result<(), String> {
+    pub(crate) fn watch(&self, coin: &str, interval: &str) -> Result<(), String> {
+        let pool = self.pool.as_ref().ok_or("feed is stopping")?;
         let wanted = vec![
             Subscription::ActiveAssetCtx { coin: coin.into() },
             Subscription::Bbo { coin: coin.into() },
@@ -255,10 +365,11 @@ impl ConsoleFeed {
             if held.contains(sub) {
                 continue;
             }
-            match self.pool.subscribe(sub.clone()) {
+            match pool.subscribe(sub.clone()) {
                 Ok(()) => held.push(sub.clone()),
                 Err(error) => {
                     refused = Some(format!("{}: {error}", sub.key()));
+                    remember_failure(&self.failure, format!("feed subscription failed: {error}"));
                     break;
                 }
             }
@@ -271,7 +382,9 @@ impl ConsoleFeed {
             if wanted.contains(sub) {
                 return true;
             }
-            let _ = self.pool.unsubscribe(sub);
+            if let Err(error) = pool.unsubscribe(sub) {
+                remember_failure(&self.failure, format!("feed unsubscribe failed: {error}"));
+            }
             false
         });
         match refused {
@@ -279,6 +392,35 @@ impl ConsoleFeed {
             None => Ok(()),
         }
     }
+}
+
+fn failure_detail(failure: &Mutex<Option<String>>) -> Option<String> {
+    failure
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
+fn remember_failure(failure: &Mutex<Option<String>>, error: String) {
+    failure
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get_or_insert(error);
+}
+
+fn spawn_event_consumer(
+    mut events: mpsc::Receiver<WsEvent>,
+    failure: Arc<Mutex<Option<String>>>,
+    mut apply: impl FnMut(WsEvent) -> Result<(), String> + Send + 'static,
+) -> JoinHandle<Result<(), String>> {
+    tokio::task::spawn_blocking(move || {
+        while let Some(event) = events.blocking_recv() {
+            if let Err(error) = apply(event) {
+                remember_failure(&failure, error);
+            }
+        }
+        failure_detail(&failure).map_or(Ok(()), Err)
+    })
 }
 
 /// Where the ledger lives.
@@ -407,6 +549,194 @@ fn now_ms() -> u64 {
 mod tests {
     use super::*;
     use oppen_hl::types::{AssetCtx, Candle, L2Book};
+
+    fn owned_test_feed(
+        pool: Option<WsPool>,
+        event_task: JoinHandle<Result<(), String>>,
+        failure: Arc<Mutex<Option<String>>>,
+    ) -> ConsoleFeed {
+        ConsoleFeed {
+            network: Network::Testnet,
+            session: Arc::new(FeedSession::new()),
+            pool,
+            event_task: Some(event_task),
+            failure,
+            drained: None,
+            watching: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn tick(at_ms: u64) -> WsEvent {
+        WsEvent::Bbo {
+            coin: "BTC".into(),
+            venue_time_ms: at_ms,
+            bid: None,
+            ask: None,
+        }
+    }
+
+    #[test]
+    fn envelope_preserves_update_and_distinguishes_return_to_same_network() {
+        let envelope = |generation: &str| FeedEnvelope {
+            network: Network::Testnet,
+            generation: generation.to_owned(),
+            failure: None,
+            update: translate(&tick(7), Some(7)).unwrap(),
+        };
+        let first = serde_json::to_value(envelope("1")).unwrap();
+        let returned = serde_json::to_value(envelope("3")).unwrap();
+        assert_eq!(first["network"], serde_json::json!(Network::Testnet));
+        assert_ne!(first["generation"], returned["generation"]);
+        assert_eq!(first["update"], returned["update"]);
+        assert_eq!(first["update"]["kind"], "bbo");
+        assert_eq!(first["update"]["at_ms"], 7);
+        assert!(first.get("failure").is_none());
+    }
+
+    #[test]
+    fn envelope_failure_is_latched_work_failure_not_normal_disconnect() {
+        let failure = Mutex::new(None);
+        let status = || FeedUpdate::Status {
+            last_tick_ms: Some(7),
+            connected: false,
+            detail: Some("normal socket disconnect".into()),
+        };
+        let normal =
+            serde_json::to_value(FeedEnvelope::new(Network::Testnet, "1", status(), &failure))
+                .unwrap();
+        assert!(normal.get("failure").is_none());
+        remember_failure(&failure, "synthetic ledger write failure".into());
+        let degraded =
+            serde_json::to_value(FeedEnvelope::new(Network::Testnet, "1", status(), &failure))
+                .unwrap();
+        assert_eq!(degraded["failure"], "synthetic ledger write failure");
+        assert_eq!(degraded["update"], normal["update"]);
+    }
+
+    #[tokio::test]
+    async fn drain_drops_pool_sender_then_joins_consumer_and_is_repeatable() {
+        // An unsubscribed pool starts no connection and needs no venue.
+        let (pool, events) = WsPool::new(WsPoolConfig::default()).unwrap();
+        let failure = Arc::new(Mutex::new(None));
+        let task = spawn_event_consumer(events, failure.clone(), |_| Ok(()));
+        let mut feed = owned_test_feed(Some(pool), task, failure);
+        assert!(feed.serves(Network::Testnet));
+        tokio::time::timeout(std::time::Duration::from_secs(2), feed.shutdown_and_drain())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(feed.event_task.is_none());
+        assert!(feed.pool.is_none());
+        assert!(feed.failure().is_none());
+        assert!(feed.watch("BTC", "1m").is_err());
+        feed.shutdown_and_drain().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dropped_drain_waiter_retains_blocking_work_and_queue_order() {
+        let (tx, events) = mpsc::channel(4);
+        let (started, started_rx) = tokio::sync::oneshot::channel();
+        let mut started = Some(started);
+        let (release, gate) = std::sync::mpsc::channel();
+        let applied = Arc::new(Mutex::new(Vec::new()));
+        let observed = applied.clone();
+        let failure = Arc::new(Mutex::new(None));
+        let task = spawn_event_consumer(events, failure.clone(), move |event| {
+            let WsEvent::Bbo { venue_time_ms, .. } = event else {
+                unreachable!()
+            };
+            if let Some(started) = started.take() {
+                started.send(()).unwrap();
+                gate.recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+            }
+            observed.lock().unwrap().push(venue_time_ms);
+            Ok(())
+        });
+        let mut feed = owned_test_feed(None, task, failure);
+        tx.send(tick(1)).await.unwrap();
+        tx.send(tick(2)).await.unwrap();
+        drop(tx);
+        started_rx.await.unwrap();
+        // A current-thread runtime still runs this timer while the fold blocks.
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(20),
+                feed.shutdown_and_drain()
+            )
+            .await
+            .is_err()
+        );
+        assert!(feed.event_task.is_some());
+        assert!(feed.drained.is_none());
+        assert!(applied.lock().unwrap().is_empty());
+        release.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), feed.shutdown_and_drain())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(*applied.lock().unwrap(), vec![1, 2]);
+        assert!(feed.event_task.is_none());
+    }
+
+    #[tokio::test]
+    async fn application_failure_remains_degraded_but_does_not_discard_queue() {
+        let (tx, events) = mpsc::channel(4);
+        let failure = Arc::new(Mutex::new(None));
+        let applied = Arc::new(Mutex::new(Vec::new()));
+        let observed = applied.clone();
+        let envelopes = Arc::new(Mutex::new(Vec::new()));
+        let emitted = envelopes.clone();
+        let loop_failure = failure.clone();
+        let task = spawn_event_consumer(events, failure.clone(), move |event| {
+            emitted.lock().unwrap().push(FeedEnvelope::new(
+                Network::Testnet,
+                "1",
+                translate(&event, None).unwrap(),
+                &loop_failure,
+            ));
+            let WsEvent::Bbo { venue_time_ms, .. } = event else {
+                unreachable!()
+            };
+            observed.lock().unwrap().push(venue_time_ms);
+            if venue_time_ms == 1 {
+                Err("synthetic ledger write failure".into())
+            } else {
+                Ok(())
+            }
+        });
+        let mut feed = owned_test_feed(None, task, failure);
+        tx.send(tick(1)).await.unwrap();
+        tx.send(tick(2)).await.unwrap();
+        drop(tx);
+        let first = feed.shutdown_and_drain().await.unwrap_err();
+        assert!(first.contains("ledger write failure"));
+        assert_eq!(feed.failure(), Some(first.clone()));
+        assert_eq!(feed.shutdown_and_drain().await.unwrap_err(), first);
+        assert_eq!(*applied.lock().unwrap(), vec![1, 2]);
+        let envelopes = envelopes.lock().unwrap();
+        assert!(envelopes[0].failure.is_none());
+        let later = serde_json::to_value(&envelopes[1]).unwrap();
+        assert_eq!(later["update"]["kind"], "bbo");
+        assert_eq!(later["failure"], "synthetic ledger write failure");
+        assert!(feed.event_task.is_none());
+    }
+
+    #[tokio::test]
+    async fn consumer_panic_is_a_factual_drain_failure_not_stopped_success() {
+        let (tx, events) = mpsc::channel(1);
+        let failure = Arc::new(Mutex::new(None));
+        let task = spawn_event_consumer(events, failure.clone(), |_| {
+            panic!("synthetic consumer panic")
+        });
+        let mut feed = owned_test_feed(None, task, failure);
+        tx.send(tick(1)).await.unwrap();
+        drop(tx);
+        let error = feed.shutdown_and_drain().await.unwrap_err();
+        assert!(error.contains("feed event task failed"));
+        assert_eq!(feed.shutdown_and_drain().await.unwrap_err(), error);
+        assert!(feed.event_task.is_none());
+    }
 
     fn ctx() -> AssetCtx {
         serde_json::from_value(serde_json::json!({

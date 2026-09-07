@@ -7,17 +7,20 @@
 //! the operator and the agent cannot be shown different accounts (A3).
 
 mod feed;
+mod local_reads;
+mod runtime;
 mod updates;
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use feed::ConsoleFeed;
+use local_reads::ReadKind;
 use oppen_core::candles::Interval;
 use oppen_core::keys::{KeyStore, KeychainKeyStore};
 use oppen_core::ledger::{EventViews, Ledger, PilotStatus};
 use oppen_core::market::{ChartSeries, MarketRow, MarketSnapshot, chart, rows, snapshot};
 use oppen_core::state::{AccountState, VenueReadings, assemble};
 use oppen_hl::{Address, InfoClient, Network};
+use runtime::{FeedBinding, Runtime, RuntimeError, RuntimeStatus};
 use tauri::{Manager, State};
 
 /// Why the console has nothing to show.
@@ -47,20 +50,26 @@ impl std::fmt::Display for ConsoleError {
     }
 }
 
+impl From<RuntimeError> for ConsoleError {
+    fn from(error: RuntimeError) -> Self {
+        Self::LocalStatus(error.to_string())
+    }
+}
+
 /// The gateway's existing ledger and persisted policy, never a second store.
 #[tauri::command]
 async fn operator_state(
+    runtime: State<'_, Runtime>,
     network: String,
 ) -> Result<oppen_core::operator::OperatorRead, ConsoleError> {
-    let dir = std::env::var_os("OPPEN_DATA_DIR").ok_or_else(|| ConsoleError::NotConfigured(
-        "Gateway data is not configured. Launch the console with OPPEN_DATA_DIR pointing to the gateway's data directory.".into()
-    ))?;
+    let dir = runtime.data_dir().to_owned();
     let network = network_of(&network);
-    tauri::async_runtime::spawn_blocking(move || {
-        oppen_core::operator::read(std::path::Path::new(&dir), network)
-    })
-    .await
-    .map_err(|error| ConsoleError::LocalStatus(error.to_string()))
+    runtime
+        .local_read(network, ReadKind::Operator, move || {
+            oppen_core::operator::read(&dir, network)
+        })?
+        .await
+        .map_err(|error| ConsoleError::LocalStatus(error.to_string()))
 }
 
 /// The configured account.
@@ -82,38 +91,18 @@ fn configured_account(network: Network) -> Result<Address, ConsoleError> {
         .map_err(|e| ConsoleError::NotConfigured(format!("{variable} is not an address: {e}")))
 }
 
-/// ES15: read verified pilot evidence without starting feeds or execution.
-#[derive(Default)]
-struct PilotReads(Arc<tauri::async_runtime::Mutex<()>>);
-
-impl PilotReads {
-    fn spawn<T: Send + 'static>(
-        &self,
-        read: impl FnOnce() -> T + Send + 'static,
-    ) -> Result<tauri::async_runtime::JoinHandle<T>, ConsoleError> {
-        let permit = self.0.clone().try_lock_owned().map_err(|_| {
-            ConsoleError::LocalStatus("A local pilot status read is still in progress.".into())
-        })?;
-        // The blocking closure owns the permit. Dropping the IPC future or
-        // reloading the window must not permit another read to queue behind it.
-        Ok(tauri::async_runtime::spawn_blocking(move || {
-            let _permit = permit;
-            read()
-        }))
-    }
-}
-
 #[tauri::command]
 async fn pilot_status(
-    app: tauri::AppHandle,
-    reads: State<'_, PilotReads>,
+    runtime: State<'_, Runtime>,
     network: String,
 ) -> Result<Option<PilotStatus>, ConsoleError> {
     let network = network_of(&network);
     let account = configured_account(network)?;
-    let dir = feed::data_dir(&app).map_err(ConsoleError::LocalStatus)?;
-    reads
-        .spawn(move || read_pilot_status(&dir, network, account))?
+    let dir = runtime.data_dir().to_owned();
+    runtime
+        .local_read(network, ReadKind::Pilot, move || {
+            read_pilot_status(&dir, network, account)
+        })?
         .await
         .map_err(|e| ConsoleError::LocalStatus(format!("local status task: {e}")))?
 }
@@ -155,22 +144,27 @@ fn read_pilot_status(
 /// that reads a key: the console never needs one, and a command that could is
 /// a command that can be called.
 #[tauri::command]
-async fn keychain_status(network: String) -> KeychainStatus {
-    let store = KeychainKeyStore::new(network_of(&network));
-    match store.reachable() {
-        Ok(()) => KeychainStatus {
-            reachable: true,
-            detail: None,
-        },
-        // The error is shown to the operator, so it is the store's own words:
-        // "the keychain is locked" is actionable where "unreachable" is not.
-        Err(error) => KeychainStatus {
-            reachable: false,
-            detail: Some(error.to_string()),
-        },
-    }
+async fn keychain_status(
+    runtime: State<'_, Runtime>,
+    network: String,
+) -> Result<KeychainStatus, ConsoleError> {
+    let network = network_of(&network);
+    let result = match runtime.local_read(network, ReadKind::Keychain, move || {
+        KeychainKeyStore::new(network)
+            .reachable()
+            .map_err(|error| error.to_string())
+    }) {
+        Ok(task) => task
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|result| result),
+        Err(error) => Err(error.to_string()),
+    };
+    Ok(KeychainStatus {
+        reachable: result.is_ok(),
+        detail: result.err(),
+    })
 }
-
 /// What [`keychain_status`] answers.
 #[derive(Debug, serde::Serialize)]
 struct KeychainStatus {
@@ -193,7 +187,11 @@ fn network_of(network: &str) -> Network {
 /// One read serves the rail *and* the strip above the chart, so selecting a
 /// symbol costs nothing extra for the numbers both already show.
 #[tauri::command]
-async fn markets(network: String) -> Result<Vec<MarketRow>, ConsoleError> {
+async fn markets(
+    runtime: State<'_, Runtime>,
+    network: String,
+) -> Result<Vec<MarketRow>, ConsoleError> {
+    let _read = runtime.read_lease(network_of(&network))?;
     let info =
         InfoClient::new(network_of(&network)).map_err(|e| ConsoleError::Venue(e.to_string()))?;
     let contexts = info
@@ -209,8 +207,13 @@ async fn markets(network: String) -> Result<Vec<MarketRow>, ConsoleError> {
 /// why [`MarketSnapshot::as_of_ms`] exists — this panel ages on its own clock
 /// and has to be able to say so.
 #[tauri::command]
-async fn market_snapshot(network: String, coin: String) -> Result<MarketSnapshot, ConsoleError> {
+async fn market_snapshot(
+    runtime: State<'_, Runtime>,
+    network: String,
+    coin: String,
+) -> Result<MarketSnapshot, ConsoleError> {
     let network = network_of(&network);
+    let _read = runtime.read_lease(network)?;
     let info = InfoClient::new(network).map_err(|e| ConsoleError::Venue(e.to_string()))?;
     let now_ms = now_ms();
 
@@ -256,10 +259,12 @@ const CHART_BARS: u64 = 600;
 /// broke costs the chart and says that instead.
 #[tauri::command]
 async fn chart_series(
+    runtime: State<'_, Runtime>,
     network: String,
     coin: String,
     interval: String,
 ) -> Result<ChartSeries, ConsoleError> {
+    let _read = runtime.read_lease(network_of(&network))?;
     let parsed = Interval::parse(&interval)
         .map_err(|e| ConsoleError::Venue(format!("{interval} is not an interval: {e}")))?;
     let info =
@@ -296,10 +301,11 @@ async fn chart_series(
 /// endpoint that answers it and spot is load-bearing under unified margin.
 #[tauri::command]
 async fn account_state(
-    feeds: State<'_, Feeds>,
+    runtime: State<'_, Runtime>,
     network: String,
 ) -> Result<AccountState, ConsoleError> {
     let network = network_of(&network);
+    let _read = runtime.read_lease(network)?;
     let account = configured_account(network)?;
     let info = InfoClient::new(network).map_err(|e| ConsoleError::Venue(e.to_string()))?;
 
@@ -337,64 +343,37 @@ async fn account_state(
             // first `watch_market` builds the feed, which is the honest answer
             // then: nothing has connected, so there is no last-good value
             // behind the overlay.
-            last_tick_ms: feeds
-                .0
-                .lock()
-                .ok()
-                .and_then(|slot| slot.as_ref().filter(|f| f.serves(network))?.last_tick_ms()),
+            last_tick_ms: runtime.last_tick_ms(network),
         },
     ))
 }
 
-/// The console's live socket, once something has asked for one.
-///
-/// Lazily built and rebuilt on a network switch: the pool is bound to one
-/// network's endpoint, and invariant 5 makes that switch explicit rather than
-/// something a socket can straddle. Dropping the old feed closes its sockets.
-#[derive(Default)]
-struct Feeds(Mutex<Option<ConsoleFeed>>);
-
-/// Point the live feed at the symbol the operator selected (items 31, 34).
-///
-/// Called on selection and on an interval change, and it is what makes the
-/// console real-time: everything the panels draw for the selected symbol
-/// arrives on the socket from here on, and the REST reads beside it are only
-/// the seed and the history a socket cannot supply.
 #[tauri::command]
 async fn watch_market(
     app: tauri::AppHandle,
-    feeds: State<'_, Feeds>,
+    runtime: State<'_, Runtime>,
     network: String,
     coin: String,
     interval: String,
-) -> Result<(), ConsoleError> {
-    // Parsed and re-rendered, exactly as `chart_series` does. The venue takes
-    // the interval as a string and answers an unknown one by refusing the
-    // subscription, which arrives as a feed that silently never delivers — the
-    // chart would then sit still with every other channel healthy, which is
-    // the failure this whole change is about. Canonicalising here also means
-    // `120s` reaches the socket as `2m`, so the streamed bucket width is the
-    // one the chart's REST seed was drawn at.
+) -> Result<FeedBinding, ConsoleError> {
     let interval = Interval::parse(&interval)
-        .map_err(|e| ConsoleError::Venue(format!("{interval} is not an interval: {e}")))?
+        .map_err(|error| ConsoleError::Venue(format!("{interval} is not an interval: {error}")))?
         .to_string();
     let network = network_of(&network);
-    let mut slot = feeds
-        .0
-        .lock()
-        .map_err(|_| ConsoleError::Venue("the feed lock is poisoned".into()))?;
-    if !slot.as_ref().is_some_and(|feed| feed.serves(network)) {
-        // The account is optional: market data needs none, and a console with
-        // no account configured still has a chart to draw.
-        let account = configured_account(network).ok().map(|a| a.to_string());
-        *slot = Some(ConsoleFeed::start(&app, network, account).map_err(ConsoleError::Venue)?);
-    }
-    slot.as_ref()
-        .expect("the feed was just built")
-        .watch(&coin, &interval)
-        .map_err(ConsoleError::Venue)
+    let account = configured_account(network)
+        .ok()
+        .map(|account| account.to_string());
+    runtime
+        .watch(app, network, account, coin, interval)?
+        .await
+        .map_err(|error| ConsoleError::LocalStatus(format!("feed reply: {error}")))?
+        .map_err(ConsoleError::from)
 }
 
+#[tauri::command]
+fn runtime_status(runtime: State<'_, Runtime>) -> RuntimeStatus {
+    runtime.status()
+}
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -408,8 +387,8 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
-            app.manage(Feeds::default());
-            app.manage(PilotReads::default());
+            let dir = feed::data_dir(app.handle()).map_err(std::io::Error::other)?;
+            app.manage(Runtime::new(dir));
             app.manage(updates::Updates::default());
             Ok(())
         })
@@ -422,12 +401,34 @@ pub fn run() {
             market_snapshot,
             chart_series,
             watch_market,
+            runtime_status,
             updates::check_update,
             updates::download_update,
             updates::install_update
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            if let tauri::RunEvent::WindowEvent {
+                event: tauri::WindowEvent::CloseRequested { api, .. },
+                ..
+            } = &event
+            {
+                let runtime = app.state::<Runtime>();
+                if !runtime.exit_allowed() {
+                    api.prevent_close();
+                    runtime.request_exit(app.clone(), 0);
+                }
+            }
+            if let tauri::RunEvent::ExitRequested { api, code, .. } = event {
+                let runtime = app.state::<Runtime>();
+                if !runtime.exit_allowed() {
+                    // Restart cannot be prevented here; the updater must drain first.
+                    api.prevent_exit();
+                    runtime.request_exit(app.clone(), code.unwrap_or(0));
+                }
+            }
+        });
 }
 
 #[cfg(test)]
@@ -461,44 +462,6 @@ mod pilot_status_tests {
         "0x1111111111111111111111111111111111111111"
             .parse()
             .expect("public address")
-    }
-
-    #[test]
-    fn dropped_ipc_cannot_queue_another_read_before_blocking_work_finishes() {
-        use std::sync::mpsc;
-        use std::time::{Duration, Instant};
-
-        let reads = PilotReads::default();
-        let (started, observing) = mpsc::channel();
-        let (release, waiting) = mpsc::channel();
-        let task = reads
-            .spawn(move || {
-                started.send(()).expect("observer");
-                waiting.recv().expect("release blocked read");
-            })
-            .expect("first read");
-        observing
-            .recv_timeout(Duration::from_secs(1))
-            .expect("read started");
-        drop(task);
-        assert!(matches!(
-            reads.spawn(|| panic!("overlapping read must never run")),
-            Err(ConsoleError::LocalStatus(_))
-        ));
-        release.send(()).expect("finish read");
-        let deadline = Instant::now() + Duration::from_secs(1);
-        while reads.0.try_lock().is_err() {
-            assert!(
-                Instant::now() < deadline,
-                "finished read retained its permit"
-            );
-            std::thread::yield_now();
-        }
-        let next = reads.spawn(|| 7).expect("read after completion");
-        assert_eq!(
-            tauri::async_runtime::block_on(next).expect("completed read"),
-            7
-        );
     }
 
     #[test]

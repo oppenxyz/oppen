@@ -6,6 +6,8 @@ use tauri::State;
 use tauri_plugin_updater::{Update, UpdaterExt};
 use tokio::{process::Command, sync::Mutex};
 
+use crate::runtime::{Runtime, UpdateGuard};
+
 const ASSETS: &str = "https://api.github.com/repos/oppenxyz/oppen/releases/assets/";
 
 #[derive(Default)]
@@ -198,6 +200,7 @@ pub(crate) async fn download_update(
 pub(crate) async fn install_update(
     app: tauri::AppHandle,
     state: State<'_, Updates>,
+    runtime: State<'_, Runtime>,
 ) -> Result<(), UpdateError> {
     supported(&app)?;
     let mut pending = state
@@ -208,28 +211,139 @@ pub(crate) async fn install_update(
     if !pending.as_ref().is_some_and(|p| p.bytes.is_some()) {
         return Err(UpdateError::InvalidRelease);
     }
-    // The blocking installer owns the lock even if the invoking webview closes.
-    tauri::async_runtime::spawn_blocking(move || {
-        let candidate = pending.as_ref().ok_or(UpdateError::InvalidRelease)?;
-        candidate
-            .update
-            .install(
-                candidate
-                    .bytes
-                    .as_ref()
-                    .ok_or(UpdateError::InvalidRelease)?,
-            )
-            .map_err(|_| UpdateError::InstallFailed)?;
-        *pending = None;
-        app.restart();
-    })
+    let guard = runtime
+        .begin_update()
+        .map_err(|_| UpdateError::Unavailable("Desktop shutdown is already in progress."))?;
+    install_after_shutdown(
+        guard,
+        move || {
+            let candidate = pending.as_ref().ok_or(UpdateError::InvalidRelease)?;
+            candidate
+                .update
+                .install(
+                    candidate
+                        .bytes
+                        .as_ref()
+                        .ok_or(UpdateError::InvalidRelease)?,
+                )
+                .map_err(|_| UpdateError::InstallFailed)?;
+            *pending = None;
+            drop(pending);
+            Ok(())
+        },
+        move || app.request_restart(),
+    )
     .await
     .map_err(|_| UpdateError::InstallFailed)?
+}
+
+fn install_after_shutdown(
+    guard: UpdateGuard,
+    install: impl FnOnce() -> Result<(), UpdateError> + Send + 'static,
+    restart: impl FnOnce() + Send + 'static,
+) -> tauri::async_runtime::JoinHandle<Result<(), UpdateError>> {
+    // The task, not the IPC observer, owns the claim and candidate. Tauri cannot
+    // veto a restart, so the barrier must precede both installation and restart.
+    tauri::async_runtime::spawn(async move {
+        guard.shutdown().await.map_err(|_| {
+            UpdateError::Unavailable("Desktop work did not shut down safely; update not installed.")
+        })?;
+        tauri::async_runtime::spawn_blocking(move || {
+            let _guard = guard;
+            install()?;
+            restart();
+            Ok(())
+        })
+        .await
+        .map_err(|_| UpdateError::InstallFailed)?
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::local_reads::ReadKind;
+    use oppen_hl::Network;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    };
+
+    #[tokio::test]
+    async fn dropped_update_observer_keeps_claim_until_drain_and_install_complete() {
+        let runtime = Runtime::new(std::env::temp_dir());
+        let (read_started, read_observer) = tokio::sync::oneshot::channel();
+        let (release_read, blocked_read) = mpsc::channel();
+        let read = runtime
+            .local_read(Network::Testnet, ReadKind::Operator, move || {
+                read_started.send(()).unwrap();
+                blocked_read.recv().unwrap();
+            })
+            .unwrap();
+        read_observer.await.unwrap();
+        let guard = runtime.begin_update().unwrap();
+        let (install_started, install_observer) = tokio::sync::oneshot::channel();
+        let (release_install, blocked_install) = mpsc::channel();
+        let restarted = Arc::new(AtomicBool::new(false));
+        let restart_flag = restarted.clone();
+        let task = install_after_shutdown(
+            guard,
+            move || {
+                install_started.send(()).unwrap();
+                blocked_install.recv().unwrap();
+                Ok(())
+            },
+            move || {
+                restart_flag.store(true, Ordering::SeqCst);
+            },
+        );
+        drop(task);
+        let mut install_observer = install_observer;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), &mut install_observer)
+                .await
+                .is_err()
+        );
+        assert!(runtime.begin_update().is_err());
+        assert!(!runtime.exit_allowed());
+        release_read.send(()).unwrap();
+        read.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), install_observer)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!restarted.load(Ordering::SeqCst));
+        assert!(!runtime.exit_allowed());
+        assert!(runtime.begin_update().is_err());
+        release_install.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !restarted.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_install_never_requests_restart() {
+        let runtime = Runtime::new(std::env::temp_dir());
+        let restarted = Arc::new(AtomicBool::new(false));
+        let restart_flag = restarted.clone();
+        let task = install_after_shutdown(
+            runtime.begin_update().unwrap(),
+            || Err(UpdateError::InstallFailed),
+            move || {
+                restart_flag.store(true, Ordering::SeqCst);
+            },
+        );
+        assert!(matches!(
+            task.await.unwrap(),
+            Err(UpdateError::InstallFailed)
+        ));
+        assert!(!restarted.load(Ordering::SeqCst));
+    }
+
     #[test]
     fn credentials_are_only_sent_to_exact_repository_assets() {
         assert!(asset_url(&format!("{ASSETS}123")));
