@@ -26,3 +26,8 @@ tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
 serde.workspace = true
 serde_json.workspace = true
+
+[dev-dependencies]
+# The live feed test drives a real socket, so it needs a runtime of its own.
+# Tauri's `async_runtime` is tokio; this is the same one, not a second choice.
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
