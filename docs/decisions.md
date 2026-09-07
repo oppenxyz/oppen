@@ -11,6 +11,22 @@ decisions" section until then.
 
 ---
 
+## 2026-09-07 · The chart panel
+
+`lib/candles.ts` has been a finished 707-line renderer with a golden-frame test
+and nothing to draw since it landed: a reused character buffer, a cell-level
+frame diff, run-length ink grouping, and a typed `FrameStatus` that tells three
+different blank frames apart. `oppen-core::candles` has been an equally finished
+1,300 lines of `Bar`, `Interval`, partition checking and resampling. Neither had
+ever been handed to the other. This is the join.
+
+| # | Decision | Choice | Why |
+|---|---|---|---|
+| E1 | How prices cross to a renderer that needs floats | **Strings on the wire, parsed at the chart's own edge, in one named function** | The rule is that decimals cross every boundary as strings, and the chart is the one consumer that genuinely cannot use them that way — it maps every price to a character cell. The tempting shortcut was to have the command emit JSON numbers for this one call. That would put an `f64` on the same wire that carries order prices, where the next reader has no way to know which kind it is holding. So the wire stays exact and `parseBar` is the single, named, tested place the precision is spent. **What this gives up:** a float now exists in the front end that did not before. Nothing constrains it structurally to the chart; only the fact that the order path reads the venue's own decimals through the guardrail engine and never imports this module. |
+| E2 | What an unreadable price does | **Drops the bar — and the emptiness check is not redundant** | The obvious guard is `Number.isFinite`, and it is wrong on its own: `Number("")` is `0`, so a missing price passes it and draws a candle to the floor of the chart. A reading that looks deliberate and never happened is worse than a gap, and the renderer already reports a window with nothing in it as `no_finite_bars` rather than painting a lie. This one was found by a test written to assert the behaviour the code's own comment claimed, which the code did not have. |
+| E3 | What a broken partition does | **Costs the chart, with the reason, and never a drawn approximation** | `bars_from_candles` refuses rows that are the wrong interval, misaligned to the epoch, or not one width wide. A venue doing any of those has stopped partitioning the time axis, and bars drawn from them picture something that did not happen. The error travels to the panel as its own error channel, separate from the book's and the snapshot's, because a broken partition costs the chart and nothing beside it — one shared channel would make the panel claim an outage it is not having. |
+| E4 | When the chart reads | **On selection and on an interval change, never on the rail's tick** | Z2 split the rail from the snapshot for this reason and the chart is a third clock again: a window of hourly bars does not change between hours, and putting it on the minute tick would spend a venue read a minute redrawing an identical frame — which the renderer's own `changed: false` would then discard. The interval buttons are the honest trigger, and a selection that moves while three reads are in flight discards the late answer rather than landing bars under another symbol's header. |
+
 ## 2026-09-07 · The vol-scaled cap learns what the hour is doing
 
 #31 shipped `effective_cap = max_risk_usd / (2 · σ_day)` and named a caveat: σ

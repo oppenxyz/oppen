@@ -99,10 +99,16 @@ export interface CandleFrame {
 
 /** Everything the renderer needs. No market state, no clock, no venue handle. */
 export interface CandleInput {
-  /** Closed bars, oldest first. Only the last `cols` are drawn. */
-  closed: readonly Bar[];
+  /**
+   * Closed bars, oldest first. Only the last `cols` are drawn.
+   *
+   * Deeply readonly because the renderer only ever reads them, and saying so
+   * lets a caller pass bars it holds in immutable state without copying the
+   * window on every frame.
+   */
+  closed: readonly Readonly<Bar>[];
   /** The in-progress bar, drawn with the forming glyph. */
-  forming?: Bar | null;
+  forming?: Readonly<Bar> | null;
   /** Candle slots across the plot. Plot width is `cols * 4` characters. */
   cols: number;
   /** Total grid rows, including the axis rule, the volume row and the time-label row. */

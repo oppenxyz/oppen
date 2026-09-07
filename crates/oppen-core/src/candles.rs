@@ -317,7 +317,7 @@ impl Interval {
     }
 
     /// Width in milliseconds. Never zero, so it is always a safe divisor.
-    const fn millis(self) -> i64 {
+    pub const fn millis(self) -> i64 {
         self.count as i64 * self.unit.millis()
     }
 
