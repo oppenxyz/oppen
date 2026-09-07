@@ -7,6 +7,7 @@
 //! the operator and the agent cannot be shown different accounts (A3).
 
 mod feed;
+mod updates;
 
 use std::sync::{Arc, Mutex};
 
@@ -405,9 +406,11 @@ fn now_ms() -> u64 {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             app.manage(Feeds::default());
             app.manage(PilotReads::default());
+            app.manage(updates::Updates::default());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -418,7 +421,10 @@ pub fn run() {
             markets,
             market_snapshot,
             chart_series,
-            watch_market
+            watch_market,
+            updates::check_update,
+            updates::download_update,
+            updates::install_update
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

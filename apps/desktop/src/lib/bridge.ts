@@ -344,3 +344,9 @@ export async function onFeedUpdate(
   const { listen } = await import("@tauri-apps/api/event");
   return listen<FeedUpdate>("feed://update", (event) => handler(event.payload));
 }
+
+/** UP2: only version/readiness cross IPC; private-release credentials stay in Rust. */
+export interface UpdateInfo { current_version: string; available_version: string | null; ready: boolean }
+export function checkUpdate(): Promise<UpdateInfo> { return invoke("check_update"); }
+export function downloadUpdate(): Promise<UpdateInfo> { return invoke("download_update"); }
+export function installUpdate(): Promise<void> { return invoke("install_update"); }

@@ -406,3 +406,7 @@ them "under any license" and so needs no amendment. Third-party attributions in
 ship under the oppen name. The safety claims here are claims about a particular
 build with particular invariants — a fork that removes the guardrail check and
 keeps the name would be a security problem for users, not merely a branding one.
+
+### Private desktop updates
+
+Owner installations can follow main through the [signed private update channel](docs/runbooks/desktop-updates.md). This personal Apple Silicon channel does not change the roadmap gates or imply general release readiness.

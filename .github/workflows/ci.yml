@@ -4,13 +4,14 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   rust:
@@ -49,3 +50,43 @@ jobs:
       - run: bun install --frozen-lockfile --ignore-scripts
       - run: bun run build
       - run: bun run test
+      - run: python3 -m unittest discover -s ../../scripts -p "test_*.py"
+
+  release:
+    name: private macOS update
+    needs: [rust, deny, web]
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: macos-15
+    permissions:
+      contents: write
+    concurrency:
+      group: desktop-release
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          targets: aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          shared-key: desktop-release
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version: 1.2.19
+      - run: bun install --cwd apps/desktop --frozen-lockfile --ignore-scripts
+      - name: Set monotonic app version
+        run: python3 scripts/desktop-release.py prepare "$GITHUB_RUN_NUMBER"
+      - name: Build signed update
+        working-directory: apps/desktop
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
+        run: |
+          test -n "$TAURI_SIGNING_PRIVATE_KEY"
+          bun run tauri build --target aarch64-apple-darwin --bundles app
+      - name: Publish complete private release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/desktop-release.py publish "$GITHUB_RUN_NUMBER"
