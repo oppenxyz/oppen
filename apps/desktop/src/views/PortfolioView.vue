@@ -1,25 +1,21 @@
 <script setup lang="ts">
 import { computed } from "vue";
 import AsciiGauge from "../components/ascii/AsciiGauge.vue";
-import ColumnHeader from "../components/housing/ColumnHeader.vue";
+import AccountPositions from "../components/AccountPositions.vue";
+import AccountNotice from "../components/AccountNotice.vue";
 import EmptyState from "../components/housing/EmptyState.vue";
 import PanelHousing from "../components/housing/PanelHousing.vue";
+import { decimal, sumDecimals } from "../lib/display";
 import { shell } from "../stores/shell";
-
-const POSITION_COLUMNS = ["Market", "Side", "Size", "Entry", "Liq", "Liq dist", "PnL", "Margin"] as const;
-const POSITION_TEMPLATE = "1.2fr 0.8fr 1fr 1fr 1fr 1fr 1fr 1.2fr";
 
 const account = computed(() => shell.account);
 const positions = computed(() => account.value?.positions ?? []);
 const dash = "—";
 
-/** Decimals arrive as strings and are formatted, never parsed for display. */
+/** Exact balances are rounded only for the screen. */
 function usd(value: string | null | undefined): string {
-  if (value === null || value === undefined) return dash;
-  const n = Number(value);
-  return Number.isFinite(n)
-    ? n.toLocaleString("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 2 })
-    : dash;
+  const formatted = decimal(value);
+  return formatted === dash ? dash : formatted.startsWith("−") ? `−$${formatted.slice(1)}` : `$${formatted}`;
 }
 
 function pct(fraction: string | null): string {
@@ -35,21 +31,17 @@ const available = computed(() => usd(account.value?.balances.spot_usdc_available
 /** Margin used as a fraction of equity, for the gauge. */
 const marginFraction = computed(() => {
   const balances = account.value?.balances;
-  if (!balances) return 0;
+  if (!balances) return null;
   const [used, eq] = [Number(balances.total_margin_used_usd), Number(balances.equity_usd)];
-  return eq > 0 && Number.isFinite(used) ? Math.min(1, used / eq) : 0;
+  return eq > 0 && Number.isFinite(used) ? used / eq : null;
 });
 
-const exposure = computed(() => {
-  const total = positions.value.reduce((sum, p) => sum + Math.abs(Number(p.position_value_usd) || 0), 0);
-  return positions.value.length ? usd(String(total)) : dash;
-});
-
-const unrealised = computed(() => {
-  if (!positions.value.length) return dash;
-  const total = positions.value.reduce((sum, p) => sum + (Number(p.unrealized_pnl_usd) || 0), 0);
-  return usd(String(total));
-});
+const exactExposure = computed(() => sumDecimals(positions.value.map(p => p.position_value_usd), true));
+const exposure = computed(() => account.value ? usd(exactExposure.value) : dash);
+// Approximation is only used for the visual fill fraction, never monetary totals.
+const totalExposure = computed(() => Number(exactExposure.value));
+const unrealised = computed(() => account.value
+  ? usd(sumDecimals(positions.value.map(p => p.unrealized_pnl_usd))) : dash);
 
 /** The position closest to liquidation, which is the one that matters. */
 const nearestLiq = computed(() => {
@@ -61,19 +53,20 @@ const nearestLiq = computed(() => {
   return { value: pct(nearest.liq_distance_frac), note: `${nearest.symbol} · ${usd(nearest.liquidation_px)}` };
 });
 
-const side = (size: string): string => (Number(size) >= 0 ? "LONG" : "SHORT");
+
 </script>
 
 <template>
   <div class="portfolio">
+    <div><AccountNotice /></div>
     <div class="portfolio__tiles">
-      <PanelHousing inset label="Equity · unified margin" :brackets="['tl']" data-tour="portfolio">
+      <PanelHousing inset label="Equity · configured account" :brackets="['tl']" data-tour="portfolio">
         <div class="tile__value tile__value--xl">{{ equity }}</div>
         <div class="tile__note">{{ available }} available</div>
       </PanelHousing>
       <PanelHousing inset label="Unrealised PnL">
         <div class="tile__value">{{ unrealised }}</div>
-        <div class="tile__note">across {{ positions.length }} position(s)</div>
+        <div class="tile__note">{{ account ? `across ${positions.length} position(s)` : "Account not read" }}</div>
       </PanelHousing>
       <PanelHousing inset label="Exposure">
         <div class="tile__value">{{ exposure }}</div>
@@ -82,7 +75,7 @@ const side = (size: string): string => (Number(size) >= 0 ? "LONG" : "SHORT");
       <PanelHousing inset label="Margin used">
         <div class="tile__value">{{ marginUsed }}</div>
         <div class="tile__note">
-          <AsciiGauge :value="marginFraction" :cells="14" label="Margin used" />
+          <AsciiGauge v-if="marginFraction !== null" :value="marginFraction" :cells="14" label="Margin used" /><span v-else>Utilization unknown</span>
         </div>
       </PanelHousing>
       <PanelHousing inset label="Nearest liq">
@@ -92,34 +85,21 @@ const side = (size: string): string => (Number(size) >= 0 ? "LONG" : "SHORT");
     </div>
 
     <div class="portfolio__lower">
-      <PanelHousing label="Positions · Hyperliquid" :meta="`${positions.length} open`">
-        <ColumnHeader :columns="POSITION_COLUMNS" :template="POSITION_TEMPLATE" />
-        <div
-          v-for="position in positions"
-          :key="position.symbol"
-          class="row"
-          :style="{ gridTemplateColumns: POSITION_TEMPLATE }"
-        >
-          <span>{{ position.symbol }}</span>
-          <span :class="Number(position.size) >= 0 ? 'row__up' : 'row__down'">{{ side(position.size) }}</span>
-          <span>{{ position.size }}</span>
-          <span>{{ position.entry_px ?? dash }}</span>
-          <span>{{ position.liquidation_px ?? dash }}</span>
-          <span>{{ pct(position.liq_distance_frac) }}</span>
-          <span :class="Number(position.unrealized_pnl_usd) >= 0 ? 'row__up' : 'row__down'">
-            {{ usd(position.unrealized_pnl_usd) }}
-          </span>
-          <span>{{ usd(position.margin_used_usd) }}</span>
-        </div>
-        <EmptyState v-if="!positions.length" matrix size="md" line="No open positions." />
+      <PanelHousing label="Positions · Hyperliquid" :meta="account ? `${positions.length} open` : 'Not read'">
+        <AccountPositions />
       </PanelHousing>
 
       <div class="portfolio__side">
-        <PanelHousing inset label="Exposure by agent">
-          <EmptyState line="No agents paired." />
+        <PanelHousing inset label="Exposure by market" :brackets="['br']">
+          <div v-for="position in positions" :key="position.symbol" class="exposure-row">
+            <div>{{ position.symbol }} <span>{{ usd(position.position_value_usd.replace('-', '')) }}</span></div>
+            <AsciiGauge :value="totalExposure > 0 ? Math.abs(Number(position.position_value_usd)) / totalExposure : null" :cells="28" :label="`${position.symbol} share of account gross exposure`" />
+          </div>
+          <EmptyState v-if="!positions.length" :line="account ? 'No position exposure.' : 'Exposure is unknown until the account is read.'" />
         </PanelHousing>
-        <PanelHousing inset label="By sub-account">
-          <EmptyState line="No sub-accounts mapped." />
+        <PanelHousing inset label="By container">
+          <p v-if="account" class="container-address">Hyperliquid · {{ account.network }}<br />{{ account.address }}</p>
+          <EmptyState line="Agent attribution and other containers are not connected. Margin remains independent per account." />
         </PanelHousing>
       </div>
     </div>
@@ -130,7 +110,7 @@ const side = (size: string): string => (Number(size) >= 0 ? "LONG" : "SHORT");
 .portfolio {
   display: grid;
   flex: 1;
-  grid-template-rows: auto 1fr;
+  grid-template-rows: auto auto minmax(0, 1fr);
   grid-template-columns: minmax(0, 1fr);
   gap: var(--panel-gap);
   min-width: 0;
@@ -153,7 +133,8 @@ const side = (size: string): string => (Number(size) >= 0 ? "LONG" : "SHORT");
 
 .portfolio__side {
   display: grid;
-  grid-template-rows: auto auto;
+  grid-template-rows: max-content max-content;
+  overflow: auto;
   align-content: start;
   gap: var(--panel-gap);
   min-height: 0;
@@ -164,7 +145,7 @@ const side = (size: string): string => (Number(size) >= 0 ? "LONG" : "SHORT");
   font-weight: 700;
   line-height: 1;
   letter-spacing: var(--ls-display);
-  color: var(--bracket);
+  color: var(--signal);
 }
 
 .tile__value--xl {
@@ -179,23 +160,7 @@ const side = (size: string): string => (Number(size) >= 0 ? "LONG" : "SHORT");
   color: var(--bracket);
 }
 
-.row {
-  display: grid;
-  gap: var(--s-2);
-  padding: var(--s-2) var(--s-3);
-  border-bottom: 1px solid var(--rule);
-  font-family: var(--font-mono);
-  font-size: var(--fs-body);
-  font-variant-numeric: tabular-nums;
-  color: var(--body);
-}
-
-.row > span {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.row__up { color: var(--up); }
-.row__down { color: var(--down); }
+.exposure-row { padding-block: var(--s-3); border-bottom: 1px solid var(--rule); font-size: var(--fs-body); }
+.exposure-row > div { display: flex; justify-content: space-between; margin-bottom: var(--s-2); color: var(--signal); }
+.container-address { overflow-wrap: anywhere; font-size: var(--fs-body); color: var(--body); line-height: 1.6; }
 </style>

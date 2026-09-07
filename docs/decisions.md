@@ -824,6 +824,16 @@ An audit of the live Hyperliquid API settled this. See [specs/fair-value.md](spe
 - The five centralised-exchange feeds would break the local-first posture to buy
   a worse estimate of a number Hyperliquid already publishes for free.
 
+### Console visual refinement — 2026-09-07
+
+| # | Decision | Chosen | Why |
+|---|---|---|---|
+| UI1 | Website-to-app design direction | **Terrain on Setup; quantitative ASCII on trading surfaces** | The owner approved the full [UI review](design/ui-review-2026-09-07.md). Reuse the approved terrain sampler and inspection lighting on the arrival surface. Keep trading backgrounds quiet; add measured book depth, exposure and utilization detail. No new rendering dependency. U1–U3 chart geometry and directional ink remain authoritative. |
+| UI2 | Working-data hierarchy | **12px working numerals, compact readable labels, exact display rounding** | The review found clipped axes and long raw decimals. Reserve actual chart gutters, format decimal strings only at display, expose original values in details, and distinguish unknown/stale from zero. Spec #31/#34/F. |
+| UI3 | Console navigation and decoration | **Searchable markets, functional settings navigation, explicit decorative-motion control** | These complete the approved review without changing execution behavior. Motion settings affect decorative sampling only; live feeds and freshness clocks continue. Empty apertures are static, not fictional activity. Spec #4/#31/#36. |
+| UI4 | Read existing gateway files in the console | **Read-only ledger and persisted policy projection in core** | Spec #31/#32 and D6: reuse the existing page reader and policy loader; never create/migrate a missing source or start a second engine merely to display records. Stored agent/kill records do not prove active pairing, pending approvals or completed cancels. Those require a live operator connection. |
+| UI5 | Populated and enlarged-text visual verification | **Separate development-only fixture entry and Vite config** | Verify spec #31/#34 surfaces using the real Vue views and stores with local read fixtures. The review config refuses builds; the production entry never imports QA files. No venue, keychain, signing or account mutation is involved. Existing Vite/Vue dependencies suffice; no production demo mode or alternate event store. |
+
 ### Still open
 
 Everything listed under "Open decisions" in each spec that is not resolved above.

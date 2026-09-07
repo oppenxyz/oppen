@@ -49,6 +49,8 @@ interface MarketState {
   /** `null` until the operator picks one, or the rail's busiest arrives. */
   selected: string | null;
   snapshot: MarketSnapshot | null;
+  /** Derived packs keep their own REST time when the book receives new ticks. */
+  featuresReadMs: number | null;
   /** Why the last rail read failed, shown beside the stale rows. */
   error: string | null;
   /** Why the last snapshot read failed. Kept apart: the two fail separately. */
@@ -69,6 +71,7 @@ const state = reactive<MarketState>({
   rows: [],
   selected: null,
   snapshot: null,
+  featuresReadMs: null,
   error: null,
   snapshotError: null,
   chart: null,
@@ -162,29 +165,38 @@ export async function refreshMarkets(): Promise<void> {
  * which is served by the rail, not the snapshot — updates without waiting on
  * three venue reads.
  */
+let snapshotRequest = 0;
+async function readSnapshot(symbol: string): Promise<void> {
+  const request = ++snapshotRequest;
+  const network = shell.network;
+  try {
+    const snapshot = await fetchMarketSnapshot(network, symbol);
+    if (request !== snapshotRequest || state.selected !== symbol || shell.network !== network) return;
+    state.snapshot = snapshot;
+    state.featuresReadMs = snapshot.as_of_ms;
+    state.snapshotError = null;
+  } catch (error) {
+    if (request === snapshotRequest && state.selected === symbol && shell.network === network) state.snapshotError = reason(error);
+  }
+}
+
 export async function select(symbol: string): Promise<void> {
   state.selected = symbol;
   state.snapshot = null;
-  // Cleared, not left in place: bars from the previous symbol under this
-  // symbol's header is a chart that lies rather than one that is missing.
+  state.featuresReadMs = null;
+  state.snapshotError = null;
   state.chart = null;
+  state.chartError = null;
+  snapshotRequest += 1;
   if (!inTauri()) return;
-  // The socket first: the seed reads below take three round trips, and a
-  // symbol that starts streaming while they are in flight is a symbol whose
-  // panels are live the moment they fill.
   await watchSelected();
-  try {
-    state.snapshot = await fetchMarketSnapshot(shell.network, symbol);
-    state.snapshotError = null;
-  } catch (error) {
-    state.snapshotError = reason(error);
-  }
-  await refreshChart();
+  if (state.selected !== symbol) return;
+  await Promise.all([readSnapshot(symbol), refreshChart()]);
 }
 
-/** Re-reads the selected symbol. Bound to the panel's own refresh. */
+/** Re-read derived packs without tearing down a live chart or book. */
 export async function refreshSnapshot(): Promise<void> {
-  if (state.selected !== null) await select(state.selected);
+  if (state.selected !== null && inTauri()) await readSnapshot(state.selected);
 }
 
 /**
@@ -198,12 +210,13 @@ export async function refreshChart(): Promise<void> {
   if (state.selected === null || !inTauri()) return;
   const symbol = state.selected;
   const interval = state.interval;
+  const network = shell.network;
   try {
-    const series = await fetchChartSeries(shell.network, symbol, interval);
+    const series = await fetchChartSeries(network, symbol, interval);
     // The selection may have moved while three venue reads were in flight.
     // Landing stale bars under a different symbol's header would be the worst
     // kind of wrong: it looks right.
-    if (state.selected !== symbol || state.interval !== interval) return;
+    if (state.selected !== symbol || state.interval !== interval || shell.network !== network) return;
     state.chart = {
       closed: series.closed.map(parseBar).filter((bar): bar is Bar => bar !== null),
       forming: series.forming ? parseBar(series.forming) : null,
@@ -212,7 +225,7 @@ export async function refreshChart(): Promise<void> {
     };
     state.chartError = null;
   } catch (error) {
-    state.chartError = reason(error);
+    if (state.selected === symbol && state.interval === interval && shell.network === network) state.chartError = reason(error);
   }
 }
 
@@ -263,8 +276,8 @@ export function applyFeed(update: FeedUpdate): void {
       // never showed.
       state.snapshot = {
         ...state.snapshot,
-        bids: mergeTop(state.snapshot.bids, update.bid),
-        asks: mergeTop(state.snapshot.asks, update.ask),
+        bids: mergeTop(state.snapshot.bids, update.bid, "bid"),
+        asks: mergeTop(state.snapshot.asks, update.ask, "ask"),
         as_of_ms: update.at_ms,
       };
       return;
@@ -322,9 +335,12 @@ export function applyFeed(update: FeedUpdate): void {
  * rather than splice a hole into it — a spread computed off that hole is a
  * number the venue never quoted.
  */
-export function mergeTop(levels: BookLevel[], top: BookLevel | undefined): BookLevel[] {
+export function mergeTop(levels: BookLevel[], top: BookLevel | undefined, side: "bid" | "ask"): BookLevel[] {
   if (top === undefined) return levels;
-  return [top, ...levels.slice(1)];
+  // A worsened touch invalidates deeper cached levels that now outrank it.
+  // Keep exact wire strings; numeric comparison only orders the displayed ladder.
+  const price = Number(top.px);
+  return [top, ...levels.slice(1).filter(level => side === "bid" ? Number(level.px) < price : Number(level.px) > price)];
 }
 
 /**

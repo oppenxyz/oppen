@@ -23,8 +23,8 @@ const MARK: Record<string, string> = {
 <template>
   <PanelHousing inset label="Setup · first agent" :brackets="['tr']">
     <template #meta>
-      <AsciiGauge :value="progress.fraction" :cells="12" label="Checked" />
-      <span>{{ progress.done }} / {{ progress.total }}</span>
+      <AsciiGauge :value="progress.fraction" :cells="12" label="Verifiable checks complete" />
+      <span>{{ progress.done }} / {{ progress.total }} verifiable</span>
     </template>
 
     <ol class="track">
@@ -33,16 +33,14 @@ const MARK: Record<string, string> = {
         <span class="track__text">
           <span class="track__label">{{ m.label }}</span>
           <span class="track__detail">{{ m.detail }}</span>
-          <span v-if="m.blocked" class="track__blocked">Cannot check yet — {{ m.blocked }}</span>
+          <details v-if="m.blocked" class="track__blocked"><summary>Why this is unknown</summary>{{ m.blocked }}</details>
         </span>
         <span class="track__state">{{ m.state === "unverifiable" ? "unknown" : m.state }}</span>
       </li>
     </ol>
 
     <p class="track__note">
-      The count above is of steps this console can actually verify.
-      {{ progress.unverifiable }} more are listed and unchecked because the reads that would confirm
-      them are not built — they are named rather than hidden.
+      {{ progress.done }} checks complete · {{ progress.total - progress.done }} pending · {{ progress.unverifiable }} unknown. Unknown checks are excluded from the completion gauge.
     </p>
   </PanelHousing>
 </template>

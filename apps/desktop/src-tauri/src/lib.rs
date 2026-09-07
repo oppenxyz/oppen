@@ -46,20 +46,39 @@ impl std::fmt::Display for ConsoleError {
     }
 }
 
+/// The gateway's existing ledger and persisted policy, never a second store.
+#[tauri::command]
+async fn operator_state(
+    network: String,
+) -> Result<oppen_core::operator::OperatorRead, ConsoleError> {
+    let dir = std::env::var_os("OPPEN_DATA_DIR").ok_or_else(|| ConsoleError::NotConfigured(
+        "Gateway data is not configured. Launch the console with OPPEN_DATA_DIR pointing to the gateway's data directory.".into()
+    ))?;
+    let network = network_of(&network);
+    tauri::async_runtime::spawn_blocking(move || {
+        oppen_core::operator::read(std::path::Path::new(&dir), network)
+    })
+    .await
+    .map_err(|error| ConsoleError::LocalStatus(error.to_string()))
+}
+
 /// The configured account.
 ///
 /// Read from the environment until the onboarding flow persists it. Failing
 /// with a named variable is deliberate: an unconfigured console must say so,
 /// not show a zeroed account that looks like a real empty one.
-fn configured_account() -> Result<Address, ConsoleError> {
-    let raw = std::env::var("OPPEN_TESTNET_USER").map_err(|_| {
+fn configured_account(network: Network) -> Result<Address, ConsoleError> {
+    let variable = match network {
+        Network::Testnet => "OPPEN_TESTNET_USER",
+        Network::Mainnet => "OPPEN_MAINNET_USER",
+    };
+    let raw = std::env::var(variable).map_err(|_| {
         ConsoleError::NotConfigured(
-            "No account configured. Set OPPEN_TESTNET_USER, or run onboarding.".into(),
+            format!("No account configured. Set {variable} when launching the desktop app. Account provisioning is not available in the console yet."),
         )
     })?;
-    raw.parse().map_err(|e| {
-        ConsoleError::NotConfigured(format!("OPPEN_TESTNET_USER is not an address: {e}"))
-    })
+    raw.parse()
+        .map_err(|e| ConsoleError::NotConfigured(format!("{variable} is not an address: {e}")))
 }
 
 /// ES15: read verified pilot evidence without starting feeds or execution.
@@ -89,8 +108,8 @@ async fn pilot_status(
     reads: State<'_, PilotReads>,
     network: String,
 ) -> Result<Option<PilotStatus>, ConsoleError> {
-    let account = configured_account()?;
     let network = network_of(&network);
+    let account = configured_account(network)?;
     let dir = feed::data_dir(&app).map_err(ConsoleError::LocalStatus)?;
     reads
         .spawn(move || read_pilot_status(&dir, network, account))?
@@ -280,7 +299,7 @@ async fn account_state(
     network: String,
 ) -> Result<AccountState, ConsoleError> {
     let network = network_of(&network);
-    let account = configured_account()?;
+    let account = configured_account(network)?;
     let info = InfoClient::new(network).map_err(|e| ConsoleError::Venue(e.to_string()))?;
 
     let perps = info
@@ -366,7 +385,7 @@ async fn watch_market(
     if !slot.as_ref().is_some_and(|feed| feed.serves(network)) {
         // The account is optional: market data needs none, and a console with
         // no account configured still has a chart to draw.
-        let account = configured_account().ok().map(|a| a.to_string());
+        let account = configured_account(network).ok().map(|a| a.to_string());
         *slot = Some(ConsoleFeed::start(&app, network, account).map_err(ConsoleError::Venue)?);
     }
     slot.as_ref()
@@ -393,6 +412,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             account_state,
+            operator_state,
             pilot_status,
             keychain_status,
             markets,

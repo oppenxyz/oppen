@@ -32,14 +32,16 @@ export function matrix(t: number, mode: MatrixMode = "breathe"): string {
         continue;
       }
 
-      let f = Math.min(1, Math.abs(d - r) / 0.34);
-      if (sweep !== null) {
-        let a = Math.atan2(dy, dx);
-        if (a < 0) a += Math.PI * 2;
-        let ad = Math.abs(a - sweep);
-        if (ad > Math.PI) ad = Math.PI * 2 - ad;
-        f = Math.max(0, Math.min(1, f - Math.max(0, 1 - ad / 0.6) * 0.85 + 0.25));
-      }
+      // UI1: sampled inner bevel, square rim and concentric machining.
+      // Loading can illuminate the surface; an idle frame never implies activity.
+      const bevel = Math.exp(-Math.pow((d - r - 0.02) / 0.025, 2));
+      const rim = Math.exp(-Math.pow((Math.max(Math.abs(dx), Math.abs(dy)) - 0.44) / 0.018, 2));
+      const angle = Math.atan2(dy, dx);
+      const machining = 0.1 * (1 + Math.sin(d * 140 + angle * 5));
+      const light = 0.12 + 0.12 * Math.max(0, (-dx - dy) / Math.max(d, 0.001));
+      const scan = sweep === null ? 0 : Math.pow(Math.max(0, Math.cos(angle - sweep)), 18) * 0.3;
+      const brightness = Math.min(1, light + bevel * 0.5 + rim * 0.3 + machining + scan);
+      const f = 1 - brightness;
       row += RAMP[Math.min(4, Math.floor(f * 5))];
     }
     rows.push(row.replace(/\s+$/, ""));

@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import UiButton from "../ui/UiButton.vue";
 import type { MatrixMode } from "../../lib/ascii";
 import CharacterMatrix from "../ascii/CharacterMatrix.vue";
 
@@ -8,17 +9,22 @@ withDefaults(
     line: string;
     /** Only the view's one live housing carries the matrix. */
     matrix?: boolean;
+    /** Only true while the source read is actually in flight. */
+    reading?: boolean;
+    action?: string;
     mode?: MatrixMode;
     size?: "xs" | "sm" | "md" | "lg" | "xl";
   }>(),
   { matrix: false, mode: "breathe", size: "sm" },
 );
+defineEmits<{ action: [] }>();
 </script>
 
 <template>
-  <div class="empty" :class="{ 'empty--matrix': matrix }">
-    <CharacterMatrix v-if="matrix" :mode="mode" :size="size" />
-    <p class="empty__line">{{ line }}</p>
+  <div class="empty" :class="{ 'empty--matrix': matrix }" :aria-busy="reading || undefined">
+    <CharacterMatrix v-if="matrix" :static="!reading" :mode="reading ? 'sweep' : mode" :size="size" />
+    <p class="empty__line">{{ reading ? 'Reading records…' : line }}</p>
+    <UiButton v-if="action" @click="$emit('action')">{{ action }}</UiButton>
   </div>
 </template>
 

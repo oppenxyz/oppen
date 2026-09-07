@@ -1,50 +1,66 @@
 <script setup lang="ts">
+import { computed, ref, watch } from "vue";
+import DecisionStream from "../components/DecisionStream.vue";
 import EmptyState from "../components/housing/EmptyState.vue";
 import PanelHousing from "../components/housing/PanelHousing.vue";
-import ReadoutRows, { type ReadoutRow } from "../components/housing/ReadoutRows.vue";
+import ReadoutRows from "../components/housing/ReadoutRows.vue";
 import UiButton from "../components/ui/UiButton.vue";
+import { decimal } from "../lib/display";
+import { events, operator, recordedAgents, storedPolicy, refreshOperator } from "../stores/operator";
 import { setView } from "../stores/shell";
 
-const RUNTIME: readonly ReadoutRow[] = [
-  { k: "PROCESS", v: "local" },
-  { k: "KEYS", v: "never leave device" },
-  { k: "MODEL CALLS", v: "—" },
-];
+const selected = ref("");
+watch(recordedAgents, agents => { if (!agents.includes(selected.value)) selected.value = agents[0] ?? ""; }, { immediate: true });
+const policy = computed(() => storedPolicy.value?.guardrails[selected.value]);
+const lastSeen = computed(() => [...events.value].reverse().find(event => event.agent_id === selected.value)?.ts_ms);
+const halt = computed(() => storedPolicy.value?.kill.global ?? storedPolicy.value?.kill.agents[selected.value]);
+const policyRows = computed(() => policy.value ? [
+  { k: "Allowed markets", v: policy.value.symbols.join(", ") || "None · orders refused" },
+  { k: "Order cap · USD", v: decimal(policy.value.max_order_usd) },
+  { k: "Position cap · USD", v: decimal(policy.value.max_position_usd) },
+  { k: "Slippage cap · bp", v: decimal(policy.value.max_slippage_bps) },
+  { k: "Leverage cap", v: `${policy.value.risk.max_leverage}×` },
+  { k: "Daily loss halt · USD", v: policy.value.loss.max_daily_loss_usd === null ? "Unset" : decimal(policy.value.loss.max_daily_loss_usd) },
+  { k: "Approval required", v: policy.value.approval_required ? "Yes" : "No" },
+  { k: "Reduce only", v: policy.value.reduce_only ? "Yes" : "No" },
+] : []);
 </script>
 
 <template>
   <div class="agents">
-    <PanelHousing label="Agents · 0 · local runtime" data-tour="agents">
-      <template #meta>
-        <UiButton size="sm" @click="setView('builder')">+ New</UiButton>
-      </template>
-      <EmptyState line="No agents paired." />
-      <template #footer>
-        New agents start in approval mode with tight caps.<br />
-        Autonomy is granted per policy — revoked in one click.
-      </template>
+    <PanelHousing label="Recorded agents" :meta="operator.policy || operator.ledger ? `${recordedAgents.length}` : 'Not read'" data-tour="agents">
+      <div class="roster" v-if="recordedAgents.length">
+        <button v-for="agent in recordedAgents" :key="agent" :aria-pressed="selected === agent" @click="selected = agent">
+          <strong>{{ agent }}</strong><span>{{ storedPolicy?.vaults[agent] ?? 'Container address not recorded' }}</span>
+        </button>
+      </div>
+      <EmptyState v-else matrix size="sm" :reading="operator.reading && !operator.policy && !operator.ledger" :line="operator.error ?? operator.policyError ?? operator.ledgerError ?? (operator.policy && operator.ledger ? 'No agents in stored policies or recent events.' : 'No agent records have been read.')" action="Open MCP setup" @action="setView('builder')" />
+      <template #footer>From stored policies and recent events. A record does not prove an active pairing.</template>
     </PanelHousing>
-
     <div class="agents__main">
-      <PanelHousing inset :brackets="['tl']">
-        <EmptyState line="No agent selected." />
+      <PanelHousing inset :brackets="['tl']" :label="selected || 'Gateway data'">
+        <div class="agent-summary">
+          <span>Last recorded event · {{ lastSeen ? new Date(lastSeen).toLocaleString() : 'Unknown' }}</span>
+          <span>Stored halt · {{ storedPolicy ? (halt ? 'Engaged' : 'Not engaged') : 'Unknown' }}</span>
+          <UiButton size="sm" @click="refreshOperator" :disabled="operator.reading">Refresh records</UiButton>
+        </div>
+        <p v-if="operator.error || operator.policyError" class="agents__note" role="status">{{ operator.error ?? operator.policyError }} Last successful readings remain visible.</p>
       </PanelHousing>
-
       <div class="agents__lower">
-        <PanelHousing label="Decision log" meta="Every decision, including holds">
-          <EmptyState matrix size="md" line="Pair an agent to see decisions." />
+        <PanelHousing label="Decision log" meta="Recorded events">
+          <DecisionStream :agent="selected || undefined" />
         </PanelHousing>
-
         <div class="agents__side">
-          <PanelHousing inset label="Policy">
-            <EmptyState line="No policy loaded." />
+          <PanelHousing inset label="Stored policy">
+            <ReadoutRows v-if="policy" :rows="policyRows" />
+            <EmptyState v-else line="No policy read for this agent." />
+            <p class="agents__note">{{ operator.policyReadMs ? `Read ${new Date(operator.policyReadMs).toLocaleTimeString()}` : 'Not read' }} · editing requires the live operator connection.</p>
           </PanelHousing>
-          <PanelHousing inset label="Approvals" meta="0 pending" :brackets="['br']">
-            <EmptyState line="No proposals queued." />
-            <p class="agents__note">Re-priced at approval · expires unsent</p>
+          <PanelHousing inset label="Live approvals" meta="Not connected" :brackets="['br']">
+            <EmptyState line="Pending proposals live in the gateway. Recorded approval decisions are in the log; they do not prove the current queue is empty." />
           </PanelHousing>
-          <PanelHousing inset label="Runtime">
-            <ReadoutRows :rows="RUNTIME" />
+          <PanelHousing inset label="Runtime state">
+            <ReadoutRows :rows="[{ k: 'Active pairing', v: 'Not read' }, { k: 'Dead-man coverage', v: 'Not read' }, { k: 'Cancel completion', v: 'Not read' }]" />
           </PanelHousing>
         </div>
       </div>
@@ -53,6 +69,13 @@ const RUNTIME: readonly ReadoutRow[] = [
 </template>
 
 <style scoped>
+.roster { overflow: auto; min-height: 0; }
+.roster button { display: grid; gap: var(--s-2); width: 100%; padding: var(--s-4); text-align: left; border-bottom: 1px solid var(--rule); border-left: 2px solid transparent; }
+.roster button[aria-pressed="true"] { border-left-color: var(--signal); background: var(--void); }
+.roster strong { color: var(--signal); font-weight: 400; }
+.roster span { color: var(--bracket); font-size: var(--fs-body-sm); overflow-wrap: anywhere; }
+.agent-summary { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: var(--s-3); font-size: var(--fs-body); }
+
 .agents {
   display: grid;
   flex: 1;
@@ -81,7 +104,9 @@ const RUNTIME: readonly ReadoutRow[] = [
 
 .agents__side {
   display: grid;
-  grid-template-rows: auto auto 1fr;
+  grid-template-rows: max-content max-content max-content;
+  align-content: start;
+  overflow: auto;
   gap: var(--panel-gap);
   min-height: 0;
 }

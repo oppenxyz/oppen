@@ -34,7 +34,7 @@ pub enum StoreError {
 }
 
 /// Everything the engine loads at startup.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct PersistedState {
     pub guardrails: BTreeMap<AgentId, AgentGuardrails>,
     pub kill: KillSwitch,
@@ -136,6 +136,18 @@ pub struct SqliteGuardrailStore {
 }
 
 impl SqliteGuardrailStore {
+    /// Read persisted operator policy without creating a database or starting
+    /// an engine. This is stored policy, not proof of a gateway's live state.
+    pub(crate) fn read_snapshot(path: impl AsRef<Path>) -> Result<PersistedState, StoreError> {
+        let connection =
+            Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        connection.execute_batch("BEGIN")?;
+        Self {
+            conn: Mutex::new(connection),
+        }
+        .load()
+    }
+
     /// Opens or creates the store at `path`, which should be the per-network
     /// database file named by [`crate::db_file_name`].
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {

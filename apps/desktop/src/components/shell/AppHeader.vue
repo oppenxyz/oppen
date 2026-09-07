@@ -1,12 +1,12 @@
 <script setup lang="ts">
 import { computed } from "vue";
-import { formatLatency, formatUsd, NAV, setView, shell, venueLabel } from "../../stores/shell";
+import { formatLatency, formatUsd, NAV, setView, shell, feedLabel } from "../../stores/shell";
 import { progress } from "../../stores/tour";
 import UiButton from "../ui/UiButton.vue";
 import ApertureMark from "./ApertureMark.vue";
 import WordMark from "./WordMark.vue";
 
-const venue = computed(() => venueLabel(shell.feeds));
+const venue = computed(() => feedLabel(shell.feeds.wsMarket));
 const latency = computed(() => formatLatency(shell.latencyMs));
 const equity = computed(() => formatUsd(shell.equityUsd));
 const network = computed(() => shell.network.toUpperCase());
@@ -36,14 +36,14 @@ const network = computed(() => shell.network.toUpperCase());
     <div class="hdr__spacer" />
 
     <div class="hdr__status">
-      <span>LOCAL · <span class="hdr__v">RUNTIME OK</span></span>
-      <span>HYPERLIQUID · <span class="hdr__v">{{ venue }}</span></span>
+      <span>LOCAL · <span class="hdr__v">CONSOLE OPEN</span></span>
+      <span>HYPERLIQUID MKT · <span class="hdr__v">{{ venue }}</span></span>
       <span class="hdr__chip" :class="`hdr__chip--${shell.network}`" data-tour="network">{{ network }}</span>
       <span>LAT · <span class="hdr__v">{{ latency }}</span></span>
       <span>EQUITY · <span class="hdr__v hdr__v--signal">{{ equity }}</span></span>
       <button
         type="button"
-        class="hdr__setup"
+        class="hdr__setup" data-tour="setup"
         :class="{ 'hdr__setup--active': shell.view === 'onboarding' }"
         @click="setView('onboarding')"
       >
@@ -55,7 +55,7 @@ const network = computed(() => shell.network.toUpperCase());
           {{ progress.done }}/{{ progress.total }}
         </span>
       </button>
-      <UiButton variant="hazard" size="sm" class="hdr__halt" disabled title="Kill switch arrives with the guardrail phase">
+      <UiButton variant="hazard" size="sm" class="hdr__halt" disabled title="Gateway halt control is not connected to this console">
         HALT ALL
       </UiButton>
     </div>
@@ -164,5 +164,11 @@ const network = computed(() => shell.network.toUpperCase());
   padding: 6px 10px;
   font-size: var(--fs-label-lg);
   letter-spacing: var(--ls-chip);
+}
+@media (max-width: 1450px) {
+  .hdr { display: grid; grid-template-columns: auto 1fr; height: auto; gap: 0 var(--s-4); }
+  .hdr__brand, .hdr__nav { min-height: 40px; }
+  .hdr__spacer { display: none; }
+  .hdr__status { grid-column: 1 / -1; justify-content: flex-end; min-height: 38px; gap: var(--s-4); border-top: 1px solid var(--rule); }
 }
 </style>

@@ -54,7 +54,7 @@ export const TOUR: readonly TourStep[] = [
     target: "nav",
     view: "trade",
     title: "Five screens, one machine",
-    body: "Trade, Agents, Builder, Portfolio, Settings. Everything runs locally: your keys, your agents, the execution engine. Nothing here calls home.",
+    body: "Trade, Agents, Builder, Portfolio, Settings. The console and execution engine run locally. External agents connect through MCP and may use their own model providers.",
     placement: "bottom",
   },
   {
@@ -84,15 +84,15 @@ export const TOUR: readonly TourStep[] = [
     title: "The manual ticket",
     body: "Your own orders, signed by the same engine and recorded in the same ledger as an agent's. A trade you made by hand is not a special case.",
     placement: "left",
-    caveat: "Wired to the guardrail engine; live signing arrives with the keychain phase.",
+    caveat: "The manual ticket is not connected to the execution engine in this console yet.",
   },
   {
     target: "positions",
     view: "trade",
     title: "Positions, orders and fills",
-    body: "Three ledgers behind one set of tabs, and each position carries its liquidation price and how far the mark is from it. Agent-held and manual rows sit together: a trade you made by hand is not a special case.",
+    body: "Positions and open orders come from the configured account read. Unknown account state is distinct from a successful empty result.",
     placement: "top",
-    caveat: "The same distance in daily standard deviations — the figure that compares across symbols — is answered to agents through the gateway but is not on this screen yet.",
+    caveat: "Fills and activity show the latest 200 gateway ledger events when its data directory is connected.",
   },
   {
     target: "agents",
@@ -104,8 +104,8 @@ export const TOUR: readonly TourStep[] = [
   {
     target: "builder",
     view: "builder",
-    title: "Build an agent, then prove it before arming it",
-    body: "Source, the hard limits the runtime enforces, and the instructions the model actually sees — then a testnet run whose trades, PnL and refusals you read before anything is armed. The order of the panels is the order of the ceremony.",
+    title: "Connect an external agent",
+    body: "Builder explains the current testnet development path: configure the account, start the gateway, pair your MCP client and verify state and preflight.",
     placement: "right",
     caveat: "Saving a draft and arming an agent arrive with the agent registry and the pairing flow.",
   },
@@ -113,7 +113,7 @@ export const TOUR: readonly TourStep[] = [
     target: "portfolio",
     view: "portfolio",
     title: "What actually happened",
-    body: "Equity, unrealised PnL, exposure, margin used and the nearest liquidation across every position — then the same broken out by agent and by sub-account, so a number you do not like has somewhere to be traced to.",
+    body: "Equity, unrealised PnL, gross exposure, margin and nearest liquidation for the configured account. Exposure bars show each market’s share. Other containers do not share its margin.",
     placement: "right",
     caveat: "The execution report — slippage against the price each order was decided at, split by whether you crossed — is answered to agents through the gateway and is not on this screen yet.",
   },
@@ -121,7 +121,8 @@ export const TOUR: readonly TourStep[] = [
     target: "settings",
     view: "settings",
     title: "Guardrails, and who may reach them",
-    body: "Limits are set here and nowhere else. No agent can read this screen or change what is on it — the one path from an agent to the signer runs through the guardrail engine, and it has no door onto this page.",
+    caveat: "Stored limits can be inspected. Editing and live runtime controls are not connected yet.",
+    body: "Risk limits are operator owned and enforced in Rust before signing. Settings identifies which controls are connected. External agents cannot change risk parameters through MCP.",
     placement: "right",
   },
   {
@@ -130,7 +131,7 @@ export const TOUR: readonly TourStep[] = [
     title: "The kill switch",
     body: "Stops an agent, or all of them, and cancels their resting orders. Risk-reducing actions still go through while it is engaged — it stops new exposure, it never traps you in a position.",
     placement: "left",
-    caveat: "The engine enforces this today; the console control is wired up in the guardrail phase.",
+    caveat: "The gateway halt control and per-container dead-man coverage are not connected to this console.",
   },
   {
     // The status bar is shell furniture, on screen whatever view is open, so
@@ -139,6 +140,7 @@ export const TOUR: readonly TourStep[] = [
     target: "statusbar",
     view: "settings",
     title: "The last thing an agent did, and why",
+    caveat: "Connect the gateway data directory to read recorded reasons. They do not prove a current pairing or pending approval state.",
     body: "Every decision an agent takes is written to an append-only, hash-chained ledger with the agent's own stated reason. The reason is the agent's claim, shown as plain text and never acted on.",
     placement: "top",
   },
@@ -260,8 +262,8 @@ export const milestones = computed<Milestone[]>(() => {
   return [
     {
       id: "runtime",
-      label: "Local runtime",
-      detail: "The console is running and talking to its own engine.",
+      label: "Console open",
+      detail: "This interface is open. Engine and feed connectivity are checked separately.",
       // Reaching this code at all means the runtime served the page.
       state: "done",
     },
@@ -273,16 +275,16 @@ export const milestones = computed<Milestone[]>(() => {
     },
     {
       id: "venue",
-      label: "Venue reachable",
-      detail: "A read of your account returned, so the venue is answering.",
+      label: "Account read",
+      detail: "A successful account read is separate from the public market feed.",
       state: account !== null ? "done" : "pending",
     },
     {
       id: "funded",
-      label: "Container funded",
+      label: "Account has equity",
       detail: funded
-        ? "Equity is positive, so an order has something to be sized against."
-        : "Send test USDC to the container address, then refresh.",
+        ? "The configured account has positive equity. Agent binding and trading approvals are separate checks."
+        : (account ? `No positive equity reported for the configured ${shell.network} account.` : "Configure an account before checking its funding."),
       state: funded ? "done" : "pending",
     },
     {

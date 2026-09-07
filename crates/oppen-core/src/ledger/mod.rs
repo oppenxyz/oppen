@@ -730,6 +730,35 @@ pub struct Ledger {
 }
 
 impl Ledger {
+    /// Open an existing ledger for the operator console without creating or
+    /// migrating it. SQLite enforces read-only access; the normal coordinated
+    /// page reader remains the single event source (spec #31, D6 and R4).
+    pub(crate) fn open_readonly(dir: &Path, network: Network) -> Result<Self> {
+        let path = std::fs::canonicalize(dir.join(crate::db_file_name(network)))?;
+        let connection =
+            Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        connection.busy_timeout(BUSY_TIMEOUT)?;
+        schema::supported_version(&connection)?;
+        let found: String = connection.query_row(
+            "SELECT value FROM ledger_meta WHERE key = 'network'",
+            [],
+            |row| row.get(0),
+        )?;
+        let expected = network_key(network);
+        if found != expected {
+            return Err(LedgerError::NetworkMismatch { expected, found });
+        }
+        let mut coordination_path = path.clone().into_os_string();
+        coordination_path.push(".lock");
+        Ok(Self {
+            connection: Mutex::new(connection),
+            coordination_path: PathBuf::from(coordination_path),
+            network,
+            genesis: hash::genesis_hash(network),
+            anchor: Some(Box::new(FileAnchor::beside(&path))),
+        })
+    }
+
     /// Open the ledger for `network` inside `dir`.
     ///
     /// The file name comes from [`crate::db_file_name`], which is what makes

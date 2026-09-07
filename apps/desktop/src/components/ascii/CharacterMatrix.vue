@@ -7,6 +7,7 @@ const props = withDefaults(
   defineProps<{
     /** breathe = idle aperture; sweep = a scanning arm, for loading and waiting. */
     mode?: MatrixMode;
+    static?: boolean;
     size?: "xs" | "sm" | "md" | "lg" | "xl";
     /** matrix = bracket-grey ink; field = one step darker, for backgrounds. */
     tone?: "matrix" | "field";
@@ -15,7 +16,7 @@ const props = withDefaults(
 );
 
 const tick = useClock();
-const frame = computed(() => matrix(tick.value, props.mode));
+const frame = computed(() => matrix(props.static ? 0 : tick.value, props.mode));
 </script>
 
 <template>
