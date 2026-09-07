@@ -6,7 +6,8 @@ use tempfile::TempDir;
 
 use super::*;
 use crate::guardrail::{AuditEntry, AuditOutcome, AuditSink, Utilization};
-use crate::ledger::{EventViews, LedgerAuditSink, SubmissionReceipt};
+use crate::ledger::tests::{audit_route, audit_sink};
+use crate::ledger::{EventViews, SubmissionReceipt};
 
 const BASE: u64 = 1_800_000_000_000;
 
@@ -25,8 +26,21 @@ fn fixture() -> (TempDir, Arc<Ledger>, PilotJournal) {
     let journal = PilotJournal::new(ledger.clone());
     (dir, ledger, journal)
 }
+
+// Pilot-only lock proofs retain the guard for the simulated signing window.
+// Production combines route and pilot validation under its own single guard.
+fn before_sign<'a>(
+    ledger: &'a Ledger,
+    clearance: &Clearance,
+) -> Result<super::super::LedgerGuard<'a>> {
+    let guard = ledger.lock()?;
+    check_before_sign(ledger, &guard, clearance)?;
+    Ok(guard)
+}
+
 fn order(id: u8, size: &str) -> Clearance {
     Clearance {
+        route: audit_route(agent(), account(), BASE + 1),
         agent: agent(),
         vault_address: None,
         network: Network::Testnet,
@@ -58,7 +72,7 @@ fn order(id: u8, size: &str) -> Clearance {
     }
 }
 fn persist(ledger: &Arc<Ledger>, clearance: &Clearance) {
-    LedgerAuditSink::new(ledger.clone())
+    audit_sink(ledger.clone())
         .record(&AuditEntry {
             agent: Some(&clearance.agent),
             at_ms: clearance.evaluated_at_ms,
@@ -787,6 +801,39 @@ fn deleted_authorization_cannot_hide_from_unconfigured_read_or_sign() {
         .unwrap();
     assert!(journal.state(account()).is_err());
     assert!(before_sign(&ledger, &order(1, "1")).is_err());
+}
+
+#[test]
+fn unavailable_pilot_evidence_blocks_orders_but_not_cleanup() {
+    for target in ["authorization", "submission"] {
+        let (_dir, ledger, journal) = fixture();
+        journal.authorize(agent(), account(), BASE).unwrap();
+        let authorization = ledger.chain_head().unwrap().seq;
+        let mut clearance = order(1, "1");
+        begin(&ledger, &clearance);
+        let submission = ledger.chain_head().unwrap().seq;
+        drop(before_sign(&ledger, &clearance).unwrap());
+        ledger
+            .redact(
+                if target == "authorization" {
+                    authorization
+                } else {
+                    submission
+                },
+                "synthetic redaction",
+                (BASE + 10) as i64,
+            )
+            .unwrap();
+        assert!(ledger.verify().unwrap().is_intact());
+        assert!(before_sign(&ledger, &clearance).is_err(), "{target}");
+        for kind in [
+            ClearedKind::Cancel { count: 1 },
+            ClearedKind::ScheduleCancel { cancel_at_ms: None },
+        ] {
+            clearance.kind = kind;
+            drop(before_sign(&ledger, &clearance).unwrap());
+        }
+    }
 }
 
 #[test]

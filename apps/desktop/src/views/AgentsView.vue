@@ -31,7 +31,7 @@ const policyRows = computed(() => policy.value ? [
     <PanelHousing label="Recorded agents" :meta="operator.policy || operator.ledger ? `${recordedAgents.length}` : 'Not read'" data-tour="agents">
       <div class="roster" v-if="recordedAgents.length">
         <button v-for="agent in recordedAgents" :key="agent" :aria-pressed="selected === agent" @click="selected = agent">
-          <strong>{{ agent }}</strong><span>{{ storedPolicy?.vaults[agent] ?? 'Container address not recorded' }}</span>
+          <strong>{{ agent }}</strong><span>Container route unavailable</span>
         </button>
       </div>
       <EmptyState v-else matrix size="sm" :reading="operator.reading && !operator.policy && !operator.ledger" :line="operator.error ?? operator.policyError ?? operator.ledgerError ?? (operator.policy && operator.ledger ? 'No agents in stored policies or recent events.' : 'No agent records have been read.')" action="Open MCP setup" @action="setView('builder')" />

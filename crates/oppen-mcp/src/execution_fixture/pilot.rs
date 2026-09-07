@@ -131,7 +131,13 @@ async fn pilot_stop_retries_resting_cancels_for_revoked_binding_after_restart() 
     let bindings = runtime.pairings.read().unwrap().bindings();
     assert!(runtime.gateway.inner.engine.paused_agents().is_empty());
     venue.next_response(Behavior::Rejected);
-    assert!(runtime.gateway.enforce_pauses(&bindings).await.is_err());
+    assert!(
+        runtime
+            .gateway
+            .enforce_pauses(&bindings, runtime.tracker())
+            .await
+            .is_err()
+    );
     assert_eq!(venue.submissions().len(), 2);
     assert_eq!(
         runtime
@@ -144,7 +150,11 @@ async fn pilot_stop_retries_resting_cancels_for_revoked_binding_after_restart() 
             .len(),
         1
     );
-    runtime.gateway.enforce_pauses(&bindings).await.unwrap();
+    runtime
+        .gateway
+        .enforce_pauses(&bindings, runtime.tracker())
+        .await
+        .unwrap();
     assert_eq!(
         venue.submissions().len(),
         3,
@@ -171,7 +181,11 @@ async fn pilot_stop_retries_resting_cancels_for_revoked_binding_after_restart() 
         Decimal::from(5),
         Decimal::from(5),
     );
-    runtime.gateway.enforce_pauses(&bindings).await.unwrap();
+    runtime
+        .gateway
+        .enforce_pauses(&bindings, runtime.tracker())
+        .await
+        .unwrap();
     assert_eq!(
         venue.submissions().len(),
         3,
@@ -242,7 +256,7 @@ async fn pilot_awaiting_order_linkage_does_not_cancel_resting_orders() {
     );
     runtime
         .gateway
-        .enforce_pauses(&[binding(&runtime)])
+        .enforce_pauses(&[binding(&runtime)], runtime.tracker())
         .await
         .unwrap();
     assert_eq!(venue.submissions().len(), 1);
@@ -259,7 +273,7 @@ async fn pilot_awaiting_order_linkage_does_not_cancel_resting_orders() {
     assert!(state(&runtime).halt.is_none());
     runtime
         .gateway
-        .enforce_pauses(&[binding(&runtime)])
+        .enforce_pauses(&[binding(&runtime)], runtime.tracker())
         .await
         .unwrap();
     assert_eq!(venue.submissions().len(), 1);
@@ -305,6 +319,7 @@ async fn ordinary_resume_during_cancel_reads_cannot_clear_a_pilot_stop() {
             &bound,
             &params,
             true,
+            runtime.tracker(),
             async {
                 runtime
                     .gateway
@@ -325,7 +340,7 @@ async fn ordinary_resume_during_cancel_reads_cannot_clear_a_pilot_stop() {
             },
             |cleared| async {
                 assert!(queue.try_lock().is_err());
-                runtime.gateway.submit(cleared, None, None).await
+                runtime.gateway.submit(cleared, None, &bound, None).await
             },
         ));
         assert!(matches!(

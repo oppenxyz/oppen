@@ -170,6 +170,15 @@ impl SubmissionJournal {
         if clearance.network != self.0.network {
             return Err(SubmissionError::WrongNetwork);
         }
+        if clearance.route.network != clearance.network
+            || clearance.route.binding.agent != clearance.agent
+            || clearance.route.binding.container != account
+            || clearance.route.binding.vault_address != clearance.vault_address
+        {
+            return Err(invalid(
+                "clearance route does not match submission identity",
+            ));
+        }
         let ClearedKind::Order {
             cloid: Some(cloid), ..
         } = &clearance.kind

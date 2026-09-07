@@ -23,6 +23,42 @@ use tempfile::TempDir;
 
 use super::*;
 
+// Audit-only clearances carry a complete route without granting signing
+// authority or inserting extra rows into the historical chain under test.
+pub(super) fn audit_route(
+    agent: crate::guardrail::AgentId,
+    container: oppen_hl::Address,
+    at_ms: u64,
+) -> AuthorizedRoute {
+    use crate::keys::{KeyStore, MemoryKeyStore, SecretText};
+    let keys = MemoryKeyStore::new(Network::Testnet);
+    let wallet = keys
+        .create_agent_key(
+            &agent,
+            SecretText::new(format!("{:064x}", 1)),
+            at_ms + 86_400_000,
+            at_ms,
+        )
+        .expect("synthetic wallet");
+    AuthorizedRoute {
+        network: Network::Testnet,
+        binding_seq: 1,
+        binding: RegistryBinding {
+            agent,
+            container,
+            vault_address: None,
+            wallet,
+        },
+    }
+}
+
+pub(super) fn audit_sink(ledger: Arc<Ledger>) -> LedgerAuditSink {
+    LedgerAuditSink::new(
+        RegistryJournal::open(ledger, Arc::new(crate::keys::HmacKey::from_bytes([31; 32])))
+            .expect("registry replay"),
+    )
+}
+
 /// D6 / item 29: production audit writes survive reopening as one intact chain.
 #[test]
 fn production_audit_sink_persists_orders_decisions_and_typed_refusals() {
@@ -30,6 +66,7 @@ fn production_audit_sink_persists_orders_decisions_and_typed_refusals() {
         AgentId, AuditEntry, AuditOutcome, AuditSink, ClearedKind, GuardrailEngine, Refusal,
         SqliteGuardrailStore,
     };
+    use crate::keys::{KeyStore, MemoryKeyStore, SecretText};
     use rust_decimal::Decimal;
 
     let dir = TempDir::new().expect("tempdir");
@@ -41,19 +78,40 @@ fn production_audit_sink_persists_orders_decisions_and_typed_refusals() {
         observed_usd: Decimal::from(100),
         limit_usd: Decimal::from(25),
     };
-    let head = {
+    let registry_key = Arc::new(crate::keys::HmacKey::from_bytes([31; 32]));
+    let (head, route) = {
         let ledger = Arc::new(Ledger::open_at(&path, Network::Testnet).expect("open"));
-        let sink = Arc::new(LedgerAuditSink::new(ledger.clone()));
+        let keys = Arc::new(MemoryKeyStore::new(Network::Testnet));
+        let wallet = keys
+            .create_agent_key(
+                &agent,
+                SecretText::new(format!("{:064x}", 1)),
+                86_400_999,
+                999,
+            )
+            .expect("synthetic wallet");
+        let registry =
+            RegistryJournal::open(ledger.clone(), registry_key.clone()).expect("registry");
+        let route = registry
+            .grant(
+                RegistryBinding {
+                    agent: agent.clone(),
+                    container: oppen_hl::Address::from_bytes([1; 20]),
+                    vault_address: None,
+                    wallet,
+                },
+                999,
+            )
+            .expect("explicit grant");
+        let sink = Arc::new(LedgerAuditSink::new(registry));
         let engine = GuardrailEngine::new(
             Arc::new(SqliteGuardrailStore::open(dir.path().join("guardrails.db")).expect("store")),
             sink.clone(),
-            Arc::new(crate::keys::MemoryKeyStore::new(Network::Testnet)),
+            keys,
             Network::Testnet,
         )
         .expect("engine");
-        engine
-            .register_agent(&agent, None, 1_000)
-            .expect("register");
+        engine.register_agent(&agent, 1_000).expect("register");
         let cancel = engine
             .clear_cancel(
                 &agent,
@@ -99,16 +157,22 @@ fn production_audit_sink_persists_orders_decisions_and_typed_refusals() {
         })
         .expect("refusal");
         assert!(ledger.verify().expect("verify").is_intact());
-        ledger.chain_head().expect("head")
+        (ledger.chain_head().expect("head"), route)
     };
 
-    let ledger = Ledger::open_at(&path, Network::Testnet).expect("reopen");
+    let ledger = Arc::new(Ledger::open_at(&path, Network::Testnet).expect("reopen"));
+    let registry = RegistryJournal::open(ledger.clone(), registry_key).expect("replay registry");
+    assert_eq!(
+        registry.route_for_agent(&agent).expect("persisted route"),
+        route
+    );
     assert_eq!(ledger.chain_head().expect("head"), head);
     assert!(ledger.verify().expect("verify persisted chain").is_intact());
     let events = ledger.get_events(0, 10).expect("events").events;
     assert_eq!(
         events.iter().map(|event| event.kind).collect::<Vec<_>>(),
         vec![
+            EventKind::RegistryGranted,
             EventKind::OperatorAction,
             EventKind::AgentDecision,
             EventKind::AgentDecision,
@@ -116,22 +180,24 @@ fn production_audit_sink_persists_orders_decisions_and_typed_refusals() {
             EventKind::Refusal,
         ]
     );
-    for (index, event) in events.iter().enumerate() {
+    assert_eq!(events[0].seq, route.binding_seq);
+    assert_eq!(events[0].ts_ms, 999);
+    for (index, event) in events.iter().skip(1).enumerate() {
         assert_eq!(event.agent_id.as_deref(), Some(agent.as_str()));
         assert_eq!(event.ts_ms, 1_000 + index as i64);
     }
-    let cancel = events[1].payload.as_ref().expect("cancel payload");
+    let cancel = events[2].payload.as_ref().expect("cancel payload");
     assert_eq!(cancel["kind"]["cleared"], "cancel");
     assert_eq!(cancel["kind"]["count"], 1);
     assert_eq!(cancel["reason"], reason);
-    let deadman = events[2].payload.as_ref().expect("dead-man payload");
+    let deadman = events[3].payload.as_ref().expect("dead-man payload");
     assert_eq!(deadman["kind"]["cleared"], "schedule_cancel");
     assert_eq!(deadman["reason"], "dead-man's switch");
-    let order = events[3].payload.as_ref().expect("order payload");
+    let order = events[4].payload.as_ref().expect("order payload");
     assert_eq!(order["kind"]["cleared"], "order");
     assert_eq!(order["kind"]["notional_usd"], "100");
     assert_eq!(order["reason"], reason);
-    let rejected = events[4].payload.as_ref().expect("refusal payload");
+    let rejected = events[5].payload.as_ref().expect("refusal payload");
     assert_eq!(rejected["reason"], reason);
     assert_eq!(rejected["refusal"], refusal.to_string());
     assert_eq!(
@@ -161,23 +227,36 @@ fn engine_evaluates_and_signs_an_order_through_the_production_audit_sink() {
     let now_ms = 1_788_998_400_000;
     let keys = Arc::new(MemoryKeyStore::new(Network::Testnet));
     // Public test scalar, held only in memory; never opens an OS keychain.
-    keys.create_agent_key(
-        &agent,
-        SecretText::new(format!("{:064x}", 1)),
-        now_ms + 86_400_000,
-        now_ms,
-    )
-    .expect("test wallet");
+    let wallet = keys
+        .create_agent_key(
+            &agent,
+            SecretText::new(format!("{:064x}", 1)),
+            now_ms + 86_400_000,
+            now_ms,
+        )
+        .expect("test wallet");
+    let account = oppen_hl::Address::from_bytes([1; 20]);
+    let registry_key = Arc::new(crate::keys::HmacKey::from_bytes([31; 32]));
+    let registry = RegistryJournal::open(ledger.clone(), registry_key.clone()).expect("registry");
+    let route = registry
+        .grant(
+            RegistryBinding {
+                agent: agent.clone(),
+                container: account,
+                vault_address: None,
+                wallet,
+            },
+            now_ms,
+        )
+        .expect("explicit grant");
     let engine = GuardrailEngine::new(
         Arc::new(SqliteGuardrailStore::open(dir.path().join("policy.db")).expect("policy store")),
-        Arc::new(LedgerAuditSink::new(ledger.clone())),
+        Arc::new(LedgerAuditSink::new(registry)),
         keys,
         Network::Testnet,
     )
     .expect("engine");
-    engine
-        .register_agent(&agent, None, now_ms)
-        .expect("register");
+    engine.register_agent(&agent, now_ms).expect("register");
     engine
         .operator_set_guardrails(
             &agent,
@@ -228,6 +307,7 @@ fn engine_evaluates_and_signs_an_order_through_the_production_audit_sink() {
         vol_ratio: None,
     };
     let exposure = Exposure {
+        account,
         agent: AccountSnapshot {
             as_of_ms: now_ms,
             reconciled: true,
@@ -265,7 +345,7 @@ fn engine_evaluates_and_signs_an_order_through_the_production_audit_sink() {
     let head = ledger.chain_head().expect("head before signing");
 
     let (request, clearance) = engine
-        .sign_cleared(cleared, now_ms, None, now_ms)
+        .sign_cleared(cleared, now_ms, None, || now_ms)
         .expect("real engine signs with the in-memory test wallet");
     let oppen_hl::Action::Order { orders, .. } = request.action() else {
         panic!("expected a signed order");
@@ -276,11 +356,17 @@ fn engine_evaluates_and_signs_an_order_through_the_production_audit_sink() {
     assert_eq!(clearance.network, Network::Testnet);
     assert_eq!(clearance.agent, agent);
     assert_eq!(clearance.vault_address, None);
+    assert_eq!(clearance.route, route);
     assert_eq!(ledger.chain_head().expect("head after signing"), head);
     drop(engine);
     drop(ledger);
 
-    let reopened = Ledger::open_at(&path, Network::Testnet).expect("reopen");
+    let reopened = Arc::new(Ledger::open_at(&path, Network::Testnet).expect("reopen"));
+    let registry = RegistryJournal::open(reopened.clone(), registry_key).expect("replay registry");
+    assert_eq!(
+        registry.route_for_agent(&agent).expect("persisted route"),
+        route
+    );
     assert_eq!(
         reopened.event(stored.seq).expect("read intent").as_ref(),
         Some(stored)
@@ -1314,6 +1400,8 @@ fn every_event_kind_round_trips_through_its_stored_name() {
         EventKind::WsReconnected,
         EventKind::Alert,
         EventKind::AgentWalletExpiryWarning,
+        EventKind::RegistryGranted,
+        EventKind::RegistryRetired,
         EventKind::PayloadRedacted,
     ];
     for kind in kinds {
@@ -2363,12 +2451,28 @@ fn generic_writers_cannot_forge_submission_lifecycle_events() {
             Err(LedgerError::UsePairingJournal)
         ));
     }
+    for kind in [EventKind::RegistryGranted, EventKind::RegistryRetired] {
+        assert!(matches!(
+            ledger.append(&NewEvent {
+                kind,
+                ts_ms: 1,
+                agent_id: Some("alpha"),
+                payload: &json!({}),
+                snapshot: None,
+            }),
+            Err(LedgerError::UseRegistryJournal)
+        ));
+        assert!(matches!(
+            ledger.record_outcome(&receipt, kind, 2, &json!({})),
+            Err(LedgerError::UseRegistryJournal)
+        ));
+    }
     assert_eq!(ledger.get_events(0, 10).expect("events").events.len(), 1);
 }
 
 #[test]
 fn authority_reader_barriers_preserve_the_existing_chain_on_upgrade() {
-    for prior_version in [3, 4] {
+    for prior_version in [3, 4, 5] {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("testnet.db");
         let head = {
@@ -2401,7 +2505,7 @@ fn authority_reader_barriers_preserve_the_existing_chain_on_upgrade() {
             .unwrap()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 5);
+        assert_eq!(version, 6);
     }
 }
 
@@ -2415,14 +2519,14 @@ fn a_reader_refuses_a_newer_authority_schema_without_rewriting_history() {
         .connection
         .lock()
         .unwrap()
-        .pragma_update(None, "user_version", 6)
+        .pragma_update(None, "user_version", 7)
         .unwrap();
     drop(ledger);
     assert!(matches!(
         Ledger::open_at(&path, Network::Testnet),
         Err(LedgerError::SchemaTooNew {
-            found: 6,
-            supported: 5
+            found: 7,
+            supported: 6
         })
     ));
     let connection = rusqlite::Connection::open(&path).unwrap();
@@ -2430,7 +2534,7 @@ fn a_reader_refuses_a_newer_authority_schema_without_rewriting_history() {
         connection
             .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
             .unwrap(),
-        6
+        7
     );
     let (seq, hash) = super::head(&connection).unwrap();
     assert_eq!(Anchor { seq, hash }, head);

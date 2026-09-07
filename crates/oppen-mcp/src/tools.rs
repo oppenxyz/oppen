@@ -39,6 +39,7 @@ use oppen_hl::{Address, InfoClient, Network, Universe, meta::MIN_NOTIONAL_USD};
 use oppen_hl::{ExchangeClient, ExchangeResponse, NonceAllocator, OrderKind, Status};
 
 use crate::auth::Binding;
+use crate::server::ExecutionTracker;
 
 /// Basis points per unit. A bound 1% wide is 100 bps.
 /// The execution report's default window. A day: long enough that a few
@@ -76,6 +77,8 @@ struct GatewayInner {
     // A timed-out blocking replay may still be finishing. Never accumulate
     // more replay tasks behind its ledger lock on subsequent sweeps.
     pilot_reader: Arc<tokio::sync::Semaphore>,
+    route_reader: Arc<tokio::sync::Semaphore>,
+    decision_worker: Arc<tokio::sync::Semaphore>,
     submissions: SubmissionJournal,
     network: Network,
     info: InfoClient,
@@ -118,6 +121,8 @@ struct GatewayInner {
     /// is a compile error rather than a review note.
     events: EventViews,
     #[cfg(test)]
+    test_registry: Option<oppen_core::ledger::RegistryJournal>,
+    #[cfg(test)]
     _test_dir: Option<tempfile::TempDir>,
 }
 
@@ -132,6 +137,7 @@ struct EvaluationContext {
 #[derive(Debug)]
 struct ExecutionPermit {
     _queue: tokio::sync::OwnedMutexGuard<()>,
+    account: Address,
     revision: u64,
 }
 
@@ -517,6 +523,8 @@ impl Gateway {
             inner: Arc::new(GatewayInner {
                 execution: Mutex::new(HashMap::new()),
                 pilot_reader: Arc::new(tokio::sync::Semaphore::new(1)),
+                route_reader: Arc::new(tokio::sync::Semaphore::new(1)),
+                decision_worker: Arc::new(tokio::sync::Semaphore::new(1)),
                 submissions: events.submissions(),
                 network,
                 info: InfoClient::new(network)?,
@@ -531,6 +539,8 @@ impl Gateway {
                 events,
                 #[cfg(test)]
                 _test_dir: None,
+                #[cfg(test)]
+                test_registry: None,
             }),
         })
     }
@@ -570,11 +580,13 @@ impl Gateway {
     }
 
     async fn reserve_submission(&self, bound: &Binding) -> Result<ExecutionPermit, ToolError> {
+        self.require_route(bound).await?;
         reserve_account(
             self.execution_queue(bound.account),
             &self.inner.submissions,
             bound.account,
             |cloid| async move {
+                self.require_route(bound).await?;
                 self.inner
                     .info
                     .order_status(bound.account, OrderRef::Cloid(cloid))
@@ -585,31 +597,94 @@ impl Gateway {
         .await
     }
 
+    async fn require_route(&self, bound: &Binding) -> Result<(), ToolError> {
+        let permit = self
+            .inner
+            .route_reader
+            .clone()
+            .try_acquire_owned()
+            .map_err(|error| ToolError::unavailable("registry reader busy", error))?;
+        let engine = self.inner.engine.clone();
+        let agent = bound.agent.clone();
+        let route = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                engine.route_for_agent(&agent)
+            }),
+        )
+        .await
+        .map_err(|error| ToolError::unavailable("registry read timeout", error))?
+        .map_err(|error| ToolError::unavailable("registry reader", error))?
+        .map_err(|refusal| ToolError::GuardrailRefused { refusal })?;
+        if route.binding.container != bound.account {
+            return Err(ToolError::unavailable(
+                "registry route",
+                "pairing account differs from authorized container",
+            ));
+        }
+        Ok(())
+    }
+
     /// Runtime-only: retry from persisted pause and pilot state, never from the
     /// drainable kill-effect queue. This is not an MCP tool or an unpause path.
-    pub(crate) async fn enforce_pauses(&self, bindings: &[Binding]) -> Result<(), ToolError> {
-        self.enforce_pauses_with(bindings, |bound| async move {
-            let result = self
-                .cancel_all_bound(
-                    &bound,
-                    &SymbolActionParams {
-                        symbol: None,
-                        reason: "cancel resting orders while trading is paused or pilot stopped"
-                            .to_owned(),
-                    },
-                    true,
-                )
-                .await?;
-            if result.complete {
-                Ok(())
-            } else {
-                Err(ToolError::unavailable(
-                    "pause cancellation",
-                    "resting orders were not all confirmed canceled",
-                ))
+    pub(crate) async fn enforce_pauses(
+        &self,
+        bindings: &[Binding],
+        tracker: ExecutionTracker,
+    ) -> Result<(), ToolError> {
+        self.enforce_pauses_with(bindings, |bound| {
+            let tracker = tracker.clone();
+            async move {
+                let result = self
+                    .cancel_all_bound(
+                        &bound,
+                        &SymbolActionParams {
+                            symbol: None,
+                            reason:
+                                "cancel resting orders while trading is paused or pilot stopped"
+                                    .to_owned(),
+                        },
+                        true,
+                        tracker,
+                    )
+                    .await?;
+                if result.complete {
+                    Ok(())
+                } else {
+                    Err(ToolError::unavailable(
+                        "pause cancellation",
+                        "resting orders were not all confirmed canceled",
+                    ))
+                }
             }
         })
         .await
+    }
+
+    async fn decision<T: Send + 'static>(
+        &self,
+        tracker: ExecutionTracker,
+        work: impl FnOnce(Arc<GuardrailEngine>) -> T + Send + 'static,
+    ) -> Result<T, ToolError> {
+        let permit = self
+            .inner
+            .decision_worker
+            .clone()
+            .try_acquire_owned()
+            .map_err(|error| ToolError::unavailable("decision worker busy", error))?;
+        let engine = self.inner.engine.clone();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio::task::spawn_blocking(move || {
+                let _tracker = tracker;
+                let _permit = permit;
+                work(engine)
+            }),
+        )
+        .await
+        .map_err(|error| ToolError::unavailable("decision timeout", error))?
+        .map_err(|error| ToolError::unavailable("decision worker", error))
     }
 
     async fn runtime_cancellation_needed(&self, bound: &Binding) -> Result<bool, ToolError> {
@@ -732,7 +807,7 @@ impl Gateway {
         Parameters(params): Parameters<PlaceParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
-        let inner = &self.inner;
+        let tracker = ExecutionTracker::from_context(&ctx)?;
         let bound = Self::bound(&ctx)?;
         let permit = self.reserve_submission(&bound).await?;
         let now_ms = now_ms();
@@ -821,20 +896,27 @@ impl Gateway {
         };
 
         // The gate. There is no branch around it.
-        let cleared = match inner.engine.evaluate(
-            &bound.agent,
-            &intent,
-            asset,
-            &context.market,
-            &context.exposure,
-            self::now_ms(),
-        ) {
+        let agent = bound.agent.clone();
+        let asset = asset.clone();
+        let cleared = match self
+            .decision(tracker, move |engine| {
+                engine.evaluate(
+                    &agent,
+                    &intent,
+                    &asset,
+                    &context.market,
+                    &context.exposure,
+                    self::now_ms(),
+                )
+            })
+            .await?
+        {
             Ok(cleared) => cleared,
             Err(refusal) => return Ok(outcome::refused(refusal).into_result()),
         };
 
         let response = match self
-            .submit(cleared, Some(&cloid), Some((&bound, &permit)))
+            .submit(cleared, Some(&cloid), &bound, Some(&permit))
             .await
         {
             Ok(response) => response,
@@ -858,10 +940,13 @@ impl Gateway {
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let inner = &self.inner;
+        let tracker = ExecutionTracker::from_context(&ctx)?;
         let bound = Self::bound(&ctx)?;
         let queue = self.execution_queue(bound.account);
         let _execution = queue.lock().await;
         let now_ms = now_ms();
+
+        self.require_route(&bound).await?;
 
         // Which resting order this names, and on which asset. The asset id is
         // part of both cancel wires, so an oid alone is not enough and the
@@ -900,20 +985,30 @@ impl Gateway {
             .get(&order.coin)
             .map_err(|e| ToolError::unavailable("universe", e))?;
 
-        let cleared = match inner.engine.clear_cancel(
-            &bound.agent,
-            vec![CancelWire {
-                a: asset.index,
-                o: order.oid,
-            }],
-            &params.reason,
-            now_ms,
-        ) {
+        let agent = bound.agent.clone();
+        let asset_index = asset.index;
+        let oid = order.oid;
+        let cleared = match self
+            .decision(tracker, move |engine| {
+                engine.clear_cancel(
+                    &agent,
+                    vec![CancelWire {
+                        a: asset_index,
+                        o: oid,
+                    }],
+                    &params.reason,
+                    now_ms,
+                )
+            })
+            .await?
+        {
             Ok(cleared) => cleared,
             Err(refusal) => return Ok(outcome::refused(refusal).into_result()),
         };
 
-        let response = self.submit(cleared, order.cloid.as_ref(), None).await?;
+        let response = self
+            .submit(cleared, order.cloid.as_ref(), &bound, None)
+            .await?;
         Ok(cancel_outcome(
             response,
             vec![(
@@ -937,8 +1032,9 @@ impl Gateway {
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let bound = Self::bound(&ctx)?;
+        let tracker = ExecutionTracker::from_context(&ctx)?;
         Ok(self
-            .cancel_all_bound(&bound, &params, false)
+            .cancel_all_bound(&bound, &params, false, tracker)
             .await?
             .reply
             .into_result())
@@ -949,11 +1045,13 @@ impl Gateway {
         bound: &Binding,
         params: &SymbolActionParams,
         paused_only: bool,
+        tracker: ExecutionTracker,
     ) -> Result<CancelAllResult, ToolError> {
         self.cancel_all_with(
             bound,
             params,
             paused_only,
+            tracker,
             async {
                 let orders = self
                     .inner
@@ -963,7 +1061,7 @@ impl Gateway {
                     .map_err(|e| ToolError::unavailable("orders", e))?;
                 Ok((orders, self.universe().await?))
             },
-            |cleared| self.submit(cleared, None, None),
+            |cleared| self.submit(cleared, None, bound, None),
         )
         .await
     }
@@ -973,6 +1071,7 @@ impl Gateway {
         bound: &Binding,
         params: &SymbolActionParams,
         paused_only: bool,
+        tracker: ExecutionTracker,
         read: Read,
         submit: Submit,
     ) -> Result<CancelAllResult, ToolError>
@@ -981,9 +1080,9 @@ impl Gateway {
         Submit: FnOnce(Cleared) -> Posted,
         Posted: Future<Output = Result<ExchangeResponse, ToolError>>,
     {
-        let inner = &self.inner;
         let queue = self.execution_queue(bound.account);
         let _execution = queue.lock().await;
+        self.require_route(bound).await?;
         let cancellation_needed = || async {
             if paused_only {
                 self.runtime_cancellation_needed(bound).await
@@ -1033,9 +1132,13 @@ impl Gateway {
             ));
         }
 
-        let cleared = match inner
-            .engine
-            .clear_cancel(&bound.agent, wires, &params.reason, now_ms)
+        let agent = bound.agent.clone();
+        let reason = params.reason.clone();
+        let cleared = match self
+            .decision(tracker, move |engine| {
+                engine.clear_cancel(&agent, wires, &reason, now_ms)
+            })
+            .await?
         {
             Ok(cleared) => cleared,
             Err(refusal) => {
@@ -1076,7 +1179,7 @@ impl Gateway {
         Parameters(params): Parameters<ClosePositionParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
-        let inner = &self.inner;
+        let tracker = ExecutionTracker::from_context(&ctx)?;
         let bound = Self::bound(&ctx)?;
         let permit = self.reserve_submission(&bound).await?;
         let now_ms = now_ms();
@@ -1131,21 +1234,28 @@ impl Gateway {
         // The same gate as `place`. A close is not privileged: it is refused
         // when the account is unreconciled or the feed is stale, exactly as an
         // opening order is.
-        let cleared = match inner.engine.evaluate(
-            &bound.agent,
-            &intent,
-            asset,
-            &context.market,
-            &context.exposure,
-            self::now_ms(),
-        ) {
+        let cloid = intent.cloid.clone();
+        let agent = bound.agent.clone();
+        let asset = asset.clone();
+        let cleared = match self
+            .decision(tracker, move |engine| {
+                engine.evaluate(
+                    &agent,
+                    &intent,
+                    &asset,
+                    &context.market,
+                    &context.exposure,
+                    self::now_ms(),
+                )
+            })
+            .await?
+        {
             Ok(cleared) => cleared,
             Err(refusal) => return Ok(outcome::refused(refusal).into_result()),
         };
 
-        let cloid = intent.cloid.clone();
         let response = match self
-            .submit(cleared, cloid.as_ref(), Some((&bound, &permit)))
+            .submit(cleared, cloid.as_ref(), &bound, Some(&permit))
             .await
         {
             Ok(response) => response,
@@ -1173,6 +1283,7 @@ impl Gateway {
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let inner = &self.inner;
+        let tracker = ExecutionTracker::from_context(&ctx)?;
         let bound = Self::bound(&ctx)?;
         let now_ms = now_ms();
 
@@ -1213,14 +1324,15 @@ impl Gateway {
             // predicate honest without inviting a placeholder from the agent.
             reason: "preflight".to_owned(),
         };
-        let verdict = inner.engine.preflight(
-            &bound.agent,
-            &intent,
-            asset,
-            &context.market,
-            &context.exposure,
-            now_ms,
-        );
+        let agent = bound.agent.clone();
+        let decision_asset = asset.clone();
+        let market = context.market.clone();
+        let exposure = context.exposure.clone();
+        let verdict = self
+            .decision(tracker, move |engine| {
+                engine.preflight(&agent, &intent, &decision_asset, &market, &exposure, now_ms)
+            })
+            .await?;
 
         // The live book, walked for this exact size.
         let l2 = inner
@@ -1611,6 +1723,7 @@ impl Gateway {
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let bound = Self::bound(&ctx)?;
+        self.require_route(&bound).await?;
         let reference = match (params.oid, &params.cloid) {
             (Some(oid), _) => OrderRef::Oid(oid),
             (None, Some(cloid)) => {
@@ -1665,6 +1778,7 @@ impl Gateway {
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let bound = Self::bound(&ctx)?;
+        self.require_route(&bound).await?;
         let now = now_ms();
         let mut state = self.read_state(bound.account, now).await?;
         self.add_position_risk(&mut state, now).await;
@@ -1726,20 +1840,29 @@ impl Gateway {
         &self,
         cleared: Cleared,
         cloid: Option<&Cloid>,
-        submission: Option<(&Binding, &ExecutionPermit)>,
+        bound: &Binding,
+        submission: Option<&ExecutionPermit>,
     ) -> Result<ExchangeResponse, ToolError> {
         let inner = &self.inner;
+        if cleared.clearance().agent != bound.agent
+            || cleared.clearance().route.binding.container != bound.account
+        {
+            return Err(ToolError::unavailable(
+                "submission route",
+                "clearance and pairing identity differ",
+            ));
+        }
         let receipt = if matches!(
             cleared.clearance().kind,
             oppen_core::guardrail::ClearedKind::Order { .. }
         ) {
-            let (bound, permit) = submission.ok_or_else(|| {
+            let permit = submission.ok_or_else(|| {
                 ToolError::unavailable("submission ledger", "order has no account reservation")
             })?;
-            if cleared.clearance().agent != bound.agent {
+            if permit.account != bound.account {
                 return Err(ToolError::unavailable(
                     "submission ledger",
-                    "clearance and bound agent differ",
+                    "reservation and bound account differ",
                 ));
             }
             Some(
@@ -1759,7 +1882,7 @@ impl Gateway {
         let nonce = inner.nonces.next();
         let signed = inner
             .engine
-            .sign_cleared(cleared, nonce, None, self::now_ms());
+            .sign_cleared(cleared, nonce, None, self::now_ms);
         let (request, _clearance) = match signed {
             Ok(signed) => signed,
             Err(error) => {
@@ -1803,6 +1926,7 @@ impl Gateway {
         symbol: &str,
         now_ms: u64,
     ) -> Result<EvaluationContext, ToolError> {
+        self.require_route(bound).await?;
         let inner = &self.inner;
         let account = bound.account;
         let universe = self.universe().await?;
@@ -2245,6 +2369,7 @@ where
     }
     Ok(ExecutionPermit {
         _queue: held,
+        account,
         revision: state.revision,
     })
 }
@@ -2699,7 +2824,13 @@ mod tests {
                 std::sync::Arc::new(
                     SqliteGuardrailStore::open(dir.path().join("guardrails.db")).expect("store"),
                 ),
-                std::sync::Arc::new(LedgerAuditSink::new(ledger.clone())),
+                std::sync::Arc::new(LedgerAuditSink::new(
+                    oppen_core::ledger::RegistryJournal::open(
+                        ledger.clone(),
+                        Arc::new(oppen_core::keys::HmacKey::from_bytes([42; 32])),
+                    )
+                    .unwrap(),
+                )),
                 std::sync::Arc::new(NoKeys),
                 Network::Testnet,
             )
@@ -2708,6 +2839,11 @@ mod tests {
         let journal = std::sync::Arc::new(
             oppen_core::journal::Journal::open(dir.path().join("journal.db")).expect("journal"),
         );
+        let registry = oppen_core::ledger::RegistryJournal::open(
+            ledger.clone(),
+            Arc::new(oppen_core::keys::HmacKey::from_bytes([42; 32])),
+        )
+        .unwrap();
         let mut gateway = Gateway::new(
             Network::Testnet,
             engine,
@@ -2719,6 +2855,7 @@ mod tests {
         )
         .expect("gateway");
         Arc::get_mut(&mut gateway.inner).unwrap()._test_dir = Some(dir);
+        Arc::get_mut(&mut gateway.inner).unwrap().test_registry = Some(registry);
         gateway
     }
 
@@ -2734,11 +2871,25 @@ mod tests {
         .unwrap()
     }
 
+    fn test_tracker(gateway: &Gateway) -> ExecutionTracker {
+        let path = gateway
+            .inner
+            ._test_dir
+            .as_ref()
+            .unwrap()
+            .path()
+            .join("testnet.db");
+        ExecutionTracker::supervision(
+            &tokio::sync::watch::channel(()).0,
+            Arc::new(std::sync::RwLock::new(pairing_store(&path))),
+        )
+    }
+
     #[tokio::test]
     async fn request_binding_requires_authority_and_ignores_an_untrusted_binding() {
         let gateway = gateway_over(&[]);
         let (transport, _client) = tokio::io::duplex(4096);
-        let service = rmcp::service::serve_directly(gateway, transport, None);
+        let service = rmcp::service::serve_directly(gateway.clone(), transport, None);
         let mut context = RequestContext::new(
             rmcp::model::NumberOrString::Number(1),
             service.peer().clone(),
@@ -2759,6 +2910,22 @@ mod tests {
             .insert(store.authenticate(token.reveal()).unwrap().authority());
         context.extensions.insert(parts);
         assert_eq!(Gateway::bound(&context).unwrap(), expected);
+        let error = gateway
+            .preflight(
+                Parameters(PreflightParams {
+                    symbol: "TEST".into(),
+                    is_buy: true,
+                    size: "0.12".into(),
+                    limit_px: "100".into(),
+                    reduce_only: false,
+                }),
+                context,
+            )
+            .await
+            .unwrap_err();
+        let data = error.data.unwrap();
+        assert_eq!(data["code"], "unavailable");
+        assert!(data["detail"].as_str().unwrap().contains("tracked method"));
         service.cancel().await.unwrap();
     }
 
@@ -2799,13 +2966,41 @@ mod tests {
         }
     }
 
+    fn grant_test_route(gateway: &Gateway, bound: &Binding) {
+        let registry = gateway.inner.test_registry.as_ref().unwrap();
+        if let Ok(route) = registry.route_for_agent(&bound.agent) {
+            assert_eq!(route.binding.container, bound.account);
+            return;
+        }
+        let mut wallet_address = *bound.account.as_bytes();
+        wallet_address[0] ^= 0x80;
+        let now = now_ms();
+        registry
+            .grant(
+                oppen_core::ledger::RegistryBinding {
+                    agent: bound.agent.clone(),
+                    container: bound.account,
+                    vault_address: None,
+                    wallet: oppen_core::keys::AgentWallet {
+                        generation: 0,
+                        address: Address::from_bytes(wallet_address),
+                        approved_at_ms: now,
+                        valid_until_ms: now + 86_400_000,
+                    },
+                },
+                now,
+            )
+            .unwrap();
+    }
+
     fn cleared_test_order(gateway: &Gateway, bound: &Binding, cloid: Cloid) -> Cleared {
         use oppen_core::guardrail::{AccountSnapshot, Exposure, RestingExposure};
+        grant_test_route(gateway, bound);
         let at = now_ms();
         let mut config = gateway
             .inner
             .engine
-            .register_agent(&bound.agent, None, at)
+            .register_agent(&bound.agent, at)
             .expect("register");
         config.symbols.insert("TEST".into());
         config.approval_required = false;
@@ -2839,6 +3034,7 @@ mod tests {
             vol_ratio: None,
         };
         let exposure = Exposure {
+            account: bound.account,
             agent: AccountSnapshot {
                 as_of_ms: at,
                 reconciled: true,
@@ -2927,7 +3123,7 @@ mod tests {
         let bound = binding_for("alpha");
         let cleared = cleared_test_order(&gateway, &bound, a_cloid());
         let error = gateway
-            .submit(cleared, Some(&a_cloid()), None)
+            .submit(cleared, Some(&a_cloid()), &bound, None)
             .await
             .expect_err("no permit");
         assert!(matches!(
@@ -2949,6 +3145,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn clearance_pairing_and_reservation_accounts_must_agree_before_submission() {
+        let gateway = gateway_over(&[]);
+        let bound = binding_for("alpha");
+        let other = Binding {
+            account: Address::from_bytes([8; 20]),
+            ..bound.clone()
+        };
+        let cleared = cleared_test_order(&gateway, &bound, a_cloid());
+        let error = gateway
+            .submit(cleared, Some(&a_cloid()), &other, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ToolError::Unavailable {
+                what: "submission route",
+                ..
+            }
+        ));
+        let permit = reserve_account(
+            gateway.execution_queue(other.account),
+            &gateway.inner.submissions,
+            other.account,
+            |_| async { panic!("no pending order") },
+        )
+        .await
+        .unwrap();
+        let cleared = cleared_test_order(&gateway, &bound, a_cloid());
+        let error = gateway
+            .submit(cleared, Some(&a_cloid()), &bound, Some(&permit))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ToolError::Unavailable {
+                what: "submission ledger",
+                ..
+            }
+        ));
+        assert!(
+            gateway
+                .inner
+                .submissions
+                .state(bound.account)
+                .unwrap()
+                .pending
+                .is_none()
+        );
+        assert!(
+            gateway
+                .inner
+                .submissions
+                .state(other.account)
+                .unwrap()
+                .pending
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
     async fn a_signer_failure_durably_records_not_sent_and_prevents_cloid_reuse() {
         let gateway = gateway_over(&[]);
         let bound = binding_for("alpha");
@@ -2962,7 +3218,7 @@ mod tests {
         .expect("permit");
         let cleared = cleared_test_order(&gateway, &bound, a_cloid());
         let error = gateway
-            .submit(cleared, Some(&a_cloid()), Some((&bound, &permit)))
+            .submit(cleared, Some(&a_cloid()), &bound, Some(&permit))
             .await
             .expect_err("test store has no key");
         assert!(matches!(
@@ -3036,7 +3292,7 @@ mod tests {
             )
             .expect("other process resolved");
         let error = gateway
-            .submit(cleared, Some(&a_cloid()), Some((&bound, &permit)))
+            .submit(cleared, Some(&a_cloid()), &bound, Some(&permit))
             .await
             .expect_err("stale snapshot");
         assert!(
@@ -3577,14 +3833,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn canceled_registry_read_holds_single_flight_until_blocking_work_drains() {
+        use oppen_core::guardrail::SqliteGuardrailStore;
+        use oppen_core::ledger::{Ledger, LedgerAuditSink, RegistryJournal};
+        let dir = tempfile::tempdir().unwrap();
+        let anchor = Arc::new(BlockingPilotAnchor::default());
+        let ledger = Arc::new(
+            Ledger::open_anchored(
+                &dir.path().join("registry.db"),
+                Network::Testnet,
+                Some(Box::new(PilotAnchorHandle(anchor.clone()))),
+            )
+            .unwrap(),
+        );
+        let hmac = Arc::new(oppen_core::keys::HmacKey::from_bytes([42; 32]));
+        let mut gateway = gateway_over(&[]);
+        let inner = Arc::get_mut(&mut gateway.inner).unwrap();
+        inner.engine = Arc::new(
+            GuardrailEngine::new(
+                Arc::new(SqliteGuardrailStore::open(dir.path().join("policy.db")).unwrap()),
+                Arc::new(LedgerAuditSink::new(
+                    RegistryJournal::open(ledger.clone(), hmac.clone()).unwrap(),
+                )),
+                Arc::new(NoKeys),
+                Network::Testnet,
+            )
+            .unwrap(),
+        );
+        inner.test_registry = Some(RegistryJournal::open(ledger, hmac).unwrap());
+        let bound = binding_for("alpha");
+        grant_test_route(&gateway, &bound);
+        let (release, wait) = std::sync::mpsc::channel();
+        *anchor.wait.lock().unwrap() = Some(wait);
+        let task_gateway = gateway.clone();
+        let task_bound = bound.clone();
+        let request = tokio::spawn(async move { task_gateway.require_route(&task_bound).await });
+        tokio::time::timeout(std::time::Duration::from_secs(2), anchor.entered.notified())
+            .await
+            .unwrap();
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        assert_eq!(gateway.inner.route_reader.available_permits(), 0);
+        assert!(matches!(
+            gateway.require_route(&bound).await,
+            Err(ToolError::Unavailable {
+                what: "registry reader busy",
+                ..
+            })
+        ));
+        release.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while gateway.inner.route_reader.available_permits() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        gateway.require_route(&bound).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn busy_pilot_reader_reports_failure_but_does_not_block_paused_accounts_or_agent_cancels()
     {
         let gateway = gateway_over(&[]);
         let alpha = binding_for("alpha");
+        grant_test_route(&gateway, &alpha);
         gateway
             .inner
             .engine
-            .register_agent(&alpha.agent, None, 1)
+            .register_agent(&alpha.agent, 1)
             .unwrap();
         let beta = Binding {
             account: Address::from_bytes([7; 20]),
@@ -3620,6 +3937,7 @@ mod tests {
                     reason: "operator independent agent cancel".into(),
                 },
                 false,
+                test_tracker(&gateway),
                 async { Ok(cancel_fixture()) },
                 |_| async { Ok(response(vec![Status::Success])) },
             )
@@ -3657,6 +3975,7 @@ mod tests {
             &bound,
             &params,
             true,
+            test_tracker(&gateway),
             async { panic!("resumed account must not even read cancellation targets") },
             |_| async { panic!("resumed account must not submit a cancel") },
         ));
@@ -3685,6 +4004,7 @@ mod tests {
                 &bound,
                 &params,
                 true,
+                test_tracker(&gateway),
                 async {
                     resume(&gateway, &bound);
                     Ok(cancel_fixture())
@@ -3700,6 +4020,7 @@ mod tests {
                 &bound,
                 &params,
                 false,
+                test_tracker(&gateway),
                 async { Ok(cancel_fixture()) },
                 |cleared| {
                     submitted = true;
@@ -3731,6 +4052,7 @@ mod tests {
                 &bound,
                 &params,
                 true,
+                test_tracker(&gateway),
                 async { Ok(cancel_fixture()) },
                 |cleared| {
                     assert!(
@@ -3762,10 +4084,11 @@ mod tests {
 
     fn pause(gateway: &Gateway, bound: &Binding) {
         use oppen_core::guardrail::{KillReason, KillScope};
+        grant_test_route(gateway, bound);
         gateway
             .inner
             .engine
-            .register_agent(&bound.agent, None, 1)
+            .register_agent(&bound.agent, 1)
             .expect("register");
         gateway
             .inner

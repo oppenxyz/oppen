@@ -12,7 +12,7 @@ use serde_json::Value;
 
 use super::submission::{PilotSubmission, replay_for_pilot};
 use super::{
-    Anchor, Appended, Event, EventKind, Ledger, LedgerError, LedgerGuard, NewEvent, NewFill,
+    Anchor, Appended, Event, EventKind, Ledger, LedgerError, NewEvent, NewFill,
     SubmissionResolution,
 };
 use crate::guardrail::{AgentId, Clearance, ClearedKind, PilotMetric};
@@ -292,21 +292,21 @@ pub(super) fn status(ledger: &Ledger, account: Address) -> Result<Option<PilotSt
     }))
 }
 
-pub(super) fn before_sign<'a>(
-    ledger: &'a Ledger,
+pub(super) fn check_before_sign(
+    ledger: &Ledger,
+    connection: &Connection,
     clearance: &Clearance,
-) -> Result<LedgerGuard<'a>> {
-    let guard = ledger.lock()?;
-    let history = history(ledger, &guard, true)?;
+) -> Result<()> {
     if !matches!(clearance.kind, ClearedKind::Order { .. }) {
-        return Ok(guard);
+        return Ok(());
     }
+    let history = history(ledger, connection, true)?;
     let Some(authority) = history
         .authorities
         .iter()
         .find(|a| a.data.agent == clearance.agent)
     else {
-        return Ok(guard);
+        return Ok(());
     };
     identity(authority, authority.data.account, clearance)?;
     let state = project(&history, authority)?;
@@ -328,7 +328,7 @@ pub(super) fn before_sign<'a>(
         ));
     }
     order_limit(&value, &authority.data)?;
-    Ok(guard)
+    Ok(())
 }
 
 pub(super) fn check_admission(

@@ -14,7 +14,7 @@ use oppen_core::feed::pump::FeedPump;
 use oppen_core::guardrail::{AgentId, GuardrailEngine, SqliteGuardrailStore};
 use oppen_core::journal::Journal;
 use oppen_core::keys::{KeyStore, KeychainKeyStore};
-use oppen_core::ledger::{EventViews, Ledger, LedgerAuditSink, PairingJournal};
+use oppen_core::ledger::{EventViews, Ledger, LedgerAuditSink, PairingJournal, RegistryJournal};
 use oppen_core::reconcile::VenueSource;
 use oppen_hl::ws::{Subscription, WsPool, WsPoolConfig};
 use oppen_mcp::Network;
@@ -61,19 +61,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let hmac = keys
         .load_hmac_key()?
         .ok_or("testnet authentication key is not configured; complete operator setup first")?;
-    let mut store = TokenStore::open(PairingJournal::open(ledger.clone(), Arc::new(hmac))?)?;
+    let hmac = Arc::new(hmac);
+    let registry = RegistryJournal::open(ledger.clone(), hmac.clone())?;
+    let route = registry.route_for_agent(&agent).map_err(|error| {
+        std::io::Error::other(format!(
+            "no active signing route; complete explicit operator registry setup first: {error}"
+        ))
+    })?;
+    if route.binding.container != account {
+        return Err("OPPEN_TESTNET_USER differs from the authorized container; correct explicit operator setup".into());
+    }
+    let mut store = TokenStore::open(PairingJournal::open(ledger.clone(), hmac)?)?;
     let engine = Arc::new(GuardrailEngine::new(
         Arc::new(SqliteGuardrailStore::open(
             dir.join("guardrails-testnet.db"),
         )?),
-        Arc::new(LedgerAuditSink::new(ledger.clone())),
+        Arc::new(LedgerAuditSink::new(registry)),
         keys,
         Network::Testnet,
     )?);
 
     // D-c near-zero defaults: empty allowlist, $25 orders, $100 positions.
     // The first order is refused with the limit to raise named in the reason.
-    let guardrails = engine.register_agent(&agent, None, now_ms())?;
+    let guardrails = engine.register_agent(&agent, now_ms())?;
     println!("agent    {agent} registered");
     println!("limits   {guardrails:?}");
     println!();

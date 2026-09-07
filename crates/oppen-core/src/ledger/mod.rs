@@ -55,6 +55,7 @@ mod export;
 mod hash;
 mod pairing;
 mod pilot;
+mod registry;
 mod schema;
 mod submission;
 mod verify;
@@ -77,6 +78,7 @@ use serde_json::Value;
 pub use anchor::{Anchor, FileAnchor, HeadAnchor};
 pub use pairing::{PairingBinding, PairingError, PairingId, PairingJournal, PairingRecord};
 pub use pilot::{PilotAccounting, PilotError, PilotJournal, PilotState, PilotStatus, PilotStop};
+pub use registry::{AuthorizedRoute, RegistryBinding, RegistryError, RegistryJournal};
 pub use submission::{
     SubmissionError, SubmissionJournal, SubmissionReceipt, SubmissionResolution, SubmissionState,
 };
@@ -210,6 +212,10 @@ pub enum LedgerError {
     UsePilotJournal,
     #[error("pairing authority events must use PairingJournal")]
     UsePairingJournal,
+    #[error("registry authority events must use RegistryJournal")]
+    UseRegistryJournal,
+    #[error("ledger has an unfinished transaction; reopen required")]
+    UnfinishedTransaction,
     #[error("pilot accounting failed: {detail}")]
     PilotBudget { detail: String },
     /// A [`EventKind::PayloadRedacted`] row was itself passed to
@@ -314,6 +320,10 @@ pub enum EventKind {
     PairingIssued,
     /// Authenticated, durable revocation of an earlier pairing.
     PairingRevoked,
+    /// Explicit authenticated account and signer authority.
+    RegistryGranted,
+    /// Authenticated retirement of an earlier registry grant.
+    RegistryRetired,
     /// Something the human did: a manual ticket, a flatten, a setting change.
     OperatorAction,
     /// An approval-mode proposal was approved, rejected or expired
@@ -354,6 +364,8 @@ impl EventKind {
             EventKind::PilotHalted => "pilot_halted",
             EventKind::PairingIssued => "pairing_issued",
             EventKind::PairingRevoked => "pairing_revoked",
+            EventKind::RegistryGranted => "registry_granted",
+            EventKind::RegistryRetired => "registry_retired",
             EventKind::OperatorAction => "operator_action",
             EventKind::ApprovalDecision => "approval_decision",
             EventKind::KillSwitchChanged => "kill_switch_changed",
@@ -383,6 +395,8 @@ impl std::str::FromStr for EventKind {
             "pilot_halted" => Ok(EventKind::PilotHalted),
             "pairing_issued" => Ok(EventKind::PairingIssued),
             "pairing_revoked" => Ok(EventKind::PairingRevoked),
+            "registry_granted" => Ok(EventKind::RegistryGranted),
+            "registry_retired" => Ok(EventKind::RegistryRetired),
             "operator_action" => Ok(EventKind::OperatorAction),
             "approval_decision" => Ok(EventKind::ApprovalDecision),
             "kill_switch_changed" => Ok(EventKind::KillSwitchChanged),
@@ -906,6 +920,9 @@ impl Ledger {
             EventKind::PairingIssued | EventKind::PairingRevoked => {
                 Err(LedgerError::UsePairingJournal)
             }
+            EventKind::RegistryGranted | EventKind::RegistryRetired => {
+                Err(LedgerError::UseRegistryJournal)
+            }
             _ => Ok(()),
         }
     }
@@ -1216,7 +1233,7 @@ impl Ledger {
     /// The agent's own rows, plus the account-wide ones no agent owns — a kill
     /// switch, a feed dropping, an alert. Item 18's taxonomy still arrives
     /// whole; what does not arrive is another agent's intents and reason
-    /// strings. Pairing authority records remain operator-only even though
+    /// strings. Pairing and registry authority records remain operator-only even though
     /// they have no agent attribution.
     pub(crate) fn get_events_for_agent(
         &self,
@@ -1260,7 +1277,7 @@ impl Ledger {
         let mut statement = guard.prepare(&format!(
             "SELECT {SELECT_EVENT_COLUMNS} FROM events WHERE seq > ?1{} ORDER BY seq ASC LIMIT ?2",
             match scope {
-                Some(_) => " AND (agent_id = ?3 OR agent_id IS NULL) AND kind NOT IN ('pairing_issued', 'pairing_revoked')",
+                Some(_) => " AND (agent_id = ?3 OR agent_id IS NULL) AND kind NOT IN ('pairing_issued', 'pairing_revoked', 'registry_granted', 'registry_retired')",
                 None => "",
             }
         ))?;
@@ -1710,29 +1727,24 @@ impl Ledger {
     /// `created_ts_ms` is kept from the first write: rediscovering an account
     /// does not make it new.
     pub fn upsert_sub_account(&self, account: &SubAccount) -> Result<()> {
-        let guard = self.lock()?;
-        guard.execute(
-            "INSERT INTO sub_accounts (address, name, owner_type, owner_id, recorded, \
-             provisioned_by_oppen, active, created_ts_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
-             ON CONFLICT (address) DO UPDATE SET name = excluded.name, \
-             owner_type = excluded.owner_type, owner_id = excluded.owner_id, \
-             recorded = excluded.recorded, provisioned_by_oppen = excluded.provisioned_by_oppen, \
-             active = excluded.active",
-            params![
-                account.address,
-                account.name,
-                account
-                    .owner
-                    .as_ref()
-                    .map(|owner| owner.owner_type.as_str()),
-                account.owner.as_ref().map(|owner| owner.owner_id.as_str()),
-                account.recorded,
-                account.provisioned_by_oppen,
-                account.active,
-                account.created_ts_ms,
-            ],
-        )?;
+        let mut guard = self.lock()?;
+        let tx = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        upsert_sub_account_on(&tx, account)?;
+        tx.commit()?;
         Ok(())
+    }
+
+    pub(crate) fn registry_transaction<T>(
+        &self,
+        operation: impl FnOnce(&Connection) -> std::result::Result<T, crate::accounts::AccountsError>,
+    ) -> std::result::Result<T, crate::accounts::AccountsError> {
+        let mut guard = self.lock()?;
+        let tx = guard
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(LedgerError::from)?;
+        let value = operation(&tx)?;
+        tx.commit().map_err(LedgerError::from)?;
+        Ok(value)
     }
 
     /// Every known sub-account, ordered by address.
@@ -1741,30 +1753,13 @@ impl Ledger {
     /// deterministic output on anything serialised.
     pub fn sub_accounts(&self) -> Result<Vec<SubAccount>> {
         let guard = self.lock()?;
-        let mut statement = guard.prepare(
-            "SELECT address, name, owner_type, owner_id, recorded, provisioned_by_oppen, active, \
-             created_ts_ms FROM sub_accounts ORDER BY address ASC",
-        )?;
-        let mut rows = statement.query([])?;
-        let mut accounts = Vec::new();
-        while let Some(row) = rows.next()? {
-            accounts.push(sub_account_from_row(row)?);
-        }
-        Ok(accounts)
+        sub_accounts_on(&guard)
     }
 
     /// One sub-account by address.
     pub fn sub_account(&self, address: &str) -> Result<Option<SubAccount>> {
         let guard = self.lock()?;
-        let mut statement = guard.prepare(
-            "SELECT address, name, owner_type, owner_id, recorded, provisioned_by_oppen, active, \
-             created_ts_ms FROM sub_accounts WHERE address = ?1",
-        )?;
-        let mut rows = statement.query(params![address])?;
-        match rows.next()? {
-            Some(row) => Ok(Some(sub_account_from_row(row)?)),
-            None => Ok(None),
-        }
+        sub_account_on(&guard, address)
     }
 
     /// Write the whole chain as CSV, returning the row count.
@@ -1788,6 +1783,9 @@ impl Ledger {
     /// one ledger call should not make every later call panic too.
     fn lock(&self) -> Result<LedgerGuard<'_>> {
         let connection = self.connection.lock().map_err(|_| LedgerError::Poisoned)?;
+        if !connection.is_autocommit() {
+            return Err(LedgerError::UnfinishedTransaction);
+        }
         let coordination = acquire_coordination(&self.coordination_path)?;
         Ok(LedgerGuard {
             connection,
@@ -1816,6 +1814,36 @@ impl Deref for LedgerGuard<'_> {
 impl DerefMut for LedgerGuard<'_> {
     fn deref_mut(&mut self) -> &mut Connection {
         &mut self.connection
+    }
+}
+
+// Own the read transaction as well as the coordination guard through crypto.
+// A borrowing rusqlite::Transaction cannot be stored beside its owned guard.
+struct LedgerSigningPermit<'a>(LedgerGuard<'a>);
+
+impl<'a> LedgerSigningPermit<'a> {
+    fn new(guard: LedgerGuard<'a>) -> Result<Self> {
+        guard.execute_batch("BEGIN DEFERRED")?;
+        Ok(Self(guard))
+    }
+}
+
+impl crate::guardrail::SigningPermit for LedgerSigningPermit<'_> {}
+
+impl Deref for LedgerSigningPermit<'_> {
+    type Target = Connection;
+
+    fn deref(&self) -> &Connection {
+        &self.0
+    }
+}
+
+impl Drop for LedgerSigningPermit<'_> {
+    fn drop(&mut self) {
+        if let Err(error) = self.0.execute_batch("ROLLBACK") {
+            // lock() refuses a connection left in a transaction after failure.
+            tracing::error!(%error, "could not release signing snapshot");
+        }
     }
 }
 
@@ -1872,7 +1900,10 @@ impl AgentView {
         Ok(self.ledger.event(seq)?.filter(|event| {
             !matches!(
                 event.kind,
-                EventKind::PairingIssued | EventKind::PairingRevoked
+                EventKind::PairingIssued
+                    | EventKind::PairingRevoked
+                    | EventKind::RegistryGranted
+                    | EventKind::RegistryRetired
             ) && event
                 .agent_id
                 .as_ref()
@@ -2198,6 +2229,74 @@ pub(crate) fn event_from_row(row: &Row<'_>) -> Result<Event> {
     })
 }
 
+pub(crate) fn sub_accounts_on(connection: &Connection) -> Result<Vec<SubAccount>> {
+    let mut statement = connection.prepare(
+        "SELECT address, name, owner_type, owner_id, recorded, provisioned_by_oppen, active, \
+         created_ts_ms FROM sub_accounts ORDER BY address ASC",
+    )?;
+    let mut rows = statement.query([])?;
+    let mut accounts = Vec::new();
+    while let Some(row) = rows.next()? {
+        accounts.push(sub_account_from_row(row)?);
+    }
+    Ok(accounts)
+}
+
+pub(crate) fn sub_account_on(connection: &Connection, address: &str) -> Result<Option<SubAccount>> {
+    let mut statement = connection.prepare(
+        "SELECT address, name, owner_type, owner_id, recorded, provisioned_by_oppen, active, \
+         created_ts_ms FROM sub_accounts WHERE address = ?1",
+    )?;
+    let mut rows = statement.query(params![address])?;
+    match rows.next()? {
+        Some(row) => Ok(Some(sub_account_from_row(row)?)),
+        None => Ok(None),
+    }
+}
+
+pub(crate) fn registry_managed_on(connection: &Connection, address: &str) -> Result<bool> {
+    registry::managed_on(connection, address)
+}
+
+pub(crate) fn upsert_sub_account_on(connection: &Connection, account: &SubAccount) -> Result<()> {
+    if registry_managed_on(connection, &account.address)? {
+        let existing =
+            sub_account_on(connection, &account.address)?.ok_or(LedgerError::UseRegistryJournal)?;
+        if existing.owner != account.owner || existing.active != account.active || !account.recorded
+        {
+            return Err(LedgerError::UseRegistryJournal);
+        }
+    }
+    write_sub_account_on(connection, account)
+}
+
+// Authenticated lifecycle code writes its projection in the same transaction
+// as the signed event. Generic callers must use the protected helper above.
+fn write_sub_account_on(connection: &Connection, account: &SubAccount) -> Result<()> {
+    connection.execute(
+        "INSERT INTO sub_accounts (address, name, owner_type, owner_id, recorded, \
+         provisioned_by_oppen, active, created_ts_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+         ON CONFLICT (address) DO UPDATE SET name = excluded.name, \
+         owner_type = excluded.owner_type, owner_id = excluded.owner_id, \
+         recorded = excluded.recorded, provisioned_by_oppen = excluded.provisioned_by_oppen, \
+         active = excluded.active",
+        params![
+            account.address,
+            account.name,
+            account
+                .owner
+                .as_ref()
+                .map(|owner| owner.owner_type.as_str()),
+            account.owner.as_ref().map(|owner| owner.owner_id.as_str()),
+            account.recorded,
+            account.provisioned_by_oppen,
+            account.active,
+            account.created_ts_ms,
+        ],
+    )?;
+    Ok(())
+}
+
 /// Build a [`SubAccount`] from a row of the registry query.
 fn sub_account_from_row(row: &Row<'_>) -> Result<SubAccount> {
     let owner_type: Option<String> = row.get(2)?;
@@ -2239,12 +2338,12 @@ fn sub_account_from_row(row: &Row<'_>) -> Result<SubAccount> {
 ///   requires in the record because the refusal is the onboarding;
 /// - an operator mutation is [`EventKind::OperatorAction`].
 pub struct LedgerAuditSink {
-    ledger: std::sync::Arc<Ledger>,
+    registry: RegistryJournal,
 }
 
 impl LedgerAuditSink {
-    pub fn new(ledger: std::sync::Arc<Ledger>) -> Self {
-        Self { ledger }
+    pub fn new(registry: RegistryJournal) -> Self {
+        Self { registry }
     }
 }
 
@@ -2255,13 +2354,53 @@ impl std::fmt::Debug for LedgerAuditSink {
 }
 
 impl crate::guardrail::AuditSink for LedgerAuditSink {
+    fn route_for_agent(
+        &self,
+        agent: &crate::guardrail::AgentId,
+    ) -> std::result::Result<AuthorizedRoute, crate::guardrail::Refusal> {
+        self.registry.route_for_agent(agent).map_err(|error| {
+            crate::guardrail::Unevaluable::RouteAuthority {
+                detail: error.to_string(),
+            }
+            .into()
+        })
+    }
+
     fn before_sign(
         &self,
         clearance: &crate::guardrail::Clearance,
+        actual_wallet: &crate::keys::AgentWallet,
+        actual_signer: oppen_hl::Address,
     ) -> std::result::Result<Box<dyn crate::guardrail::SigningPermit + '_>, crate::guardrail::Refusal>
     {
-        let permit =
-            pilot::before_sign(&self.ledger, clearance).map_err(PilotError::into_refusal)?;
+        let ledger = self.registry.ledger();
+        let permit = ledger
+            .lock()
+            .and_then(LedgerSigningPermit::new)
+            .map_err(|error| {
+                crate::guardrail::Refusal::from(crate::guardrail::Unevaluable::RouteAuthority {
+                    detail: error.to_string(),
+                })
+            })?;
+        if clearance.route.network != clearance.network
+            || clearance.route.binding.agent != clearance.agent
+            || clearance.route.binding.vault_address != clearance.vault_address
+            || &clearance.route.binding.wallet != actual_wallet
+            || actual_wallet.address != actual_signer
+        {
+            return Err(crate::guardrail::Unevaluable::RouteAuthority {
+                detail: "clearance identity differs from the loaded signer or route".into(),
+            }
+            .into());
+        }
+        self.registry
+            .verify_route_in(&permit, &clearance.route, actual_signer)
+            .map_err(|error| {
+                crate::guardrail::Refusal::from(crate::guardrail::Unevaluable::RouteAuthority {
+                    detail: error.to_string(),
+                })
+            })?;
+        pilot::check_before_sign(ledger, &permit, clearance).map_err(PilotError::into_refusal)?;
         Ok(Box::new(permit))
     }
 
@@ -2311,7 +2450,8 @@ impl crate::guardrail::AuditSink for LedgerAuditSink {
             && matches!(clearance.kind, ClearedKind::Order { .. })
         {
             return self
-                .ledger
+                .registry
+                .ledger()
                 .record_intent(&NewIntent {
                     agent_id: clearance.agent.as_str(),
                     ts_ms: entry.at_ms as i64,
@@ -2324,7 +2464,8 @@ impl crate::guardrail::AuditSink for LedgerAuditSink {
                 });
         }
 
-        self.ledger
+        self.registry
+            .ledger()
             .append(&NewEvent {
                 kind,
                 ts_ms: entry.at_ms as i64,

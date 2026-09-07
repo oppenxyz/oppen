@@ -33,11 +33,620 @@ use super::config::{
     DEFAULT_ORDER_RATE, MAX_REASON_BYTES,
 };
 use super::deadman::DEAD_MAN_MIN_LEAD_MS;
-use super::engine::NullAuditSink;
 use super::store::MemoryStore;
 use super::*;
+use crate::ledger::{AuthorizedRoute, RegistryBinding};
 
 // ---- fixtures -----------------------------------------------------------
+
+#[derive(Debug)]
+struct TestRoutes(Mutex<std::collections::BTreeMap<AgentId, AuthorizedRoute>>);
+impl TestRoutes {
+    fn new(routes: impl IntoIterator<Item = AuthorizedRoute>) -> Self {
+        Self(Mutex::new(
+            routes
+                .into_iter()
+                .map(|r| (r.binding.agent.clone(), r))
+                .collect(),
+        ))
+    }
+    fn get(&self, agent: &AgentId) -> Result<AuthorizedRoute, Refusal> {
+        self.0
+            .lock()
+            .unwrap()
+            .get(agent)
+            .cloned()
+            .ok_or_else(|| route_error("test route missing"))
+    }
+    fn permit(
+        &self,
+        clearance: &Clearance,
+        wallet: &crate::keys::AgentWallet,
+        signer: oppen_hl::Address,
+    ) -> Result<Box<dyn SigningPermit + '_>, Refusal> {
+        let guard = self.0.lock().unwrap();
+        if guard.get(&clearance.agent) != Some(&clearance.route)
+            || &clearance.route.binding.wallet != wallet
+            || clearance.route.binding.wallet.address != signer
+            || clearance.agent != clearance.route.binding.agent
+            || clearance.network != clearance.route.network
+            || clearance.vault_address != clearance.route.binding.vault_address
+        {
+            return Err(route_error("test route changed or signer mismatched"));
+        }
+        Ok(Box::new(TestRoutePermit { _guard: guard }))
+    }
+}
+struct TestRoutePermit<'a> {
+    _guard: std::sync::MutexGuard<'a, std::collections::BTreeMap<AgentId, AuthorizedRoute>>,
+}
+impl SigningPermit for TestRoutePermit<'_> {}
+fn route_error(detail: &str) -> Refusal {
+    Unevaluable::RouteAuthority {
+        detail: detail.into(),
+    }
+    .into()
+}
+fn route_for(
+    keys: &dyn KeyStore,
+    agent: &str,
+    container: oppen_hl::Address,
+    vault_address: Option<oppen_hl::Address>,
+) -> AuthorizedRoute {
+    AuthorizedRoute {
+        network: keys.network(),
+        binding_seq: 1,
+        binding: RegistryBinding {
+            agent: AgentId::new(agent),
+            container,
+            vault_address,
+            wallet: keys.agent_wallet(&AgentId::new(agent)).unwrap().unwrap(),
+        },
+    }
+}
+fn alpha_route() -> AuthorizedRoute {
+    route_for(
+        key_store(&["alpha"]).as_ref(),
+        "alpha",
+        vault(),
+        Some(vault()),
+    )
+}
+
+fn expiring_wallet_fixture(config: AgentGuardrails) -> Fixture {
+    let keys = Arc::new(crate::keys::MemoryKeyStore::new(Network::Testnet));
+    let agent = AgentId::new("alpha");
+    keys.create_agent_key(
+        &agent,
+        crate::keys::SecretText::new(format!("{:064x}", 1)),
+        NOW_MS + 1_000,
+        NOW_MS,
+    )
+    .unwrap();
+    let route = route_for(keys.as_ref(), "alpha", vault(), Some(vault()));
+    let engine = GuardrailEngine::new(
+        Arc::new(MemoryStore::new()),
+        Arc::new(NullAuditSink::new([route])),
+        keys,
+        Network::Testnet,
+    )
+    .unwrap();
+    engine.register_agent(&agent, NOW_MS).unwrap();
+    engine
+        .operator_set_guardrails(&agent, config, NOW_MS)
+        .unwrap();
+    Fixture { engine, agent }
+}
+
+#[test]
+fn order_approval_window_is_start_inclusive_end_exclusive_without_admission_effects() {
+    for approval_required in [false, true] {
+        let mut config = permissive(&["BTC"]);
+        config.approval_required = approval_required;
+        config.order_rate.count = 1;
+        let f = expiring_wallet_fixture(config);
+        let order = intent("BTC", true, d("100"), d("1"));
+        let instrument = asset("BTC", 2, 40);
+        let market = MarketRef::fresh("BTC", d("100"), NOW_MS);
+        let state = exposure(d("100000"));
+        for at_ms in [NOW_MS - 1, NOW_MS + 1_000, NOW_MS + 1_001] {
+            assert!(matches!(
+                f.engine
+                    .evaluate(&f.agent, &order, &instrument, &market, &state, at_ms),
+                Err(Refusal::Unevaluable(Unevaluable::RouteAuthority { .. }))
+            ));
+            assert!(
+                !f.engine
+                    .preflight(&f.agent, &order, &instrument, &market, &state, at_ms)
+                    .would_clear
+            );
+            assert!(f.engine.pending_proposals(at_ms).is_empty());
+        }
+        let result = f.evaluate(&order, &instrument, &market, &state);
+        if approval_required {
+            assert!(matches!(result, Err(Refusal::ApprovalRequired { .. })));
+            assert_eq!(f.engine.pending_proposals(NOW_MS).len(), 1);
+        } else {
+            assert_eq!(
+                result
+                    .unwrap()
+                    .clearance()
+                    .utilization
+                    .order_tokens_remaining,
+                Decimal::ZERO
+            );
+        }
+    }
+}
+
+#[test]
+fn order_wallet_expiry_between_evaluation_and_signature_refuses_at_exact_boundary() {
+    let f = expiring_wallet_fixture(permissive(&["BTC"]));
+    let cleared = route_clearance(&f, 0);
+    assert!(matches!(
+        f.engine.sign_cleared(cleared, 1, None, || NOW_MS + 1_000),
+        Err(SignClearedError::Refused(Refusal::Unevaluable(
+            Unevaluable::RouteAuthority { .. }
+        )))
+    ));
+    let cleared = route_clearance(&f, 0);
+    f.engine
+        .sign_cleared(cleared, 2, None, || NOW_MS + 999)
+        .expect("last approved millisecond signs");
+}
+
+#[test]
+fn expired_wallet_keeps_live_route_cleanup_authority_for_cancels_and_schedule_cancel() {
+    let f = expiring_wallet_fixture(permissive(&["BTC"]));
+    let expired = NOW_MS + 1_000;
+    for kind in 1u8..5 {
+        let cleared = match kind {
+            1 => f.engine.clear_cancel(
+                &f.agent,
+                vec![CancelWire { a: 0, o: 1 }],
+                "expired cleanup",
+                expired,
+            ),
+            2 => f.engine.clear_cancel_by_cloid(
+                &f.agent,
+                vec![oppen_hl::wire::CancelByCloidWire {
+                    asset: 0,
+                    cloid: cloid(),
+                }],
+                "expired cleanup",
+                expired,
+            ),
+            3 => f
+                .engine
+                .clear_schedule_cancel(&f.agent, Some(expired + 60_000), expired),
+            4 => f.engine.clear_schedule_cancel(&f.agent, None, expired),
+            _ => unreachable!(),
+        }
+        .unwrap();
+        f.engine
+            .sign_cleared(cleared, u64::from(kind), None, || expired)
+            .expect("cleanup retains route and signer checks, not order expiry gate");
+    }
+}
+
+struct WaitingKeys {
+    inner: Arc<crate::keys::MemoryKeyStore>,
+    wait: Option<(
+        std::sync::mpsc::Sender<()>,
+        Mutex<std::sync::mpsc::Receiver<()>>,
+    )>,
+}
+
+impl KeyStore for WaitingKeys {
+    fn network(&self) -> Network {
+        self.inner.network()
+    }
+    fn write(
+        &self,
+        entry: &crate::keys::EntryName,
+        secret: &str,
+    ) -> Result<(), crate::keys::KeyStoreError> {
+        self.inner.write(entry, secret)
+    }
+    fn read(
+        &self,
+        entry: &crate::keys::EntryName,
+    ) -> Result<Option<crate::keys::SecretText>, crate::keys::KeyStoreError> {
+        self.inner.read(entry)
+    }
+    fn remove(&self, entry: &crate::keys::EntryName) -> Result<(), crate::keys::KeyStoreError> {
+        self.inner.remove(entry)
+    }
+    fn load_agent_key_with_wallet(
+        &self,
+        agent: &AgentId,
+    ) -> Result<(oppen_hl::AgentKey, crate::keys::AgentWallet), crate::keys::KeyStoreError> {
+        if let Some((entered, release)) = &self.wait {
+            entered.send(()).unwrap();
+            release
+                .lock()
+                .unwrap()
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+        }
+        self.inner.load_agent_key_with_wallet(agent)
+    }
+}
+
+struct TimedLedgerSink {
+    inner: crate::ledger::LedgerAuditSink,
+    entering_permit: Option<std::sync::mpsc::Sender<()>>,
+    refused_at: Mutex<Vec<u64>>,
+}
+
+impl AuditSink for TimedLedgerSink {
+    fn route_for_agent(&self, agent: &AgentId) -> Result<AuthorizedRoute, Refusal> {
+        self.inner.route_for_agent(agent)
+    }
+    fn before_sign(
+        &self,
+        clearance: &Clearance,
+        wallet: &crate::keys::AgentWallet,
+        signer: oppen_hl::Address,
+    ) -> Result<Box<dyn SigningPermit + '_>, Refusal> {
+        if let Some(entered) = &self.entering_permit {
+            entered.send(()).unwrap();
+        }
+        self.inner.before_sign(clearance, wallet, signer)
+    }
+    fn record(&self, entry: &AuditEntry<'_>) -> Result<(), AuditError> {
+        self.inner.record(entry)?;
+        if matches!(entry.outcome, AuditOutcome::Refused(_)) {
+            self.refused_at.lock().unwrap().push(entry.at_ms);
+        }
+        Ok(())
+    }
+}
+
+// Both waits use real generation loading, registry grants, and durable permits.
+// Only time and the point at which a dependency is released are synthetic.
+fn expiry_during_signing_wait(key_wait: bool) {
+    use std::sync::{atomic::AtomicU64, mpsc};
+    use std::time::Duration;
+
+    for reduce_only in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("expiry.db");
+        let ledger = Arc::new(crate::ledger::Ledger::open_at(&path, Network::Testnet).unwrap());
+        let inner_keys = Arc::new(crate::keys::MemoryKeyStore::new(Network::Testnet));
+        let agent = AgentId::new("alpha");
+        inner_keys
+            .create_agent_key(
+                &agent,
+                crate::keys::SecretText::new(format!("{:064x}", 1)),
+                NOW_MS + 1_000,
+                NOW_MS,
+            )
+            .unwrap();
+        let registry = crate::ledger::RegistryJournal::open(
+            ledger,
+            Arc::new(crate::keys::HmacKey::from_bytes([31; 32])),
+        )
+        .unwrap();
+        registry
+            .grant(
+                route_for(inner_keys.as_ref(), "alpha", vault(), Some(vault())).binding,
+                NOW_MS,
+            )
+            .unwrap();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let keys = Arc::new(WaitingKeys {
+            inner: inner_keys,
+            wait: key_wait.then(|| (entered_tx.clone(), Mutex::new(release_rx))),
+        });
+        let sink = Arc::new(TimedLedgerSink {
+            inner: crate::ledger::LedgerAuditSink::new(registry),
+            entering_permit: (!key_wait).then_some(entered_tx),
+            refused_at: Mutex::new(Vec::new()),
+        });
+        let engine = GuardrailEngine::new(
+            Arc::new(MemoryStore::new()),
+            sink.clone(),
+            keys,
+            Network::Testnet,
+        )
+        .unwrap();
+        engine.register_agent(&agent, NOW_MS).unwrap();
+        engine
+            .operator_set_guardrails(&agent, permissive(&["BTC"]), NOW_MS)
+            .unwrap();
+        let mut order = intent("BTC", !reduce_only, d("100"), Decimal::ONE);
+        order.reduce_only = reduce_only;
+        let mut state = exposure(d("100000"));
+        if reduce_only {
+            state
+                .agent
+                .positions
+                .insert("BTC".into(), PositionSnapshot { szi: Decimal::ONE });
+            state.agent.total_position_notional_usd = d("100");
+        }
+        let cleared = engine
+            .evaluate(
+                &agent,
+                &order,
+                &asset("BTC", 2, 40),
+                &MarketRef::fresh("BTC", d("100"), NOW_MS),
+                &state,
+                NOW_MS,
+            )
+            .unwrap();
+        let clock = AtomicU64::new(NOW_MS);
+        let samples = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            // An independent handle holds the actual ledger coordination file.
+            let coordination = (!key_wait).then(|| {
+                let file = std::fs::File::options()
+                    .read(true)
+                    .write(true)
+                    .open(path.with_extension("db.lock"))
+                    .unwrap();
+                file.lock().unwrap();
+                file
+            });
+            let (done_tx, done_rx) = mpsc::channel();
+            let engine = &engine;
+            let clock = &clock;
+            let samples = &samples;
+            scope.spawn(move || {
+                let result = engine.sign_cleared(cleared, 1, None, || {
+                    samples.fetch_add(1, Ordering::SeqCst);
+                    clock.load(Ordering::SeqCst)
+                });
+                done_tx.send(result).unwrap();
+            });
+            entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            let waiting = done_rx.recv_timeout(Duration::from_millis(100));
+            let samples_before_release = samples.load(Ordering::SeqCst);
+            clock.store(NOW_MS + 1_000, Ordering::SeqCst);
+            drop(coordination);
+            if key_wait {
+                release_tx.send(()).unwrap();
+            }
+            assert!(matches!(waiting, Err(mpsc::RecvTimeoutError::Timeout)));
+            assert_eq!(
+                samples_before_release, 0,
+                "clock must follow dependency waits"
+            );
+            assert!(
+                matches!(
+                    done_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+                    Err(SignClearedError::Refused(Refusal::Unevaluable(
+                        Unevaluable::RouteAuthority { .. }
+                    )))
+                ),
+                "expired order returned a signature or the wrong refusal; reduce_only={reduce_only}"
+            );
+        });
+        assert_eq!(
+            samples.load(Ordering::SeqCst),
+            1,
+            "audit must reuse the final observation"
+        );
+        assert_eq!(*sink.refused_at.lock().unwrap(), [NOW_MS + 1_000]);
+    }
+}
+
+#[test]
+fn order_expiry_is_sampled_after_key_loading_including_reduce_only() {
+    expiry_during_signing_wait(true);
+}
+
+#[test]
+fn order_expiry_is_sampled_after_ledger_contention_including_reduce_only() {
+    expiry_during_signing_wait(false);
+}
+
+fn route_clearance(f: &Fixture, kind: u8) -> Cleared {
+    match kind {
+        0 => f
+            .evaluate(
+                &intent("BTC", true, d("100"), d("1")),
+                &asset("BTC", 2, 40),
+                &MarketRef::fresh("BTC", d("100"), NOW_MS),
+                &exposure(d("100000")),
+            )
+            .unwrap(),
+        1 => f
+            .engine
+            .clear_cancel(
+                &f.agent,
+                vec![CancelWire { a: 0, o: 1 }],
+                "route test",
+                NOW_MS,
+            )
+            .unwrap(),
+        2 => f
+            .engine
+            .clear_cancel_by_cloid(
+                &f.agent,
+                vec![oppen_hl::wire::CancelByCloidWire {
+                    asset: 0,
+                    cloid: cloid(),
+                }],
+                "route test",
+                NOW_MS,
+            )
+            .unwrap(),
+        3 => f
+            .engine
+            .clear_schedule_cancel(&f.agent, Some(NOW_MS + 60_000), NOW_MS)
+            .unwrap(),
+        4 => f
+            .engine
+            .clear_schedule_cancel(&f.agent, None, NOW_MS)
+            .unwrap(),
+        _ => unreachable!(),
+    }
+}
+
+#[test]
+fn route_retirement_and_revision_changes_refuse_every_signed_action() {
+    for kind in 0..5 {
+        for retire in [false, true] {
+            let sink = Arc::new(CountingSink::new([alpha_route()]));
+            let f = Fixture::with(
+                permissive(&["BTC"]),
+                Arc::new(MemoryStore::new()),
+                sink.clone(),
+            );
+            let cleared = route_clearance(&f, kind);
+            assert_eq!(cleared.clearance().route.binding.container, vault());
+            if retire {
+                sink.routes.0.lock().unwrap().remove(&f.agent);
+            } else {
+                sink.routes
+                    .0
+                    .lock()
+                    .unwrap()
+                    .get_mut(&f.agent)
+                    .unwrap()
+                    .binding_seq += 1;
+            }
+            assert!(
+                matches!(
+                    f.engine.sign_cleared(cleared, 1, None, || NOW_MS),
+                    Err(SignClearedError::Refused(Refusal::Unevaluable(
+                        Unevaluable::RouteAuthority { .. }
+                    )))
+                ),
+                "kind {kind}, retired {retire}"
+            );
+            assert_eq!(
+                sink.refused.load(Ordering::Relaxed),
+                1,
+                "permit must release before refusal audit"
+            );
+        }
+    }
+}
+
+#[test]
+fn exposure_account_and_route_identity_must_agree_before_clearance() {
+    let f = Fixture::new(permissive(&["BTC"]));
+    let mut wrong = exposure(d("100000"));
+    wrong.account = oppen_hl::Address::from_bytes([8; 20]);
+    let order = intent("BTC", true, d("100"), d("1"));
+    let instrument = asset("BTC", 2, 40);
+    let market = MarketRef::fresh("BTC", d("100"), NOW_MS);
+    assert!(matches!(
+        f.evaluate(&order, &instrument, &market, &wrong),
+        Err(Refusal::Unevaluable(Unevaluable::RouteAuthority { .. }))
+    ));
+    assert!(
+        !f.preflight(&order, &instrument, &market, &wrong)
+            .would_clear
+    );
+    for variant in 0..4 {
+        let mut route = alpha_route();
+        match variant {
+            0 => route.network = Network::Mainnet,
+            1 => route.binding_seq = 0,
+            2 => route.binding.container = oppen_hl::Address::from_bytes([8; 20]),
+            3 => route.binding.agent = AgentId::new("other"),
+            _ => unreachable!(),
+        }
+        let sink = Arc::new(NullAuditSink::new([]));
+        sink.routes
+            .0
+            .lock()
+            .unwrap()
+            .insert(AgentId::new("alpha"), route);
+        let f = Fixture::with(permissive(&["BTC"]), Arc::new(MemoryStore::new()), sink);
+        assert!(matches!(
+            f.evaluate(&order, &instrument, &market, &exposure(d("100000"))),
+            Err(Refusal::Unevaluable(Unevaluable::RouteAuthority { .. }))
+        ));
+    }
+}
+
+#[test]
+fn policy_registration_and_restart_never_grant_route_authority() {
+    let store = Arc::new(MemoryStore::new());
+    for _ in 0..2 {
+        let engine = GuardrailEngine::new(
+            store.clone(),
+            Arc::new(NullAuditSink::new([])),
+            key_store(&["alpha"]),
+            Network::Testnet,
+        )
+        .unwrap();
+        let agent = AgentId::new("alpha");
+        let first = engine.register_agent(&agent, NOW_MS).unwrap();
+        assert_eq!(engine.register_agent(&agent, NOW_MS).unwrap(), first);
+        assert!(matches!(
+            engine.route_for_agent(&agent),
+            Err(Refusal::Unevaluable(Unevaluable::RouteAuthority { .. }))
+        ));
+        assert!(matches!(
+            engine.clear_cancel(&agent, vec![CancelWire { a: 0, o: 1 }], "no grant", NOW_MS),
+            Err(Refusal::Unevaluable(Unevaluable::RouteAuthority { .. }))
+        ));
+    }
+}
+
+#[test]
+fn every_wallet_field_in_the_grant_must_match_the_loaded_wallet_for_all_actions() {
+    for kind in 0..5 {
+        for field in 0..4 {
+            let mut route = alpha_route();
+            match field {
+                0 => route.binding.wallet.generation += 1,
+                1 => route.binding.wallet.address = oppen_hl::Address::from_bytes([8; 20]),
+                2 => route.binding.wallet.approved_at_ms -= 1,
+                3 => route.binding.wallet.valid_until_ms += 1,
+                _ => unreachable!(),
+            }
+            let f = Fixture::with(
+                permissive(&["BTC"]),
+                Arc::new(MemoryStore::new()),
+                Arc::new(NullAuditSink::new([route])),
+            );
+            let cleared = route_clearance(&f, kind);
+            assert!(
+                matches!(
+                    f.engine.sign_cleared(cleared, 1, None, || NOW_MS),
+                    Err(SignClearedError::Refused(Refusal::Unevaluable(
+                        Unevaluable::RouteAuthority { .. }
+                    )))
+                ),
+                "kind {kind}, wallet field {field}"
+            );
+        }
+    }
+}
+#[derive(Debug)]
+struct NullAuditSink {
+    routes: TestRoutes,
+}
+impl NullAuditSink {
+    fn new(routes: impl IntoIterator<Item = AuthorizedRoute>) -> Self {
+        Self {
+            routes: TestRoutes::new(routes),
+        }
+    }
+}
+impl AuditSink for NullAuditSink {
+    fn route_for_agent(&self, agent: &AgentId) -> Result<AuthorizedRoute, Refusal> {
+        self.routes.get(agent)
+    }
+    fn before_sign(
+        &self,
+        clearance: &Clearance,
+        wallet: &crate::keys::AgentWallet,
+        signer: oppen_hl::Address,
+    ) -> Result<Box<dyn SigningPermit + '_>, Refusal> {
+        self.routes.permit(clearance, wallet, signer)
+    }
+    fn record(&self, _: &AuditEntry<'_>) -> Result<(), AuditError> {
+        Ok(())
+    }
+}
 
 /// 2026-09-03T00:00:00Z, an exact UTC midnight.
 const MIDNIGHT_MS: u64 = 1_788_998_400_000;
@@ -134,6 +743,7 @@ fn with_resting(mut exposure: Exposure, symbol: &str, szi: Decimal, px: Decimal)
 
 fn exposure(equity: Decimal) -> Exposure {
     Exposure {
+        account: vault(),
         agent: account(equity),
         fleet: None,
     }
@@ -183,16 +793,25 @@ fn permissive(symbols: &[&str]) -> AgentGuardrails {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct CountingSink {
+    routes: TestRoutes,
     cleared: AtomicUsize,
     refused: AtomicUsize,
     operator: Mutex<Vec<OperatorAction>>,
 }
 
 impl AuditSink for CountingSink {
-    fn before_sign(&self, _clearance: &Clearance) -> Result<Box<dyn SigningPermit + '_>, Refusal> {
-        Ok(Box::new(()))
+    fn route_for_agent(&self, agent: &AgentId) -> Result<AuthorizedRoute, Refusal> {
+        self.routes.get(agent)
+    }
+    fn before_sign(
+        &self,
+        clearance: &Clearance,
+        wallet: &crate::keys::AgentWallet,
+        signer: oppen_hl::Address,
+    ) -> Result<Box<dyn SigningPermit + '_>, Refusal> {
+        self.routes.permit(clearance, wallet, signer)
     }
 
     fn record(&self, entry: &AuditEntry<'_>) -> Result<(), AuditError> {
@@ -214,6 +833,14 @@ impl AuditSink for CountingSink {
 }
 
 impl CountingSink {
+    fn new(routes: impl IntoIterator<Item = AuthorizedRoute>) -> Self {
+        Self {
+            routes: TestRoutes::new(routes),
+            cleared: AtomicUsize::new(0),
+            refused: AtomicUsize::new(0),
+            operator: Mutex::new(Vec::new()),
+        }
+    }
     fn operator_actions(&self) -> Vec<OperatorAction> {
         self.operator
             .lock()
@@ -223,10 +850,20 @@ impl CountingSink {
 }
 
 #[derive(Debug)]
-struct FailingSink;
+struct FailingSink {
+    routes: TestRoutes,
+}
 
 impl AuditSink for FailingSink {
-    fn before_sign(&self, _clearance: &Clearance) -> Result<Box<dyn SigningPermit + '_>, Refusal> {
+    fn route_for_agent(&self, agent: &AgentId) -> Result<AuthorizedRoute, Refusal> {
+        self.routes.get(agent)
+    }
+    fn before_sign(
+        &self,
+        _clearance: &Clearance,
+        _wallet: &crate::keys::AgentWallet,
+        _signer: oppen_hl::Address,
+    ) -> Result<Box<dyn SigningPermit + '_>, Refusal> {
         Err(Unevaluable::AuditWriteFailed {
             detail: "the ledger disk is full".into(),
         }
@@ -258,9 +895,6 @@ impl GuardrailStore for FailingStore {
     fn save_account_limits(&self, _l: &LossLimits) -> Result<(), StoreError> {
         Ok(())
     }
-    fn save_vault(&self, _a: &AgentId, _v: &oppen_hl::Address) -> Result<(), StoreError> {
-        Ok(())
-    }
 }
 
 struct Fixture {
@@ -272,13 +906,13 @@ impl Fixture {
     fn without_keys(config: AgentGuardrails) -> Self {
         let engine = GuardrailEngine::new(
             Arc::new(MemoryStore::new()),
-            Arc::new(NullAuditSink),
+            Arc::new(NullAuditSink::new([alpha_route()])),
             Arc::new(crate::keys::MemoryKeyStore::new(Network::Testnet)),
             Network::Testnet,
         )
         .expect("engine without signing credentials");
         let agent = AgentId::new("alpha");
-        engine.register_agent(&agent, None, NOW_MS).unwrap();
+        engine.register_agent(&agent, NOW_MS).unwrap();
         engine
             .operator_set_guardrails(&agent, config, NOW_MS)
             .unwrap();
@@ -289,7 +923,7 @@ impl Fixture {
         Self::with(
             config,
             Arc::new(MemoryStore::new()),
-            Arc::new(NullAuditSink),
+            Arc::new(NullAuditSink::new([alpha_route()])),
         )
     }
 
@@ -306,9 +940,7 @@ impl Fixture {
         )
         .expect("engine");
         let agent = AgentId::new("alpha");
-        engine
-            .register_agent(&agent, Some(vault()), NOW_MS)
-            .expect("register");
+        engine.register_agent(&agent, NOW_MS).expect("register");
         engine
             .operator_set_guardrails(&agent, config, NOW_MS)
             .expect("set guardrails");
@@ -319,17 +951,17 @@ impl Fixture {
     /// the **top-level** account the revised D1 (V2) makes the Hyperliquid
     /// default, which carries no `vaultAddress` on the wire at all.
     fn in_container(config: AgentGuardrails, vault_address: Option<oppen_hl::Address>) -> Self {
+        let mut route = alpha_route();
+        route.binding.vault_address = vault_address;
         let engine = GuardrailEngine::new(
             Arc::new(MemoryStore::new()),
-            Arc::new(NullAuditSink),
+            Arc::new(NullAuditSink::new([route])),
             key_store(&["alpha"]) as Arc<dyn KeyStore>,
             Network::Testnet,
         )
         .expect("engine");
         let agent = AgentId::new("alpha");
-        engine
-            .register_agent(&agent, vault_address, NOW_MS)
-            .expect("register");
+        engine.register_agent(&agent, NOW_MS).expect("register");
         engine
             .operator_set_guardrails(&agent, config, NOW_MS)
             .expect("set guardrails");
@@ -385,15 +1017,13 @@ fn a_freshly_paired_agent_is_refused_and_told_which_limit_to_raise() {
     let store: Arc<dyn GuardrailStore> = Arc::new(MemoryStore::new());
     let engine = GuardrailEngine::new(
         store,
-        Arc::new(NullAuditSink),
+        Arc::new(NullAuditSink::new([alpha_route()])),
         key_store(&["alpha"]) as Arc<dyn KeyStore>,
         Network::Testnet,
     )
     .expect("engine");
     let agent = AgentId::new("alpha");
-    let config = engine
-        .register_agent(&agent, Some(vault()), NOW_MS)
-        .expect("register");
+    let config = engine.register_agent(&agent, NOW_MS).expect("register");
 
     // D-c verbatim.
     assert!(config.symbols.is_empty());
@@ -1104,6 +1734,7 @@ fn the_gauge_shows_the_shared_budget_an_agent_would_otherwise_never_see() {
     let rows = f.engine.loss_budget(
         &f.agent,
         &Exposure {
+            account: vault(),
             agent: agent_account,
             fleet: Some(fleet),
         },
@@ -1203,6 +1834,7 @@ fn a_preflight_reports_the_drawdown_budget_it_used_to_omit() {
         &asset("BTC", 2, 40),
         &MarketRef::fresh("BTC", d("100"), NOW_MS),
         &Exposure {
+            account: vault(),
             agent: down,
             fleet: None,
         },
@@ -1612,6 +2244,7 @@ fn an_account_wide_breach_stops_every_agent() {
     fleet.realized_pnl_today_usd = d("-400");
     fleet.peak_equity_usd = d("5000");
     let with_fleet = Exposure {
+        account: vault(),
         agent: account(d("1000")),
         fleet: Some(fleet),
     };
@@ -2149,7 +2782,9 @@ fn open_exposure_config_defaults_validation_and_sqlite_round_trip() {
     assert_eq!(loaded.guardrails[&AgentId::new("legacy")], decoded);
     let engine = GuardrailEngine::new(
         Arc::new(store),
-        Arc::new(NullAuditSink),
+        Arc::new(NullAuditSink::new(["bounded", "zero", "legacy"].map(
+            |agent| route_for(key_store(&[agent]).as_ref(), agent, vault(), None),
+        ))),
         Arc::new(crate::keys::MemoryKeyStore::new(Network::Testnet)),
         Network::Testnet,
     )
@@ -2278,7 +2913,7 @@ fn a_failed_kill_release_keeps_the_live_engine_paused() {
     let f = Fixture::with(
         permissive(&["BTC"]),
         Arc::new(FailingStore),
-        Arc::new(NullAuditSink),
+        Arc::new(NullAuditSink::new([alpha_route()])),
     );
     assert!(
         f.engine
@@ -2320,7 +2955,7 @@ fn changing_policy_invalidates_an_order_already_cleared() {
         .operator_set_guardrails(&f.agent, permissive(&[]), NOW_MS)
         .expect("tighten policy");
     assert!(matches!(
-        f.engine.sign_cleared(cleared, 1, None, NOW_MS),
+        f.engine.sign_cleared(cleared, 1, None, || NOW_MS),
         Err(SignClearedError::Refused(Refusal::Unevaluable(
             Unevaluable::PolicyChanged
         )))
@@ -2338,14 +2973,12 @@ fn the_kill_switch_survives_a_restart() {
             Arc::new(SqliteGuardrailStore::open(&path).expect("open"));
         let engine = GuardrailEngine::new(
             store,
-            Arc::new(NullAuditSink),
+            Arc::new(NullAuditSink::new([alpha_route()])),
             key_store(&["alpha"]) as Arc<dyn KeyStore>,
             Network::Testnet,
         )
         .expect("engine");
-        engine
-            .register_agent(&agent, Some(vault()), NOW_MS)
-            .expect("register");
+        engine.register_agent(&agent, NOW_MS).expect("register");
         engine
             .operator_set_guardrails(&agent, permissive(&["BTC"]), NOW_MS)
             .expect("set guardrails");
@@ -2361,7 +2994,7 @@ fn the_kill_switch_survives_a_restart() {
         Arc::new(SqliteGuardrailStore::open(&path).expect("reopen"));
     let engine = GuardrailEngine::new(
         store,
-        Arc::new(NullAuditSink),
+        Arc::new(NullAuditSink::new([alpha_route()])),
         key_store(&["alpha"]) as Arc<dyn KeyStore>,
         Network::Testnet,
     )
@@ -2503,9 +3136,7 @@ fn a_breaker_trip_queues_the_same_cancels_an_operator_engagement_would() {
 fn a_global_breaker_trip_names_every_agent() {
     let f = Fixture::new(permissive(&["BTC"]));
     let beta = AgentId::new("beta");
-    f.engine
-        .register_agent(&beta, None, NOW_MS)
-        .expect("register");
+    f.engine.register_agent(&beta, NOW_MS).expect("register");
     f.engine
         .operator_set_account_limits(
             LossLimits {
@@ -2519,6 +3150,7 @@ fn a_global_breaker_trip_names_every_agent() {
     let mut fleet = account(d("4600"));
     fleet.realized_pnl_today_usd = d("-400");
     let with_fleet = Exposure {
+        account: vault(),
         agent: account(d("1000")),
         fleet: Some(fleet),
     };
@@ -2554,7 +3186,11 @@ fn a_trip_whose_state_write_fails_still_queues_the_cancels() {
         max_daily_loss_usd: Some(d("25")),
         max_drawdown_usd: None,
     };
-    let f = Fixture::with(config, Arc::new(FailingStore), Arc::new(NullAuditSink));
+    let f = Fixture::with(
+        config,
+        Arc::new(FailingStore),
+        Arc::new(NullAuditSink::new([alpha_route()])),
+    );
     let mut losing = exposure(d("975"));
     losing.agent.realized_pnl_today_usd = d("-30");
     assert!(matches!(
@@ -2859,7 +3495,9 @@ fn a_ledger_write_failure_refuses_the_order() {
     let f = Fixture::with(
         permissive(&["BTC"]),
         Arc::new(MemoryStore::new()),
-        Arc::new(FailingSink),
+        Arc::new(FailingSink {
+            routes: TestRoutes::new([alpha_route()]),
+        }),
     );
     match f
         .evaluate(
@@ -2887,7 +3525,9 @@ fn a_ledger_write_failure_never_blocks_a_cancel_or_the_dead_man_switch() {
     let f = Fixture::with(
         permissive(&["BTC"]),
         Arc::new(MemoryStore::new()),
-        Arc::new(FailingSink),
+        Arc::new(FailingSink {
+            routes: TestRoutes::new([alpha_route()]),
+        }),
     );
 
     f.engine
@@ -2940,7 +3580,7 @@ fn a_ledger_write_failure_never_blocks_a_cancel_or_the_dead_man_switch() {
 /// refused yesterday cleared today.
 #[test]
 fn operator_actions_reach_the_ledger() {
-    let sink = Arc::new(CountingSink::default());
+    let sink = Arc::new(CountingSink::new([alpha_route()]));
     let f = Fixture::with(
         permissive(&["BTC"]),
         Arc::new(MemoryStore::new()),
@@ -3012,7 +3652,9 @@ fn an_operator_action_still_happens_when_its_ledger_row_fails() {
     let f = Fixture::with(
         permissive(&["BTC"]),
         Arc::new(MemoryStore::new()),
-        Arc::new(FailingSink),
+        Arc::new(FailingSink {
+            routes: TestRoutes::new([alpha_route()]),
+        }),
     );
     let effect = f
         .engine
@@ -3173,7 +3815,11 @@ fn a_kill_switch_write_failure_refuses_rather_than_forgetting_the_trip() {
         max_daily_loss_usd: Some(d("25")),
         max_drawdown_usd: None,
     };
-    let f = Fixture::with(config, Arc::new(FailingStore), Arc::new(NullAuditSink));
+    let f = Fixture::with(
+        config,
+        Arc::new(FailingStore),
+        Arc::new(NullAuditSink::new([alpha_route()])),
+    );
     let mut losing = exposure(d("975"));
     losing.agent.realized_pnl_today_usd = d("-30");
 
@@ -3196,7 +3842,7 @@ fn a_kill_switch_write_failure_refuses_rather_than_forgetting_the_trip() {
 
 #[test]
 fn refusals_are_recorded_too() {
-    let sink = Arc::new(CountingSink::default());
+    let sink = Arc::new(CountingSink::new([alpha_route()]));
     let f = Fixture::with(
         permissive(&[]),
         Arc::new(MemoryStore::new()),
@@ -3804,7 +4450,7 @@ fn a_clearance_is_signed_for_the_network_and_sub_account_it_was_evaluated_for() 
 
     let (request, _) = f
         .engine
-        .sign_cleared(cleared, 1, None, NOW_MS)
+        .sign_cleared(cleared, 1, None, || NOW_MS)
         .expect("signs");
     assert_eq!(request.vault_address(), Some(vault()));
 
@@ -3819,19 +4465,22 @@ fn a_clearance_is_signed_for_the_network_and_sub_account_it_was_evaluated_for() 
             NOW_MS,
         )
         .expect("wallet");
+    let other_vault = oppen_hl::Address::from_bytes([7; 20]);
+    let route = route_for(
+        mainnet_keys.as_ref(),
+        "beta",
+        other_vault,
+        Some(other_vault),
+    );
     let mainnet = GuardrailEngine::new(
         Arc::new(MemoryStore::new()),
-        Arc::new(NullAuditSink),
+        Arc::new(NullAuditSink::new([route])),
         mainnet_keys as Arc<dyn KeyStore>,
         Network::Mainnet,
     )
     .expect("engine");
     let other = AgentId::new("beta");
-    let other_vault =
-        oppen_hl::Address::parse("0x000000000000000000000000000000000000beef").expect("address");
-    mainnet
-        .register_agent(&other, Some(other_vault), NOW_MS)
-        .expect("register");
+    mainnet.register_agent(&other, NOW_MS).expect("register");
     mainnet
         .operator_set_guardrails(&other, permissive(&["BTC"]), NOW_MS)
         .expect("set guardrails");
@@ -3841,61 +4490,16 @@ fn a_clearance_is_signed_for_the_network_and_sub_account_it_was_evaluated_for() 
             &intent("BTC", true, d("100"), d("1")),
             &asset("BTC", 2, 40),
             &MarketRef::fresh("BTC", d("100"), NOW_MS),
-            &exposure(d("100000")),
+            &Exposure {
+                account: other_vault,
+                ..exposure(d("100000"))
+            },
             NOW_MS,
         )
         .expect("clears");
     assert_eq!(cleared.clearance().network, Network::Mainnet);
     assert_eq!(cleared.clearance().vault_address, Some(other_vault));
 }
-
-/// The binding has to survive a restart, or the second launch signs a
-/// sub-account's orders against the master account.
-#[test]
-fn the_sub_account_binding_survives_a_restart() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let path = dir.path().join("testnet.db");
-    let agent = AgentId::new("alpha");
-    {
-        let store: Arc<dyn GuardrailStore> =
-            Arc::new(SqliteGuardrailStore::open(&path).expect("open"));
-        let engine = GuardrailEngine::new(
-            store,
-            Arc::new(NullAuditSink),
-            key_store(&["alpha"]) as Arc<dyn KeyStore>,
-            Network::Testnet,
-        )
-        .expect("engine");
-        engine
-            .register_agent(&agent, Some(vault()), NOW_MS)
-            .expect("register");
-        engine
-            .operator_set_guardrails(&agent, permissive(&["BTC"]), NOW_MS)
-            .expect("set guardrails");
-    }
-    let store: Arc<dyn GuardrailStore> =
-        Arc::new(SqliteGuardrailStore::open(&path).expect("reopen"));
-    let engine = GuardrailEngine::new(
-        store,
-        Arc::new(NullAuditSink),
-        key_store(&["alpha"]) as Arc<dyn KeyStore>,
-        Network::Testnet,
-    )
-    .expect("engine");
-    assert_eq!(engine.vault_address(&agent), Some(vault()));
-    let cleared = engine
-        .evaluate(
-            &agent,
-            &intent("BTC", true, d("100"), d("1")),
-            &asset("BTC", 2, 40),
-            &MarketRef::fresh("BTC", d("100"), NOW_MS),
-            &exposure(d("100000")),
-            NOW_MS,
-        )
-        .expect("clears");
-    assert_eq!(cleared.clearance().vault_address, Some(vault()));
-}
-
 /// Internally-tagged enums with newtype variants fail at *serialization*
 /// time, not compile time, if the inner value is not a map. `Refusal`
 /// wraps `VenueRule` and `Unevaluable` that way, so the taxonomy is
@@ -4215,6 +4819,7 @@ fn no_input_produces_a_signable_value_without_passing_every_predicate() {
             },
         };
         let exposure = Exposure {
+            account: vault(),
             agent: agent_account,
             fleet: None,
         };
@@ -4773,7 +5378,7 @@ fn a_kill_switch_engaged_after_the_clearance_still_stops_the_signature() {
         )
         .expect("engage");
 
-    match f.engine.sign_cleared(cleared, 1, None, NOW_MS + 2) {
+    match f.engine.sign_cleared(cleared, 1, None, || NOW_MS + 2) {
         Err(SignClearedError::Refused(Refusal::TradingPaused {
             scope,
             since_ms,
@@ -4793,7 +5398,7 @@ fn a_kill_switch_engaged_after_the_clearance_still_stops_the_signature() {
 /// say why no fill followed — and item 18 names guardrail trips as events.
 #[test]
 fn a_refusal_at_the_signer_reaches_the_ledger() {
-    let sink = Arc::new(CountingSink::default());
+    let sink = Arc::new(CountingSink::new([alpha_route()]));
     let f = Fixture::with(
         permissive(&["BTC"]),
         Arc::new(MemoryStore::new()),
@@ -4815,7 +5420,7 @@ fn a_refusal_at_the_signer_reaches_the_ledger() {
         .expect("engage");
     let err = f
         .engine
-        .sign_cleared(cleared, 1, None, NOW_MS + 2)
+        .sign_cleared(cleared, 1, None, || NOW_MS + 2)
         .expect_err("the signer refuses");
     assert!(matches!(
         err,
@@ -4836,7 +5441,7 @@ fn a_failed_ledger_write_never_turns_a_signer_refusal_into_a_signature() {
     let f = Fixture::with(
         permissive(&["BTC"]),
         Arc::new(MemoryStore::new()),
-        Arc::new(NullAuditSink),
+        Arc::new(NullAuditSink::new([alpha_route()])),
     );
     let cleared = f
         .evaluate(
@@ -4851,13 +5456,15 @@ fn a_failed_ledger_write_never_turns_a_signer_refusal_into_a_signature() {
     // which has never paired this agent.
     let broken = GuardrailEngine::new(
         Arc::new(MemoryStore::new()),
-        Arc::new(FailingSink),
+        Arc::new(FailingSink {
+            routes: TestRoutes::new([alpha_route()]),
+        }),
         key_store(&["alpha"]) as Arc<dyn KeyStore>,
         Network::Testnet,
     )
     .expect("engine");
     let err = broken
-        .sign_cleared(cleared, 1, None, NOW_MS)
+        .sign_cleared(cleared, 1, None, || NOW_MS)
         .expect_err("still refuses with the ledger down");
     assert!(matches!(
         err,
@@ -4887,7 +5494,7 @@ fn a_cancel_still_signs_while_the_kill_switch_is_engaged() {
         .expect("a cancel clears while paused");
     let (request, _) = f
         .engine
-        .sign_cleared(cleared, 1, None, NOW_MS)
+        .sign_cleared(cleared, 1, None, || NOW_MS)
         .expect("and it signs while paused");
     assert!(matches!(request.action(), Action::Cancel { .. }));
 
@@ -4900,7 +5507,7 @@ fn a_cancel_still_signs_while_the_kill_switch_is_engaged() {
         .expect("the dead-man's switch clears while paused");
     let (request, _) = f
         .engine
-        .sign_cleared(cleared, 2, None, NOW_MS)
+        .sign_cleared(cleared, 2, None, || NOW_MS)
         .expect("and it signs");
     assert!(matches!(request.action(), Action::ScheduleCancel { .. }));
     assert_eq!(request.vault_address(), Some(vault()));
@@ -4934,17 +5541,22 @@ fn a_clearance_cannot_be_signed_through_another_networks_engine() {
         .expect("wallet");
     let mainnet = GuardrailEngine::new(
         Arc::new(MemoryStore::new()),
-        Arc::new(NullAuditSink),
+        Arc::new(NullAuditSink::new([route_for(
+            mainnet_keys.as_ref(),
+            "alpha",
+            vault(),
+            Some(vault()),
+        )])),
         mainnet_keys as Arc<dyn KeyStore>,
         Network::Mainnet,
     )
     .expect("engine");
     // Same agent, same sub-account: only the network differs.
     mainnet
-        .register_agent(&AgentId::new("alpha"), Some(vault()), NOW_MS)
+        .register_agent(&AgentId::new("alpha"), NOW_MS)
         .expect("register");
 
-    match mainnet.sign_cleared(cleared, 1, None, NOW_MS) {
+    match mainnet.sign_cleared(cleared, 1, None, || NOW_MS) {
         Err(SignClearedError::Refused(Refusal::Unevaluable(Unevaluable::WrongNetwork {
             expected,
             supplied,
@@ -4969,7 +5581,7 @@ fn a_clearance_cannot_be_signed_through_an_engine_that_does_not_know_its_agent()
     let stranger = || {
         GuardrailEngine::new(
             Arc::new(MemoryStore::new()),
-            Arc::new(NullAuditSink),
+            Arc::new(NullAuditSink::new([alpha_route()])),
             key_store(&["alpha"]) as Arc<dyn KeyStore>,
             Network::Testnet,
         )
@@ -4988,7 +5600,7 @@ fn a_clearance_cannot_be_signed_through_an_engine_that_does_not_know_its_agent()
             .expect("clears");
         assert_eq!(cleared.clearance().vault_address, container);
 
-        match stranger().sign_cleared(cleared, 1, None, NOW_MS) {
+        match stranger().sign_cleared(cleared, 1, None, || NOW_MS) {
             Err(SignClearedError::Refused(Refusal::Unevaluable(Unevaluable::UnknownAgent {
                 agent,
             }))) => assert_eq!(agent, f.agent),
@@ -5099,7 +5711,7 @@ fn an_agent_scoped_kill_stops_a_top_level_containers_signature() {
         )
         .expect("engage");
 
-    match f.engine.sign_cleared(cleared, 1, None, NOW_MS + 2) {
+    match f.engine.sign_cleared(cleared, 1, None, || NOW_MS + 2) {
         Err(SignClearedError::Refused(Refusal::TradingPaused {
             scope, since_ms, ..
         })) => {
@@ -5109,63 +5721,6 @@ fn an_agent_scoped_kill_stops_a_top_level_containers_signature() {
         other => panic!("a paused agent's top-level container must not sign, got {other:?}"),
     }
 }
-
-/// **D1's 1:1 mapping, enforced where the binding is made.**
-///
-/// Nothing used to stop two agents being registered against one sub-account,
-/// and the signer then resolved that address by taking the *first* agent in
-/// the registry — so the second agent's kill switch, loss budget and caps
-/// were silently evaluated as the first agent's. One container is one
-/// position book, one margin pool and one loss budget; two agents on it is a
-/// segregation the roster displays and the venue does not enforce.
-#[test]
-fn one_container_binds_to_exactly_one_agent() {
-    let engine = GuardrailEngine::new(
-        Arc::new(MemoryStore::new()),
-        Arc::new(NullAuditSink),
-        key_store(&["alpha", "beta", "gamma", "delta"]) as Arc<dyn KeyStore>,
-        Network::Testnet,
-    )
-    .expect("engine");
-    let alpha = AgentId::new("alpha");
-    let beta = AgentId::new("beta");
-    engine
-        .register_agent(&alpha, Some(vault()), NOW_MS)
-        .expect("the first agent takes the container");
-
-    match engine.register_agent(&beta, Some(vault()), NOW_MS) {
-        Err(GuardrailError::ContainerAlreadyBound {
-            vault_address,
-            bound_to,
-        }) => {
-            assert_eq!(vault_address, vault());
-            assert_eq!(bound_to, alpha);
-        }
-        other => panic!("a second agent must not take an occupied container, got {other:?}"),
-    }
-
-    // The refusal changed nothing: the container is still alpha's and beta
-    // has none, so the roster cannot show a binding that was refused.
-    assert_eq!(engine.vault_address(&alpha), Some(vault()));
-    assert_eq!(engine.vault_address(&beta), None);
-
-    // Re-registering the same pair stays idempotent; pairing calls this every
-    // time an agent reconnects.
-    engine
-        .register_agent(&alpha, Some(vault()), NOW_MS)
-        .expect("the same agent may re-take its own container");
-    assert_eq!(engine.vault_address(&alpha), Some(vault()));
-
-    // Two top-level containers are not a collision: `None` is the absence of
-    // a vaultAddress on the wire, not a shared account (D1 V2).
-    engine
-        .register_agent(&AgentId::new("gamma"), None, NOW_MS)
-        .expect("a top-level container");
-    engine
-        .register_agent(&AgentId::new("delta"), None, NOW_MS)
-        .expect("another top-level container");
-}
-
 /// **A clearance is a verdict about the market it was measured against, and
 /// it expires.**
 ///
@@ -5193,7 +5748,7 @@ fn an_order_clearance_expires_between_the_evaluation_and_the_signature() {
 
     match f
         .engine
-        .sign_cleared(clear(), 1, None, NOW_MS + budget_ms + 1)
+        .sign_cleared(clear(), 1, None, || NOW_MS + budget_ms + 1)
     {
         Err(SignClearedError::Refused(Refusal::Unevaluable(Unevaluable::StaleClearance {
             age_ms,
@@ -5208,19 +5763,30 @@ fn an_order_clearance_expires_between_the_evaluation_and_the_signature() {
     // The boundary is inclusive, so the refusal above is the age and not an
     // off-by-one that would refuse every order at the limit.
     f.engine
-        .sign_cleared(clear(), 2, None, NOW_MS + budget_ms)
+        .sign_cleared(clear(), 2, None, || NOW_MS + budget_ms)
         .expect("a clearance exactly at the budget still signs");
 
     // A clock that moved backwards is unevaluable, not "zero milliseconds
     // old": saturating the age would make a rewound clock the one way to sign
     // anything, however old.
-    match f.engine.sign_cleared(clear(), 3, None, NOW_MS - 1) {
+    let later = f
+        .engine
+        .evaluate(
+            &f.agent,
+            &intent("BTC", true, d("100"), d("1")),
+            &asset("BTC", 2, 40),
+            &MarketRef::fresh("BTC", d("100"), NOW_MS + 1),
+            &exposure(d("100000")),
+            NOW_MS + 1,
+        )
+        .unwrap();
+    match f.engine.sign_cleared(later, 3, None, || NOW_MS) {
         Err(SignClearedError::Refused(Refusal::Unevaluable(Unevaluable::ClockWentBackwards {
             now_ms,
             last_ms,
         }))) => {
-            assert_eq!(now_ms, NOW_MS - 1);
-            assert_eq!(last_ms, NOW_MS);
+            assert_eq!(now_ms, NOW_MS);
+            assert_eq!(last_ms, NOW_MS + 1);
         }
         other => panic!("a rewound clock must not sign, got {other:?}"),
     }
@@ -5238,7 +5804,7 @@ fn an_order_clearance_expires_between_the_evaluation_and_the_signature() {
         )
         .expect("a cancel clears");
     f.engine
-        .sign_cleared(cancel, 4, None, NOW_MS + 3_600_000)
+        .sign_cleared(cancel, 4, None, || NOW_MS + 3_600_000)
         .expect("a cancel does not go stale");
 }
 
@@ -5269,7 +5835,12 @@ fn a_clearance_is_signed_by_the_wallet_of_the_agent_it_names() {
     let sign_for = |keys: Arc<crate::keys::MemoryKeyStore>, agent: &str| -> String {
         let engine = GuardrailEngine::new(
             Arc::new(MemoryStore::new()),
-            Arc::new(NullAuditSink),
+            Arc::new(NullAuditSink::new([route_for(
+                keys.as_ref(),
+                agent,
+                vault(),
+                None,
+            )])),
             keys as Arc<dyn KeyStore>,
             Network::Testnet,
         )
@@ -5277,9 +5848,7 @@ fn a_clearance_is_signed_by_the_wallet_of_the_agent_it_names() {
         let agent = AgentId::new(agent);
         // Top-level containers: no `vaultAddress`, so nothing but the key
         // distinguishes where this order lands.
-        engine
-            .register_agent(&agent, None, NOW_MS)
-            .expect("register");
+        engine.register_agent(&agent, NOW_MS).expect("register");
         engine
             .operator_set_guardrails(&agent, permissive(&["BTC"]), NOW_MS)
             .expect("rails");
@@ -5296,7 +5865,7 @@ fn a_clearance_is_signed_by_the_wallet_of_the_agent_it_names() {
         assert_eq!(cleared.clearance().agent, agent);
         assert_eq!(cleared.clearance().vault_address, None);
         let (request, _) = engine
-            .sign_cleared(cleared, 1, None, NOW_MS)
+            .sign_cleared(cleared, 1, None, || NOW_MS)
             .expect("signs");
         request.signature().to_hex()
     };
@@ -5333,170 +5902,6 @@ fn a_clearance_is_signed_by_the_wallet_of_the_agent_it_names() {
         "the signature did not follow the wallet in the named agent's record"
     );
 }
-
-/// Fail closed on a missing wallet: no key, no signature, and a typed error
-/// the operator can act on rather than a refusal an agent would retry against.
-#[test]
-fn a_clearance_whose_agent_has_no_wallet_is_not_signed() {
-    let engine = GuardrailEngine::new(
-        Arc::new(MemoryStore::new()),
-        Arc::new(NullAuditSink),
-        // The store knows a different agent entirely.
-        key_store(&["stranger"]) as Arc<dyn KeyStore>,
-        Network::Testnet,
-    )
-    .expect("engine");
-    let agent = AgentId::new("alpha");
-    engine
-        .register_agent(&agent, None, NOW_MS)
-        .expect("register");
-    engine
-        .operator_set_guardrails(&agent, permissive(&["BTC"]), NOW_MS)
-        .expect("rails");
-    let cleared = engine
-        .evaluate(
-            &agent,
-            &intent("BTC", true, d("100"), d("1")),
-            &asset("BTC", 2, 40),
-            &MarketRef::fresh("BTC", d("100"), NOW_MS),
-            &exposure(d("100000")),
-            NOW_MS,
-        )
-        .expect("clears");
-    assert!(matches!(
-        engine.sign_cleared(cleared, 1, None, NOW_MS),
-        Err(SignClearedError::Key(_))
-    ));
-}
-
-/// **The 1:1 container rule holds on every door, not just the front one.**
-///
-/// [`GuardrailStore`] is a `pub` trait and `save_vault` is a `pub` method, so
-/// any holder of the store writes bindings directly; and a restart reads back
-/// whatever is on disk. Guarding only [`GuardrailEngine::register_agent`] left
-/// the exact state it refuses reachable in one line plus a relaunch — two
-/// agents' caps, loss budgets and kill switches measured against one pool of
-/// capital, with a roster showing a segregation the venue does not enforce.
-#[test]
-fn a_store_holding_one_container_for_two_agents_refuses_to_start() {
-    let store = Arc::new(MemoryStore::new());
-    let alpha = AgentId::new("alpha");
-    let beta = AgentId::new("beta");
-    store.save_vault(&alpha, &vault()).expect("bind alpha");
-    store.save_vault(&beta, &vault()).expect("bind beta");
-
-    match GuardrailEngine::new(
-        store as Arc<dyn GuardrailStore>,
-        Arc::new(NullAuditSink),
-        key_store(&["alpha", "beta"]) as Arc<dyn KeyStore>,
-        Network::Testnet,
-    ) {
-        Err(GuardrailError::ContainerAlreadyBound {
-            vault_address,
-            bound_to,
-        }) => {
-            assert_eq!(vault_address, vault());
-            // Deterministic: `vaults` is a `BTreeMap`, so the holder named is
-            // the same one on every run.
-            assert_eq!(bound_to, alpha);
-        }
-        other => panic!("an ambiguous registry must not start an engine, got {other:?}"),
-    }
-}
-
-/// **A container binds once — and `None` is a container.**
-///
-/// Pairing calls [`GuardrailEngine::register_agent`] on every reconnect, so an
-/// address that disagreed with the stored one silently moved which capital the
-/// agent's caps, loss budget and ledger history describe — and, because the
-/// early return for an already-configured agent happens first, without a
-/// ledger row. `docs/decisions.md` V5 makes the container migration an
-/// explicit operator gesture that does not exist yet.
-///
-/// The guard read the binding out of `vaults`, where a **top-level** container
-/// has no row at all — so it fired only for a sub-account, and under the
-/// revised D1 (V2) a sub-account is the shape v1 never provisions. The second
-/// half of this test is that case: a top-level agent, a reconnect supplying an
-/// address, and the same refusal.
-#[test]
-fn an_agents_container_is_bound_once_and_never_re_pointed() {
-    let sink = Arc::new(CountingSink::default());
-    let engine = GuardrailEngine::new(
-        Arc::new(MemoryStore::new()),
-        sink.clone() as Arc<dyn AuditSink>,
-        key_store(&["alpha", "beta"]) as Arc<dyn KeyStore>,
-        Network::Testnet,
-    )
-    .expect("engine");
-    let alpha = AgentId::new("alpha");
-    let elsewhere =
-        oppen_hl::Address::parse("0x00000000000000000000000000000000000000ff").expect("address");
-    engine
-        .register_agent(&alpha, Some(vault()), NOW_MS)
-        .expect("the first binding");
-    let rows = sink.operator_actions().len();
-
-    match engine.register_agent(&alpha, Some(elsewhere), NOW_MS) {
-        Err(GuardrailError::ContainerChanged {
-            agent,
-            bound_to,
-            supplied,
-        }) => {
-            assert_eq!(agent, alpha);
-            assert_eq!(bound_to, Some(vault()));
-            assert_eq!(supplied, Some(elsewhere));
-        }
-        other => panic!("a re-point must be refused, got {other:?}"),
-    }
-    // Dropping the container is the same move in the other direction: it would
-    // send the next order to a top-level account nobody funded.
-    assert!(matches!(
-        engine.register_agent(&alpha, None, NOW_MS),
-        Err(GuardrailError::ContainerChanged { .. })
-    ));
-    assert_eq!(engine.vault_address(&alpha), Some(vault()));
-    assert_eq!(
-        sink.operator_actions().len(),
-        rows,
-        "a refused registration must not have written anything"
-    );
-
-    // The reconnect case still works: same agent, same container, no-op.
-    engine
-        .register_agent(&alpha, Some(vault()), NOW_MS)
-        .expect("re-pairing with the same container");
-
-    // **The top-level container, which is the only shape v1 provisions.** It
-    // has no row in `vaults`, so a guard that reads the binding out of that
-    // map alone sees "never bound" and lets the reconnect path move it.
-    let beta = AgentId::new("beta");
-    engine.register_agent(&beta, None, NOW_MS).expect("beta");
-    engine
-        .register_agent(&beta, None, NOW_MS)
-        .expect("beta again");
-    let rows = sink.operator_actions().len();
-    match engine.register_agent(&beta, Some(elsewhere), NOW_MS) {
-        Err(GuardrailError::ContainerChanged {
-            agent,
-            bound_to,
-            supplied,
-        }) => {
-            assert_eq!(agent, beta);
-            assert_eq!(bound_to, None, "a top-level container is bound to None");
-            assert_eq!(supplied, Some(elsewhere));
-        }
-        other => {
-            panic!("a top-level container must not be re-pointed onto a sub-account, got {other:?}")
-        }
-    }
-    assert_eq!(engine.vault_address(&beta), None);
-    assert_eq!(
-        sink.operator_actions().len(),
-        rows,
-        "the refused re-point must not have written anything"
-    );
-}
-
 /// **One proposal is one approval.**
 ///
 /// [`GuardrailEngine::operator_approve_proposal`] read the proposal under one
@@ -5515,16 +5920,22 @@ fn one_proposal_authorises_exactly_one_approval() {
     /// happened before it acts, which is what makes the interleaving certain
     /// rather than a race the spawn order decides.
     struct HoldFirstClearance {
+        routes: TestRoutes,
         parked: std::sync::Barrier,
         release: std::sync::Barrier,
         held: std::sync::atomic::AtomicBool,
     }
     impl AuditSink for HoldFirstClearance {
+        fn route_for_agent(&self, agent: &AgentId) -> Result<AuthorizedRoute, Refusal> {
+            self.routes.get(agent)
+        }
         fn before_sign(
             &self,
-            _clearance: &Clearance,
+            clearance: &Clearance,
+            wallet: &crate::keys::AgentWallet,
+            signer: oppen_hl::Address,
         ) -> Result<Box<dyn SigningPermit + '_>, Refusal> {
-            Ok(Box::new(()))
+            self.routes.permit(clearance, wallet, signer)
         }
 
         fn record(&self, entry: &AuditEntry<'_>) -> Result<(), AuditError> {
@@ -5539,6 +5950,7 @@ fn one_proposal_authorises_exactly_one_approval() {
     }
 
     let sink = Arc::new(HoldFirstClearance {
+        routes: TestRoutes::new([alpha_route()]),
         parked: std::sync::Barrier::new(2),
         release: std::sync::Barrier::new(2),
         held: std::sync::atomic::AtomicBool::new(false),
@@ -5559,9 +5971,7 @@ fn one_proposal_authorises_exactly_one_approval() {
         .expect("engine"),
     );
     let alpha = AgentId::new("alpha");
-    engine
-        .register_agent(&alpha, None, NOW_MS)
-        .expect("register");
+    engine.register_agent(&alpha, NOW_MS).expect("register");
     engine
         .operator_set_guardrails(&alpha, config, NOW_MS)
         .expect("rails");
@@ -5630,17 +6040,15 @@ fn one_proposal_authorises_exactly_one_approval() {
 fn the_dead_man_switch_is_armed_per_container() {
     let engine = GuardrailEngine::new(
         Arc::new(MemoryStore::new()),
-        Arc::new(NullAuditSink),
+        Arc::new(NullAuditSink::new([alpha_route()])),
         key_store(&["alpha", "beta"]) as Arc<dyn KeyStore>,
         Network::Testnet,
     )
     .expect("engine");
     let alpha = AgentId::new("alpha");
     let beta = AgentId::new("beta");
-    engine
-        .register_agent(&alpha, Some(vault()), NOW_MS)
-        .expect("alpha");
-    engine.register_agent(&beta, None, NOW_MS).expect("beta");
+    engine.register_agent(&alpha, NOW_MS).expect("alpha");
+    engine.register_agent(&beta, NOW_MS).expect("beta");
     engine.set_agent_active(&alpha, true);
 
     assert!(matches!(
@@ -5688,7 +6096,7 @@ fn an_arm_whose_lead_has_run_out_is_refused_at_the_signer() {
     };
 
     // 56 s later the lead is 4 s, inside the venue's 5 s minimum.
-    match f.engine.sign_cleared(arm(), 1, None, NOW_MS + 56_000) {
+    match f.engine.sign_cleared(arm(), 1, None, || NOW_MS + 56_000) {
         Err(SignClearedError::Refused(Refusal::VenueRule(VenueRule::ScheduleCancelTooSoon {
             cancel_at_ms,
             earliest_ms,
@@ -5701,7 +6109,7 @@ fn an_arm_whose_lead_has_run_out_is_refused_at_the_signer() {
     // Exactly at the minimum still signs, so the refusal above is the lead and
     // not an off-by-one.
     f.engine
-        .sign_cleared(arm(), 2, None, NOW_MS + 55_000)
+        .sign_cleared(arm(), 2, None, || NOW_MS + 55_000)
         .expect("an arm still clear of the minimum signs");
 
     let disarm = f
@@ -5709,7 +6117,7 @@ fn an_arm_whose_lead_has_run_out_is_refused_at_the_signer() {
         .clear_schedule_cancel(&f.agent, None, NOW_MS)
         .expect("disarms");
     f.engine
-        .sign_cleared(disarm, 3, None, NOW_MS + 3_600_000)
+        .sign_cleared(disarm, 3, None, || NOW_MS + 3_600_000)
         .expect("a disarm carries no deadline and never goes stale");
 }
 
@@ -5807,7 +6215,7 @@ fn the_position_cap_holds_when_the_caller_reports_what_it_has_in_flight() {
 #[test]
 fn no_generated_intent_reaches_the_signer_without_an_evaluation() {
     const CASES: u64 = 3_000;
-    let sink = Arc::new(CountingSink::default());
+    let sink = Arc::new(CountingSink::new([alpha_route()]));
     let mut config = permissive(&["BTC", "ETH"]);
     config.max_order_usd = d("5000");
     config.max_position_usd = d("50000");
@@ -5850,6 +6258,7 @@ fn no_generated_intent_reaches_the_signer_without_an_evaluation() {
         let market = MarketRef::fresh(symbol, d("100"), now_ms);
         let instrument = asset(symbol, 2, 40);
         let exposure = Exposure {
+            account: vault(),
             agent: account_at(d("1000000"), now_ms),
             fleet: None,
         };
@@ -5879,7 +6288,7 @@ fn no_generated_intent_reaches_the_signer_without_an_evaluation() {
         }
         let paused = f.engine.kill_switch().blocking(&f.agent).is_some();
 
-        match f.engine.sign_cleared(cleared, nonce, None, now_ms) {
+        match f.engine.sign_cleared(cleared, nonce, None, || now_ms) {
             Ok((request, clearance)) => {
                 assert!(!paused, "case {case}: a paused agent got a signature");
                 assert_eq!(request.nonce(), nonce, "case {case}");

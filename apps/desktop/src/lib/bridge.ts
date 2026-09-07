@@ -109,7 +109,6 @@ export interface AgentPolicy {
 }
 export interface StoredPolicy {
   guardrails: Record<string, AgentPolicy>;
-  vaults: Record<string, string>;
   account_limits: { max_daily_loss_usd: string | null; max_drawdown_usd: string | null };
   kill: { global: { engaged_at_ms: number; reason: unknown } | null; agents: Record<string, { engaged_at_ms: number; reason: unknown }> };
 }

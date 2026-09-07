@@ -57,6 +57,18 @@ Onboarding is complete for one agent when all six hold:
 Nothing about onboarding is complete because a screen was dismissed. Each of the
 six is a query against venue state or the local ledger.
 
+### 1.1a Client setup scope
+
+After the current safety work, MVP onboarding includes the in-app Connect Agent
+flow, account/permission assignment, read-only connection testing, status and
+durable revocation, an initial verified client matrix, generic MCP configuration
+and external local-model runners. Beta expands verified clients and adds
+permission-based one-click configuration; cloud connectivity such as ChatGPT
+requires a separate security review. Compatible and verified support remain
+distinct, with identical server-side safeguards. The detailed requirements are
+in [agent-connections.md](agent-connections.md); no client is claimed verified by
+this specification alone.
+
 ### 1.2 The invariants onboarding may never break
 
 | Invariant | Source | What it forbids in this flow |
