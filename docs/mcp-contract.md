@@ -13,7 +13,7 @@ This document is the normative reference for every tool the gateway exposes. `do
 
 ## Tools (v1)
 
-`get_state` · `get_meta` · `get_events` · `get_features` · `preflight` · `place` · `cancel` · `cancel_all` · `close_position` · `get_order_status` · `remember` · `recall` · `set_alert` · `get_alerts` · `cancel_alert`
+`get_state` · `get_meta` · `get_events` · `get_features` · `preflight` · `place` · `cancel` · `cancel_all` · `close_position` · `get_order_status` · `remember` · `recall` · `set_alert` · `get_alerts` · `cancel_alert` · `get_execution_report`
 
 Every tool in that list is implemented.
 
@@ -186,6 +186,24 @@ The point is that one budget means different sizes on different markets: $5 of r
 If the volatility cannot be measured, an order on that symbol is **refused**, not sized against a guess: `missing_volatility` names the symbol. A configured cap that cannot be computed is a cap that is not enforced.
 
 **Not included: estimated fees.** Item 20 names them; oppen has no fee schedule yet, and guessing a tier would be worse than omitting one. It needs a `userFees` read audited against the live API, which is its own change.
+
+### `get_execution_report(hours?)`
+
+What your execution actually cost, from your own chained fills. Default window 24 hours.
+
+Returns `{contract_version, from_ms, to_ms, scored_fills, unscored_fills, slippage, all, costs, by_symbol}`.
+
+**`slip_bps` is measured against the arrival mid** — the price the guardrails measured your order against at the instant the decision was taken, before anything was sent. Positive is cost; **negative is price improvement and is reported as such**, not floored at zero. A mean that floored would be biased upward by every fill that went well.
+
+**Every statistic carries its `n`, and every one carries a baseline.** The baseline is the maker/taker split: `slippage.taker` against `slippage.maker`, per symbol and overall. That is what crossing the spread cost you, measured against what resting earned — the comparison you can act on. A side is absent when nothing landed on it, which is itself the finding if you only ever cross.
+
+`p90_bps` is nearest-rank, so every percentile is a slippage that really happened and can be found in the ledger beside the report.
+
+**Read `unscored_fills` before believing the rest.** A fill with no arrival mid cannot be scored — an external trade, a manual ticket, or an order placed before arrival mids were stamped. The count is published rather than dropped, because a clean mean over half your trading would be worse than no report.
+
+**`costs` keeps price and fees apart** — `closed_pnl_usd`, `fees_usd`, `fee_bps_of_notional` — because they are fixed by different decisions and a net number hides which one is the problem.
+
+**Not included: funding.** The decomposition spec F asks for is price / funding / fees, and funding is the missing third. It needs a `userFunding` read that does not exist in the client yet and would have to be audited against the live API before being trusted — the same treatment the fee estimate above gets. An `n` of four is not evidence: the report tells you the sample size precisely so you do not have to guess whether it is.
 
 ### `remember(key, value)` · `recall(key?)`
 

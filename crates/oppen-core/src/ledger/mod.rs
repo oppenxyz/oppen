@@ -848,6 +848,42 @@ impl Ledger {
     /// Served by the `events_kind` index. The reconciler reads the intent and
     /// operator rows through it at the moment it needs them, which is what lets
     /// it hold no cursor of its own.
+    /// Every fill attributed to one agent inside a time window, newest last.
+    ///
+    /// For spec F's execution report. Narrow on purpose: it answers one
+    /// question rather than exposing the chain by kind, and it filters in SQL
+    /// on the `events_kind` index rather than reading the fills — which are
+    /// the bulk of the chain — into memory to throw most of them away.
+    ///
+    /// The window is on `ts_ms`, which for a fill row is the **venue's** own
+    /// timestamp, not oppen's. That is the right clock for execution analysis:
+    /// a fill recovered from an outage days later still belongs to the moment
+    /// it traded, and scoring it into the window oppen happened to learn about
+    /// it would put the outage in the report instead of the execution.
+    ///
+    /// Redacted rows carry no payload and are skipped by the caller, which is
+    /// the honest treatment: a tombstone is not a fill that cost nothing.
+    fn fills_for(&self, agent_id: &str, from_ms: i64, to_ms: i64) -> Result<Vec<Value>> {
+        let guard = self.lock()?;
+        let mut statement = guard.prepare(
+            "SELECT payload FROM events \
+             WHERE kind = ?1 AND agent_id = ?2 AND ts_ms >= ?3 AND ts_ms <= ?4 \
+             ORDER BY seq ASC",
+        )?;
+        let mut rows =
+            statement.query(params![EventKind::Fill.as_str(), agent_id, from_ms, to_ms])?;
+        let mut payloads = Vec::new();
+        while let Some(row) = rows.next()? {
+            let text: Option<String> = row.get(0)?;
+            if let Some(text) = text
+                && let Ok(value) = serde_json::from_str(&text)
+            {
+                payloads.push(value);
+            }
+        }
+        Ok(payloads)
+    }
+
     pub(crate) fn events_of_kind(&self, kind: EventKind) -> Result<Vec<Event>> {
         let guard = self.lock()?;
         let mut statement = guard.prepare(&format!(
@@ -1600,6 +1636,16 @@ impl AgentView {
                 .as_ref()
                 .is_none_or(|owner| *owner == self.agent_id)
         }))
+    }
+
+    /// This agent's fills inside a time window, for spec F's execution report.
+    ///
+    /// On the agent view rather than on [`EventViews`] so the scoping is
+    /// structural: there is no argument here that could name another agent,
+    /// which is the same reason `EventViews` exposes one verb and not the
+    /// `Arc<Ledger>` behind it.
+    pub fn fills_between(&self, from_ms: i64, to_ms: i64) -> Result<Vec<Value>> {
+        self.ledger.fills_for(&self.agent_id, from_ms, to_ms)
     }
 
     /// The agent this view speaks for.
