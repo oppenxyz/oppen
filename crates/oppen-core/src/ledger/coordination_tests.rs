@@ -24,6 +24,7 @@ const BLOCKED_WINDOW: Duration = Duration::from_millis(300);
 const COMPLETION_TIMEOUT: Duration = Duration::from_secs(10);
 const CHILD_DATABASE: &str = "OPPEN_LEDGER_COORDINATION_TEST_DATABASE";
 const CHILD_READY: &str = "OPPEN_LEDGER_COORDINATION_LOCK_HELD";
+const CHILD_PAIRING: &str = "OPPEN_PAIRING_OWNER_TEST";
 
 #[cfg(unix)]
 #[test]
@@ -312,7 +313,7 @@ impl Drop for ChildGuard {
     }
 }
 
-fn spawn_lock_holder(path: &Path) -> ChildGuard {
+fn spawn_lock_holder(path: &Path, pairing: bool) -> ChildGuard {
     let mut child = ChildGuard(
         Command::new(std::env::current_exe().unwrap())
             .args([
@@ -322,6 +323,7 @@ fn spawn_lock_holder(path: &Path) -> ChildGuard {
                 "--nocapture",
             ])
             .env(CHILD_DATABASE, path)
+            .env(CHILD_PAIRING, if pairing { "1" } else { "0" })
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -356,13 +358,77 @@ fn spawn_lock_holder(path: &Path) -> ChildGuard {
 #[ignore = "subprocess helper, invoked by the coordination recovery test"]
 fn subprocess_lock_holder() {
     let path = std::env::var_os(CHILD_DATABASE).expect("parent supplies fixture database");
-    let ledger = Ledger::open_at(Path::new(&path), crate::Network::Testnet).unwrap();
-    let guard = ledger.lock().unwrap();
+    let ledger = Arc::new(Ledger::open_at(Path::new(&path), crate::Network::Testnet).unwrap());
+    let (owner, guard) = if std::env::var(CHILD_PAIRING).as_deref() == Ok("1") {
+        (
+            Some(
+                PairingJournal::open(
+                    ledger.clone(),
+                    Arc::new(crate::keys::HmacKey::from_bytes([11; 32])),
+                )
+                .unwrap(),
+            ),
+            None,
+        )
+    } else {
+        (None, Some(ledger.lock().unwrap()))
+    };
     println!("{CHILD_READY}");
     std::io::stdout().flush().unwrap();
     let mut release = [0];
     std::io::stdin().read_exact(&mut release).unwrap();
     drop(guard);
+    drop(owner);
+}
+
+#[test]
+fn pairing_owner_process_death_preserves_revocation_and_releases_ownership() {
+    for graceful in [true, false] {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("pairing-process.db");
+        let ledger = Arc::new(Ledger::open_at(&path, crate::Network::Testnet).unwrap());
+        let key = Arc::new(crate::keys::HmacKey::from_bytes([11; 32]));
+        let journal = PairingJournal::open(ledger.clone(), key.clone()).unwrap();
+        let issued = journal
+            .issue(
+                PairingBinding {
+                    agent: AgentId::new("coordination-agent"),
+                    account: Address::from_bytes([1; 20]),
+                },
+                [12; 32],
+                100,
+            )
+            .unwrap();
+        assert!(journal.revoke(issued.id, 101).unwrap());
+        drop(journal);
+        let mut child = spawn_lock_holder(&alternate_path(&path), true);
+        assert!(matches!(
+            PairingJournal::open(ledger.clone(), key.clone()),
+            Err(PairingError::AlreadyOwned)
+        ));
+        ledger
+            .append(&NewEvent {
+                kind: EventKind::OperatorAction,
+                ts_ms: 102,
+                agent_id: None,
+                payload: &json!({"action": "ledger writes continue beside pairing ownership"}),
+                snapshot: None,
+            })
+            .unwrap();
+        if graceful {
+            child.0.stdin.take().unwrap().write_all(&[1]).unwrap();
+        } else {
+            child.0.kill().unwrap();
+        }
+        let status = wait_for_exit(&mut child.0, COMPLETION_TIMEOUT).unwrap();
+        assert_eq!(status.success(), graceful);
+        let journal = PairingJournal::open(ledger.clone(), key).unwrap();
+        let records = journal.records().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].id, issued.id);
+        assert_eq!(records[0].revoked_at_ms, Some(101));
+        assert!(ledger.verify().unwrap().is_intact());
+    }
 }
 
 #[test]
@@ -371,7 +437,7 @@ fn process_lock_releases_on_guard_drop_and_process_death() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("process.db");
         let ledger = Arc::new(Ledger::open_at(&path, crate::Network::Testnet).unwrap());
-        let mut child = spawn_lock_holder(&alternate_path(&path));
+        let mut child = spawn_lock_holder(&alternate_path(&path), false);
         let (attempted_tx, attempted_rx) = mpsc::channel();
         let (completed_tx, completed_rx) = mpsc::channel();
         let writer = {

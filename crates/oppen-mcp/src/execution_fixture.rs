@@ -103,6 +103,7 @@ struct Runtime {
     gateway: Gateway,
     ledger: Arc<Ledger>,
     app: Router,
+    pairings: crate::server::Pairings,
     token: String,
     session: String,
     account: Address,
@@ -160,17 +161,26 @@ impl Runtime {
         inner.info = InfoClient::loopback_fixture(port).unwrap();
         inner.exchange = ExchangeClient::loopback_fixture(port).unwrap();
         *keys.ledger.lock().unwrap() = Arc::downgrade(&ledger);
-        let mut pairings = crate::auth::TokenStore::new();
+        let mut pairings = crate::auth::TokenStore::open(
+            oppen_core::ledger::PairingJournal::open(
+                ledger.clone(),
+                Arc::new(oppen_core::keys::HmacKey::from_bytes([77; 32])),
+            )
+            .unwrap(),
+        )
+        .unwrap();
         let token = pairings
             .issue(Binding { agent, account })
             .unwrap()
             .reveal()
             .to_owned();
-        let app = crate::server::router(gateway.clone(), Arc::new(RwLock::new(pairings)));
+        let pairings = Arc::new(RwLock::new(pairings));
+        let app = crate::server::router(gateway.clone(), pairings.clone());
         let mut runtime = Self {
             gateway,
             ledger,
             app,
+            pairings,
             token,
             session: String::new(),
             account,

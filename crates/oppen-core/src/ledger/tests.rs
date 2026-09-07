@@ -2347,42 +2347,91 @@ fn generic_writers_cannot_forge_submission_lifecycle_events() {
             Err(LedgerError::UsePilotJournal)
         ));
     }
+    for kind in [EventKind::PairingIssued, EventKind::PairingRevoked] {
+        assert!(matches!(
+            ledger.append(&NewEvent {
+                kind,
+                ts_ms: 1,
+                agent_id: None,
+                payload: &json!({}),
+                snapshot: None,
+            }),
+            Err(LedgerError::UsePairingJournal)
+        ));
+        assert!(matches!(
+            ledger.record_outcome(&receipt, kind, 2, &json!({})),
+            Err(LedgerError::UsePairingJournal)
+        ));
+    }
     assert_eq!(ledger.get_events(0, 10).expect("events").events.len(), 1);
 }
 
 #[test]
-fn pilot_reader_barrier_preserves_the_existing_chain_on_upgrade() {
-    let dir = TempDir::new().unwrap();
-    let path = dir.path().join("testnet.db");
-    let head = {
-        let ledger = Ledger::open_at(&path, Network::Testnet).unwrap();
-        let head = ledger
-            .append(&NewEvent {
-                kind: EventKind::AgentDecision,
-                ts_ms: 1,
-                agent_id: None,
-                payload: &json!({"reason": "prior history"}),
-                snapshot: None,
-            })
-            .unwrap();
-        ledger
+fn authority_reader_barriers_preserve_the_existing_chain_on_upgrade() {
+    for prior_version in [3, 4] {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("testnet.db");
+        let head = {
+            let ledger = Ledger::open_at(&path, Network::Testnet).unwrap();
+            let head = ledger
+                .append(&NewEvent {
+                    kind: EventKind::AgentDecision,
+                    ts_ms: 1,
+                    agent_id: None,
+                    payload: &json!({"reason": "prior history"}),
+                    snapshot: None,
+                })
+                .unwrap();
+            ledger
+                .connection
+                .lock()
+                .unwrap()
+                .pragma_update(None, "user_version", prior_version)
+                .unwrap();
+            head
+        };
+        let upgraded = Ledger::open_at(&path, Network::Testnet).unwrap();
+        let report = upgraded.verify().unwrap();
+        assert!(report.is_intact());
+        assert_eq!(report.head_seq, head.seq);
+        assert_eq!(upgraded.event(head.seq).unwrap().unwrap().hash, head.hash);
+        let version: i64 = upgraded
             .connection
             .lock()
             .unwrap()
-            .pragma_update(None, "user_version", 3)
+            .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        head
-    };
-    let upgraded = Ledger::open_at(&path, Network::Testnet).unwrap();
-    let report = upgraded.verify().unwrap();
-    assert!(report.is_intact());
-    assert_eq!(report.head_seq, head.seq);
-    assert_eq!(upgraded.event(head.seq).unwrap().unwrap().hash, head.hash);
-    let version: i64 = upgraded
+        assert_eq!(version, 5);
+    }
+}
+
+#[test]
+fn a_reader_refuses_a_newer_authority_schema_without_rewriting_history() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("testnet.db");
+    let ledger = Ledger::open_at(&path, Network::Testnet).unwrap();
+    let head = ledger.chain_head().unwrap();
+    ledger
         .connection
         .lock()
         .unwrap()
-        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .pragma_update(None, "user_version", 6)
         .unwrap();
-    assert_eq!(version, 4);
+    drop(ledger);
+    assert!(matches!(
+        Ledger::open_at(&path, Network::Testnet),
+        Err(LedgerError::SchemaTooNew {
+            found: 6,
+            supported: 5
+        })
+    ));
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    assert_eq!(
+        connection
+            .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+            .unwrap(),
+        6
+    );
+    let (seq, hash) = super::head(&connection).unwrap();
+    assert_eq!(Anchor { seq, hash }, head);
 }

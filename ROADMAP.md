@@ -47,6 +47,14 @@ before expanding features:
    cover view changes, venue outage, stale local reads and network isolation;
    the safety banner fits narrow windows, while the wider console layout remains
    desktop-only. This read-only surface does not start or authorize execution.
+   Durable pairing authority uses authenticated issuance/revocation records
+   that survive restart. Credential records remain hidden
+   from agent event reads, and one runtime owns the pairing cache until its
+   sessions and actual method tasks drain. Local tests cover tampered authority,
+   interrupted persistence, process death, disconnected requests, network
+   mismatch and stalled durable writes without blocking HTTP or shutdown.
+   Desktop lifecycle controls, verified registry/policy setup and operator
+   activation remain open. See decision ES16.
 4. **Recovery:** PR #44 merged as `06fc0e3` after green CI and separate automated
    review. The durable submission journal has SQLite reopen, independent
    handle, stale-revision, corruption and dropped-request regressions. Starts and

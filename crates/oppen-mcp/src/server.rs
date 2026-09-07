@@ -34,7 +34,7 @@ use tokio::sync::watch;
 use tokio_util::io::ReaderStream;
 use tokio_util::sync::CancellationToken;
 
-use crate::auth::TokenStore;
+use crate::auth::{SessionAuthority, TokenStore};
 use crate::guard::{Refusal, bearer_token, check_host, check_origin};
 use crate::tools::Gateway;
 
@@ -69,11 +69,12 @@ pub fn router(gateway: Gateway, pairings: Pairings) -> axum::Router {
 }
 
 fn router_with_lifecycle(
-    gateway: impl ServerHandler + Clone,
+    gateway: impl GatewayHandler,
     pairings: Pairings,
     shutdown: CancellationToken,
     execution: watch::Sender<()>,
 ) -> axum::Router {
+    let network = gateway.gateway().network();
     let handler = ShutdownHandler {
         inner: gateway,
         shutdown: shutdown.clone(),
@@ -89,7 +90,7 @@ fn router_with_lifecycle(
     axum::Router::new()
         .nest_service(MCP_PATH, service)
         .layer(axum::middleware::from_fn_with_state(
-            (pairings, shutdown),
+            (pairings, shutdown, network),
             guard_middleware,
         ))
 }
@@ -112,8 +113,23 @@ impl<H: ServerHandler> ServerHandler for ShutdownHandler<H> {
         // Receivers count active tool futures. Register before checking
         // shutdown: a late rmcp task cannot enter the tool after closed().
         let _execution = self.execution.subscribe();
+        let mut authority = context
+            .extensions
+            .get::<http::request::Parts>()
+            .and_then(|parts| parts.extensions.get::<SessionAuthority>())
+            .cloned()
+            .ok_or_else(|| crate::outcome::ToolError::Unavailable {
+                what: "pairing authority",
+                detail: "this method task carries no authenticated pairing authority".into(),
+            })?;
+        // Keep authority outside the selected inner future: HTTP disconnects
+        // and cancellation must not release the owner lease before it drains.
         tokio::select! {
             biased;
+            () = authority.closed() => Err(crate::outcome::ToolError::TimeoutUnknownOutcome {
+                cloid: None,
+                detail: "pairing revoked during execution; reconcile before resubmitting".into(),
+            }.into()),
             () = self.shutdown.cancelled() => Err(crate::outcome::ToolError::TimeoutUnknownOutcome {
                 cloid: None,
                 detail: "gateway shutdown interrupted execution; reconcile before resubmitting".into(),
@@ -152,6 +168,23 @@ pub async fn serve(
     pairings: Pairings,
     shutdown: tokio_util::sync::CancellationToken,
 ) -> std::io::Result<()> {
+    let network = gateway.gateway().network();
+    let pairing_network = pairings
+        .try_read()
+        .map(|store| store.network())
+        .map_err(|error| {
+            let kind = match error {
+                std::sync::TryLockError::WouldBlock => std::io::ErrorKind::WouldBlock,
+                std::sync::TryLockError::Poisoned(_) => std::io::ErrorKind::Other,
+            };
+            std::io::Error::new(kind, "pairing authority unavailable")
+        })?;
+    if pairing_network != network {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "pairing store and gateway networks do not match",
+        ));
+    }
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(%addr, path = MCP_PATH, "MCP gateway listening on loopback");
@@ -176,10 +209,10 @@ pub async fn serve(
                 () = enforcement_shutdown.cancelled() => break,
                 () = async {
                     interval.tick().await;
-                    let bindings = match enforcement_pairings.read() {
+                    let bindings = match enforcement_pairings.try_read() {
                         Ok(store) => store.bindings(),
                         Err(error) => {
-                            tracing::warn!(%error, "pause enforcement could not read pairings");
+                            tracing::warn!(%error, "pause enforcement could not read pairings; will retry");
                             return;
                         }
                     };
@@ -282,7 +315,7 @@ impl AsyncWrite for ShutdownIo {
 
 /// Refuse anything that is not a paired agent on this machine.
 async fn guard_middleware(
-    State((pairings, shutdown)): State<(Pairings, CancellationToken)>,
+    State((pairings, shutdown, network)): State<(Pairings, CancellationToken, oppen_hl::Network)>,
     request: Request,
     next: Next,
 ) -> Response {
@@ -311,12 +344,15 @@ async fn guard_middleware(
     // Release the read guard before forwarding so the operator can revoke a
     // pairing while its authenticated requests are still in flight.
     let authenticated = {
-        let store = match pairings.read() {
+        let store = match pairings.try_read() {
             Ok(store) => store,
-            // A poisoned lock means a previous request panicked while holding
-            // it. Fail closed rather than reason about what it left behind.
+            // Durable mutation can hold the writer through ledger IO. Never
+            // wait on an async worker; contention and poison both fail closed.
             Err(_) => return refuse(Refusal::Auth(crate::auth::AuthError::Unauthenticated)),
         };
+        if store.network() != network {
+            return refuse(Refusal::Auth(crate::auth::AuthError::Unauthenticated));
+        }
         store.authenticate(&token)
     };
 
@@ -330,6 +366,7 @@ async fn guard_middleware(
             // nothing here to find.
             let mut request = request;
             request.extensions_mut().insert(session.binding.clone());
+            request.extensions_mut().insert(session.authority());
             let mut closed: Pin<Box<dyn Future<Output = ()> + Send>> = Box::pin(async move {
                 tokio::select! {
                     () = session.closed() => {},
@@ -407,4 +444,78 @@ fn refuse(refusal: Refusal) -> Response {
         Refusal::BearerMissing | Refusal::Auth(_) => StatusCode::UNAUTHORIZED,
     };
     (status, "not authorised").into_response()
+}
+
+#[cfg(test)]
+mod authority_tests {
+    use super::*;
+    use crate::auth::Binding;
+    use oppen_core::guardrail::AgentId;
+    use oppen_core::keys::HmacKey;
+    use oppen_core::ledger::{Ledger, PairingJournal};
+
+    #[derive(Clone)]
+    struct MustNotRun;
+
+    impl ServerHandler for MustNotRun {
+        async fn call_tool(
+            &self,
+            _: CallToolRequestParams,
+            _: RequestContext<RoleServer>,
+        ) -> Result<CallToolResponse, ErrorData> {
+            panic!("unauthorized method reached inner execution")
+        }
+    }
+
+    #[tokio::test]
+    async fn actual_method_requires_authority_and_checks_already_revoked() {
+        let (transport, _client) = tokio::io::duplex(4096);
+        let service = rmcp::service::serve_directly(MustNotRun, transport, None);
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = Arc::new(
+            Ledger::open_at(&dir.path().join("ledger.db"), oppen_hl::Network::Testnet).unwrap(),
+        );
+        let mut store = TokenStore::open(
+            PairingJournal::open(ledger, Arc::new(HmacKey::from_bytes([42; 32]))).unwrap(),
+        )
+        .unwrap();
+        let binding = Binding {
+            agent: AgentId::new("alpha"),
+            account: oppen_hl::Address::from_bytes([9; 20]),
+        };
+        let token = store.issue(binding.clone()).unwrap();
+        let authority = store.authenticate(token.reveal()).unwrap().authority();
+        store.revoke(token.id).unwrap();
+        let handler = ShutdownHandler {
+            inner: MustNotRun,
+            shutdown: CancellationToken::new(),
+            execution: watch::channel(()).0,
+        };
+        for mode in 0..3 {
+            let mut context = RequestContext::new(
+                rmcp::model::NumberOrString::Number(1),
+                service.peer().clone(),
+            );
+            if mode != 0 {
+                let (mut parts, ()) = http::Request::new(()).into_parts();
+                parts.extensions.insert(binding.clone());
+                if mode == 2 {
+                    parts.extensions.insert(authority.clone());
+                }
+                context.extensions.insert(parts);
+            }
+            let error = handler
+                .call_tool(CallToolRequestParams::new("must_not_run"), context)
+                .await
+                .unwrap_err();
+            let expected = if mode == 2 {
+                "timeout_unknown_outcome"
+            } else {
+                "unavailable"
+            };
+            assert_eq!(error.data.unwrap()["code"], expected);
+            assert_eq!(handler.execution.receiver_count(), 0);
+        }
+        service.cancel().await.unwrap();
+    }
 }

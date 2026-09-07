@@ -120,6 +120,55 @@ proof that cancellation succeeded or positions closed. No automatic flattening,
 budget renewal, second event store, new worker or dependency is introduced.
 Account confirmation, runtime activation and supervised live proof remain gated.
 
+### Durable pairing authority (ES16)
+
+Items 14, 15, 26 and 29 require pairing identity and revocation to survive
+restart. Store digest-only issuance and revocation in the existing event chain,
+one event per operation, with issuance sequence as the stable ID and explicit
+network identity. Operator-only lifecycle rows have no agent attribution and
+are explicitly excluded from agent event pages and single-event reads, so
+agent views do not expose credential digests. Other account-wide events remain
+visible. No bearer is stored or recoverable.
+
+The chain's one-row crash tolerance is not sufficient to authenticate a new
+grant. Authenticate both lifecycle kinds with the existing HMAC key primitive,
+using domain-separated canonical bytes covering kind, version, network, sequence,
+previous hash and every authority/linkage field. There is no unsigned fallback.
+The journal requires an anchored ledger and an explicitly supplied key; it never
+provisions or replaces a key. Missing or incorrect keys and invalid or redacted
+history fail closed without granting authority.
+
+One canonical-path lifetime lease owns one token cache. Keep the separate lease
+file permanently; do not hold the ledger's short coordination lock for the
+runtime lifetime. The non-clonable journal is consumed by the token store and
+its private ownership references survive inside authenticated sessions and
+actual tool tasks until they drain. Competing owners fail explicitly instead
+of caching different revocation states. Stop older runtimes before migration;
+already-open old binaries do not honor this lease.
+
+Persist issuance before revealing its bearer and persist revocation before
+reporting success. A mutation error or panic terminally closes the current
+store and notifies every live session; reopening replays durable truth rather
+than treating a local watch notification as a persisted revoke. A write that
+failed before durable publication is not promised to survive a crash. Revocation
+cancels asynchronous execution but cannot retract already-admitted synchronous
+signing or exchange work; interrupted submissions retain their reconciliation
+obligations. Retain revoked bindings for cancellation supervision.
+
+Pairing reads on async serving paths must not wait on a contended store lock:
+authentication and startup refuse, while the cancellation sweep skips that
+iteration and retries on its existing interval without claiming delivery.
+Opening or mutating the store performs synchronous disk I/O. Operator async
+commands must offload that work and await its durable result; canceling a
+waiter does not cancel or prove the outcome of an already-started mutation.
+
+Advance to V5 as an additive reader barrier, with no historical row rewrite or
+second store. Rollback requires a compatible reader; never lower the version or
+discard authority records from a used ledger. Reuse existing crypto, locking and
+canonicalization code without new dependencies. Pairing does not prove registry
+ownership, assign guardrails, read a trading key or authorize a pilot; verified
+operator identity and activation remain separate gates.
+
 ## 2026-09-07 · The console's own socket
 
 Item 34 asks for per-feed status, last-tick timestamps and a stale overlay. The

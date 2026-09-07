@@ -50,7 +50,7 @@ async fn pilot_stop_retries_resting_cancels_for_revoked_binding_after_restart() 
     let dir = tempfile::tempdir().unwrap();
     let venue = Venue::start().await;
     let keys = Arc::new(FixtureKeys::default());
-    let runtime = Runtime::open(dir.path(), venue.port(), keys.clone()).await;
+    let mut runtime = Runtime::open(dir.path(), venue.port(), keys.clone()).await;
     authorize(&runtime).await;
     let cloid = Cloid::from_bytes([90; 16]);
     assert_eq!(
@@ -66,15 +66,36 @@ async fn pilot_stop_retries_resting_cancels_for_revoked_binding_after_restart() 
             .await
             .unwrap()
     );
+    let revoked = {
+        let mut pairings = runtime.pairings.write().unwrap();
+        let original = pairings.authenticate(&runtime.token).unwrap().id;
+        assert!(pairings.revoke(original).unwrap());
+        let token = pairings.issue(binding(&runtime)).unwrap();
+        assert!(pairings.revoke(token.id).unwrap());
+        // DELETE still needs a live bearer, but not one for the stopped account.
+        runtime.token = pairings
+            .issue(Binding {
+                account: Address::from_bytes([8; 20]),
+                ..binding(&runtime)
+            })
+            .unwrap()
+            .reveal()
+            .to_owned();
+        token
+    };
     runtime.shutdown().await;
 
-    let runtime = Runtime::open(dir.path(), venue.port(), keys.clone()).await;
+    let mut runtime = Runtime::open(dir.path(), venue.port(), keys.clone()).await;
     runtime.reconcile().await;
     let bound = binding(&runtime);
-    let mut pairings = crate::auth::TokenStore::new();
-    let token = pairings.issue(bound.clone()).unwrap();
-    pairings.revoke(token.id);
-    pairings.issue(bound.clone()).unwrap();
+    {
+        let pairings = runtime.pairings.read().unwrap();
+        assert!(matches!(
+            pairings.authenticate(revoked.reveal()),
+            Err(crate::auth::AuthError::Revoked)
+        ));
+        assert!(pairings.bindings().contains(&bound));
+    }
     let other = Binding {
         account: Address::from_bytes([8; 20]),
         ..bound.clone()
@@ -86,7 +107,16 @@ async fn pilot_stop_retries_resting_cancels_for_revoked_binding_after_restart() 
             .await
             .unwrap()
     );
-    pairings.issue(other).unwrap();
+    {
+        let mut pairings = runtime.pairings.write().unwrap();
+        let current = pairings.authenticate(&runtime.token).unwrap().id;
+        assert!(pairings.revoke(current).unwrap());
+        runtime.token = pairings.issue(other).unwrap().reveal().to_owned();
+        assert!(
+            pairings.bindings().contains(&bound),
+            "only revoked pairings name the stopped account"
+        );
+    }
     let wrong_agent = Binding {
         agent: AgentId::new("other-agent"),
         ..bound.clone()
@@ -98,7 +128,7 @@ async fn pilot_stop_retries_resting_cancels_for_revoked_binding_after_restart() 
             .await,
         Err(ToolError::Unavailable { .. })
     ));
-    let bindings = pairings.bindings();
+    let bindings = runtime.pairings.read().unwrap().bindings();
     assert!(runtime.gateway.inner.engine.paused_agents().is_empty());
     venue.next_response(Behavior::Rejected);
     assert!(runtime.gateway.enforce_pauses(&bindings).await.is_err());

@@ -372,7 +372,7 @@ fn service_of(network: Network) -> &'static str {
 /// `AgentId::new` accepts any `String`, so without this an id containing the
 /// separator — `"a/0"` — would produce the same entry name as another agent's
 /// generation, and reading one agent's key would return another's.
-fn checked_agent_id(agent: &AgentId) -> Result<&str, KeyStoreError> {
+pub(crate) fn checked_agent_id(agent: &AgentId) -> Result<&str, KeyStoreError> {
     let id = agent.as_str();
     let reason = if id.is_empty() {
         "empty"
