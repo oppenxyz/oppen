@@ -633,33 +633,55 @@ impl Gateway {
         bindings: &[Binding],
         tracker: ExecutionTracker,
     ) -> Result<(), ToolError> {
-        self.enforce_pauses_with(bindings, |bound| {
-            let tracker = tracker.clone();
-            async move {
-                let result = self
-                    .cancel_all_bound(
-                        &bound,
-                        &SymbolActionParams {
-                            symbol: None,
-                            reason:
-                                "cancel resting orders while trading is paused or pilot stopped"
-                                    .to_owned(),
-                        },
-                        true,
-                        tracker,
-                    )
-                    .await?;
-                if result.complete {
-                    Ok(())
-                } else {
-                    Err(ToolError::unavailable(
-                        "pause cancellation",
-                        "resting orders were not all confirmed canceled",
-                    ))
-                }
+        // A separate operator can change policy while this gateway is idle.
+        // Replay failure inhibits the engine but must not suppress cleanup.
+        let refresh_failure = match self
+            .decision(tracker.clone(), |engine| engine.policy_observation())
+            .await
+        {
+            Ok(Ok(_)) => None,
+            Ok(Err(error)) => {
+                tracing::warn!(%error, "policy unavailable; continuing registry-authenticated cleanup");
+                None
             }
-        })
-        .await
+            Err(error) => {
+                tracing::warn!(%error, "policy refresh incomplete; attempting known-stop cleanup before retry");
+                Some(error)
+            }
+        };
+        let cleanup = self
+            .enforce_pauses_with(bindings, |bound| {
+                let tracker = tracker.clone();
+                async move {
+                    let result = self
+                        .cancel_all_bound(
+                            &bound,
+                            &SymbolActionParams {
+                                symbol: None,
+                                reason:
+                                    "cancel resting orders while trading is paused or pilot stopped"
+                                        .to_owned(),
+                            },
+                            true,
+                            tracker,
+                        )
+                        .await?;
+                    if result.complete {
+                        Ok(())
+                    } else {
+                        Err(ToolError::unavailable(
+                            "pause cancellation",
+                            "resting orders were not all confirmed canceled",
+                        ))
+                    }
+                }
+            })
+            .await;
+        cleanup?;
+        match refresh_failure {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     async fn decision<T: Send + 'static>(
@@ -688,7 +710,7 @@ impl Gateway {
     }
 
     async fn runtime_cancellation_needed(&self, bound: &Binding) -> Result<bool, ToolError> {
-        if self.inner.engine.paused_agents().contains(&bound.agent) {
+        if self.inner.engine.cancellation_needed(&bound.agent) {
             return Ok(true);
         }
         let permit = self
@@ -1771,7 +1793,9 @@ impl Gateway {
     #[tool(
         description = "The account right now: equity, margin, open positions with distance to \
                        liquidation, resting orders, and feed freshness. Read this before acting. \
-                       If `feed` is not `live`, the data is stale and execution will fail closed."
+                       If `feed` is not `live`, the data is stale and execution will fail closed. \
+                       `policy_status` is a cached local observation, not fresh authority. \
+                       An uninhibited observation does not mean ready: all other execution gates apply."
     )]
     async fn get_state(
         &self,
@@ -1782,9 +1806,26 @@ impl Gateway {
         let now = now_ms();
         let mut state = self.read_state(bound.account, now).await?;
         self.add_position_risk(&mut state, now).await;
-        self.add_loss_budget(&mut state, &bound, now).await;
+        let before = self.inner.engine.policy_status();
+        if !before.admission_inhibited {
+            self.add_loss_budget(&mut state, &bound, now).await;
+        }
+        let policy_status = self.inner.engine.policy_status();
+        if policy_status.admission_inhibited || before != policy_status {
+            state.loss_budget.clear();
+        }
+        #[derive(serde::Serialize)]
+        struct StateReply {
+            #[serde(flatten)]
+            account: AccountState,
+            policy_status: oppen_core::guardrail::PolicyStatus,
+        }
         Ok(CallToolResult::success(vec![ContentBlock::text(
-            serde_json::to_string(&state).expect("AccountState serializes"),
+            serde_json::to_string(&StateReply {
+                account: state,
+                policy_status,
+            })
+            .expect("StateReply serializes"),
         )]))
     }
 
@@ -2012,7 +2053,10 @@ impl Gateway {
                 .guardrails(&bound.agent)
                 .ok_or_else(|| ToolError::Unavailable {
                     what: "guardrails",
-                    detail: format!("{} is not a paired agent", bound.agent),
+                    detail: format!(
+                        "no verified policy projection is available for {}",
+                        bound.agent
+                    ),
                 })?;
         Ok(guardrails.max_slippage_bps)
     }
@@ -2799,8 +2843,16 @@ mod tests {
     /// nothing — which is what makes the real envelope testable here rather
     /// than only over a live socket.
     fn gateway_over(events: &[(Option<&str>, &str)]) -> Gateway {
-        use oppen_core::guardrail::{GuardrailEngine, SqliteGuardrailStore};
-        use oppen_core::ledger::{EventKind, Ledger, LedgerAuditSink, NewEvent};
+        gateway_fixture(events, false)
+    }
+
+    fn activated_gateway() -> Gateway {
+        gateway_fixture(&[], true)
+    }
+
+    fn gateway_fixture(events: &[(Option<&str>, &str)], initialize_policy: bool) -> Gateway {
+        use oppen_core::guardrail::GuardrailEngine;
+        use oppen_core::ledger::{EventKind, Ledger, NewEvent, PolicyJournal};
 
         let dir = tempfile::tempdir().expect("tempdir");
         let ledger = std::sync::Arc::new(
@@ -2819,23 +2871,38 @@ mod tests {
                 })
                 .expect("append");
         }
-        let engine = std::sync::Arc::new(
-            GuardrailEngine::new(
-                std::sync::Arc::new(
-                    SqliteGuardrailStore::open(dir.path().join("guardrails.db")).expect("store"),
-                ),
-                std::sync::Arc::new(LedgerAuditSink::new(
-                    oppen_core::ledger::RegistryJournal::open(
-                        ledger.clone(),
-                        Arc::new(oppen_core::keys::HmacKey::from_bytes([42; 32])),
-                    )
-                    .unwrap(),
-                )),
-                std::sync::Arc::new(NoKeys),
-                Network::Testnet,
+        let policy = Arc::new(PolicyJournal::new(Arc::new(
+            oppen_core::ledger::RegistryJournal::open(
+                ledger.clone(),
+                Arc::new(oppen_core::keys::HmacKey::from_bytes([42; 32])),
             )
-            .expect("engine"),
+            .unwrap(),
+        )));
+        let at = now_ms();
+        if initialize_policy {
+            let review = oppen_core::guardrail::LegacyPolicyReview::open(
+                dir.path().join("guardrails.db"),
+                Network::Testnet,
+                at,
+            )
+            .unwrap();
+            policy
+                .initialize(
+                    &review,
+                    oppen_core::guardrail::PersistedState::paused(at),
+                    at,
+                )
+                .unwrap();
+        }
+        let engine = std::sync::Arc::new(
+            GuardrailEngine::new(policy, std::sync::Arc::new(NoKeys)).expect("engine"),
         );
+        if initialize_policy {
+            engine
+                .operator_release_kill(&oppen_core::guardrail::KillScope::Global, at)
+                .unwrap();
+            acknowledge_test_policy(&engine);
+        }
         let journal = std::sync::Arc::new(
             oppen_core::journal::Journal::open(dir.path().join("journal.db")).expect("journal"),
         );
@@ -2887,7 +2954,7 @@ mod tests {
 
     #[tokio::test]
     async fn request_binding_requires_authority_and_ignores_an_untrusted_binding() {
-        let gateway = gateway_over(&[]);
+        let gateway = activated_gateway();
         let (transport, _client) = tokio::io::duplex(4096);
         let service = rmcp::service::serve_directly(gateway.clone(), transport, None);
         let mut context = RequestContext::new(
@@ -3009,6 +3076,7 @@ mod tests {
             .engine
             .operator_set_guardrails(&bound.agent, config, at)
             .expect("policy");
+        acknowledge_test_policy(&gateway.inner.engine);
         let intent = OrderIntent {
             symbol: "TEST".into(),
             is_buy: true,
@@ -3064,7 +3132,7 @@ mod tests {
     }
 
     fn pending_fixture() -> (Gateway, Binding, SubmissionReceipt) {
-        let gateway = gateway_over(&[]);
+        let gateway = activated_gateway();
         let bound = binding_for("alpha");
         let cleared = cleared_test_order(&gateway, &bound, a_cloid());
         let journal = &gateway.inner.submissions;
@@ -3119,7 +3187,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_order_cannot_reach_the_signer_without_an_account_permit() {
-        let gateway = gateway_over(&[]);
+        let gateway = activated_gateway();
         let bound = binding_for("alpha");
         let cleared = cleared_test_order(&gateway, &bound, a_cloid());
         let error = gateway
@@ -3146,7 +3214,7 @@ mod tests {
 
     #[tokio::test]
     async fn clearance_pairing_and_reservation_accounts_must_agree_before_submission() {
-        let gateway = gateway_over(&[]);
+        let gateway = activated_gateway();
         let bound = binding_for("alpha");
         let other = Binding {
             account: Address::from_bytes([8; 20]),
@@ -3206,7 +3274,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_signer_failure_durably_records_not_sent_and_prevents_cloid_reuse() {
-        let gateway = gateway_over(&[]);
+        let gateway = activated_gateway();
         let bound = binding_for("alpha");
         let permit = reserve_account(
             gateway.execution_queue(bound.account),
@@ -3259,7 +3327,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_stale_account_revision_refuses_before_signing() {
-        let gateway = gateway_over(&[]);
+        let gateway = activated_gateway();
         let bound = binding_for("alpha");
         let permit = reserve_account(
             gateway.execution_queue(bound.account),
@@ -3302,7 +3370,7 @@ mod tests {
 
     #[tokio::test]
     async fn different_agents_on_one_address_share_the_execution_queue() {
-        let gateway = gateway_over(&[]);
+        let gateway = activated_gateway();
         let alpha = binding_for("alpha");
         let beta = binding_for("beta");
         let other: Address = "0x1111111111111111111111111111111111111111"
@@ -3656,6 +3724,12 @@ mod tests {
         }
     }
 
+    fn acknowledge_test_policy(engine: &GuardrailEngine) {
+        engine
+            .operator_acknowledge_policy(engine.policy_observation().unwrap(), now_ms())
+            .unwrap();
+    }
+
     fn resume(gateway: &Gateway, bound: &Binding) {
         gateway
             .inner
@@ -3664,9 +3738,10 @@ mod tests {
                 &oppen_core::guardrail::KillScope::Agent {
                     agent: bound.agent.clone(),
                 },
-                3,
+                now_ms(),
             )
             .expect("resume");
+        acknowledge_test_policy(&gateway.inner.engine);
     }
 
     #[test]
@@ -3746,7 +3821,7 @@ mod tests {
                 )
                 .unwrap(),
             );
-            let mut gateway = gateway_over(&[]);
+            let mut gateway = activated_gateway();
             Arc::get_mut(&mut gateway.inner).unwrap().events = EventViews::new(ledger.clone());
             let alpha = binding_for("alpha");
             let beta = Binding {
@@ -3834,8 +3909,7 @@ mod tests {
 
     #[tokio::test]
     async fn canceled_registry_read_holds_single_flight_until_blocking_work_drains() {
-        use oppen_core::guardrail::SqliteGuardrailStore;
-        use oppen_core::ledger::{Ledger, LedgerAuditSink, RegistryJournal};
+        use oppen_core::ledger::{Ledger, PolicyJournal, RegistryJournal};
         let dir = tempfile::tempdir().unwrap();
         let anchor = Arc::new(BlockingPilotAnchor::default());
         let ledger = Arc::new(
@@ -3847,16 +3921,14 @@ mod tests {
             .unwrap(),
         );
         let hmac = Arc::new(oppen_core::keys::HmacKey::from_bytes([42; 32]));
-        let mut gateway = gateway_over(&[]);
+        let mut gateway = activated_gateway();
         let inner = Arc::get_mut(&mut gateway.inner).unwrap();
         inner.engine = Arc::new(
             GuardrailEngine::new(
-                Arc::new(SqliteGuardrailStore::open(dir.path().join("policy.db")).unwrap()),
-                Arc::new(LedgerAuditSink::new(
+                Arc::new(PolicyJournal::new(Arc::new(
                     RegistryJournal::open(ledger.clone(), hmac.clone()).unwrap(),
-                )),
+                ))),
                 Arc::new(NoKeys),
-                Network::Testnet,
             )
             .unwrap(),
         );
@@ -3895,13 +3967,13 @@ mod tests {
     #[tokio::test]
     async fn busy_pilot_reader_reports_failure_but_does_not_block_paused_accounts_or_agent_cancels()
     {
-        let gateway = gateway_over(&[]);
+        let gateway = activated_gateway();
         let alpha = binding_for("alpha");
         grant_test_route(&gateway, &alpha);
         gateway
             .inner
             .engine
-            .register_agent(&alpha.agent, 1)
+            .register_agent(&alpha.agent, now_ms())
             .unwrap();
         let beta = Binding {
             account: Address::from_bytes([7; 20]),
@@ -3962,7 +4034,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_resume_while_waiting_for_execution_skips_the_stale_pause_cancel() {
-        let gateway = gateway_over(&[]);
+        let gateway = activated_gateway();
         let bound = binding_for("alpha");
         pause(&gateway, &bound);
         let queue = gateway.execution_queue(bound.account);
@@ -3992,7 +4064,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_resume_during_target_reads_skips_submission_but_agent_cancel_still_works() {
-        let gateway = gateway_over(&[]);
+        let gateway = activated_gateway();
         let bound = binding_for("alpha");
         pause(&gateway, &bound);
         let params = SymbolActionParams {
@@ -4088,7 +4160,7 @@ mod tests {
         gateway
             .inner
             .engine
-            .register_agent(&bound.agent, 1)
+            .register_agent(&bound.agent, now_ms())
             .expect("register");
         gateway
             .inner
@@ -4098,14 +4170,38 @@ mod tests {
                     agent: bound.agent.clone(),
                 },
                 KillReason::Operator,
-                2,
+                now_ms(),
             )
             .expect("persist pause");
+        acknowledge_test_policy(&gateway.inner.engine);
+    }
+
+    #[tokio::test]
+    async fn busy_decision_worker_does_not_report_a_successful_fresh_pause_sweep() {
+        let gateway = activated_gateway();
+        let permit = gateway
+            .inner
+            .decision_worker
+            .clone()
+            .try_acquire_owned()
+            .unwrap();
+        assert!(matches!(
+            gateway.enforce_pauses(&[], test_tracker(&gateway)).await,
+            Err(ToolError::Unavailable {
+                what: "decision worker busy",
+                ..
+            })
+        ));
+        drop(permit);
+        gateway
+            .enforce_pauses(&[], test_tracker(&gateway))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
     async fn pause_enforcement_retries_revoked_bindings_and_continues_after_a_failure() {
-        let gateway = gateway_over(&[]);
+        let gateway = activated_gateway();
         let alpha = binding_for("alpha");
         let mut beta = binding_for("beta");
         beta.account = "0x1111111111111111111111111111111111111111"
@@ -4155,7 +4251,7 @@ mod tests {
 
     #[tokio::test]
     async fn dropping_a_pause_sweep_keeps_the_persisted_pause_for_retry() {
-        let gateway = gateway_over(&[]);
+        let gateway = activated_gateway();
         let bound = binding_for("alpha");
         pause(&gateway, &bound);
         let bindings = [bound.clone()];
@@ -4188,7 +4284,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_hung_pause_cancel_does_not_starve_another_account() {
-        let gateway = gateway_over(&[]);
+        let gateway = activated_gateway();
         let alpha = binding_for("alpha");
         let mut beta = binding_for("beta");
         beta.account = "0x1111111111111111111111111111111111111111"

@@ -69,10 +69,33 @@ cleanup also require route authority; retirement is not a cancel-only grant.
 Cancel before retirement or use a separately approved operator recovery path.
 
 Route records express local operator authorization, not proof of venue approval
-or trading readiness. Account confirmation, wallet approval, authenticated policy
-and pilot activation remain separate gates. Existing unresolved submissions keep
+or trading readiness. Account confirmation, wallet approval and pilot activation
+remain separate gates. Existing unresolved submissions keep
 their historical payloads and reservations; migration never fabricates route
-evidence to release them. Schema V6 requires a compatible reader on rollback.
+evidence to release them. Schema V7 requires a compatible reader on rollback.
+
+Policy authority uses complete authenticated snapshots in the same ledger
+(ES18), including agent limits, approval settings, account limits and kills.
+Initialization is explicit and globally paused; unsigned legacy settings remain
+inspection evidence, never an automatic fallback. Complete policy events stay
+hidden from agent event views, while ordinary operator audit visibility remains
+unchanged.
+
+Every engine starts order-inhibited. Explicit operator acknowledgment records a
+claim about an observed policy revision and local stop generation; it does not
+prove venue reconciliation. Orders, including reduce-only orders, require the
+verified policy revision, clearance revision and acknowledged revision to match
+inside final signing. Policy refresh cannot transfer acknowledgment to a newer
+revision or clear emergency stop evidence. Acknowledgment does not override
+durable kills or pilot stops.
+
+Missing or corrupt policy blocks orders but not construction of registry-verified
+cancel/dead-man cleanup. A failed policy write retains local inhibition and
+cancellation effects. Commit-before-anchor failure has an uncertain durable
+outcome; a failed call is not proof that the stored policy stayed unchanged.
+Explicit reconciliation is required before orders resume, and an exact retry
+must publish the verified head before reporting success. None of these local
+states proves cancellation delivery.
 
 Decision replay runs on a bounded worker that retains execution tracking and
 pairing ownership until completion. Canceling or timing out its waiter cannot
@@ -166,6 +189,13 @@ Per-symbol trading rules. Read-only. Returns an array sorted by `asset_id`: `sym
 
 ### `get_state()`
 
+`policy_status` is a cached local observation, not fresh authority verification.
+It carries `cached_revision`, `acknowledgment` (revision and stop generation),
+`stop_generation`, and `admission_inhibited`. A false inhibition flag is not
+trading readiness: final policy verification, registry, kills, pilot budgets and
+venue-state checks still apply. Independent policy edits may not yet appear in
+this cache. The call does not acknowledge policy or enable orders.
+
 The account now: `contract_version`, `network`, `address`, `as_of_ms`, `feed_age_ms`, `feed`, `balances`, `margin_runway_h`, `loss_budget`, `positions`, `orders`. If `feed` is not `live` the data is stale and execution fails closed.
 
 **Risk in σ-units.** Each position carries `liq_distance_frac` and `liq_distance_sigma` — the same distance as a fraction of the mark and in daily standard deviations. The second is the one to compare across symbols: a 4% gap is a different fact on BTC than on a coin that moves 20% a day. `carry_usd_per_day` is signed funding on that position over a day, **negative when the position pays**.
@@ -176,7 +206,14 @@ The account now: `contract_version`, `network`, `address`, `as_of_ms`, `feed_age
 
 Read the `account` rows. That budget is shared with every other container under the same operator, and a breach there stops **you**, not just the agent that spent it — so you can sit at 20% of your own daily budget and be one bad hour from a kill nothing you have been refused would have mentioned.
 
-Absent rows mean the budget is not configured. `utilization_pct` is absent only when the limit is zero, where a ratio has no meaning; `tripped` answers for that case. On a profitable day `utilization_pct` is `0` while `consumed_usd` goes negative — that is the dollars you are up, and it does not buy extra budget: `remaining_usd` never exceeds `limit_usd`.
+An empty `loss_budget` does not prove limits are unset. Policy-derived gauges are
+withheld while local admission is inhibited or its status changes during the
+read; missing inputs can also prevent a reading. Inspect `policy_status` and
+refusals rather than assuming unlimited authority. `utilization_pct` is absent
+when the limit is zero, where a ratio has no meaning; `tripped` answers for that
+case. On a profitable day `utilization_pct` is `0` while `consumed_usd` goes
+negative, and it does not buy extra budget: `remaining_usd` never exceeds
+`limit_usd`.
 
 Any of these is absent when its input is: no liquidation price, no σ yet, or a symbol the venue has stopped quoting (which also cannot be traded — see above).
 

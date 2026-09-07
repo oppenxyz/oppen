@@ -53,10 +53,28 @@ pub(super) fn audit_route(
 }
 
 pub(super) fn audit_sink(ledger: Arc<Ledger>) -> LedgerAuditSink {
-    LedgerAuditSink::new(
+    LedgerAuditSink::new(Arc::new(PolicyJournal::new(Arc::new(
         RegistryJournal::open(ledger, Arc::new(crate::keys::HmacKey::from_bytes([31; 32])))
             .expect("registry replay"),
-    )
+    ))))
+}
+
+// Audit serialization only; never accepted as persisted signing authority.
+pub(super) const AUDIT_POLICY_REVISION: u64 = 41;
+
+pub(super) fn initialize_policy(
+    registry: Arc<RegistryJournal>,
+    legacy_path: &std::path::Path,
+    agent: crate::guardrail::AgentId,
+    at_ms: u64,
+) -> Arc<PolicyJournal> {
+    use crate::guardrail::{AgentGuardrails, LegacyPolicyReview, PersistedState};
+    let policy = Arc::new(PolicyJournal::new(registry));
+    let review = LegacyPolicyReview::open(legacy_path, Network::Testnet, at_ms).unwrap();
+    let mut state = PersistedState::paused(at_ms);
+    state.guardrails.insert(agent, AgentGuardrails::default());
+    policy.initialize(&review, state, at_ms).unwrap();
+    policy
 }
 
 /// D6 / item 29: production audit writes survive reopening as one intact chain.
@@ -64,7 +82,6 @@ pub(super) fn audit_sink(ledger: Arc<Ledger>) -> LedgerAuditSink {
 fn production_audit_sink_persists_orders_decisions_and_typed_refusals() {
     use crate::guardrail::{
         AgentId, AuditEntry, AuditOutcome, AuditSink, ClearedKind, GuardrailEngine, Refusal,
-        SqliteGuardrailStore,
     };
     use crate::keys::{KeyStore, MemoryKeyStore, SecretText};
     use rust_decimal::Decimal;
@@ -103,14 +120,14 @@ fn production_audit_sink_persists_orders_decisions_and_typed_refusals() {
                 999,
             )
             .expect("explicit grant");
-        let sink = Arc::new(LedgerAuditSink::new(registry));
-        let engine = GuardrailEngine::new(
-            Arc::new(SqliteGuardrailStore::open(dir.path().join("guardrails.db")).expect("store")),
-            sink.clone(),
-            keys,
-            Network::Testnet,
-        )
-        .expect("engine");
+        let policy = initialize_policy(
+            Arc::new(registry),
+            &dir.path().join("guardrails.db"),
+            agent.clone(),
+            1_000,
+        );
+        let sink = Arc::new(LedgerAuditSink::new(policy.clone()));
+        let engine = GuardrailEngine::new(policy.clone(), keys).expect("engine");
         engine.register_agent(&agent, 1_000).expect("register");
         let cancel = engine
             .clear_cancel(
@@ -127,6 +144,7 @@ fn production_audit_sink_persists_orders_decisions_and_typed_refusals() {
         // Exercise the adapter's order branch without duplicating the engine's
         // market/exposure fixtures. Clearance is audit data, not signing proof.
         let mut order = cancel.clearance().clone();
+        order.policy_revision = policy.current().unwrap().revision;
         order.evaluated_at_ms = 1_003;
         order.kind = ClearedKind::Order {
             symbol: "BTC".into(),
@@ -173,7 +191,7 @@ fn production_audit_sink_persists_orders_decisions_and_typed_refusals() {
         events.iter().map(|event| event.kind).collect::<Vec<_>>(),
         vec![
             EventKind::RegistryGranted,
-            EventKind::OperatorAction,
+            EventKind::PolicyInitialized,
             EventKind::AgentDecision,
             EventKind::AgentDecision,
             EventKind::OrderIntent,
@@ -182,9 +200,11 @@ fn production_audit_sink_persists_orders_decisions_and_typed_refusals() {
     );
     assert_eq!(events[0].seq, route.binding_seq);
     assert_eq!(events[0].ts_ms, 999);
-    for (index, event) in events.iter().skip(1).enumerate() {
+    assert_eq!(events[1].ts_ms, 1_000);
+    assert_eq!(events[1].agent_id, None);
+    for (index, event) in events.iter().skip(2).enumerate() {
         assert_eq!(event.agent_id.as_deref(), Some(agent.as_str()));
-        assert_eq!(event.ts_ms, 1_000 + index as i64);
+        assert_eq!(event.ts_ms, 1_001 + index as i64);
     }
     let cancel = events[2].payload.as_ref().expect("cancel payload");
     assert_eq!(cancel["kind"]["cleared"], "cancel");
@@ -209,9 +229,18 @@ fn production_audit_sink_persists_orders_decisions_and_typed_refusals() {
 /// D6 / item 29: a policy-cleared order is durable before it can be signed.
 #[test]
 fn engine_evaluates_and_signs_an_order_through_the_production_audit_sink() {
+    engine_order_signing(false);
+}
+
+#[test]
+fn independent_policy_change_between_evaluation_and_signing_refuses_the_real_order() {
+    engine_order_signing(true);
+}
+
+fn engine_order_signing(change_policy: bool) {
     use crate::guardrail::{
         AccountSnapshot, AgentGuardrails, AgentId, Exposure, FeedQuality, GuardrailEngine,
-        MarketRef, OrderIntent, RestingExposure, SqliteGuardrailStore,
+        KillScope, MarketRef, OrderIntent, RestingExposure,
     };
     use crate::keys::{KeyStore, MemoryKeyStore, SecretText};
     use oppen_hl::meta::Asset;
@@ -249,13 +278,13 @@ fn engine_evaluates_and_signs_an_order_through_the_production_audit_sink() {
             now_ms,
         )
         .expect("explicit grant");
-    let engine = GuardrailEngine::new(
-        Arc::new(SqliteGuardrailStore::open(dir.path().join("policy.db")).expect("policy store")),
-        Arc::new(LedgerAuditSink::new(registry)),
-        keys,
-        Network::Testnet,
-    )
-    .expect("engine");
+    let policy = initialize_policy(
+        Arc::new(registry),
+        &dir.path().join("policy.db"),
+        agent.clone(),
+        now_ms,
+    );
+    let engine = GuardrailEngine::new(policy.clone(), keys.clone()).expect("engine");
     engine.register_agent(&agent, now_ms).expect("register");
     engine
         .operator_set_guardrails(
@@ -270,6 +299,13 @@ fn engine_evaluates_and_signs_an_order_through_the_production_audit_sink() {
             now_ms,
         )
         .expect("valid policy");
+    engine
+        .operator_release_kill(&KillScope::Global, now_ms)
+        .unwrap();
+    let observation = engine.policy_observation().unwrap();
+    engine
+        .operator_acknowledge_policy(observation, now_ms)
+        .unwrap();
     let cloid = Cloid::parse("0x00000000000000000000000000000001").expect("cloid");
     let intent = OrderIntent {
         symbol: "BTC".into(),
@@ -325,8 +361,12 @@ fn engine_evaluates_and_signs_an_order_through_the_production_audit_sink() {
     let cleared = engine
         .evaluate(&agent, &intent, &asset, &market, &exposure, now_ms)
         .expect("policy-cleared order must reach the real ledger");
+    assert_eq!(
+        cleared.clearance().policy_revision,
+        policy.current().unwrap().revision
+    );
     let events = ledger
-        .get_events(0, 10)
+        .get_events(0, 100)
         .expect("events before signing")
         .events;
     let intents: Vec<_> = events
@@ -343,6 +383,38 @@ fn engine_evaluates_and_signs_an_order_through_the_production_audit_sink() {
     assert_eq!(expected["kind"]["cloid"], json!(cloid));
     assert!(ledger.verify().expect("verify before signing").is_intact());
     let head = ledger.chain_head().expect("head before signing");
+
+    if change_policy {
+        let independent = Arc::new(Ledger::open_at(&path, Network::Testnet).unwrap());
+        let authority = PolicyJournal::new(Arc::new(
+            RegistryJournal::open(independent, registry_key.clone()).unwrap(),
+        ));
+        let mut next = authority.current().unwrap();
+        next.state.guardrails.get_mut(&agent).unwrap().max_order_usd = Decimal::from(50);
+        let changed = authority
+            .replace(next.revision, next.state, now_ms)
+            .unwrap();
+        assert_ne!(changed.revision, cleared.clearance().policy_revision);
+        assert!(matches!(
+            engine.sign_cleared(cleared, now_ms, None, || now_ms),
+            Err(crate::guardrail::SignClearedError::Refused(
+                crate::guardrail::Refusal::Unevaluable(
+                    crate::guardrail::Unevaluable::PolicyChanged
+                )
+            ))
+        ));
+        assert_eq!(ledger.event(stored.seq).unwrap().as_ref(), Some(stored));
+        let restarted = GuardrailEngine::new(policy.clone(), keys).unwrap();
+        assert!(matches!(
+            restarted.evaluate(&agent, &intent, &asset, &market, &exposure, now_ms),
+            Err(crate::guardrail::Refusal::Unevaluable(
+                crate::guardrail::Unevaluable::PolicyAuthority { .. }
+            ))
+        ));
+        assert_eq!(policy.current().unwrap().revision, changed.revision);
+        assert!(ledger.verify().unwrap().is_intact());
+        return;
+    }
 
     let (request, clearance) = engine
         .sign_cleared(cleared, now_ms, None, || now_ms)
@@ -1402,6 +1474,8 @@ fn every_event_kind_round_trips_through_its_stored_name() {
         EventKind::AgentWalletExpiryWarning,
         EventKind::RegistryGranted,
         EventKind::RegistryRetired,
+        EventKind::PolicyInitialized,
+        EventKind::PolicyReplaced,
         EventKind::PayloadRedacted,
     ];
     for kind in kinds {
@@ -2472,10 +2546,10 @@ fn generic_writers_cannot_forge_submission_lifecycle_events() {
 
 #[test]
 fn authority_reader_barriers_preserve_the_existing_chain_on_upgrade() {
-    for prior_version in [3, 4, 5] {
+    for prior_version in [3, 4, 5, 6] {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("testnet.db");
-        let head = {
+        let (head, original) = {
             let ledger = Ledger::open_at(&path, Network::Testnet).unwrap();
             let head = ledger
                 .append(&NewEvent {
@@ -2492,21 +2566,45 @@ fn authority_reader_barriers_preserve_the_existing_chain_on_upgrade() {
                 .unwrap()
                 .pragma_update(None, "user_version", prior_version)
                 .unwrap();
-            head
+            let original = ledger.get_events(0, 100).unwrap().events;
+            (head, original)
         };
         let upgraded = Ledger::open_at(&path, Network::Testnet).unwrap();
         let report = upgraded.verify().unwrap();
         assert!(report.is_intact());
         assert_eq!(report.head_seq, head.seq);
         assert_eq!(upgraded.event(head.seq).unwrap().unwrap().hash, head.hash);
+        assert_eq!(upgraded.get_events(0, 100).unwrap().events, original);
         let version: i64 = upgraded
             .connection
             .lock()
             .unwrap()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 6);
+        assert_eq!(version, 7);
     }
+}
+
+#[test]
+fn generic_writers_cannot_forge_policy_authority() {
+    let dir = TempDir::new().unwrap();
+    let ledger = Ledger::open(dir.path(), Network::Testnet).unwrap();
+    let head = ledger.chain_head().unwrap();
+    for kind in [EventKind::PolicyInitialized, EventKind::PolicyReplaced] {
+        let payload = json!({"forged": true});
+        assert!(matches!(
+            ledger.append(&NewEvent {
+                kind,
+                ts_ms: 100,
+                agent_id: None,
+                payload: &payload,
+                snapshot: None,
+            }),
+            Err(LedgerError::UsePolicyJournal)
+        ));
+    }
+    assert_eq!(ledger.chain_head().unwrap(), head);
+    assert!(ledger.get_events(0, 100).unwrap().events.is_empty());
 }
 
 #[test]
@@ -2519,14 +2617,14 @@ fn a_reader_refuses_a_newer_authority_schema_without_rewriting_history() {
         .connection
         .lock()
         .unwrap()
-        .pragma_update(None, "user_version", 7)
+        .pragma_update(None, "user_version", 8)
         .unwrap();
     drop(ledger);
     assert!(matches!(
         Ledger::open_at(&path, Network::Testnet),
         Err(LedgerError::SchemaTooNew {
-            found: 7,
-            supported: 6
+            found: 8,
+            supported: 7
         })
     ));
     let connection = rusqlite::Connection::open(&path).unwrap();
@@ -2534,7 +2632,7 @@ fn a_reader_refuses_a_newer_authority_schema_without_rewriting_history() {
         connection
             .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
             .unwrap(),
-        7
+        8
     );
     let (seq, hash) = super::head(&connection).unwrap();
     assert_eq!(Anchor { seq, hash }, head);

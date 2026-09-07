@@ -3333,6 +3333,7 @@ dependencies = [
  "oppen-core",
  "oppen-hl",
  "rmcp",
+ "rusqlite",
  "rust_decimal",
  "schemars 1.2.2",
  "serde",

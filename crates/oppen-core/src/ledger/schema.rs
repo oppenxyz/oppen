@@ -164,7 +164,8 @@ CREATE INDEX events_submission_account
 // No row rewrite or new table is needed for these additional chained events.
 // V5 also excludes readers that cannot enforce durable pairing revocation.
 // V6 requires authenticated registry authority at the signing boundary.
-const MIGRATIONS: &[&str] = &[V1, V2, V3, "", "", ""];
+// V7 requires authenticated policy and revision-bound runtime admission.
+const MIGRATIONS: &[&str] = &[V1, V2, V3, "", "", "", ""];
 
 /// Bring the database up to the schema this build expects.
 ///

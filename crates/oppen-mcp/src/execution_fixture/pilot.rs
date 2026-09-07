@@ -5,7 +5,7 @@ use oppen_core::guardrail::PilotMetric;
 use oppen_core::ledger::{PilotJournal, PilotState, PilotStop};
 
 async fn authorize(runtime: &Runtime) {
-    runtime.reconcile().await;
+    runtime.activate_orders().await;
     let info = &runtime.gateway.inner.info;
     assert!(
         info.clearinghouse_state(runtime.account)
@@ -86,7 +86,7 @@ async fn pilot_stop_retries_resting_cancels_for_revoked_binding_after_restart() 
     runtime.shutdown().await;
 
     let mut runtime = Runtime::open(dir.path(), venue.port(), keys.clone()).await;
-    runtime.reconcile().await;
+    runtime.activate_orders().await;
     let bound = binding(&runtime);
     {
         let pairings = runtime.pairings.read().unwrap();
@@ -327,6 +327,7 @@ async fn ordinary_resume_during_cancel_reads_cannot_clear_a_pilot_stop() {
                     .engine
                     .operator_release_kill(&scope, now_ms())
                     .unwrap();
+                runtime.acknowledge_policy();
                 Ok((
                     runtime
                         .gateway
@@ -353,6 +354,7 @@ async fn ordinary_resume_during_cancel_reads_cannot_clear_a_pilot_stop() {
             .engine
             .operator_release_kill(&scope, now_ms())
             .unwrap();
+        runtime.acknowledge_policy();
         drop(held);
         assert!(cancel.as_mut().await.unwrap().complete);
         assert_eq!(venue.submissions().len(), 2);
@@ -463,7 +465,7 @@ async fn five_round_trips_exhaust_executed_budget_across_physical_restart() {
     runtime.shutdown().await;
 
     let restarted = Runtime::open(dir.path(), venue.port(), keys.clone()).await;
-    restarted.reconcile().await;
+    restarted.activate_orders().await;
     let recovered = state(&restarted);
     assert_eq!(recovered.executed_usd, Decimal::from(150));
     assert_eq!(recovered.reserved_usd, Decimal::ZERO);
@@ -516,7 +518,7 @@ async fn canceled_orders_keep_committed_budget_across_physical_restart() {
     runtime.shutdown().await;
 
     let restarted = Runtime::open(dir.path(), venue.port(), keys.clone()).await;
-    restarted.reconcile().await;
+    restarted.activate_orders().await;
     let recovered = state(&restarted);
     assert_eq!(recovered.executed_usd, Decimal::ZERO);
     assert_eq!(recovered.reserved_usd, Decimal::from(150));
@@ -570,7 +572,7 @@ async fn five_dollars_of_fees_latches_loss_and_blocks_reduce_only_close_after_re
     runtime.shutdown().await;
 
     let restarted = Runtime::open(dir.path(), venue.port(), keys.clone()).await;
-    restarted.reconcile().await;
+    restarted.activate_orders().await;
     let recovered = state(&restarted);
     assert_eq!(recovered.net_realized_pnl_usd, -Decimal::from(5));
     assert_eq!(recovered.halt, halted.halt);

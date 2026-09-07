@@ -11,23 +11,16 @@ use oppen_core::alert::AlertStore;
 use oppen_core::features::quotes::QuoteCache;
 use oppen_core::feed::FeedSession;
 use oppen_core::feed::pump::FeedPump;
-use oppen_core::guardrail::{AgentId, GuardrailEngine, SqliteGuardrailStore};
+use oppen_core::guardrail::{AgentId, GuardrailEngine};
 use oppen_core::journal::Journal;
 use oppen_core::keys::{KeyStore, KeychainKeyStore};
-use oppen_core::ledger::{EventViews, Ledger, LedgerAuditSink, PairingJournal, RegistryJournal};
+use oppen_core::ledger::{EventViews, Ledger, PairingJournal, PolicyJournal, RegistryJournal};
 use oppen_core::reconcile::VenueSource;
 use oppen_hl::ws::{Subscription, WsPool, WsPoolConfig};
 use oppen_mcp::Network;
 use oppen_mcp::auth::{Binding, TokenStore};
 use oppen_mcp::server::{MCP_PATH, serve};
 use oppen_mcp::tools::Gateway;
-
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_millis() as u64)
-        .unwrap_or(0)
-}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -73,19 +66,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let mut store = TokenStore::open(PairingJournal::open(ledger.clone(), hmac)?)?;
     let engine = Arc::new(GuardrailEngine::new(
-        Arc::new(SqliteGuardrailStore::open(
-            dir.join("guardrails-testnet.db"),
-        )?),
-        Arc::new(LedgerAuditSink::new(registry)),
+        Arc::new(PolicyJournal::new(Arc::new(registry))),
         keys,
-        Network::Testnet,
     )?);
 
-    // D-c near-zero defaults: empty allowlist, $25 orders, $100 positions.
-    // The first order is refused with the limit to raise named in the reason.
-    let guardrails = engine.register_agent(&agent, now_ms())?;
-    println!("agent    {agent} registered");
-    println!("limits   {guardrails:?}");
+    // Opening never adopts legacy policy or acknowledges order admission.
+    println!("agent    {agent}");
+    println!("orders   inhibited; explicit operator policy review and reconciliation required");
     println!();
 
     let issued = store.issue(Binding {

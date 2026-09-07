@@ -9,10 +9,10 @@
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use oppen_core::feed::FeedSession;
-use oppen_core::guardrail::{AgentId, GuardrailEngine, SqliteGuardrailStore};
+use oppen_core::guardrail::{AgentId, GuardrailEngine};
 use oppen_core::journal::Journal;
 use oppen_core::keys::{EntryName, HmacKey, KeyStore, KeyStoreError, SecretText};
-use oppen_core::ledger::{EventViews, Ledger, LedgerAuditSink, PairingJournal, RegistryJournal};
+use oppen_core::ledger::{EventViews, Ledger, PairingJournal, PolicyJournal, RegistryJournal};
 use oppen_mcp::Network;
 use oppen_mcp::auth::{Binding, TokenStore};
 use oppen_mcp::server::{GatewayHandler, MCP_PATH, router, serve};
@@ -98,15 +98,11 @@ impl Fixture {
         );
         let engine = Arc::new(
             GuardrailEngine::new(
-                Arc::new(
-                    SqliteGuardrailStore::open(dir.path().join("guardrails.db")).expect("store"),
-                ),
-                Arc::new(LedgerAuditSink::new(
+                Arc::new(PolicyJournal::new(Arc::new(
                     RegistryJournal::open(ledger.clone(), Arc::new(HmacKey::from_bytes([42; 32])))
                         .expect("registry"),
-                )),
+                ))),
                 Arc::new(NoKeys(network)),
-                network,
             )
             .expect("engine"),
         );

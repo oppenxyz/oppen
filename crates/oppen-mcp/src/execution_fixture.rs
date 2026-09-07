@@ -4,9 +4,11 @@ use super::*;
 use axum::{Router, body::Body, http::Request};
 use http_body_util::BodyExt;
 use oppen_core::feed::pump::{FeedPump, FeedSubscriber};
-use oppen_core::guardrail::{AgentId, SqliteGuardrailStore};
+use oppen_core::guardrail::{
+    AgentGuardrails, AgentId, KillScope, LegacyPolicyReview, PersistedState,
+};
 use oppen_core::keys::{EntryName, KeyStore, KeyStoreError, SecretText};
-use oppen_core::ledger::{EventKind, Ledger, LedgerAuditSink};
+use oppen_core::ledger::{EventKind, Ledger, PolicyJournal};
 use oppen_core::reconcile::ReconcileSource;
 use oppen_hl::types::{Fill, OpenOrder};
 use oppen_hl::ws::{PoolError, Subscription};
@@ -21,6 +23,8 @@ use tower::ServiceExt;
 mod decision;
 #[path = "execution_fixture/pilot.rs"]
 mod pilot;
+#[path = "execution_fixture/policy.rs"]
+mod policy;
 #[path = "execution_fixture/registry.rs"]
 mod registry;
 #[path = "execution_fixture/http.rs"]
@@ -132,6 +136,16 @@ impl Runtime {
         keys: Arc<FixtureKeys>,
         anchor: Option<Box<dyn oppen_core::ledger::HeadAnchor>>,
     ) -> Self {
+        Self::open_policy_fixture(path, port, keys, anchor, true).await
+    }
+
+    async fn open_policy_fixture(
+        path: &Path,
+        port: u16,
+        keys: Arc<FixtureKeys>,
+        anchor: Option<Box<dyn oppen_core::ledger::HeadAnchor>>,
+        initialize_policy: bool,
+    ) -> Self {
         let account = Address::from_bytes([9; 20]);
         let agent = AgentId::new("fixture-agent");
         // This constant is a disposable test vector, never a machine credential.
@@ -174,20 +188,15 @@ impl Runtime {
             .route_for_agent(&agent)
             .expect("restart must replay an existing active route");
         assert_eq!(route.binding.container, account);
-        let engine = Arc::new(
-            GuardrailEngine::new(
-                Arc::new(SqliteGuardrailStore::open(path.join("policy.db")).unwrap()),
-                Arc::new(LedgerAuditSink::new(
-                    oppen_core::ledger::RegistryJournal::open(ledger.clone(), hmac.clone())
-                        .unwrap(),
-                )),
-                keys.clone(),
-                Network::Testnet,
-            )
-            .unwrap(),
-        );
-        if engine.guardrails(&agent).is_none() {
-            let mut policy = engine.register_agent(&agent, now_ms()).unwrap();
+        let policy_journal = Arc::new(PolicyJournal::new(Arc::new(
+            oppen_core::ledger::RegistryJournal::open(ledger.clone(), hmac.clone()).unwrap(),
+        )));
+        if first_open && initialize_policy {
+            let at = now_ms();
+            let review =
+                LegacyPolicyReview::open(path.join("policy.db"), Network::Testnet, at).unwrap();
+            let mut replacement = PersistedState::paused(at);
+            let mut policy = AgentGuardrails::default();
             policy.symbols.insert("TEST".into());
             policy.approval_required = false;
             policy.max_order_usd = Decimal::from(15);
@@ -195,10 +204,10 @@ impl Runtime {
             policy.risk.max_open_exposure_usd = Some(Decimal::from(25));
             policy.risk.max_leverage = 1;
             policy.order_rate.count = 100;
-            engine
-                .operator_set_guardrails(&agent, policy, now_ms())
-                .unwrap();
+            replacement.guardrails.insert(agent.clone(), policy);
+            policy_journal.initialize(&review, replacement, at).unwrap();
         }
+        let engine = Arc::new(GuardrailEngine::new(policy_journal, keys.clone()).unwrap());
         let mut gateway = Gateway::new(
             Network::Testnet,
             engine,
@@ -317,6 +326,22 @@ impl Runtime {
         .unwrap()
     }
 
+    async fn activate_orders(&self) {
+        self.reconcile().await;
+        let engine = &self.gateway.inner.engine;
+        engine
+            .operator_release_kill(&KillScope::Global, now_ms())
+            .unwrap();
+        self.acknowledge_policy();
+    }
+
+    fn acknowledge_policy(&self) {
+        let engine = &self.gateway.inner.engine;
+        engine
+            .operator_acknowledge_policy(engine.policy_observation().unwrap(), now_ms())
+            .unwrap();
+    }
+
     async fn reconcile(&self) {
         let inner = &self.gateway.inner;
         let pump = FeedPump::new(
@@ -370,7 +395,7 @@ async fn real_mcp_signs_reconciles_partial_fill_cancels_and_closes() {
     assert_eq!(blocked["status"], "rejected", "{blocked}");
     assert!(venue.submissions().is_empty());
     assert!(keys.read_heads.lock().unwrap().is_empty());
-    runtime.reconcile().await;
+    runtime.activate_orders().await;
     let placed = runtime.call("place", place(&cloid, "0.12")).await;
     assert_eq!(placed["status"], "resting", "{placed}");
     let signed = venue.submissions();
@@ -449,7 +474,7 @@ async fn applied_but_malformed_response_survives_physical_restart() {
     let venue = Venue::start().await;
     let keys = Arc::new(FixtureKeys::default());
     let runtime = Runtime::open(dir.path(), venue.port(), keys.clone()).await;
-    runtime.reconcile().await;
+    runtime.activate_orders().await;
     let cloid = Cloid::from_bytes([10; 16]).as_str().to_owned();
     venue.next_response(Behavior::AppliedMalformed);
     let outcome = runtime.call("place", place(&cloid, "0.12")).await;
@@ -479,7 +504,7 @@ async fn applied_but_malformed_response_survives_physical_restart() {
             .pending
             .is_some()
     );
-    restarted.reconcile().await;
+    restarted.activate_orders().await;
     let refused = restarted
         .call("place", place(Cloid::from_bytes([11; 16]).as_str(), "0.14"))
         .await;
@@ -510,7 +535,7 @@ async fn authoritative_exchange_rejection_releases_account_but_not_cloid_identit
     let venue = Venue::start().await;
     let keys = Arc::new(FixtureKeys::default());
     let runtime = Runtime::open(dir.path(), venue.port(), keys).await;
-    runtime.reconcile().await;
+    runtime.activate_orders().await;
     let cloid = Cloid::from_bytes([13; 16]).as_str().to_owned();
     venue.next_response(Behavior::Rejected);
     let rejected = runtime.call("place", place(&cloid, "0.12")).await;

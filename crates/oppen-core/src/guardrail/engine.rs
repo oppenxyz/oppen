@@ -39,7 +39,7 @@ use oppen_hl::wire::{BuilderInfo, CancelByCloidWire, CancelWire, Cloid, Grouping
 use oppen_hl::{Action, Address, AgentKey, ExchangeRequest, Network};
 
 use crate::keys::{AgentWallet, KeyStore, KeyStoreError};
-use crate::ledger::AuthorizedRoute;
+use crate::ledger::{AuthorizedRoute, LedgerAuditSink, PolicyJournal};
 
 use super::AgentId;
 use super::breaker::{self, BudgetScope, LossBudget, LossKind};
@@ -51,7 +51,9 @@ use super::deadman::{DEAD_MAN_MIN_LEAD_MS, DeadManIntent};
 use super::kill::{Engagement, KillEffect, KillReason, KillScope, KillSwitch};
 use super::refusal::{ReduceOnlyBreach, Refusal, Unevaluable, VenueRule};
 use super::snapshot::{AccountSnapshot, Exposure, MarketRef, MarketSnapshotRef};
-use super::store::{GuardrailStore, StoreError};
+use super::store::{
+    GuardrailStore, PersistedState, PolicyVersion, SqliteGuardrailStore, StoreError,
+};
 
 /// One basis point is a ten-thousandth.
 const BPS: Decimal = Decimal::from_parts(10_000, 0, 0, false, 0);
@@ -260,6 +262,8 @@ pub struct Clearance {
     pub agent: AgentId,
     /// Complete evaluated authority, revalidated under the signing permit.
     pub route: AuthorizedRoute,
+    /// Authenticated policy event sequence. Zero only for policy-exempt cleanup.
+    pub policy_revision: u64,
     /// The container's `vaultAddress` where the venue granted a sub-account
     /// (D1), copied from the authenticated route rather than from the caller.
     /// `None` is D1 V2's top-level container, which sends no `vaultAddress`
@@ -286,18 +290,13 @@ pub struct Clearance {
 pub struct Cleared {
     action: Action,
     clearance: Clearance,
-    policy_revision: u64,
 }
 
 impl Cleared {
     /// Private on purpose. Moving this line, widening it to `pub(crate)`, or
     /// adding a second constructor breaks `AGENTS.md` invariant 1.
-    fn new(action: Action, clearance: Clearance, policy_revision: u64) -> Self {
-        Cleared {
-            action,
-            clearance,
-            policy_revision,
-        }
+    fn new(action: Action, clearance: Clearance) -> Self {
+        Cleared { action, clearance }
     }
 
     /// The exact action that was evaluated. Built by the engine from the
@@ -319,8 +318,8 @@ impl Cleared {
         &self.clearance
     }
 
-    fn into_parts(self) -> (Action, Clearance, u64) {
-        (self.action, self.clearance, self.policy_revision)
+    fn into_parts(self) -> (Action, Clearance) {
+        (self.action, self.clearance)
     }
 }
 
@@ -351,6 +350,8 @@ pub enum AuditOutcome<'a> {
 #[serde(tag = "operator_action", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum OperatorAction {
+    /// Operator claim only; a racing stop can still reject this request.
+    PolicyAcknowledgmentRequested { revision: u64, stop_generation: u64 },
     /// A newly paired agent got D-c's near-zero defaults.
     AgentRegistered {
         config: Box<AgentGuardrails>,
@@ -437,11 +438,33 @@ pub enum GuardrailError {
     Store(#[from] StoreError),
     #[error("guardrail config field {field} is invalid: {detail}")]
     InvalidConfig { field: String, detail: String },
+    #[error("policy requires operator reconciliation: {detail}")]
+    Policy { detail: String },
+}
+
+/// The exact verified policy and local stop evidence reviewed by the operator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct PolicyAcknowledgment {
+    pub revision: u64,
+    pub stop_generation: u64,
+}
+
+/// Local observation only, not a fresh verification or activation guarantee.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct PolicyStatus {
+    pub cached_revision: Option<u64>,
+    pub acknowledgment: Option<PolicyAcknowledgment>,
+    pub stop_generation: u64,
+    /// Other gates, including durable kills and pilot stops, still apply.
+    pub admission_inhibited: bool,
 }
 
 #[derive(Debug)]
 struct EngineState {
     policy_revision: u64,
+    acknowledged: Option<PolicyAcknowledgment>,
+    stop_generation: u64,
+    emergency: BTreeMap<KillScope, Engagement>,
     guardrails: BTreeMap<AgentId, AgentGuardrails>,
     account_limits: LossLimits,
     kill: KillSwitch,
@@ -474,6 +497,79 @@ struct EngineState {
 }
 
 impl EngineState {
+    fn inhibit(&mut self) {
+        self.acknowledged = None;
+        // Exhaustion is permanently inhibited, never an ABA generation wrap.
+        self.stop_generation = self.stop_generation.saturating_add(1);
+    }
+
+    fn policy(&self) -> PersistedState {
+        PersistedState {
+            guardrails: self.guardrails.clone(),
+            kill: self.kill.clone(),
+            account_limits: self.account_limits,
+        }
+    }
+
+    fn publish(&mut self, version: PolicyVersion) -> Result<(), GuardrailError> {
+        if version.revision == 0 || version.revision < self.policy_revision {
+            return Err(GuardrailError::Policy {
+                detail: "policy observation regressed".into(),
+            });
+        }
+        if version.revision == self.policy_revision && version.state != self.policy() {
+            return Err(GuardrailError::Policy {
+                detail: "policy changed without a revision".into(),
+            });
+        }
+        self.policy_revision = version.revision;
+        self.guardrails = version.state.guardrails;
+        self.account_limits = version.state.account_limits;
+        self.kill = version.state.kill;
+        Ok(())
+    }
+
+    fn effective_kill(&self) -> KillSwitch {
+        let mut kill = self.kill.clone();
+        for (scope, engagement) in &self.emergency {
+            kill.engage(scope.clone(), engagement.clone());
+        }
+        kill
+    }
+
+    fn check_acknowledgment(&self) -> Result<(), Refusal> {
+        if self.policy_revision == 0
+            || self.acknowledged
+                != Some(PolicyAcknowledgment {
+                    revision: self.policy_revision,
+                    stop_generation: self.stop_generation,
+                })
+        {
+            return Err(Unevaluable::PolicyAuthority {
+                detail: "operator reconciliation acknowledgment required".into(),
+            }
+            .into());
+        }
+        Ok(())
+    }
+
+    fn stop(&mut self, scope: KillScope, engagement: Engagement) -> KillEffect {
+        let newly_engaged = self
+            .effective_kill()
+            .engage(scope.clone(), engagement.clone());
+        self.emergency.entry(scope.clone()).or_insert(engagement);
+        self.inhibit();
+        let effect = KillEffect {
+            cancel_for: cancel_targets(self, &scope),
+            scope,
+            newly_engaged,
+        };
+        if newly_engaged && !self.pending_effects.iter().any(|e| e.scope == effect.scope) {
+            self.pending_effects.push(effect.clone());
+        }
+        effect
+    }
+
     /// The agent's bucket, rebuilt from scratch if the operator changed the
     /// rate. A rate change restores a full bucket, which is the generous
     /// reading; the alternative is that lowering a rate retroactively
@@ -518,6 +614,7 @@ pub struct GuardrailEngine {
     /// networks means a different database file and a different engine.
     network: Network,
     state: Mutex<EngineState>,
+    mutations: Mutex<()>,
 }
 
 impl std::fmt::Debug for GuardrailEngine {
@@ -529,9 +626,33 @@ impl std::fmt::Debug for GuardrailEngine {
 }
 
 impl GuardrailEngine {
-    /// Loads persisted guardrails and kill-switch state
-    /// (spec item 26: the switch survives a restart).
+    /// Construct one-source policy and signing authority. Opening never acknowledges
+    /// policy: even a verified restart starts order-inhibited (ES18).
     pub fn new(
+        authority: Arc<PolicyJournal>,
+        keys: Arc<dyn KeyStore>,
+    ) -> Result<Self, GuardrailError> {
+        let network = authority.network();
+        Self::build(
+            Arc::new(SqliteGuardrailStore::new(authority.clone())),
+            Arc::new(LedgerAuditSink::new(authority)),
+            keys,
+            network,
+        )
+    }
+
+    /// Explicit synthetic authority and persistence seams, never a production constructor.
+    #[cfg(test)]
+    pub(crate) fn from_parts(
+        store: Arc<dyn GuardrailStore>,
+        sink: Arc<dyn AuditSink>,
+        keys: Arc<dyn KeyStore>,
+        network: Network,
+    ) -> Result<Self, GuardrailError> {
+        Self::build(store, sink, keys, network)
+    }
+
+    fn build(
         store: Arc<dyn GuardrailStore>,
         sink: Arc<dyn AuditSink>,
         keys: Arc<dyn KeyStore>,
@@ -546,27 +667,172 @@ impl GuardrailEngine {
                 ),
             });
         }
-        let persisted = store.load()?;
         let global_budget = GlobalRateBudget::default();
-        Ok(GuardrailEngine {
+        let mut state = EngineState {
+            policy_revision: 0,
+            acknowledged: None,
+            stop_generation: 0,
+            emergency: BTreeMap::new(),
+            guardrails: BTreeMap::new(),
+            account_limits: LossLimits::UNSET,
+            kill: KillSwitch::new(),
+            buckets: BTreeMap::new(),
+            active: BTreeSet::new(),
+            proposals: BTreeMap::new(),
+            proposal_seq: 0,
+            global_budget,
+            global_bucket: TokenBucket::new(global_budget.rate, 0),
+            pending_effects: Vec::new(),
+        };
+        // These empty projections are not policy authority. A failed load must
+        // still leave registry-authenticated cleanup usable.
+        if let Ok(version) = store.load() {
+            let _ = state.publish(version);
+        }
+        Ok(Self {
             store,
             sink,
             keys,
             network,
-            state: Mutex::new(EngineState {
-                policy_revision: 0,
-                guardrails: persisted.guardrails,
-                account_limits: persisted.account_limits,
-                kill: persisted.kill,
-                buckets: BTreeMap::new(),
-                active: BTreeSet::new(),
-                proposals: BTreeMap::new(),
-                proposal_seq: 0,
-                global_budget,
-                global_bucket: TokenBucket::new(global_budget.rate, 0),
-                pending_effects: Vec::new(),
-            }),
+            state: Mutex::new(state),
+            mutations: Mutex::new(()),
         })
+    }
+
+    fn mutation_lock(&self) -> Result<MutexGuard<'_, ()>, GuardrailError> {
+        self.mutations.lock().map_err(|_| {
+            self.state().inhibit();
+            GuardrailError::Policy {
+                detail: "policy mutation lock poisoned".into(),
+            }
+        })
+    }
+
+    fn refresh_policy(&self) -> Result<(), GuardrailError> {
+        let version = match self.store.load() {
+            Ok(version) => version,
+            Err(error) => {
+                self.state().inhibit();
+                return Err(error.into());
+            }
+        };
+        let mut state = self.state();
+        if let Err(error) = state.publish(version) {
+            state.inhibit();
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Read verified policy and the stop generation for explicit operator review.
+    /// This performs synchronous ledger I/O and does not enable orders.
+    pub fn policy_observation(&self) -> Result<PolicyAcknowledgment, GuardrailError> {
+        self.refresh_policy()?;
+        let state = self.state();
+        Ok(PolicyAcknowledgment {
+            revision: state.policy_revision,
+            stop_generation: state.stop_generation,
+        })
+    }
+
+    /// Cached status for read-only runtime views. No ledger I/O, refresh, or
+    /// acknowledgment. Independent policy changes are detected by verified
+    /// reads and the final signing permit, not by this local observation.
+    pub fn policy_status(&self) -> PolicyStatus {
+        let state = self.state();
+        PolicyStatus {
+            cached_revision: (state.policy_revision != 0).then_some(state.policy_revision),
+            acknowledgment: state.acknowledged,
+            stop_generation: state.stop_generation,
+            admission_inhibited: state.check_acknowledgment().is_err(),
+        }
+    }
+
+    /// Acknowledge exactly the reviewed policy and local stop evidence. Venue
+    /// reconciliation is the operator caller's obligation, not inferred here.
+    /// Durable kills and emergency engagements still require explicit release.
+    pub fn operator_acknowledge_policy(
+        &self,
+        observed: PolicyAcknowledgment,
+        at_ms: u64,
+    ) -> Result<(), GuardrailError> {
+        let _mutation = self.mutation_lock()?;
+        self.refresh_policy()?;
+        {
+            let mut state = self.state();
+            if observed.revision != state.policy_revision
+                || observed.stop_generation != state.stop_generation
+                || observed.stop_generation == u64::MAX
+            {
+                state.inhibit();
+                return Err(GuardrailError::Policy {
+                    detail: "policy or stop generation changed during reconciliation".into(),
+                });
+            }
+            state.acknowledged = None;
+        }
+        let action = OperatorAction::PolicyAcknowledgmentRequested {
+            revision: observed.revision,
+            stop_generation: observed.stop_generation,
+        };
+        if let Err(error) = self.sink.record(&AuditEntry {
+            agent: None,
+            at_ms,
+            reason: "operator acknowledgment request; venue validation is caller-owned",
+            outcome: AuditOutcome::Operator(&action),
+        }) {
+            self.state().inhibit();
+            return Err(GuardrailError::Policy {
+                detail: format!("acknowledgment audit failed: {error}"),
+            });
+        }
+        let mut state = self.state();
+        if observed.revision != state.policy_revision
+            || observed.stop_generation != state.stop_generation
+            || observed.stop_generation == u64::MAX
+        {
+            state.inhibit();
+            return Err(GuardrailError::Policy {
+                detail: "policy or stop generation changed during reconciliation".into(),
+            });
+        }
+        state.acknowledged = Some(observed);
+        Ok(())
+    }
+
+    /// Caller serializes mutations, but never holds engine state across CAS.
+    /// The candidate is tied to its captured revision; no full-state rebasing.
+    fn commit_policy(
+        &self,
+        expected: u64,
+        next: &PersistedState,
+        at_ms: u64,
+    ) -> Result<(), GuardrailError> {
+        // A panic or uncertain durable outcome must not retain admission.
+        self.state().acknowledged = None;
+        let version = match self.store.compare_exchange(expected, next, at_ms) {
+            Ok(version) => version,
+            Err(error) => {
+                self.state().inhibit();
+                return Err(error.into());
+            }
+        };
+        let mut state = self.state();
+        if let Err(error) = state.publish(version) {
+            state.inhibit();
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn policy_candidate(&self) -> Result<(u64, PersistedState), GuardrailError> {
+        let state = self.state();
+        if state.policy_revision == 0 {
+            return Err(GuardrailError::Policy {
+                detail: "verified policy unavailable".into(),
+            });
+        }
+        Ok((state.policy_revision, state.policy()))
     }
 
     /// A poisoned lock is recovered rather than propagated: the state behind
@@ -590,14 +856,14 @@ impl GuardrailEngine {
         agent: &AgentId,
         now_ms: u64,
     ) -> Result<AgentGuardrails, GuardrailError> {
-        let mut state = self.state();
-        if let Some(existing) = state.guardrails.get(agent) {
+        let _mutation = self.mutation_lock()?;
+        let (revision, mut next) = self.policy_candidate()?;
+        if let Some(existing) = next.guardrails.get(agent) {
             return Ok(existing.clone());
         }
         let config = AgentGuardrails::default();
-        self.store.save_guardrails(agent, &config)?;
-        state.guardrails.insert(agent.clone(), config.clone());
-        drop(state);
+        next.guardrails.insert(agent.clone(), config.clone());
+        self.commit_policy(revision, &next, now_ms)?;
         self.record_operator(
             Some(agent),
             now_ms,
@@ -624,12 +890,10 @@ impl GuardrailEngine {
                 detail,
             });
         }
-        let before = {
-            let mut state = self.state();
-            self.store.save_guardrails(agent, &config)?;
-            state.policy_revision = state.policy_revision.wrapping_add(1);
-            state.guardrails.insert(agent.clone(), config.clone())
-        };
+        let _mutation = self.mutation_lock()?;
+        let (revision, mut next) = self.policy_candidate()?;
+        let before = next.guardrails.insert(agent.clone(), config.clone());
+        self.commit_policy(revision, &next, now_ms)?;
         self.record_operator(
             Some(agent),
             now_ms,
@@ -646,12 +910,10 @@ impl GuardrailEngine {
         limits: LossLimits,
         now_ms: u64,
     ) -> Result<(), GuardrailError> {
-        let before = {
-            let mut state = self.state();
-            self.store.save_account_limits(&limits)?;
-            state.policy_revision = state.policy_revision.wrapping_add(1);
-            std::mem::replace(&mut state.account_limits, limits)
-        };
+        let _mutation = self.mutation_lock()?;
+        let (revision, mut next) = self.policy_candidate()?;
+        let before = std::mem::replace(&mut next.account_limits, limits);
+        self.commit_policy(revision, &next, now_ms)?;
         self.record_operator(
             None,
             now_ms,
@@ -708,28 +970,16 @@ impl GuardrailEngine {
         reason: KillReason,
         now_ms: u64,
     ) -> Result<KillEffect, GuardrailError> {
-        let effect = {
-            let mut state = self.state();
-            let newly_engaged = state.kill.engage(
-                scope.clone(),
-                Engagement {
-                    engaged_at_ms: now_ms,
-                    reason: reason.clone(),
-                },
-            );
-            let effect = KillEffect {
-                cancel_for: cancel_targets(&state, &scope),
-                scope,
-                newly_engaged,
-            };
-            if let Err(error) = self.store.save_kill_switch(&state.kill) {
-                if newly_engaged {
-                    state.pending_effects.push(effect);
-                }
-                return Err(error.into());
-            }
-            effect
+        // Stop locally before waiting for any persistence or mutation lock.
+        let engagement = Engagement {
+            engaged_at_ms: now_ms,
+            reason: reason.clone(),
         };
+        let effect = self.state().stop(scope.clone(), engagement.clone());
+        let _mutation = self.mutation_lock()?;
+        let (revision, mut next) = self.policy_candidate()?;
+        next.kill.engage(scope, engagement);
+        self.commit_policy(revision, &next, now_ms)?;
         self.record_operator(
             None,
             now_ms,
@@ -748,14 +998,33 @@ impl GuardrailEngine {
         scope: &KillScope,
         now_ms: u64,
     ) -> Result<bool, GuardrailError> {
-        let released = {
-            let mut state = self.state();
-            let mut next = state.kill.clone();
-            let released = next.release(scope);
-            self.store.save_kill_switch(&next)?;
-            state.kill = next;
-            released
+        let _mutation = self.mutation_lock()?;
+        let (revision, mut next, generation, had_emergency) = {
+            let state = self.state();
+            if state.policy_revision == 0 {
+                return Err(GuardrailError::Policy {
+                    detail: "verified policy unavailable".into(),
+                });
+            }
+            (
+                state.policy_revision,
+                state.policy(),
+                state.stop_generation,
+                state.emergency.contains_key(scope),
+            )
         };
+        let released = next.kill.release(scope) || had_emergency;
+        self.commit_policy(revision, &next, now_ms)?;
+        {
+            let mut state = self.state();
+            if state.stop_generation == generation {
+                state.emergency.remove(scope);
+            } else {
+                return Err(GuardrailError::Policy {
+                    detail: "new stop arrived while releasing policy".into(),
+                });
+            }
+        }
         self.record_operator(
             None,
             now_ms,
@@ -774,12 +1043,23 @@ impl GuardrailEngine {
     }
 
     /// Persisted pauses remain actionable after a runtime restart.
+    /// Pure local supervision predicate, including startup and failed policy
+    /// inhibition even when this agent is absent from the policy projection.
+    /// The caller separately validates the bound registry identity.
+    pub fn cancellation_needed(&self, agent: &AgentId) -> bool {
+        let state = self.state();
+        state.check_acknowledgment().is_err() || state.effective_kill().blocking(agent).is_some()
+    }
+
+    /// Cached effective pauses. Binding-specific supervision uses
+    /// [`Self::cancellation_needed`] so an unavailable policy cannot hide it.
     pub fn paused_agents(&self) -> BTreeSet<AgentId> {
         let state = self.state();
+        let kill = state.effective_kill();
         state
             .guardrails
             .keys()
-            .filter(|agent| state.kill.blocking(agent).is_some())
+            .filter(|agent| kill.blocking(agent).is_some())
             .cloned()
             .collect()
     }
@@ -822,7 +1102,7 @@ impl GuardrailEngine {
     }
 
     pub fn kill_switch(&self) -> KillSwitch {
-        self.state().kill.clone()
+        self.state().effective_kill()
     }
 
     /// Every loss budget this agent is measured against, as a gauge rather
@@ -1149,6 +1429,10 @@ impl GuardrailEngine {
         mode: Mode,
     ) -> Result<Cleared, Refusal> {
         check_reason(&intent.reason)?;
+        self.refresh_policy()
+            .map_err(|error| Unevaluable::PolicyAuthority {
+                detail: error.to_string(),
+            })?;
         let route = self.decision_route(agent)?;
         check_order_approval_window(&route, now_ms)?;
         if exposure.account != route.binding.container {
@@ -1177,7 +1461,7 @@ impl GuardrailEngine {
 
         // Spec item 26. Cheap, needs no market data, and an agent that has
         // been stopped should hear that rather than a staleness complaint.
-        if let Some((scope, engagement)) = state.kill.blocking(agent) {
+        if let Some((scope, engagement)) = state.effective_kill().blocking(agent) {
             return Err(Refusal::TradingPaused {
                 scope,
                 since_ms: engagement.engaged_at_ms,
@@ -1186,6 +1470,8 @@ impl GuardrailEngine {
         }
 
         // The caller must supply the asset and the market tick for the symbol
+        state.check_acknowledgment()?;
+
         // it is asking about. A mismatch would measure the order against
         // another instrument's price, which is the worst silent failure in
         // this file.
@@ -1212,35 +1498,27 @@ impl GuardrailEngine {
             &account_limits,
             exposure.fleet.as_ref(),
         ) {
-            let newly_engaged = state.kill.engage(
-                breach.scope.clone(),
-                Engagement {
-                    engaged_at_ms: now_ms,
-                    reason: KillReason::LossLimit {
-                        kind: breach.kind,
-                        observed_usd: breach.observed_usd,
-                        limit_usd: breach.limit_usd,
-                    },
+            let engagement = Engagement {
+                engaged_at_ms: now_ms,
+                reason: KillReason::LossLimit {
+                    kind: breach.kind,
+                    observed_usd: breach.observed_usd,
+                    limit_usd: breach.limit_usd,
                 },
-            );
-            // Item 26: engaging the switch cancels resting orders. Queued
-            // before the store write, and regardless of whether that write
-            // succeeds, because the cancels are the risk-reducing half of the
-            // trip and a failed write must never be the reason an agent's
-            // working orders stay live overnight.
-            if newly_engaged {
-                let effect = KillEffect {
-                    cancel_for: cancel_targets(&state, &breach.scope),
-                    scope: breach.scope.clone(),
-                    newly_engaged,
-                };
-                state.pending_effects.push(effect);
-            }
-            // The in-memory engagement stands even if the write fails; the
-            // conservative direction is to stay stopped.
-            if let Err(e) = self.store.save_kill_switch(&state.kill) {
+            };
+            state.stop(breach.scope.clone(), engagement.clone());
+            let revision = state.policy_revision;
+            let mut next = state.policy();
+            next.kill.engage(breach.scope.clone(), engagement);
+            drop(state);
+            // Keep the exact evaluated revision. A conflicting writer must not
+            // be overwritten by rebasing this full snapshot onto its revision.
+            let persisted = self
+                .mutation_lock()
+                .and_then(|_mutation| self.commit_policy(revision, &next, now_ms));
+            if let Err(error) = persisted {
                 return Err(Unevaluable::StateWriteFailed {
-                    detail: e.to_string(),
+                    detail: error.to_string(),
                 }
                 .into());
             }
@@ -1589,6 +1867,7 @@ impl GuardrailEngine {
         };
         let clearance = Clearance {
             agent: agent.clone(),
+            policy_revision: state.policy_revision,
             vault_address: route.binding.vault_address,
             route,
             network: self.network,
@@ -1627,7 +1906,7 @@ impl GuardrailEngine {
                 global_tokens_remaining,
             },
         };
-        Ok(Cleared::new(action, clearance, state.policy_revision))
+        Ok(Cleared::new(action, clearance))
     }
 
     /// Clears a cancel by order id.
@@ -1693,7 +1972,7 @@ impl GuardrailEngine {
         action: Action,
     ) -> Result<Cleared, Refusal> {
         check_reason(reason)?;
-        let route = self.decision_route(agent)?;
+        let route = self.route_for_agent(agent)?;
         if count == 0 {
             return Err(Unevaluable::InputMismatch {
                 field: "cancels".to_owned(),
@@ -1703,12 +1982,6 @@ impl GuardrailEngine {
             .into());
         }
         let mut state = self.state();
-        if !state.guardrails.contains_key(agent) {
-            return Err(Unevaluable::UnknownAgent {
-                agent: agent.clone(),
-            }
-            .into());
-        }
         // Charged, never refused: the account budget has to stay honest about
         // requests oppen actually sends, but a cancel is the one thing it may
         // not stop. Saturates at zero rather than going negative.
@@ -1717,6 +1990,7 @@ impl GuardrailEngine {
             action,
             Clearance {
                 agent: agent.clone(),
+                policy_revision: 0,
                 vault_address: route.binding.vault_address,
                 route,
                 network: self.network,
@@ -1724,7 +1998,6 @@ impl GuardrailEngine {
                 kind: ClearedKind::Cancel { count },
                 utilization: Utilization::none_with_global(global_tokens_remaining),
             },
-            state.policy_revision,
         ))
     }
 
@@ -1768,7 +2041,7 @@ impl GuardrailEngine {
         cancel_at_ms: Option<u64>,
         now_ms: u64,
     ) -> Result<Cleared, Refusal> {
-        let route = self.decision_route(agent)?;
+        let route = self.route_for_agent(agent)?;
         if let Some(at) = cancel_at_ms {
             let earliest_ms = now_ms.saturating_add(DEAD_MAN_MIN_LEAD_MS);
             if at < earliest_ms {
@@ -1780,17 +2053,12 @@ impl GuardrailEngine {
             }
         }
         let mut state = self.state();
-        if !state.guardrails.contains_key(agent) {
-            return Err(Unevaluable::UnknownAgent {
-                agent: agent.clone(),
-            }
-            .into());
-        }
         let global_tokens_remaining = draw_global_reserve(&mut state.global_bucket, now_ms);
         Ok(Cleared::new(
             Action::ScheduleCancel { time: cancel_at_ms },
             Clearance {
                 agent: agent.clone(),
+                policy_revision: 0,
                 vault_address: route.binding.vault_address,
                 route,
                 network: self.network,
@@ -1798,7 +2066,6 @@ impl GuardrailEngine {
                 kind: ClearedKind::ScheduleCancel { cancel_at_ms },
                 utilization: Utilization::none_with_global(global_tokens_remaining),
             },
-            state.policy_revision,
         ))
     }
 
@@ -1848,18 +2115,18 @@ impl GuardrailEngine {
         expires_after: Option<u64>,
         clock: impl Fn() -> u64,
     ) -> Result<(ExchangeRequest, Clearance), SignClearedError> {
-        let (action, clearance, policy_revision) = cleared.into_parts();
+        let (action, clearance) = cleared.into_parts();
         let (key, wallet): (AgentKey, AgentWallet) =
             self.keys.load_agent_key_with_wallet(&clearance.agent)?;
         let actual_signer = key.address();
         let gate = PreSignGate {
             engine: self,
             clearance: &clearance,
-            policy_revision,
             clock: &clock,
             observed_at_ms: std::cell::Cell::new(None),
             actual_signer,
             wallet,
+            held_state: std::cell::RefCell::new(None),
             held_authority: std::cell::RefCell::new(None),
         };
         let signed = ExchangeRequest::sign_checked(
@@ -1877,6 +2144,14 @@ impl GuardrailEngine {
         drop(gate);
         let request = signed.map_err(|e| match e {
             SignError::Refused(refusal) => {
+                if matches!(
+                    &refusal,
+                    Refusal::Unevaluable(
+                        Unevaluable::PolicyAuthority { .. } | Unevaluable::PolicyChanged
+                    )
+                ) {
+                    self.state().inhibit();
+                }
                 self.record_pre_sign_refusal(
                     &clearance.agent,
                     observed_at_ms.unwrap_or_else(&clock),
@@ -1974,11 +2249,12 @@ struct PreSignGate<'a> {
     /// The evaluation that authorises this signature, and the only place the
     /// gate reads an identity from.
     clearance: &'a Clearance,
-    policy_revision: u64,
     clock: &'a dyn Fn() -> u64,
     observed_at_ms: std::cell::Cell<Option<u64>>,
     actual_signer: Address,
     wallet: AgentWallet,
+    // Declaration order releases state before the enclosing ledger authority.
+    held_state: std::cell::RefCell<Option<MutexGuard<'a, EngineState>>>,
     held_authority: std::cell::RefCell<Option<Box<dyn SigningPermit + 'a>>>,
 }
 
@@ -1998,12 +2274,6 @@ impl PreSignCheck for PreSignGate<'_> {
             .into());
         }
         let agent = &self.clearance.agent;
-        if engine.guardrails(agent).is_none() {
-            return Err(Unevaluable::UnknownAgent {
-                agent: agent.clone(),
-            }
-            .into());
-        }
         validate_route(&self.clearance.route, agent, self.clearance.network)?;
         if self.clearance.vault_address != self.clearance.route.binding.vault_address
             || request.vault_address != self.clearance.vault_address
@@ -2023,21 +2293,23 @@ impl PreSignCheck for PreSignGate<'_> {
         // Sample only after every potentially blocking admission dependency.
         let now_ms = (self.clock)();
         self.observed_at_ms.set(Some(now_ms));
-        let Some(config) = state.guardrails.get(agent) else {
-            return Err(Unevaluable::UnknownAgent {
-                agent: agent.clone(),
-            }
-            .into());
-        };
         // Exhaustive on purpose, and `ClearedKind` is `#[non_exhaustive]`
         // only outside this crate: a new kind cannot be added without an
         // answer here to "what does this clearance's age make untrue?".
         match &self.clearance.kind {
             ClearedKind::Order { .. } => {
                 check_order_approval_window(&self.clearance.route, now_ms)?;
-                if self.policy_revision != state.policy_revision {
+                if self.clearance.policy_revision != state.policy_revision {
                     return Err(Unevaluable::PolicyChanged.into());
                 }
+                state.check_acknowledgment()?;
+                let config =
+                    state
+                        .guardrails
+                        .get(agent)
+                        .ok_or_else(|| Unevaluable::UnknownAgent {
+                            agent: agent.clone(),
+                        })?;
                 let evaluated_at_ms = self.clearance.evaluated_at_ms;
                 if now_ms < evaluated_at_ms {
                     return Err(Unevaluable::ClockWentBackwards {
@@ -2066,16 +2338,16 @@ impl PreSignCheck for PreSignGate<'_> {
             }
             ClearedKind::Cancel { .. } | ClearedKind::ScheduleCancel { cancel_at_ms: None } => {}
         }
-        if is_risk_reducing(request.action) {
-            return Ok(());
-        }
-        if let Some((scope, engagement)) = state.kill.blocking(agent) {
+        if !is_risk_reducing(request.action)
+            && let Some((scope, engagement)) = state.effective_kill().blocking(agent)
+        {
             return Err(Refusal::TradingPaused {
                 scope,
                 since_ms: engagement.engaged_at_ms,
                 reason: engagement.reason.clone(),
             });
         }
+        *self.held_state.borrow_mut() = Some(state);
         Ok(())
     }
 }
@@ -2593,5 +2865,68 @@ fn bucket_refusal(error: BucketError, rate: OrderRate, now_ms: u64) -> Refusal {
             detail: "must be positive".to_owned(),
         }
         .into(),
+    }
+}
+
+#[cfg(test)]
+mod stop_generation_tests {
+    use super::*;
+
+    struct AuditOnly;
+
+    impl AuditSink for AuditOnly {
+        fn record(&self, _: &AuditEntry<'_>) -> Result<(), AuditError> {
+            Ok(())
+        }
+
+        fn route_for_agent(&self, _: &AgentId) -> Result<AuthorizedRoute, Refusal> {
+            Err(route_refusal("no signing authority in this fixture"))
+        }
+
+        fn before_sign(
+            &self,
+            _: &Clearance,
+            _: &AgentWallet,
+            _: Address,
+        ) -> Result<Box<dyn SigningPermit + '_>, Refusal> {
+            Err(route_refusal("no signing authority in this fixture"))
+        }
+    }
+
+    #[test]
+    fn saturated_stop_generation_never_wraps_or_accepts_acknowledgment() {
+        let engine = GuardrailEngine::from_parts(
+            Arc::new(super::super::store::MemoryStore::new()),
+            Arc::new(AuditOnly),
+            Arc::new(crate::keys::MemoryKeyStore::new(Network::Testnet)),
+            Network::Testnet,
+        )
+        .unwrap();
+        engine.state().stop_generation = u64::MAX - 1;
+        let reviewed = engine.policy_observation().unwrap();
+        engine.operator_acknowledge_policy(reviewed, 1).unwrap();
+        assert!(!engine.policy_status().admission_inhibited);
+
+        {
+            let mut state = engine.state();
+            state.inhibit();
+            assert_eq!(state.stop_generation, u64::MAX);
+            assert!(state.acknowledged.is_none());
+            state.inhibit();
+            assert_eq!(state.stop_generation, u64::MAX);
+        }
+
+        let matching = engine.policy_observation().unwrap();
+        assert_eq!(matching.revision, reviewed.revision);
+        assert_eq!(matching.stop_generation, u64::MAX);
+        assert!(matches!(
+            engine.operator_acknowledge_policy(matching, 2),
+            Err(GuardrailError::Policy { .. })
+        ));
+        let status = engine.policy_status();
+        assert_eq!(status.stop_generation, u64::MAX);
+        assert!(status.acknowledgment.is_none());
+        assert!(status.admission_inhibited);
+        assert!(engine.cancellation_needed(&AgentId::new("alpha")));
     }
 }

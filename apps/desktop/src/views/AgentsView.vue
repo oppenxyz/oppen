@@ -6,7 +6,7 @@ import PanelHousing from "../components/housing/PanelHousing.vue";
 import ReadoutRows from "../components/housing/ReadoutRows.vue";
 import UiButton from "../components/ui/UiButton.vue";
 import { decimal } from "../lib/display";
-import { events, operator, recordedAgents, storedPolicy, refreshOperator } from "../stores/operator";
+import { events, operator, recordedAgents, storedPolicy, policySourceLabel, refreshOperator } from "../stores/operator";
 import { setView } from "../stores/shell";
 
 const selected = ref("");
@@ -52,6 +52,7 @@ const policyRows = computed(() => policy.value ? [
         </PanelHousing>
         <div class="agents__side">
           <PanelHousing inset label="Stored policy">
+            <p class="agents__note" role="status">{{ policySourceLabel }}<span v-if="operator.policy?.revision != null"> · Revision {{ operator.policy.revision }}</span></p>
             <ReadoutRows v-if="policy" :rows="policyRows" />
             <EmptyState v-else line="No policy read for this agent." />
             <p class="agents__note">{{ operator.policyReadMs ? `Read ${new Date(operator.policyReadMs).toLocaleTimeString()}` : 'Not read' }} · editing requires the live operator connection.</p>

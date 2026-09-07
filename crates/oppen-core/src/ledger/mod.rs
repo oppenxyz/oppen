@@ -55,6 +55,7 @@ mod export;
 mod hash;
 mod pairing;
 mod pilot;
+mod policy;
 mod registry;
 mod schema;
 mod submission;
@@ -78,6 +79,7 @@ use serde_json::Value;
 pub use anchor::{Anchor, FileAnchor, HeadAnchor};
 pub use pairing::{PairingBinding, PairingError, PairingId, PairingJournal, PairingRecord};
 pub use pilot::{PilotAccounting, PilotError, PilotJournal, PilotState, PilotStatus, PilotStop};
+pub use policy::{PolicyError, PolicyJournal, PolicyVersion};
 pub use registry::{AuthorizedRoute, RegistryBinding, RegistryError, RegistryJournal};
 pub use submission::{
     SubmissionError, SubmissionJournal, SubmissionReceipt, SubmissionResolution, SubmissionState,
@@ -214,6 +216,8 @@ pub enum LedgerError {
     UsePairingJournal,
     #[error("registry authority events must use RegistryJournal")]
     UseRegistryJournal,
+    #[error("policy authority events must use PolicyJournal")]
+    UsePolicyJournal,
     #[error("ledger has an unfinished transaction; reopen required")]
     UnfinishedTransaction,
     #[error("pilot accounting failed: {detail}")]
@@ -324,6 +328,10 @@ pub enum EventKind {
     RegistryGranted,
     /// Authenticated retirement of an earlier registry grant.
     RegistryRetired,
+    /// Explicit, paused initialization of complete policy authority.
+    PolicyInitialized,
+    /// Authenticated replacement of the complete policy snapshot.
+    PolicyReplaced,
     /// Something the human did: a manual ticket, a flatten, a setting change.
     OperatorAction,
     /// An approval-mode proposal was approved, rejected or expired
@@ -366,6 +374,8 @@ impl EventKind {
             EventKind::PairingRevoked => "pairing_revoked",
             EventKind::RegistryGranted => "registry_granted",
             EventKind::RegistryRetired => "registry_retired",
+            EventKind::PolicyInitialized => "policy_initialized",
+            EventKind::PolicyReplaced => "policy_replaced",
             EventKind::OperatorAction => "operator_action",
             EventKind::ApprovalDecision => "approval_decision",
             EventKind::KillSwitchChanged => "kill_switch_changed",
@@ -397,6 +407,8 @@ impl std::str::FromStr for EventKind {
             "pairing_revoked" => Ok(EventKind::PairingRevoked),
             "registry_granted" => Ok(EventKind::RegistryGranted),
             "registry_retired" => Ok(EventKind::RegistryRetired),
+            "policy_initialized" => Ok(EventKind::PolicyInitialized),
+            "policy_replaced" => Ok(EventKind::PolicyReplaced),
             "operator_action" => Ok(EventKind::OperatorAction),
             "approval_decision" => Ok(EventKind::ApprovalDecision),
             "kill_switch_changed" => Ok(EventKind::KillSwitchChanged),
@@ -923,6 +935,9 @@ impl Ledger {
             EventKind::RegistryGranted | EventKind::RegistryRetired => {
                 Err(LedgerError::UseRegistryJournal)
             }
+            EventKind::PolicyInitialized | EventKind::PolicyReplaced => {
+                Err(LedgerError::UsePolicyJournal)
+            }
             _ => Ok(()),
         }
     }
@@ -1277,7 +1292,7 @@ impl Ledger {
         let mut statement = guard.prepare(&format!(
             "SELECT {SELECT_EVENT_COLUMNS} FROM events WHERE seq > ?1{} ORDER BY seq ASC LIMIT ?2",
             match scope {
-                Some(_) => " AND (agent_id = ?3 OR agent_id IS NULL) AND kind NOT IN ('pairing_issued', 'pairing_revoked', 'registry_granted', 'registry_retired')",
+                Some(_) => " AND (agent_id = ?3 OR agent_id IS NULL) AND kind NOT IN ('pairing_issued', 'pairing_revoked', 'registry_granted', 'registry_retired', 'policy_initialized', 'policy_replaced')",
                 None => "",
             }
         ))?;
@@ -1904,6 +1919,8 @@ impl AgentView {
                     | EventKind::PairingRevoked
                     | EventKind::RegistryGranted
                     | EventKind::RegistryRetired
+                    | EventKind::PolicyInitialized
+                    | EventKind::PolicyReplaced
             ) && event
                 .agent_id
                 .as_ref()
@@ -2337,13 +2354,13 @@ fn sub_account_from_row(row: &Row<'_>) -> Result<SubAccount> {
 /// - a refusal is [`EventKind::Refusal`], which `docs/decisions.md` D-c
 ///   requires in the record because the refusal is the onboarding;
 /// - an operator mutation is [`EventKind::OperatorAction`].
-pub struct LedgerAuditSink {
-    registry: RegistryJournal,
+pub(crate) struct LedgerAuditSink {
+    policy: Arc<PolicyJournal>,
 }
 
 impl LedgerAuditSink {
-    pub fn new(registry: RegistryJournal) -> Self {
-        Self { registry }
+    pub(crate) fn new(policy: Arc<PolicyJournal>) -> Self {
+        Self { policy }
     }
 }
 
@@ -2358,12 +2375,15 @@ impl crate::guardrail::AuditSink for LedgerAuditSink {
         &self,
         agent: &crate::guardrail::AgentId,
     ) -> std::result::Result<AuthorizedRoute, crate::guardrail::Refusal> {
-        self.registry.route_for_agent(agent).map_err(|error| {
-            crate::guardrail::Unevaluable::RouteAuthority {
-                detail: error.to_string(),
-            }
-            .into()
-        })
+        self.policy
+            .registry()
+            .route_for_agent(agent)
+            .map_err(|error| {
+                crate::guardrail::Unevaluable::RouteAuthority {
+                    detail: error.to_string(),
+                }
+                .into()
+            })
     }
 
     fn before_sign(
@@ -2373,7 +2393,8 @@ impl crate::guardrail::AuditSink for LedgerAuditSink {
         actual_signer: oppen_hl::Address,
     ) -> std::result::Result<Box<dyn crate::guardrail::SigningPermit + '_>, crate::guardrail::Refusal>
     {
-        let ledger = self.registry.ledger();
+        let registry = self.policy.registry();
+        let ledger = registry.ledger();
         let permit = ledger
             .lock()
             .and_then(LedgerSigningPermit::new)
@@ -2393,13 +2414,36 @@ impl crate::guardrail::AuditSink for LedgerAuditSink {
             }
             .into());
         }
-        self.registry
+        registry
             .verify_route_in(&permit, &clearance.route, actual_signer)
             .map_err(|error| {
                 crate::guardrail::Refusal::from(crate::guardrail::Unevaluable::RouteAuthority {
                     detail: error.to_string(),
                 })
             })?;
+        if matches!(clearance.kind, crate::guardrail::ClearedKind::Order { .. }) {
+            let policy = self.policy.current_in(&permit).map_err(|error| {
+                crate::guardrail::Refusal::from(crate::guardrail::Unevaluable::PolicyAuthority {
+                    detail: error.to_string(),
+                })
+            })?;
+            if policy.revision != clearance.policy_revision {
+                return Err(crate::guardrail::Unevaluable::PolicyChanged.into());
+            }
+            if !policy.state.guardrails.contains_key(&clearance.agent) {
+                return Err(crate::guardrail::Unevaluable::UnknownAgent {
+                    agent: clearance.agent.clone(),
+                }
+                .into());
+            }
+            if let Some((scope, engagement)) = policy.state.kill.blocking(&clearance.agent) {
+                return Err(crate::guardrail::Refusal::TradingPaused {
+                    scope,
+                    since_ms: engagement.engaged_at_ms,
+                    reason: engagement.reason.clone(),
+                });
+            }
+        }
         pilot::check_before_sign(ledger, &permit, clearance).map_err(PilotError::into_refusal)?;
         Ok(Box::new(permit))
     }
@@ -2450,7 +2494,8 @@ impl crate::guardrail::AuditSink for LedgerAuditSink {
             && matches!(clearance.kind, ClearedKind::Order { .. })
         {
             return self
-                .registry
+                .policy
+                .registry()
                 .ledger()
                 .record_intent(&NewIntent {
                     agent_id: clearance.agent.as_str(),
@@ -2464,7 +2509,8 @@ impl crate::guardrail::AuditSink for LedgerAuditSink {
                 });
         }
 
-        self.registry
+        self.policy
+            .registry()
             .ledger()
             .append(&NewEvent {
                 kind,

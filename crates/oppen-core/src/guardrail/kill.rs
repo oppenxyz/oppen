@@ -126,7 +126,7 @@ impl KillSwitch {
     /// Global is checked first because it is the broader statement: an
     /// operator who stopped everything should see that reason in the
     /// refusal, not whichever per-agent trip happened to be older.
-    pub(super) fn blocking(&self, agent: &AgentId) -> Option<(KillScope, &Engagement)> {
+    pub(crate) fn blocking(&self, agent: &AgentId) -> Option<(KillScope, &Engagement)> {
         if let Some(engagement) = &self.global {
             return Some((KillScope::Global, engagement));
         }
@@ -146,14 +146,8 @@ impl KillSwitch {
         }
     }
 
-    /// The global engagement, if any. Test-only, like
-    /// [`KillSwitch::is_engaged`] and for the same reason: the engine asks
-    /// [`KillSwitch::blocking`] for an agent, and a console reads the
-    /// serialized switch out of `get_state`. The pre-sign gate used to call
-    /// this for a clearance that named no agent; under D1 every clearance
-    /// names one, so nothing outside the tests needs it.
-    #[cfg(test)]
-    pub(super) fn global(&self) -> Option<&Engagement> {
+    /// Policy initialization requires an explicit global engagement.
+    pub(crate) fn global(&self) -> Option<&Engagement> {
         self.global.as_ref()
     }
 
