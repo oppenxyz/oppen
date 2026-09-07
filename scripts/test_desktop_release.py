@@ -23,3 +23,42 @@ class ReleaseTests(unittest.TestCase):
                 release.metadata("0.1.123", invalid, "signature")
         with self.assertRaises(ValueError):
             release.metadata("0.1.123", url, "")
+
+    def test_draft_assets_use_cli_lookup_and_publish_only_after_manifest_upload(self):
+        import json
+        import os
+        import plistlib
+        import tempfile
+        from unittest.mock import patch
+        from subprocess import CalledProcessError
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bundle = root / 'target/aarch64-apple-darwin/release/bundle/macos'
+            (bundle / 'oppen.app/Contents').mkdir(parents=True)
+            with (bundle / 'oppen.app/Contents/Info.plist').open('wb') as output:
+                plistlib.dump({'CFBundleShortVersionString': '0.1.114'}, output)
+            (bundle / 'oppen.app.tar.gz').write_bytes(b'signed archive fixture')
+            (bundle / 'oppen.app.tar.gz.sig').write_text('signature')
+            calls = []
+            fail_manifest = False
+            def github(*args):
+                calls.append(args)
+                if args[0] == 'api':
+                    self.assertNotIn('/tags/', args[1], 'drafts cannot be looked up through the tag API')
+                    return '[[]]'
+                if args[:2] == ('release', 'view'):
+                    return json.dumps({'assets': [{'name': 'oppen.app.tar.gz', 'apiUrl': 'https://api.github.com/repos/oppenxyz/oppen/releases/assets/42'}]})
+                if args[:2] == ('release', 'upload') and str(bundle / 'latest.json') in args:
+                    self.assertEqual(json.loads((bundle / 'latest.json').read_text())['version'], '0.1.114')
+                    if fail_manifest:
+                        raise CalledProcessError(1, 'upload')
+                return ''
+            with patch.object(release, 'ROOT', root), patch.object(release, 'gh', github), patch.object(release.subprocess, 'run'), patch.dict(os.environ, {'GITHUB_SHA': 'a' * 40}):
+                release.publish('114')
+                self.assertEqual(calls[-1][:2], ('release', 'edit'))
+                self.assertIn('--draft=false', calls[-1])
+                calls.clear()
+                fail_manifest = True
+                with self.assertRaises(CalledProcessError):
+                    release.publish('114')
+                self.assertFalse(any(call[:2] == ('release', 'edit') for call in calls))
