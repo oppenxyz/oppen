@@ -151,9 +151,16 @@ UPDATE events
 CREATE UNIQUE INDEX events_idem_key ON events (idem_key) WHERE idem_key IS NOT NULL;
 "#;
 
-/// Every migration in order. The index of a statement is the `user_version` it
-/// produces, so `MIGRATIONS.len()` is the version this build writes.
-const MIGRATIONS: &[&str] = &[V1, V2];
+// A version boundary is necessary even without a new table: older runtimes
+// must refuse a ledger whose durable reservations they cannot enforce.
+const V3: &str = r#"
+CREATE INDEX events_submission_account
+    ON events (json_extract(payload, '$.account'), seq)
+    WHERE kind IN ('submission_started', 'submission_resolved');
+"#;
+
+/// Every migration in order. `MIGRATIONS.len()` is the version this build writes.
+const MIGRATIONS: &[&str] = &[V1, V2, V3];
 
 /// Bring the database up to the schema this build expects.
 ///

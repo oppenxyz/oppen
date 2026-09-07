@@ -2260,7 +2260,8 @@ fn upgrading_keys_the_fills_already_in_the_chain() {
         let guard = ledger.connection.lock().expect("lock");
         guard
             .execute_batch(
-                "DROP INDEX events_idem_key; \
+                "DROP INDEX events_submission_account; \
+                 DROP INDEX events_idem_key; \
                  ALTER TABLE events DROP COLUMN idem_key; \
                  PRAGMA user_version = 1;",
             )
@@ -2299,4 +2300,36 @@ fn upgrading_keys_the_fills_already_in_the_chain() {
         );
     }
     assert_eq!(upgraded.get_events(0, 10).expect("page").events.len(), 2);
+}
+
+#[test]
+fn generic_writers_cannot_forge_submission_lifecycle_events() {
+    let dir = TempDir::new().expect("tempdir");
+    let ledger = open(&dir, Network::Testnet);
+    let receipt = ledger
+        .record_intent(&NewIntent {
+            agent_id: "alpha",
+            ts_ms: 1,
+            payload: &json!({}),
+            snapshot: None,
+        })
+        .expect("intent");
+    for kind in [EventKind::SubmissionStarted, EventKind::SubmissionResolved] {
+        let event = NewEvent {
+            kind,
+            ts_ms: 1,
+            agent_id: Some("alpha"),
+            payload: &json!({}),
+            snapshot: None,
+        };
+        assert!(matches!(
+            ledger.append(&event),
+            Err(LedgerError::UseSubmissionJournal)
+        ));
+        assert!(matches!(
+            ledger.record_outcome(&receipt, kind, 2, &json!({})),
+            Err(LedgerError::UseSubmissionJournal)
+        ));
+    }
+    assert_eq!(ledger.get_events(0, 10).expect("events").events.len(), 1);
 }

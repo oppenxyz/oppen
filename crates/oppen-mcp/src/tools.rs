@@ -24,7 +24,9 @@ use oppen_core::features::{
 use oppen_core::feed::FeedSession;
 use oppen_core::guardrail::{Cleared, FeedQuality, GuardrailEngine, MarketRef, OrderIntent};
 use oppen_core::journal::Journal;
-use oppen_core::ledger::EventViews;
+use oppen_core::ledger::{
+    EventViews, SubmissionError, SubmissionJournal, SubmissionReceipt, SubmissionResolution,
+};
 use oppen_core::state::{
     AccountState, VenueReadings, assemble, exposure_from, realized_pnl_since, utc_day_start_ms,
 };
@@ -63,9 +65,10 @@ pub struct Gateway {
 }
 
 struct GatewayInner {
-    // Shared by account across tokens and sessions. The pending cloid survives
-    // a dropped request, but this in-memory reservation does not survive restart.
-    execution: Mutex<HashMap<Address, Arc<tokio::sync::Mutex<Option<Cloid>>>>>,
+    // Serialize account reads within this gateway; the journal below retains
+    // unresolved submissions across gateways and process restarts.
+    execution: Mutex<HashMap<Address, Arc<tokio::sync::Mutex<()>>>>,
+    submissions: SubmissionJournal,
     network: Network,
     info: InfoClient,
     /// The agent and account are **not** here. They come from the pairing
@@ -114,6 +117,12 @@ struct EvaluationContext {
     state: AccountState,
     exposure: oppen_core::guardrail::Exposure,
     market: MarketRef,
+}
+
+#[derive(Debug)]
+struct ExecutionPermit {
+    _queue: tokio::sync::OwnedMutexGuard<()>,
+    revision: u64,
 }
 
 struct CancelAllResult {
@@ -478,6 +487,7 @@ impl Gateway {
         Ok(Self {
             inner: Arc::new(GatewayInner {
                 execution: Mutex::new(HashMap::new()),
+                submissions: events.submissions(),
                 network,
                 info: InfoClient::new(network)?,
                 engine,
@@ -517,7 +527,7 @@ impl Gateway {
         self.inner.network
     }
 
-    fn execution_queue(&self, account: Address) -> Arc<tokio::sync::Mutex<Option<Cloid>>> {
+    fn execution_queue(&self, account: Address) -> Arc<tokio::sync::Mutex<()>> {
         self.inner
             .execution
             .lock()
@@ -527,17 +537,19 @@ impl Gateway {
             .clone()
     }
 
-    async fn reserve_submission(
-        &self,
-        bound: &Binding,
-    ) -> Result<tokio::sync::OwnedMutexGuard<Option<Cloid>>, ToolError> {
-        reserve_account(self.execution_queue(bound.account), |cloid| async move {
-            self.inner
-                .info
-                .order_status(bound.account, OrderRef::Cloid(cloid))
-                .await
-                .map_err(|e| ToolError::unavailable("submission reconciliation", e))
-        })
+    async fn reserve_submission(&self, bound: &Binding) -> Result<ExecutionPermit, ToolError> {
+        reserve_account(
+            self.execution_queue(bound.account),
+            &self.inner.submissions,
+            bound.account,
+            |cloid| async move {
+                self.inner
+                    .info
+                    .order_status(bound.account, OrderRef::Cloid(cloid))
+                    .await
+                    .map_err(|e| ToolError::unavailable("submission reconciliation", e))
+            },
+        )
         .await
     }
 
@@ -660,7 +672,7 @@ impl Gateway {
     ) -> Result<CallToolResult, ErrorData> {
         let inner = &self.inner;
         let bound = Self::bound(&ctx)?;
-        let mut pending = self.reserve_submission(&bound).await?;
+        let permit = self.reserve_submission(&bound).await?;
         let now_ms = now_ms();
 
         let context = self
@@ -760,7 +772,7 @@ impl Gateway {
         };
 
         let response = self
-            .submit(cleared, Some(&cloid), Some(&mut pending))
+            .submit(cleared, Some(&cloid), Some((&bound, &permit)))
             .await?;
         Ok(order_outcome(response, Some(cloid.as_str().to_owned()))?.into_result())
     }
@@ -992,7 +1004,7 @@ impl Gateway {
     ) -> Result<CallToolResult, ErrorData> {
         let inner = &self.inner;
         let bound = Self::bound(&ctx)?;
-        let mut pending = self.reserve_submission(&bound).await?;
+        let permit = self.reserve_submission(&bound).await?;
         let now_ms = now_ms();
 
         let context = self
@@ -1059,7 +1071,7 @@ impl Gateway {
 
         let cloid = intent.cloid.clone();
         let response = self
-            .submit(cleared, cloid.as_ref(), Some(&mut pending))
+            .submit(cleared, cloid.as_ref(), Some((&bound, &permit)))
             .await?;
         Ok(order_outcome(response, cloid.map(|c| c.as_str().to_owned()))?.into_result())
     }
@@ -1633,16 +1645,65 @@ impl Gateway {
         &self,
         cleared: Cleared,
         cloid: Option<&Cloid>,
-        pending: Option<&mut Option<Cloid>>,
+        submission: Option<(&Binding, &ExecutionPermit)>,
     ) -> Result<ExchangeResponse, ToolError> {
         let inner = &self.inner;
+        let receipt = if matches!(
+            cleared.clearance().kind,
+            oppen_core::guardrail::ClearedKind::Order { .. }
+        ) {
+            let (bound, permit) = submission.ok_or_else(|| {
+                ToolError::unavailable("submission ledger", "order has no account reservation")
+            })?;
+            if cleared.clearance().agent != bound.agent {
+                return Err(ToolError::unavailable(
+                    "submission ledger",
+                    "clearance and bound agent differ",
+                ));
+            }
+            Some(
+                inner
+                    .submissions
+                    .begin(
+                        bound.account,
+                        cleared.clearance(),
+                        permit.revision,
+                        now_ms(),
+                    )
+                    .map_err(submission_error)?,
+            )
+        } else {
+            None
+        };
         let nonce = inner.nonces.next();
-        let (request, _clearance) = inner
+        let signed = inner
             .engine
-            .sign_cleared(cleared, nonce, None, self::now_ms())
-            .map_err(|e| ToolError::unavailable("signer", e))?;
+            .sign_cleared(cleared, nonce, None, self::now_ms());
+        let (request, _clearance) = match signed {
+            Ok(signed) => signed,
+            Err(error) => {
+                if let Some(receipt) = &receipt {
+                    inner
+                        .submissions
+                        .resolve(
+                            receipt,
+                            SubmissionResolution::NotSent {
+                                detail: error.to_string(),
+                            },
+                            now_ms(),
+                        )
+                        .map_err(submission_error)?;
+                }
+                return Err(ToolError::unavailable("signer", error));
+            }
+        };
 
-        track_submission(cloid, pending, inner.exchange.post(&request)).await
+        track_submission(
+            cloid,
+            receipt.as_ref().map(|r| (&inner.submissions, r)),
+            inner.exchange.post(&request),
+        )
+        .await
     }
 
     /// Everything [`GuardrailEngine::evaluate`] needs, assembled once.
@@ -2009,31 +2070,50 @@ impl Gateway {
 
 async fn track_submission(
     cloid: Option<&Cloid>,
-    mut pending: Option<&mut Option<Cloid>>,
+    durable: Option<(&SubmissionJournal, &SubmissionReceipt)>,
     post: impl Future<Output = Result<ExchangeResponse, oppen_hl::Error>>,
 ) -> Result<ExchangeResponse, ToolError> {
-    if let Some(slot) = pending.as_mut() {
-        **slot = cloid.cloned();
-    }
-    let response = post.await.map_err(|e| match e {
-        oppen_hl::Error::ExchangeRejected { message } => {
-            if let Some(slot) = pending.as_mut() {
-                **slot = None;
+    let cloid = durable.map(|(_, receipt)| receipt.cloid()).or(cloid);
+    let response = match post.await {
+        Ok(response) => response,
+        Err(oppen_hl::Error::ExchangeRejected { message }) => {
+            if let Some((journal, receipt)) = durable {
+                journal
+                    .resolve(
+                        receipt,
+                        SubmissionResolution::Rejected {
+                            message: message.clone(),
+                        },
+                        now_ms(),
+                    )
+                    .map_err(submission_error)?;
             }
-            ToolError::venue(200, message)
+            return Err(ToolError::venue(200, message));
         }
-        oppen_hl::Error::Venue { status, message } => ToolError::venue(status, message),
-        transport => ToolError::TimeoutUnknownOutcome {
-            cloid: cloid.map(|c| c.as_str().to_owned()),
-            detail: transport.to_string(),
-        },
-    })?;
+        Err(oppen_hl::Error::Venue { status, message }) => {
+            return Err(ToolError::venue(status, message));
+        }
+        Err(transport) => {
+            return Err(ToolError::TimeoutUnknownOutcome {
+                cloid: cloid.map(|c| c.as_str().to_owned()),
+                detail: transport.to_string(),
+            });
+        }
+    };
     // Only a structured rejection proves that this request cannot fill.
     // Successful submissions remain reserved until a later status read,
     // followed by fresh account reads under the same container lock.
-    if matches!(response.statuses.as_slice(), [Status::Error(_)]) {
-        if let Some(slot) = pending {
-            *slot = None;
+    if let [Status::Error(message)] = response.statuses.as_slice() {
+        if let Some((journal, receipt)) = durable {
+            journal
+                .resolve(
+                    receipt,
+                    SubmissionResolution::Rejected {
+                        message: message.clone(),
+                    },
+                    now_ms(),
+                )
+                .map_err(submission_error)?;
         }
     }
     Ok(response)
@@ -2042,24 +2122,58 @@ async fn track_submission(
 // Return the account lock only after the previous submission is visible at the
 // venue. Callers then refresh exposure and keep this lock through submission.
 async fn reserve_account<F, Fut>(
-    queue: Arc<tokio::sync::Mutex<Option<Cloid>>>,
+    queue: Arc<tokio::sync::Mutex<()>>,
+    journal: &SubmissionJournal,
+    account: Address,
     lookup: F,
-) -> Result<tokio::sync::OwnedMutexGuard<Option<Cloid>>, ToolError>
+) -> Result<ExecutionPermit, ToolError>
 where
     F: FnOnce(Cloid) -> Fut,
     Fut: Future<Output = Result<OrderStatusResponse, ToolError>>,
 {
-    let mut pending = queue.lock_owned().await;
-    if let Some(cloid) = pending.as_ref() {
-        match lookup(cloid.clone()).await? {
-            OrderStatusResponse::Order { .. } => *pending = None,
+    let held = queue.lock_owned().await;
+    let mut state = journal.state(account).map_err(submission_error)?;
+    if let Some(receipt) = state.pending.as_ref() {
+        match lookup(receipt.cloid().clone()).await? {
+            OrderStatusResponse::Order { order } => {
+                if order.order.cloid.as_ref().is_some_and(|cloid| cloid != receipt.cloid()) {
+                    return Err(ToolError::TimeoutUnknownOutcome {
+                        cloid: Some(receipt.cloid().as_str().to_owned()),
+                        detail: "venue returned a different cloid; reservation retained".into(),
+                    });
+                }
+                journal.resolve(receipt, SubmissionResolution::Observed { oid: order.order.oid, status: order.status }, now_ms()).map_err(submission_error)?;
+                state = journal.state(account).map_err(submission_error)?;
+            }
             OrderStatusResponse::UnknownOid => return Err(ToolError::TimeoutUnknownOutcome {
-                cloid: Some(cloid.as_str().to_owned()),
+                cloid: Some(receipt.cloid().as_str().to_owned()),
                 detail: "previous submission is not confirmed by the venue; this container remains reserved".into(),
             }),
         }
     }
-    Ok(pending)
+    if let Some(pending) = state.pending {
+        return Err(ToolError::TimeoutUnknownOutcome {
+            cloid: Some(pending.cloid().as_str().to_owned()),
+            detail: "another gateway reserved this account during reconciliation".into(),
+        });
+    }
+    Ok(ExecutionPermit {
+        _queue: held,
+        revision: state.revision,
+    })
+}
+
+fn submission_error(error: SubmissionError) -> ToolError {
+    match error {
+        SubmissionError::Busy { cloid } => ToolError::TimeoutUnknownOutcome {
+            cloid: Some(cloid),
+            detail: "this account already has an unresolved durable submission".into(),
+        },
+        SubmissionError::DuplicateCloid => {
+            ToolError::invalid("cloid", "already submitted; reconcile the original request")
+        }
+        other => ToolError::unavailable("submission ledger", other),
+    }
 }
 
 /// Map an order response onto item 19's synchronous result.
@@ -2472,7 +2586,6 @@ mod tests {
     /// than only over a live socket.
     fn gateway_over(events: &[(Option<&str>, &str)]) -> Gateway {
         use oppen_core::guardrail::{GuardrailEngine, SqliteGuardrailStore};
-        use oppen_core::keys::KeychainKeyStore;
         use oppen_core::ledger::{EventKind, Ledger, LedgerAuditSink, NewEvent};
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2498,7 +2611,7 @@ mod tests {
                     SqliteGuardrailStore::open(dir.path().join("guardrails.db")).expect("store"),
                 ),
                 std::sync::Arc::new(LedgerAuditSink::new(ledger.clone())),
-                std::sync::Arc::new(KeychainKeyStore::new(Network::Testnet)),
+                std::sync::Arc::new(NoKeys),
                 Network::Testnet,
             )
             .expect("engine"),
@@ -2521,6 +2634,33 @@ mod tests {
         .expect("gateway")
     }
 
+    struct NoKeys;
+
+    impl oppen_core::keys::KeyStore for NoKeys {
+        fn network(&self) -> Network {
+            Network::Testnet
+        }
+        fn read(
+            &self,
+            _: &oppen_core::keys::EntryName,
+        ) -> Result<Option<oppen_core::keys::SecretText>, oppen_core::keys::KeyStoreError> {
+            Ok(None)
+        }
+        fn write(
+            &self,
+            _: &oppen_core::keys::EntryName,
+            _: &str,
+        ) -> Result<(), oppen_core::keys::KeyStoreError> {
+            panic!("submission tests must never write credentials")
+        }
+        fn remove(
+            &self,
+            _: &oppen_core::keys::EntryName,
+        ) -> Result<(), oppen_core::keys::KeyStoreError> {
+            panic!("submission tests must never delete credentials")
+        }
+    }
+
     /// The binding the door would have injected for `agent`.
     fn binding_for(agent: &str) -> Binding {
         Binding {
@@ -2529,6 +2669,249 @@ mod tests {
                 .parse()
                 .expect("address"),
         }
+    }
+
+    fn cleared_test_order(gateway: &Gateway, bound: &Binding, cloid: Cloid) -> Cleared {
+        use oppen_core::guardrail::{AccountSnapshot, Exposure, RestingExposure};
+        let at = now_ms();
+        let mut config = gateway
+            .inner
+            .engine
+            .register_agent(&bound.agent, None, at)
+            .expect("register");
+        config.symbols.insert("TEST".into());
+        config.approval_required = false;
+        gateway
+            .inner
+            .engine
+            .operator_set_guardrails(&bound.agent, config, at)
+            .expect("policy");
+        let intent = OrderIntent {
+            symbol: "TEST".into(),
+            is_buy: true,
+            px: d("100"),
+            sz: d("0.12"),
+            kind: OrderKind::Limit { tif: Tif::Gtc },
+            reduce_only: false,
+            cloid: Some(cloid),
+            grouping: Grouping::Na,
+            builder: None,
+            max_slippage_bps: None,
+            reason: "durable submission fixture".into(),
+        };
+        let market = MarketRef {
+            symbol: "TEST".into(),
+            reference_px: Some(d("100")),
+            as_of_ms: at,
+            quality: FeedQuality::Ok,
+            mark_divergence_bps: None,
+            mark_divergent_since_ms: None,
+            snapshot: None,
+            sigma_day: None,
+            vol_ratio: None,
+        };
+        let exposure = Exposure {
+            agent: AccountSnapshot {
+                as_of_ms: at,
+                reconciled: true,
+                equity_usd: d("1000"),
+                peak_equity_usd: d("1000"),
+                realized_pnl_today_usd: Decimal::ZERO,
+                unrealized_pnl_usd: Decimal::ZERO,
+                day_start_ms: utc_day_start_ms(at),
+                total_position_notional_usd: Decimal::ZERO,
+                positions: Default::default(),
+                resting: Some(RestingExposure::default()),
+            },
+            fleet: None,
+        };
+        gateway
+            .inner
+            .engine
+            .evaluate(
+                &bound.agent,
+                &intent,
+                &test_asset(2),
+                &market,
+                &exposure,
+                at,
+            )
+            .expect("evaluated and durably audited")
+    }
+
+    fn pending_fixture() -> (Gateway, Binding, SubmissionReceipt) {
+        let gateway = gateway_over(&[]);
+        let bound = binding_for("alpha");
+        let cleared = cleared_test_order(&gateway, &bound, a_cloid());
+        let journal = &gateway.inner.submissions;
+        let revision = journal.state(bound.account).expect("state").revision;
+        let receipt = journal
+            .begin(bound.account, cleared.clearance(), revision, now_ms())
+            .expect("durable start");
+        (gateway, bound, receipt)
+    }
+
+    #[tokio::test]
+    async fn a_fresh_gateway_recovers_the_previous_gateways_pending_submission() {
+        let (gateway, bound, receipt) = pending_fixture();
+        let fresh = Gateway::new(
+            Network::Testnet,
+            gateway.inner.engine.clone(),
+            gateway.inner.events.clone(),
+            gateway.inner.journal.clone(),
+            gateway.inner.feed.clone(),
+            gateway.inner.alerts.clone(),
+            gateway.inner.quotes.clone(),
+        )
+        .expect("fresh gateway");
+        assert!(!Arc::ptr_eq(
+            &gateway.execution_queue(bound.account),
+            &fresh.execution_queue(bound.account)
+        ));
+        drop(gateway);
+        let error = reserve_account(
+            fresh.execution_queue(bound.account),
+            &fresh.inner.submissions,
+            bound.account,
+            |_| async { Ok(OrderStatusResponse::UnknownOid) },
+        )
+        .await
+        .expect_err("restart must not clear an unknown submission");
+        assert!(
+            matches!(error, ToolError::TimeoutUnknownOutcome { cloid: Some(cloid), .. } if cloid == receipt.cloid().as_str())
+        );
+        assert_eq!(
+            fresh
+                .inner
+                .submissions
+                .state(bound.account)
+                .expect("state")
+                .pending,
+            Some(receipt)
+        );
+    }
+
+    #[tokio::test]
+    async fn an_order_cannot_reach_the_signer_without_an_account_permit() {
+        let gateway = gateway_over(&[]);
+        let bound = binding_for("alpha");
+        let cleared = cleared_test_order(&gateway, &bound, a_cloid());
+        let error = gateway
+            .submit(cleared, Some(&a_cloid()), None)
+            .await
+            .expect_err("no permit");
+        assert!(matches!(
+            error,
+            ToolError::Unavailable {
+                what: "submission ledger",
+                ..
+            }
+        ));
+        assert_eq!(
+            gateway
+                .inner
+                .submissions
+                .state(bound.account)
+                .expect("state")
+                .revision,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn a_signer_failure_durably_records_not_sent_and_prevents_cloid_reuse() {
+        let gateway = gateway_over(&[]);
+        let bound = binding_for("alpha");
+        let permit = reserve_account(
+            gateway.execution_queue(bound.account),
+            &gateway.inner.submissions,
+            bound.account,
+            |_| async { panic!("no earlier submission") },
+        )
+        .await
+        .expect("permit");
+        let cleared = cleared_test_order(&gateway, &bound, a_cloid());
+        let error = gateway
+            .submit(cleared, Some(&a_cloid()), Some((&bound, &permit)))
+            .await
+            .expect_err("test store has no key");
+        assert!(matches!(
+            error,
+            ToolError::Unavailable { what: "signer", .. }
+        ));
+        let state = gateway
+            .inner
+            .submissions
+            .state(bound.account)
+            .expect("state");
+        assert!(state.pending.is_none());
+        assert!(state.revision > 0);
+        let cleared = cleared_test_order(&gateway, &bound, a_cloid());
+        assert!(matches!(
+            gateway.inner.submissions.begin(
+                bound.account,
+                cleared.clearance(),
+                state.revision,
+                now_ms()
+            ),
+            Err(SubmissionError::DuplicateCloid)
+        ));
+        let events = gateway
+            .inner
+            .events
+            .for_agent(bound.agent.as_str())
+            .get_events(0, 100)
+            .expect("events");
+        assert!(events.events.iter().any(|event| {
+            event.kind == oppen_core::ledger::EventKind::SubmissionResolved
+                && event
+                    .payload
+                    .as_ref()
+                    .is_some_and(|payload| payload["outcome"]["resolution"] == "not_sent")
+        }));
+    }
+
+    #[tokio::test]
+    async fn a_stale_account_revision_refuses_before_signing() {
+        let gateway = gateway_over(&[]);
+        let bound = binding_for("alpha");
+        let permit = reserve_account(
+            gateway.execution_queue(bound.account),
+            &gateway.inner.submissions,
+            bound.account,
+            |_| async { panic!("no earlier submission") },
+        )
+        .await
+        .expect("permit");
+        let cleared = cleared_test_order(&gateway, &bound, a_cloid());
+        let receipt = gateway
+            .inner
+            .submissions
+            .begin(
+                bound.account,
+                cleared.clearance(),
+                permit.revision,
+                now_ms(),
+            )
+            .expect("another process submitted");
+        gateway
+            .inner
+            .submissions
+            .resolve(
+                &receipt,
+                SubmissionResolution::Rejected {
+                    message: "fixture".into(),
+                },
+                now_ms(),
+            )
+            .expect("other process resolved");
+        let error = gateway
+            .submit(cleared, Some(&a_cloid()), Some((&bound, &permit)))
+            .await
+            .expect_err("stale snapshot");
+        assert!(
+            matches!(error, ToolError::Unavailable { what: "submission ledger", detail } if detail.contains("revision"))
+        );
     }
 
     #[tokio::test]
@@ -2561,17 +2944,14 @@ mod tests {
 
     #[tokio::test]
     async fn a_dropped_submission_with_unknown_status_blocks_another_agent_order() {
-        let gateway = gateway_over(&[]);
-        let queue = gateway.execution_queue(binding_for("alpha").account);
+        let (gateway, bound, receipt) = pending_fixture();
+        let queue = gateway.execution_queue(bound.account);
         let submitted_queue = queue.clone();
+        let journal = gateway.inner.submissions.clone();
         let (sent, received) = tokio::sync::oneshot::channel();
         let request = tokio::spawn(async move {
-            let mut slot = reserve_account(submitted_queue, |_| async {
-                panic!("no pending submission")
-            })
-            .await
-            .expect("first reservation");
-            track_submission(Some(&a_cloid()), Some(&mut slot), async {
+            let _held = submitted_queue.lock_owned().await;
+            track_submission(Some(&a_cloid()), Some((&journal, &receipt)), async {
                 sent.send(()).expect("observer");
                 std::future::pending().await
             })
@@ -2581,11 +2961,17 @@ mod tests {
         received.await.expect("submission started");
         let next_queue = gateway.execution_queue(binding_for("beta").account);
         let waiting_queue = next_queue.clone();
+        let recovered_journal = gateway.inner.submissions.clone();
         let mut next_request = tokio::spawn(async move {
-            reserve_account(waiting_queue, |cloid| async move {
-                assert_eq!(cloid, a_cloid());
-                Ok(OrderStatusResponse::UnknownOid)
-            })
+            reserve_account(
+                waiting_queue,
+                &recovered_journal,
+                bound.account,
+                |cloid| async move {
+                    assert_eq!(cloid, a_cloid());
+                    Ok(OrderStatusResponse::UnknownOid)
+                },
+            )
             .await
         });
         assert!(
@@ -2605,18 +2991,41 @@ mod tests {
         assert_eq!(data["code"], "timeout_unknown_outcome");
         assert_eq!(data["cloid"], a_cloid().as_str());
         assert_eq!(data["retryable"], false);
-        assert_eq!(*queue.lock().await, Some(a_cloid()));
+        assert_eq!(
+            gateway
+                .inner
+                .submissions
+                .state(bound.account)
+                .expect("durable state")
+                .pending
+                .expect("still reserved")
+                .cloid(),
+            &a_cloid()
+        );
 
         // Dropping a reconciliation lookup cannot release the reservation either.
         assert!(
             tokio::time::timeout(
                 std::time::Duration::from_millis(20),
-                reserve_account(next_queue.clone(), |_| std::future::pending())
+                reserve_account(
+                    next_queue.clone(),
+                    &gateway.inner.submissions,
+                    bound.account,
+                    |_| std::future::pending()
+                )
             )
             .await
             .is_err()
         );
-        assert_eq!(*queue.lock().await, Some(a_cloid()));
+        assert!(
+            gateway
+                .inner
+                .submissions
+                .state(bound.account)
+                .expect("state")
+                .pending
+                .is_some()
+        );
         let known = serde_json::from_value(serde_json::json!({
             "status": "order", "order": {
                 "status": "filled", "statusTimestamp": 1,
@@ -2625,10 +3034,73 @@ mod tests {
             }
         }))
         .expect("known order");
-        let next = reserve_account(next_queue, |_| async { Ok(known) })
-            .await
-            .expect("confirmed submission releases next order");
-        assert!(next.is_none());
+        let next = reserve_account(
+            next_queue,
+            &gateway.inner.submissions,
+            bound.account,
+            |_| async { Ok(known) },
+        )
+        .await
+        .expect("confirmed submission releases next order");
+        assert!(
+            gateway
+                .inner
+                .submissions
+                .state(bound.account)
+                .expect("state")
+                .pending
+                .is_none()
+        );
+        assert!(next.revision > 0);
+    }
+
+    #[tokio::test]
+    async fn a_mismatched_venue_cloid_cannot_resolve_a_pending_submission() {
+        let (gateway, bound, receipt) = pending_fixture();
+        let other = "0x11111111111111111111111111111111";
+        assert_ne!(other, receipt.cloid().as_str());
+        let known = serde_json::from_value(serde_json::json!({
+            "status": "order", "order": {
+                "status": "filled", "statusTimestamp": 1,
+                "order": { "coin": "TEST", "side": "B", "limitPx": "100", "sz": "0", "oid": 1,
+                    "timestamp": 1, "origSz": "0.12", "cloid": other }
+            }
+        }))
+        .expect("order response");
+        let error = reserve_account(
+            gateway.execution_queue(bound.account),
+            &gateway.inner.submissions,
+            bound.account,
+            |_| async { Ok(known) },
+        )
+        .await
+        .expect_err("different cloid");
+        assert!(matches!(error, ToolError::TimeoutUnknownOutcome { .. }));
+        assert_eq!(
+            gateway
+                .inner
+                .submissions
+                .state(bound.account)
+                .expect("state")
+                .pending,
+            Some(receipt)
+        );
+    }
+
+    #[tokio::test]
+    async fn ambiguous_error_reports_the_durable_cloid_not_a_callers_other_id() {
+        let (gateway, _, receipt) = pending_fixture();
+        let other = Cloid::from_bytes([17u8; 16]);
+        let error = track_submission(
+            Some(&other),
+            Some((&gateway.inner.submissions, &receipt)),
+            async { Err(oppen_hl::Error::InvalidExchangeResponse("fixture".into())) },
+        )
+        .await
+        .expect_err("ambiguous");
+        assert!(
+            matches!(error, ToolError::TimeoutUnknownOutcome { cloid: Some(cloid), .. } if cloid == receipt.cloid().as_str())
+        );
     }
 
     #[tokio::test]
@@ -2639,39 +3111,64 @@ mod tests {
             (vec![Status::WaitingForTrigger], true),
             (vec![], true),
         ] {
-            let mut pending = None;
-            track_submission(Some(&a_cloid()), Some(&mut pending), async {
-                Ok(response(statuses))
-            })
+            let (gateway, bound, receipt) = pending_fixture();
+            track_submission(
+                Some(&a_cloid()),
+                Some((&gateway.inner.submissions, &receipt)),
+                async { Ok(response(statuses)) },
+            )
             .await
             .expect("structured response");
-            assert_eq!(pending, retained.then(a_cloid));
+            assert_eq!(
+                gateway
+                    .inner
+                    .submissions
+                    .state(bound.account)
+                    .expect("state")
+                    .pending
+                    .is_some(),
+                retained
+            );
         }
     }
 
     #[tokio::test]
     async fn a_top_level_exchange_rejection_releases_the_next_submission() {
-        let queue = Arc::new(tokio::sync::Mutex::new(None));
-        let mut slot = queue.clone().lock_owned().await;
-        let error = track_submission(Some(&a_cloid()), Some(&mut slot), async {
-            Err(oppen_hl::Error::ExchangeRejected {
-                message: "invalid nonce".into(),
-            })
-        })
+        let (gateway, bound, receipt) = pending_fixture();
+        let queue = gateway.execution_queue(bound.account);
+        let error = track_submission(
+            Some(&a_cloid()),
+            Some((&gateway.inner.submissions, &receipt)),
+            async {
+                Err(oppen_hl::Error::ExchangeRejected {
+                    message: "invalid nonce".into(),
+                })
+            },
+        )
         .await
         .expect_err("authoritative rejection");
         assert!(
             matches!(error, ToolError::VenueError { http_status: 200, venue_message }
             if venue_message == "invalid nonce")
         );
-        assert!(slot.is_none());
-        drop(slot);
-        let next = reserve_account(queue, |_| async {
-            panic!("a rejected request must not need order-status reconciliation")
-        })
+        assert!(
+            gateway
+                .inner
+                .submissions
+                .state(bound.account)
+                .expect("state")
+                .pending
+                .is_none()
+        );
+        let next = reserve_account(
+            queue,
+            &gateway.inner.submissions,
+            bound.account,
+            |_| async { panic!("a rejected request must not need order-status reconciliation") },
+        )
         .await
         .expect("next submission can proceed");
-        assert!(next.is_none());
+        assert!(next.revision > 0);
     }
 
     #[tokio::test]
@@ -2687,17 +3184,34 @@ mod tests {
             },
             oppen_hl::Error::InvalidExchangeResponse("truncated JSON".into()),
         ] {
-            let queue = Arc::new(tokio::sync::Mutex::new(None));
-            let mut slot = queue.clone().lock_owned().await;
+            let (gateway, bound, receipt) = pending_fixture();
+            let queue = gateway.execution_queue(bound.account);
             assert!(
-                track_submission(Some(&a_cloid()), Some(&mut slot), async { Err(error) })
-                    .await
-                    .is_err()
+                track_submission(
+                    Some(&a_cloid()),
+                    Some((&gateway.inner.submissions, &receipt)),
+                    async { Err(error) }
+                )
+                .await
+                .is_err()
             );
-            assert_eq!(*slot, Some(a_cloid()));
-            drop(slot);
+            assert!(
+                gateway
+                    .inner
+                    .submissions
+                    .state(bound.account)
+                    .expect("state")
+                    .pending
+                    .is_some()
+            );
             assert!(matches!(
-                reserve_account(queue, |_| async { Ok(OrderStatusResponse::UnknownOid) }).await,
+                reserve_account(
+                    queue,
+                    &gateway.inner.submissions,
+                    bound.account,
+                    |_| async { Ok(OrderStatusResponse::UnknownOid) }
+                )
+                .await,
                 Err(ToolError::TimeoutUnknownOutcome { .. })
             ));
         }
@@ -2713,10 +3227,12 @@ mod tests {
                 false,
             ),
         ] {
-            let mut pending = None;
-            let error = track_submission(Some(&a_cloid()), Some(&mut pending), async {
-                ExchangeResponse::parse(body)
-            })
+            let (gateway, bound, receipt) = pending_fixture();
+            let error = track_submission(
+                Some(&a_cloid()),
+                Some((&gateway.inner.submissions, &receipt)),
+                async { ExchangeResponse::parse(body) },
+            )
             .await
             .expect_err("rejected or malformed response");
             if rejected {
@@ -2727,13 +3243,29 @@ mod tests {
                         ..
                     }
                 ));
-                assert!(pending.is_none());
+                assert!(
+                    gateway
+                        .inner
+                        .submissions
+                        .state(bound.account)
+                        .expect("state")
+                        .pending
+                        .is_none()
+                );
             } else {
                 assert!(
                     matches!(error, ToolError::TimeoutUnknownOutcome { cloid: Some(cloid), .. }
                     if cloid == a_cloid().as_str())
                 );
-                assert_eq!(pending, Some(a_cloid()));
+                assert!(
+                    gateway
+                        .inner
+                        .submissions
+                        .state(bound.account)
+                        .expect("state")
+                        .pending
+                        .is_some()
+                );
             }
         }
     }
@@ -2841,11 +3373,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_still_paused_account_submits_cancellation_without_releasing_its_reservation() {
-        let gateway = gateway_over(&[]);
-        let bound = binding_for("alpha");
+        let (gateway, bound, receipt) = pending_fixture();
         pause(&gateway, &bound);
         let queue = gateway.execution_queue(bound.account);
-        *queue.lock().await = Some(a_cloid());
         let params = SymbolActionParams {
             symbol: None,
             reason: "pause sweep".into(),
@@ -2873,7 +3403,15 @@ mod tests {
             .await
             .expect("paused cancel");
         assert!(submitted && result.complete);
-        assert_eq!(*queue.lock().await, Some(a_cloid()));
+        assert_eq!(
+            gateway
+                .inner
+                .submissions
+                .state(bound.account)
+                .expect("state")
+                .pending,
+            Some(receipt)
+        );
         assert!(gateway.inner.engine.paused_agents().contains(&bound.agent));
     }
 

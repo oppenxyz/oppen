@@ -54,6 +54,7 @@ mod anchor;
 mod export;
 mod hash;
 mod schema;
+mod submission;
 mod verify;
 
 #[cfg(test)]
@@ -68,6 +69,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub use anchor::{Anchor, FileAnchor, HeadAnchor};
+pub use submission::{
+    SubmissionError, SubmissionJournal, SubmissionReceipt, SubmissionResolution, SubmissionState,
+};
 pub use verify::{BreakReason, ChainBreak, ChainReport};
 
 use crate::Network;
@@ -172,6 +176,8 @@ pub enum LedgerError {
     /// still free to use the generic path.
     #[error("append a fill with record_fill, so the venue's trade id keys the row")]
     UseRecordFill,
+    #[error("submission lifecycle events must use SubmissionJournal")]
+    UseSubmissionJournal,
     /// A [`EventKind::PayloadRedacted`] row was itself passed to
     /// [`Ledger::redact`]. Its payload is `{redacted_seq, reason}` — two
     /// operator-authored fields with no agent text in them, so there is no
@@ -262,6 +268,10 @@ pub enum EventKind {
     Fill,
     /// An order moved between resting, filled, cancelled or rejected.
     OrderStateChange,
+    /// A durable reservation written before signing and submission.
+    SubmissionStarted,
+    /// Authoritative evidence that a reservation is no longer in flight.
+    SubmissionResolved,
     /// Something the human did: a manual ticket, a flatten, a setting change.
     OperatorAction,
     /// An approval-mode proposal was approved, rejected or expired
@@ -296,6 +306,8 @@ impl EventKind {
             EventKind::Refusal => "refusal",
             EventKind::Fill => "fill",
             EventKind::OrderStateChange => "order_state_change",
+            EventKind::SubmissionStarted => "submission_started",
+            EventKind::SubmissionResolved => "submission_resolved",
             EventKind::OperatorAction => "operator_action",
             EventKind::ApprovalDecision => "approval_decision",
             EventKind::KillSwitchChanged => "kill_switch_changed",
@@ -319,6 +331,8 @@ impl std::str::FromStr for EventKind {
             "refusal" => Ok(EventKind::Refusal),
             "fill" => Ok(EventKind::Fill),
             "order_state_change" => Ok(EventKind::OrderStateChange),
+            "submission_started" => Ok(EventKind::SubmissionStarted),
+            "submission_resolved" => Ok(EventKind::SubmissionResolved),
             "operator_action" => Ok(EventKind::OperatorAction),
             "approval_decision" => Ok(EventKind::ApprovalDecision),
             "kill_switch_changed" => Ok(EventKind::KillSwitchChanged),
@@ -771,6 +785,9 @@ impl Ledger {
             EventKind::OrderIntent => Err(LedgerError::UseRecordIntent),
             EventKind::PayloadRedacted => Err(LedgerError::UseRedact),
             EventKind::Fill => Err(LedgerError::UseRecordFill),
+            EventKind::SubmissionStarted | EventKind::SubmissionResolved => {
+                Err(LedgerError::UseSubmissionJournal)
+            }
             _ => Ok(()),
         }
     }
@@ -1643,7 +1660,7 @@ impl AgentView {
     ///
     /// On the agent view rather than on [`EventViews`] so the scoping is
     /// structural: there is no argument here that could name another agent,
-    /// which is the same reason `EventViews` exposes one verb and not the
+    /// which is the same reason `EventViews` exposes narrow capabilities, not the
     /// `Arc<Ledger>` behind it.
     pub fn fills_between(&self, from_ms: i64, to_ms: i64) -> Result<Vec<Value>> {
         self.ledger.fills_for(&self.agent_id, from_ms, to_ms)
@@ -1655,13 +1672,13 @@ impl AgentView {
     }
 }
 
-/// Hands out one agent's [`AgentView`], and nothing else.
+/// Hands out agent views and the execution-only submission journal.
 ///
 /// `oppen-mcp` resolves the agent from the pairing token on every request
 /// (`docs/spec.md` item 15), so it needs to build a view *per call* rather than
 /// hold one — and the obvious way to do that, keeping an `Arc<Ledger>`, would
 /// put `redact` and `upsert_sub_account` back within reach of a tool. This owns
-/// the `Arc` privately and exposes exactly one verb, so `AGENTS.md` invariant 3
+/// the `Arc` privately without exposing operator mutations, so `AGENTS.md` invariant 3
 /// stays a compile error rather than a review note.
 #[derive(Debug, Clone)]
 pub struct EventViews(Arc<Ledger>);
@@ -1669,6 +1686,11 @@ pub struct EventViews(Arc<Ledger>);
 impl EventViews {
     pub fn new(ledger: Arc<Ledger>) -> Self {
         EventViews(ledger)
+    }
+
+    /// Execution-only capability: no registry, redaction or policy mutations.
+    pub fn submissions(&self) -> SubmissionJournal {
+        SubmissionJournal::new(self.0.clone())
     }
 
     /// The read-only slice belonging to `agent_id`.
