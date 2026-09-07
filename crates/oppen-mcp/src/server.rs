@@ -204,10 +204,10 @@ pub async fn serve(
     .with_graceful_shutdown(shutdown.clone().cancelled_owned())
     .await;
     shutdown.cancel();
-    if let Err(error) = enforcement.await {
-        if !error.is_cancelled() {
-            tracing::warn!(%error, "pause enforcement task failed");
-        }
+    if let Err(error) = enforcement.await
+        && !error.is_cancelled()
+    {
+        tracing::warn!(%error, "pause enforcement task failed");
     }
     execution.closed().await;
     result

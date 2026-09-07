@@ -11,8 +11,8 @@ execution path failed review despite its passing unit tests. Follow this order
 before expanding features:
 
 1. **Baseline:** repositories moved to `oppenxyz` with private visibility and
-   history preserved; local remotes updated. Corrected baseline `bb623d8` passes
-   every CI job in draft PR #40; the original `main` still needs that fix merged.
+   history preserved; local remotes updated. PR #40 merged as `df4fdbd` after
+   every CI job passed and a separate automated review found no blockers.
 2. **Guarded execution:** correct the production ledger adapter, independent
    buy/sell exposure, per-container submission serialization, signing-time policy
    checks, and cancellation delivery with retries. Local regressions now cover
@@ -22,9 +22,12 @@ before expanding features:
    remain open gates.
 3. **Operator supervision:** desktop MCP lifecycle, pairing/revocation, real
    positions and orders, policy editing, approval decisions, and a working halt.
-4. **Recovery:** durable unknown-submission reconciliation across restarts,
-   reconnect/sleep/network races, feature freshness, config HMAC, and confirmed
-   dead-man behavior. A timeout or missing order status is not permission to retry.
+4. **Recovery:** the durable submission journal now has SQLite reopen, independent
+   handle, stale-revision, corruption and dropped-request regressions. Starts and
+   resolutions use the existing hash chain; unknown outcomes still block after
+   restart. Complete exchange/restart reconciliation, reconnect/sleep/network
+   races, feature freshness, config HMAC, and confirmed dead-man behavior remain
+   gates. A timeout or missing order status is not permission to retry.
 5. **Release gate:** measured first-run onboarding and a small supervised testnet
    pilot. No live-trading readiness claim until these gates pass.
 
@@ -51,7 +54,7 @@ Status as of 2026-09-07: P0 and the P1 code are on `main`; the P1 gate is waitin
 - [x] Testnet-default `Network` type, every network constant selected by it [13, D4]
 - [x] Design system in `docs/design/`, ASCII primitives and the shared 90 ms motion clock in the app shell [36]
 - [x] Ink ladder raised so labels and rules clear WCAG AA
-- **Gate:** app launches; CI must be re-established on the corrected baseline.
+- **Gate:** app launches; organization CI restored and green in merged PR #40.
 
 ### P1 · Hyperliquid protocol crate — code merged, gate pending
 

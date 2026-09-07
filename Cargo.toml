@@ -15,7 +15,7 @@ edition = "2024"
 # The split and its reasoning are decisions L1 and L2 in docs/decisions.md.
 license = "Apache-2.0"
 repository = "https://github.com/oppenxyz/oppen"
-rust-version = "1.85"
+rust-version = "1.89"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
