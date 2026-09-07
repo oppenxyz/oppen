@@ -646,6 +646,7 @@ mod tests {
             mark_divergent_since_ms: None,
             snapshot: None,
             sigma_day: None,
+            vol_ratio: None,
         };
         let intent = OrderIntent {
             symbol: "BTC".into(),

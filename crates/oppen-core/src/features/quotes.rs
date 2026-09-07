@@ -42,15 +42,38 @@ pub const LEASE_TTL: Duration = Duration::from_secs(300);
 /// `micro_tilt_bps: null` and the lease stays, so the next call has it.
 pub const WARMUP_WAIT: Duration = Duration::from_millis(1_500);
 
-/// How long a symbol's daily σ is reused before it is measured again.
+/// How long a symbol's volatility reading is reused before it is measured
+/// again.
 ///
 /// σ over a day of hourly bars barely moves minute to minute, and the fetch
 /// behind it is 24 candles per symbol. Five minutes keeps `get_state` from
 /// paying for a fresh measurement on every call while staying far shorter than
 /// the window it describes.
+///
+/// [`Volatility::vol_ratio`] is the faster half and turns over about a
+/// twelfth of its bars in five minutes, so it does not inherit that argument
+/// — it inherits the TTL anyway, because it is cached in the same entry and
+/// the alternative is fetching both legs five times as often to sharpen a
+/// correction whose competition is a twenty-four-hour lag. Five minutes late
+/// is the residue; twenty-four hours late was the problem.
 pub const SIGMA_TTL: Duration = Duration::from_secs(300);
 
-/// Daily σ per symbol, as a fraction.
+/// What the guardrail path needs to know about how much a symbol moves.
+///
+/// The two halves are measured from the same pair of candle series in one
+/// pass, so they are cached together and can never describe different
+/// moments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Volatility {
+    /// Daily σ as a fraction of price — `0.04` is a coin that moves 4% a day.
+    pub sigma_day: Decimal,
+    /// The last hour's realised vol against what `sigma_day` implies for one
+    /// hour. `None` when the minute bars behind it were unavailable, which
+    /// leaves the guardrail's cap untightened rather than refused.
+    pub vol_ratio: Option<Decimal>,
+}
+
+/// Volatility per symbol.
 ///
 /// Separate from [`QuoteCache`] because it is a different lifecycle: a quote is
 /// worthless the moment it is stale and is pushed by a socket, while a σ is
@@ -58,7 +81,7 @@ pub const SIGMA_TTL: Duration = Duration::from_secs(300);
 /// this — a miss is a fetch by whoever asked.
 #[derive(Debug, Default)]
 pub struct SigmaCache {
-    inner: Mutex<BTreeMap<String, (Decimal, u64)>>,
+    inner: Mutex<BTreeMap<String, (Volatility, u64)>>,
 }
 
 impl SigmaCache {
@@ -66,23 +89,23 @@ impl SigmaCache {
         Self::default()
     }
 
-    /// The cached σ for `symbol`, or `None` when there is none or it is stale.
-    pub fn get(&self, symbol: &str, now_ms: u64) -> Option<Decimal> {
+    /// The cached reading for `symbol`, or `None` when there is none or it is
+    /// stale.
+    pub fn get(&self, symbol: &str, now_ms: u64) -> Option<Volatility> {
         let ttl_ms = SIGMA_TTL.as_millis() as u64;
         self.lock()
             .get(symbol)
             .filter(|(_, at)| now_ms.saturating_sub(*at) < ttl_ms)
-            .map(|(sigma, _)| *sigma)
+            .map(|(volatility, _)| *volatility)
     }
 
-    /// Record a freshly measured σ.
-    pub fn put(&self, symbol: &str, sigma_day_frac: Decimal, now_ms: u64) {
-        self.lock()
-            .insert(symbol.to_owned(), (sigma_day_frac, now_ms));
+    /// Record a freshly measured reading.
+    pub fn put(&self, symbol: &str, volatility: Volatility, now_ms: u64) {
+        self.lock().insert(symbol.to_owned(), (volatility, now_ms));
     }
 
     /// See [`QuoteCache::lock`] for why a poisoned lock is taken back.
-    fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, (Decimal, u64)>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, (Volatility, u64)>> {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
@@ -318,14 +341,37 @@ mod tests {
     fn a_sigma_is_reused_inside_its_ttl_and_refetched_after() {
         let cache = SigmaCache::new();
         let ttl = SIGMA_TTL.as_millis() as u64;
-        cache.put("BTC", Decimal::ONE, NOW);
+        let reading = Volatility {
+            sigma_day: Decimal::ONE,
+            vol_ratio: Some(Decimal::TWO),
+        };
+        cache.put("BTC", reading, NOW);
 
-        assert_eq!(cache.get("BTC", NOW + ttl - 1), Some(Decimal::ONE));
+        assert_eq!(cache.get("BTC", NOW + ttl - 1), Some(reading));
         assert_eq!(
             cache.get("BTC", NOW + ttl),
             None,
             "past the ttl the caller measures again"
         );
+    }
+
+    /// The two halves come from one measurement, so a cache that let them
+    /// expire apart could hand the guardrail an hour's ratio against a
+    /// different day's sigma.
+    #[test]
+    fn the_hour_and_the_day_expire_together() {
+        let cache = SigmaCache::new();
+        let ttl = SIGMA_TTL.as_millis() as u64;
+        cache.put(
+            "BTC",
+            Volatility {
+                sigma_day: Decimal::ONE,
+                vol_ratio: Some(Decimal::TWO),
+            },
+            NOW,
+        );
+
+        assert_eq!(cache.get("BTC", NOW + ttl), None);
     }
 
     #[test]

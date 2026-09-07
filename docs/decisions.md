@@ -11,6 +11,23 @@ decisions" section until then.
 
 ---
 
+## 2026-09-07 · The vol-scaled cap learns what the hour is doing
+
+#31 shipped `effective_cap = max_risk_usd / (2 · σ_day)` and named a caveat: σ
+could be up to five minutes stale, and the staleness runs the unsafe way. That
+caveat was true and it was also the smaller half. `σ_day` is measured over
+twenty-four hourly bars, so a market that started moving an hour ago has shifted
+it by one bar in twenty-four — the cap stays too wide for most of a day *with a
+freshly fetched σ*, cache or no cache. #28's `vol_ratio` is the measurement that
+notices, and this wires it in.
+
+| # | Decision | Choice | Why |
+|---|---|---|---|
+| B1 | How the hour reaches the cap | **A multiplier on σ, not a replacement for it** | The alternatives were to replace `σ_day` with the hour's own σ annualised, or to blend the two. Replacing throws away the statistic the cap is *denominated* in — an operator sets `max_risk_usd` thinking in days, and a cap driven by a sixty-bar window would swing by multiples between orders. Blending needs a weight nobody has a basis to choose (leanness rule 4). A multiplier keeps `σ_day` as the unit and makes the hour a correction to it, which is what it is. **What this gives up:** the correction is crude — a ratio of 3 tightens exactly 3×, with no damping, so a single violent minute inside the hour moves the cap as much as a sustained hour would. |
+| B2 | Where the multiply happens | **In the engine, from two carried inputs** | The gateway could have handed over a pre-scaled σ and kept the engine untouched. It would have been fewer lines and it breaks two things. N3's replay rule says an evaluation is a pure function of its recorded inputs; a pre-scaled σ records one number where two were measured, so a ledger row could no longer be re-derived into the refusal that produced it. And the refusal could then only report the product, which B3 is about. The engine measuring nothing is the invariant, not the engine computing nothing — the multiply is arithmetic on inputs it was handed. |
+| B3 | What the refusal reports | **`sigma_day_pct` and `vol_scale` as separate fields** | Folded together, a refusal would tell an agent its cap reflects 6% daily volatility on a coin that moves 2% a day and happens to be busy. That is a false statement about the asset, and invariant 8's "every rejection typed" is worth nothing if the type carries a number that misleads. Separated, the two facts prescribe different actions: 6% daily volatility is the asset and will be true tomorrow, so trade something calmer or ask for more budget; `vol_scale: 3` is this hour and will likely be gone in the next, so wait. |
+| B4 | What an unmeasured ratio does | **Floors at one — the day's cap, not a refusal** | N5 refuses on a missing σ because the cap then has no denominator: it cannot be computed at all, so a configured cap would go unenforced. That reasoning does not transfer. Here the cap computes exactly as it did before this change; only its *tightening* is missing. Refusing every order because a minute-candle fetch failed would make the feature strictly more fragile than the one it corrects, for a correction that is itself an improvement on nothing. The same floor catches a ratio *below* one, which is the sharper case: honouring a quiet hour would **widen** a guardrail on the strength of a sixty-bar sample, and a cap should never be loosened by a statistic noisier than the one it is correcting. **What this gives up:** a bounded version of #31's caveat survives — when the minute bars are unavailable the cap is the unscaled one, and the reading is cached for up to `SIGMA_TTL`, so a spike can go uncorrected for five minutes. Five minutes late replaced most of a day late; it is not zero. |
+
 ## 2026-09-07 · Market data into the console
 
 The console had one Tauri command against seventeen gateway tools, and four of

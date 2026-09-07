@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use oppen_core::alert::{AlertStore, Condition, Direction};
 use oppen_core::book;
-use oppen_core::features::quotes::{QuoteCache, SigmaCache};
+use oppen_core::features::quotes::{QuoteCache, SigmaCache, Volatility};
 use oppen_core::features::{
     BPS_PER_UNIT, book_features, funding_features, margin_runway_h, position_risk, vol_features,
 };
@@ -1531,12 +1531,12 @@ impl Gateway {
         // whose caps depend on it. The engine refuses rather than sizing
         // against a `None`, so a fetch that fails is a refusal and never a
         // silently unenforced cap.
-        let sigma_day = match inner
+        let volatility = match inner
             .engine
             .guardrails(&bound.agent)
             .and_then(|config| config.risk.max_risk_usd)
         {
-            Some(_) => self.daily_sigma(symbol, now_ms).await,
+            Some(_) => self.volatility(symbol, now_ms).await,
             None => None,
         };
         let market = MarketRef {
@@ -1547,7 +1547,8 @@ impl Gateway {
             mark_divergence_bps: None,
             mark_divergent_since_ms: None,
             snapshot: None,
-            sigma_day,
+            sigma_day: volatility.map(|v| v.sigma_day),
+            vol_ratio: volatility.and_then(|v| v.vol_ratio),
         };
 
         Ok(EvaluationContext {
@@ -1627,7 +1628,16 @@ impl Gateway {
 
         let mut total_carry = Decimal::ZERO;
         for position in &mut state.positions {
-            let sigma = self.daily_sigma(&position.symbol, now_ms).await;
+            // The *measured* daily sigma, not the hour-corrected one: this
+            // answers "how many ordinary days of movement to liquidation",
+            // and tightening it by a live regime would make the distance
+            // shrink for a reason that has nothing to do with the position.
+            // The correction belongs to the cap, which is a limit; this is a
+            // description.
+            let sigma = self
+                .volatility(&position.symbol, now_ms)
+                .await
+                .map(|volatility| volatility.sigma_day);
             let mark = marks.get(&position.symbol);
             let risk = position_risk(
                 position.size,
@@ -1706,26 +1716,57 @@ impl Gateway {
     }
 
     /// One symbol's daily σ as a fraction, measured at most once per TTL.
-    async fn daily_sigma(&self, symbol: &str, now_ms: u64) -> Option<Decimal> {
-        if let Some(sigma) = self.inner.sigmas.get(symbol, now_ms) {
-            return Some(sigma);
+    async fn volatility(&self, symbol: &str, now_ms: u64) -> Option<Volatility> {
+        if let Some(volatility) = self.inner.sigmas.get(symbol, now_ms) {
+            return Some(volatility);
         }
-        let day_ms = 24 * 60 * 60 * 1_000;
-        let hours = self
-            .inner
-            .info
-            .candles(symbol, "1h", now_ms.saturating_sub(day_ms), now_ms)
-            .await
-            .unwrap_or_else(|error| {
-                tracing::warn!(%error, symbol, "no candles for sigma");
-                Vec::new()
-            });
-        let sigma = vol_features(&[], &hours)
+        let hour_ms = 60 * 60 * 1_000;
+        let day_ms = 24 * hour_ms;
+        // Both legs, because `vol_features` derives the ratio between them and
+        // deriving it here from two separately-fetched numbers would be the
+        // same arithmetic in a place with no tests. The minute leg is the one
+        // that notices a regime an hour old; the hourly leg is what the cap is
+        // denominated in.
+        let (hours, minutes) = tokio::join!(
+            self.candles_or_empty(symbol, "1h", now_ms.saturating_sub(day_ms), now_ms),
+            self.candles_or_empty(symbol, "1m", now_ms.saturating_sub(hour_ms), now_ms),
+        );
+        let features = vol_features(&minutes, &hours);
+        // The daily sigma is the denominator and its absence is a refusal
+        // upstream; the ratio only ever tightens, so it rides along as an
+        // `Option` and a missing minute series costs the correction, not the
+        // cap.
+        let sigma_day = features
             .rv_24h_bps
             .and_then(|bps| bps.checked_div(BPS_PER_UNIT))
             .filter(|sigma| *sigma > Decimal::ZERO)?;
-        self.inner.sigmas.put(symbol, sigma, now_ms);
-        Some(sigma)
+        let volatility = Volatility {
+            sigma_day,
+            vol_ratio: features.vol_ratio,
+        };
+        self.inner.sigmas.put(symbol, volatility, now_ms);
+        Some(volatility)
+    }
+
+    /// Candles for a window, or none — a volatility measurement that cannot
+    /// fetch its bars degrades to a missing reading, which every caller
+    /// already handles, rather than to an error that would refuse an order for
+    /// a reason the agent cannot act on.
+    async fn candles_or_empty(
+        &self,
+        symbol: &str,
+        interval: &str,
+        from_ms: u64,
+        to_ms: u64,
+    ) -> Vec<Candle> {
+        self.inner
+            .info
+            .candles(symbol, interval, from_ms, to_ms)
+            .await
+            .unwrap_or_else(|error| {
+                tracing::warn!(%error, symbol, interval, "no candles for sigma");
+                Vec::new()
+            })
     }
 
     /// The prices oppen will size against, from the venue's own contexts.

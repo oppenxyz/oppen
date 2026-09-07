@@ -1417,6 +1417,7 @@ impl GuardrailEngine {
                 effective_cap_usd: cap.effective_cap_usd,
                 risk_budget_usd: cap.risk_budget_usd,
                 sigma_day_pct: cap.sigma_day.saturating_mul(HUNDRED),
+                vol_scale: cap.vol_scale,
             });
         }
 
@@ -2377,6 +2378,7 @@ struct VolScaledCap {
     effective_cap_usd: Decimal,
     risk_budget_usd: Decimal,
     sigma_day: Decimal,
+    vol_scale: Decimal,
 }
 
 /// Spec F's `effective_cap = risk_budget / (2 * sigma_day)`, or `None` when
@@ -2387,10 +2389,18 @@ struct VolScaledCap {
 /// two-sigma day moves the position by `max_risk_usd` and no more. Halve the
 /// volatility and the same budget buys twice the size.
 ///
+/// The sigma divided by is [`MarketRef::sigma_day`] multiplied by
+/// [`vol_scale`] — the day's volatility corrected by what the last hour is
+/// actually doing, because a twenty-four-bar statistic cannot notice an hour
+/// old regime on its own.
+///
 /// **Fails closed on a missing or non-positive sigma.** A cap configured and
 /// not computable is a cap not enforced, which is the failure the whole
 /// module exists to prevent — and a zero sigma would divide to an infinite
 /// cap, so the one input that must never be defaulted is the denominator.
+/// The scale is not that input: it multiplies a denominator that already
+/// exists, so an unmeasured one leaves the cap computable and merely
+/// untightened.
 fn vol_scaled_cap(
     config: &AgentGuardrails,
     market: &MarketRef,
@@ -2407,14 +2417,31 @@ fn vol_scaled_cap(
                 symbol: symbol.to_owned(),
             })
         })?;
-    let cap = TWO
-        .checked_mul(sigma_day)
+    let vol_scale = vol_scale(market.vol_ratio);
+    let cap = sigma_day
+        .checked_mul(vol_scale)
+        .and_then(|sigma| TWO.checked_mul(sigma))
         .and_then(|denominator| risk_budget_usd.checked_div(denominator));
     Ok(Some(VolScaledCap {
         effective_cap_usd: checked(cap, "vol-scaled cap")?,
         risk_budget_usd,
         sigma_day,
+        vol_scale,
     }))
+}
+
+/// How much the last hour tightens the day's volatility: `max(1, vol_ratio)`.
+///
+/// **One is the floor, and that is the whole of the design.** A ratio below
+/// one says the last hour was quieter than the day, and honouring it would
+/// *widen* a guardrail on the strength of a sixty-bar sample — the direction
+/// in which being wrong costs money. An absent ratio lands on the same floor
+/// for the same reason it is not a refusal: the cap still has its
+/// denominator, so the fail-closed reading [`Unevaluable::MissingVolatility`]
+/// gets does not apply, and the result is exactly the cap this predicate
+/// computed before the correction existed.
+fn vol_scale(vol_ratio: Option<Decimal>) -> Decimal {
+    vol_ratio.unwrap_or(Decimal::ONE).max(Decimal::ONE)
 }
 
 /// `None` when the limit is zero (the ratio is undefined) or the arithmetic
