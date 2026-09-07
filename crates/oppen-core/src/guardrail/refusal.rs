@@ -24,6 +24,16 @@ use super::breaker::LossKind;
 use super::kill::{KillReason, KillScope};
 use super::snapshot::FeedQuality;
 
+/// Non-resetting supervised-pilot budgets, separate from daily circuit breakers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PilotMetric {
+    OrderNotional,
+    ExecutedNotional,
+    CommittedNotional,
+    RealizedLoss,
+}
+
 /// Why an order was not cleared for signing.
 ///
 /// Serializes with the variant name in a `refusal` tag and fields in
@@ -39,6 +49,12 @@ use super::snapshot::FeedQuality;
 #[serde(tag = "refusal", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum Refusal {
+    #[error("pilot {metric:?} budget stopped execution: ${observed_usd} against ${limit_usd}")]
+    PilotBudget {
+        metric: PilotMetric,
+        observed_usd: Decimal,
+        limit_usd: Decimal,
+    },
     /// Spec item 19 requires a `reason` on every execution tool call. An
     /// unexplained order is refused before anything else is evaluated.
     #[error("the order carries no reason; spec item 19 requires one")]
@@ -356,6 +372,8 @@ impl From<OrderError> for VenueRule {
 #[serde(tag = "unevaluable", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum Unevaluable {
+    #[error("pilot accounting is unavailable: {detail}")]
+    PilotBudgetUnavailable { detail: String },
     #[error("{agent} is not a paired agent")]
     UnknownAgent { agent: AgentId },
 

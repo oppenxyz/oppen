@@ -3,7 +3,7 @@
 //! Dropping a receipt never releases a reservation. Only definite submission
 //! evidence does; an unknown transport outcome must remain pending.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use oppen_hl::{Address, wire::Cloid};
@@ -18,6 +18,8 @@ type Result<T> = std::result::Result<T, SubmissionError>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SubmissionError {
+    #[error(transparent)]
+    Pilot(#[from] super::pilot::PilotError),
     #[error(transparent)]
     Ledger(#[from] LedgerError),
     #[error("account has pending submission {cloid}")]
@@ -107,6 +109,27 @@ struct Replay {
     starts: HashMap<u64, SubmissionReceipt>,
     resolved: HashSet<u64>,
     used: HashSet<(Address, Cloid)>,
+    pilot: BTreeMap<u64, PilotSubmission>,
+}
+
+pub(super) struct PilotSubmission {
+    pub seq: u64,
+    pub account: Address,
+    pub agent: String,
+    pub cloid: Cloid,
+    pub intent: Value,
+    pub resolution: Option<SubmissionResolution>,
+}
+
+pub(super) fn replay_for_pilot(
+    ledger: &Ledger,
+    connection: &Connection,
+    verify_anchor: bool,
+) -> Result<Vec<PilotSubmission>> {
+    Ok(replay(ledger, connection, verify_anchor)?
+        .pilot
+        .into_values()
+        .collect())
 }
 
 fn invalid(detail: impl Into<String>) -> SubmissionError {
@@ -196,6 +219,7 @@ impl SubmissionJournal {
         drop(rows);
         drop(statement);
         let (intent_seq, intent_hash) = intent.ok_or(SubmissionError::MissingIntent)?;
+        super::pilot::check_admission(&self.0, &tx, account, clearance)?;
         let start = Started {
             version: 1,
             account,
@@ -272,124 +296,148 @@ impl SubmissionJournal {
     }
 
     fn replay(&self, connection: &Connection) -> Result<Replay> {
-        // Do not call Ledger::verify here: it takes the mutex we already hold.
-        let anchor = match &self.0.anchor {
-            Some(anchor) => Some(anchor.load()?.ok_or_else(|| invalid("anchor missing"))?),
-            None => None,
-        };
-        let report = super::verify::walk(connection, &self.0.genesis, anchor.as_ref())?;
-        if let Some(broken) = report.first_break {
-            return Err(invalid(format!(
-                "chain broken at {}: {}",
-                broken.seq, broken.reason
-            )));
-        }
-        let mut replay = Replay::default();
-        // Never filter by account before parsing: a null or malformed payload
-        // can conceal a pending reservation for any account.
-        let mut statement = connection.prepare(&format!(
-            "SELECT {SELECT_EVENT_COLUMNS}, idem_key FROM events \
-             WHERE kind IN ('submission_started', 'submission_resolved') ORDER BY seq"
-        ))?;
-        let mut rows = statement.query([])?;
-        while let Some(row) = rows.next()? {
-            let event = super::event_from_row(row)?;
-            let key: Option<String> = row.get(12)?;
-            let agent = event
-                .agent_id
-                .ok_or_else(|| invalid("lifecycle row has no agent"))?;
-            let payload = event
-                .payload
-                .ok_or_else(|| invalid("lifecycle payload redacted"))?;
-            match event.kind {
-                EventKind::SubmissionStarted => {
-                    let start: Started = serde_json::from_value(payload)
-                        .map_err(|error| invalid(error.to_string()))?;
-                    if start.version != 1 || start.intent_seq >= event.seq || start.intent_seq == 0
-                    {
-                        return Err(invalid("unsupported start version or invalid intent order"));
-                    }
-                    if key.as_deref() != Some(start_key(&start).as_str()) {
-                        return Err(invalid("start idempotence key mismatch"));
-                    }
-                    self.validate_intent(connection, &start, &agent)?;
-                    if !replay.used.insert((start.account, start.cloid.clone())) {
-                        return Err(invalid("cloid reused in submission history"));
-                    }
-                    let state = replay.accounts.entry(start.account).or_default();
-                    if state.pending.is_some() {
-                        return Err(invalid("overlapping account submissions"));
-                    }
-                    let receipt = SubmissionReceipt {
-                        chain: self.0.genesis.clone(),
-                        seq: event.seq,
-                        hash: event.hash,
-                        agent,
-                        start,
-                    };
-                    state.revision = event.seq;
-                    state.pending = Some(receipt.clone());
-                    replay.starts.insert(event.seq, receipt);
-                }
-                EventKind::SubmissionResolved => {
-                    let resolved: Resolved = serde_json::from_value(payload)
-                        .map_err(|error| invalid(error.to_string()))?;
-                    let receipt = replay
-                        .starts
-                        .get(&resolved.start_seq)
-                        .ok_or_else(|| invalid("resolution precedes or lacks start"))?;
-                    if resolved.version != 1
-                        || resolved.account != receipt.start.account
-                        || resolved.start_hash != receipt.hash
-                        || agent != receipt.agent
-                        || key.as_deref() != Some(resolve_key(receipt.seq).as_str())
-                        || !replay.resolved.insert(receipt.seq)
-                    {
-                        return Err(invalid("invalid or duplicate resolution linkage"));
-                    }
-                    let state = replay.accounts.entry(resolved.account).or_default();
-                    if state.pending.as_ref() != Some(receipt) {
-                        return Err(invalid(
-                            "resolution does not name current pending submission",
-                        ));
-                    }
-                    state.pending = None;
-                    state.revision = event.seq;
-                }
-                _ => return Err(invalid("unexpected lifecycle kind")),
-            }
-        }
-        Ok(replay)
+        replay(&self.0, connection, true)
     }
+}
 
-    fn validate_intent(&self, connection: &Connection, start: &Started, agent: &str) -> Result<()> {
-        let mut statement = connection.prepare(&format!(
-            "SELECT {SELECT_EVENT_COLUMNS} FROM events WHERE seq = ?1"
-        ))?;
-        let mut rows = statement.query(params![
-            i64::try_from(start.intent_seq).map_err(|_| invalid("intent sequence out of range"))?
-        ])?;
-        let event = super::event_from_row(
-            rows.next()?
-                .ok_or_else(|| invalid("missing linked intent"))?,
-        )?;
+fn replay(ledger: &Ledger, connection: &Connection, verify_anchor: bool) -> Result<Replay> {
+    // Do not call Ledger::verify here: it takes the mutex we already hold.
+    let anchor = match (&ledger.anchor, verify_anchor) {
+        (Some(anchor), true) => Some(anchor.load()?.ok_or_else(|| invalid("anchor missing"))?),
+        _ => None,
+    };
+    let report = super::verify::walk(connection, &ledger.genesis, anchor.as_ref())?;
+    if let Some(broken) = report.first_break {
+        return Err(invalid(format!(
+            "chain broken at {}: {}",
+            broken.seq, broken.reason
+        )));
+    }
+    let mut replay = Replay::default();
+    // Never filter by account before parsing: a null or malformed payload
+    // can conceal a pending reservation for any account.
+    let mut statement = connection.prepare(&format!(
+        "SELECT {SELECT_EVENT_COLUMNS}, idem_key FROM events \
+             WHERE kind IN ('submission_started', 'submission_resolved') ORDER BY seq"
+    ))?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        let event = super::event_from_row(row)?;
+        let key: Option<String> = row.get(12)?;
+        let agent = event
+            .agent_id
+            .ok_or_else(|| invalid("lifecycle row has no agent"))?;
         let payload = event
             .payload
-            .ok_or_else(|| invalid("linked intent redacted"))?;
-        if event.kind != EventKind::OrderIntent
-            || event.hash != start.intent_hash
-            || event.agent_id.as_deref() != Some(agent)
-            || payload.get("agent").and_then(Value::as_str) != Some(agent)
-            || payload.get("network") != Some(&serde_json::to_value(self.0.network)?)
-            || payload["kind"]["cleared"] != "order"
-            || payload["kind"]["cloid"].as_str() != Some(start.cloid.as_str())
-            || (!payload["vault_address"].is_null()
-                && payload["vault_address"] != serde_json::to_value(start.account)?)
-        {
-            return Err(invalid("linked intent does not match submission"));
+            .ok_or_else(|| invalid("lifecycle payload redacted"))?;
+        match event.kind {
+            EventKind::SubmissionStarted => {
+                let start: Started =
+                    serde_json::from_value(payload).map_err(|error| invalid(error.to_string()))?;
+                if start.version != 1 || start.intent_seq >= event.seq || start.intent_seq == 0 {
+                    return Err(invalid("unsupported start version or invalid intent order"));
+                }
+                if key.as_deref() != Some(start_key(&start).as_str()) {
+                    return Err(invalid("start idempotence key mismatch"));
+                }
+                let intent = validate_intent(ledger, connection, &start, &agent)?;
+                replay.pilot.insert(
+                    event.seq,
+                    PilotSubmission {
+                        seq: event.seq,
+                        account: start.account,
+                        agent: agent.clone(),
+                        cloid: start.cloid.clone(),
+                        intent,
+                        resolution: None,
+                    },
+                );
+                if !replay.used.insert((start.account, start.cloid.clone())) {
+                    return Err(invalid("cloid reused in submission history"));
+                }
+                let state = replay.accounts.entry(start.account).or_default();
+                if state.pending.is_some() {
+                    return Err(invalid("overlapping account submissions"));
+                }
+                let receipt = SubmissionReceipt {
+                    chain: ledger.genesis.clone(),
+                    seq: event.seq,
+                    hash: event.hash,
+                    agent,
+                    start,
+                };
+                state.revision = event.seq;
+                state.pending = Some(receipt.clone());
+                replay.starts.insert(event.seq, receipt);
+            }
+            EventKind::SubmissionResolved => {
+                let resolved: Resolved =
+                    serde_json::from_value(payload).map_err(|error| invalid(error.to_string()))?;
+                let receipt = replay
+                    .starts
+                    .get(&resolved.start_seq)
+                    .ok_or_else(|| invalid("resolution precedes or lacks start"))?;
+                if resolved.version != 1
+                    || resolved.account != receipt.start.account
+                    || resolved.start_hash != receipt.hash
+                    || agent != receipt.agent
+                    || key.as_deref() != Some(resolve_key(receipt.seq).as_str())
+                    || !replay.resolved.insert(receipt.seq)
+                {
+                    return Err(invalid("invalid or duplicate resolution linkage"));
+                }
+                let state = replay.accounts.entry(resolved.account).or_default();
+                if state.pending.as_ref() != Some(receipt) {
+                    return Err(invalid(
+                        "resolution does not name current pending submission",
+                    ));
+                }
+                state.pending = None;
+                state.revision = event.seq;
+                replay
+                    .pilot
+                    .get_mut(&receipt.seq)
+                    .ok_or_else(|| invalid("resolution lacks validated pilot start"))?
+                    .resolution = Some(resolved.outcome);
+            }
+            _ => return Err(invalid("unexpected lifecycle kind")),
         }
-        Ok(())
     }
+    Ok(replay)
+}
+
+fn validate_intent(
+    ledger: &Ledger,
+    connection: &Connection,
+    start: &Started,
+    agent: &str,
+) -> Result<Value> {
+    let mut statement = connection.prepare(&format!(
+        "SELECT {SELECT_EVENT_COLUMNS} FROM events WHERE seq = ?1"
+    ))?;
+    let mut rows = statement.query(params![
+        i64::try_from(start.intent_seq).map_err(|_| invalid("intent sequence out of range"))?
+    ])?;
+    let event = super::event_from_row(
+        rows.next()?
+            .ok_or_else(|| invalid("missing linked intent"))?,
+    )?;
+    let payload = event
+        .payload
+        .ok_or_else(|| invalid("linked intent redacted"))?;
+    if event.kind != EventKind::OrderIntent
+        || event.hash != start.intent_hash
+        || event.agent_id.as_deref() != Some(agent)
+        || payload.get("agent").and_then(Value::as_str) != Some(agent)
+        || payload.get("network") != Some(&serde_json::to_value(ledger.network)?)
+        || payload["kind"]["cleared"] != "order"
+        || payload["kind"]["cloid"].as_str() != Some(start.cloid.as_str())
+        || (!payload["vault_address"].is_null()
+            && payload["vault_address"] != serde_json::to_value(start.account)?)
+    {
+        return Err(invalid("linked intent does not match submission"));
+    }
+    Ok(payload)
 }
 
 fn timestamp(at_ms: u64) -> Result<i64> {

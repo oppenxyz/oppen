@@ -17,6 +17,8 @@ use std::sync::{RwLock, Weak};
 use std::time::Duration;
 use tower::ServiceExt;
 
+#[path = "execution_fixture/pilot.rs"]
+mod pilot;
 #[path = "execution_fixture/venue.rs"]
 mod venue;
 use venue::{Behavior, Venue};

@@ -191,6 +191,10 @@ struct CountingSink {
 }
 
 impl AuditSink for CountingSink {
+    fn before_sign(&self, _clearance: &Clearance) -> Result<Box<dyn SigningPermit + '_>, Refusal> {
+        Ok(Box::new(()))
+    }
+
     fn record(&self, entry: &AuditEntry<'_>) -> Result<(), AuditError> {
         match entry.outcome {
             AuditOutcome::Cleared(_) => {
@@ -222,6 +226,13 @@ impl CountingSink {
 struct FailingSink;
 
 impl AuditSink for FailingSink {
+    fn before_sign(&self, _clearance: &Clearance) -> Result<Box<dyn SigningPermit + '_>, Refusal> {
+        Err(Unevaluable::AuditWriteFailed {
+            detail: "the ledger disk is full".into(),
+        }
+        .into())
+    }
+
     fn record(&self, _entry: &AuditEntry<'_>) -> Result<(), AuditError> {
         Err(AuditError {
             detail: "the ledger disk is full".to_owned(),
@@ -5509,6 +5520,13 @@ fn one_proposal_authorises_exactly_one_approval() {
         held: std::sync::atomic::AtomicBool,
     }
     impl AuditSink for HoldFirstClearance {
+        fn before_sign(
+            &self,
+            _clearance: &Clearance,
+        ) -> Result<Box<dyn SigningPermit + '_>, Refusal> {
+            Ok(Box::new(()))
+        }
+
         fn record(&self, entry: &AuditEntry<'_>) -> Result<(), AuditError> {
             if matches!(entry.outcome, AuditOutcome::Cleared(_))
                 && !self.held.swap(true, Ordering::SeqCst)
