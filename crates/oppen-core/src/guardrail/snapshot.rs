@@ -194,8 +194,9 @@ pub struct AccountSnapshot {
     pub resting: Option<RestingExposure>,
 }
 
-/// What the agent's working orders would add to its position if they all
-/// filled (spec item 24).
+/// Opening exposure on each side of the agent's working book (spec item 24).
+/// Buy and sell orders may fill independently. Reductions are tracked too:
+/// flattening first can leave an opening order free to flip the position.
 ///
 /// Without this the notional and leverage caps measure only filled positions,
 /// and both are bypassable by splitting: at D-c's $100 position cap and 5
@@ -217,14 +218,16 @@ pub struct AccountSnapshot {
 /// pins that the cap does hold once this is honoured.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RestingExposure {
-    /// Signed resting size per coin — positive for working buys, negative for
-    /// working sells, summed per coin. This is the "everything fills"
-    /// reading, which is the one a cap has to be measured against.
-    ///
-    /// `BTreeMap` for the same reason as `positions`: one serialization
-    /// (`AGENTS.md` invariant 6).
-    pub szi: BTreeMap<String, Decimal>,
-    /// Sum of `|szi| × mark` across every working order in the account,
+    /// Non-negative size on each side. Opposite orders can fill separately,
+    /// so their exposure must never net before a risk decision.
+    pub buys: BTreeMap<String, Decimal>,
+    pub sells: BTreeMap<String, Decimal>,
+    pub reduce_buys: BTreeMap<String, Decimal>,
+    pub reduce_sells: BTreeMap<String, Decimal>,
+    /// Exact contribution to `notional_usd`, so replacing one symbol's
+    /// contribution cannot subtract a different valuation from the total.
+    pub notional_by_symbol: BTreeMap<String, Decimal>,
+    /// Sum of size times limit price across opening orders in the account,
     /// including symbols the current order does not touch, for the leverage
     /// cap.
     pub notional_usd: Decimal,
@@ -239,9 +242,11 @@ impl RestingExposure {
         RestingExposure::default()
     }
 
-    /// Signed resting size for one coin, zero when nothing is working.
-    pub(super) fn szi_of(&self, symbol: &str) -> Decimal {
-        self.szi.get(symbol).copied().unwrap_or(Decimal::ZERO)
+    pub(super) fn sides(&self, symbol: &str) -> (Decimal, Decimal) {
+        (
+            self.buys.get(symbol).copied().unwrap_or(Decimal::ZERO),
+            self.sells.get(symbol).copied().unwrap_or(Decimal::ZERO),
+        )
     }
 }
 

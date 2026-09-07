@@ -131,6 +131,15 @@ impl TokenStore {
         Self::default()
     }
 
+    /// Owned bindings for pause enforcement, including revoked pairings whose
+    /// resting orders still need cancellation. No credentials leave the store.
+    pub(crate) fn bindings(&self) -> Vec<Binding> {
+        self.records
+            .values()
+            .map(|record| record.binding.clone())
+            .collect()
+    }
+
     /// Mint a pairing for one named agent on one account.
     ///
     /// The caller shows [`IssuedToken::reveal`] once and then drops it; from
@@ -263,6 +272,24 @@ mod tests {
                 .parse()
                 .expect("address"),
         }
+    }
+
+    #[test]
+    fn bindings_keep_revoked_records_and_are_an_owned_snapshot() {
+        let mut store = TokenStore::new();
+        let alpha = store.issue(binding("alpha")).expect("token");
+        store.issue(binding("beta")).expect("token");
+        assert!(store.revoke(alpha.id));
+        let snapshot = store.bindings();
+        store.issue(binding("gamma")).expect("token");
+        assert_eq!(snapshot.len(), 2);
+        assert!(snapshot.contains(&binding("alpha")));
+        assert!(snapshot.contains(&binding("beta")));
+        assert!(!snapshot.contains(&binding("gamma")));
+        assert_eq!(
+            store.authenticate(alpha.reveal()).err(),
+            Some(AuthError::Revoked)
+        );
     }
 
     #[test]

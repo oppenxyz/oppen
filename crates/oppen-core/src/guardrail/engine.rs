@@ -284,13 +284,18 @@ pub struct Clearance {
 pub struct Cleared {
     action: Action,
     clearance: Clearance,
+    policy_revision: u64,
 }
 
 impl Cleared {
     /// Private on purpose. Moving this line, widening it to `pub(crate)`, or
     /// adding a second constructor breaks `AGENTS.md` invariant 1.
-    fn new(action: Action, clearance: Clearance) -> Self {
-        Cleared { action, clearance }
+    fn new(action: Action, clearance: Clearance, policy_revision: u64) -> Self {
+        Cleared {
+            action,
+            clearance,
+            policy_revision,
+        }
     }
 
     /// The exact action that was evaluated. Built by the engine from the
@@ -312,8 +317,8 @@ impl Cleared {
         &self.clearance
     }
 
-    fn into_parts(self) -> (Action, Clearance) {
-        (self.action, self.clearance)
+    fn into_parts(self) -> (Action, Clearance, u64) {
+        (self.action, self.clearance, self.policy_revision)
     }
 }
 
@@ -463,6 +468,7 @@ pub enum GuardrailError {
 
 #[derive(Debug)]
 struct EngineState {
+    policy_revision: u64,
     guardrails: BTreeMap<AgentId, AgentGuardrails>,
     /// D1: each agent's sub-account, bound into every clearance it produces.
     vaults: BTreeMap<AgentId, Address>,
@@ -578,6 +584,7 @@ impl GuardrailEngine {
             keys,
             network,
             state: Mutex::new(EngineState {
+                policy_revision: 0,
                 guardrails: persisted.guardrails,
                 vaults: persisted.vaults,
                 account_limits: persisted.account_limits,
@@ -705,11 +712,12 @@ impl GuardrailEngine {
                 detail,
             });
         }
-        self.store.save_guardrails(agent, &config)?;
-        let before = self
-            .state()
-            .guardrails
-            .insert(agent.clone(), config.clone());
+        let before = {
+            let mut state = self.state();
+            self.store.save_guardrails(agent, &config)?;
+            state.policy_revision = state.policy_revision.wrapping_add(1);
+            state.guardrails.insert(agent.clone(), config.clone())
+        };
         self.record_operator(
             Some(agent),
             now_ms,
@@ -726,8 +734,12 @@ impl GuardrailEngine {
         limits: LossLimits,
         now_ms: u64,
     ) -> Result<(), GuardrailError> {
-        self.store.save_account_limits(&limits)?;
-        let before = std::mem::replace(&mut self.state().account_limits, limits);
+        let before = {
+            let mut state = self.state();
+            self.store.save_account_limits(&limits)?;
+            state.policy_revision = state.policy_revision.wrapping_add(1);
+            std::mem::replace(&mut state.account_limits, limits)
+        };
         self.record_operator(
             None,
             now_ms,
@@ -793,12 +805,18 @@ impl GuardrailEngine {
                     reason: reason.clone(),
                 },
             );
-            self.store.save_kill_switch(&state.kill)?;
-            KillEffect {
+            let effect = KillEffect {
                 cancel_for: cancel_targets(&state, &scope),
                 scope,
                 newly_engaged,
+            };
+            if let Err(error) = self.store.save_kill_switch(&state.kill) {
+                if newly_engaged {
+                    state.pending_effects.push(effect);
+                }
+                return Err(error.into());
             }
+            effect
         };
         self.record_operator(
             None,
@@ -820,8 +838,10 @@ impl GuardrailEngine {
     ) -> Result<bool, GuardrailError> {
         let released = {
             let mut state = self.state();
-            let released = state.kill.release(scope);
-            self.store.save_kill_switch(&state.kill)?;
+            let mut next = state.kill.clone();
+            let released = next.release(scope);
+            self.store.save_kill_switch(&next)?;
+            state.kill = next;
             released
         };
         self.record_operator(
@@ -839,6 +859,17 @@ impl GuardrailEngine {
     /// actionable without an id to look up (spec item 26).
     pub fn agents(&self) -> BTreeSet<AgentId> {
         self.state().guardrails.keys().cloned().collect()
+    }
+
+    /// Persisted pauses remain actionable after a runtime restart.
+    pub fn paused_agents(&self) -> BTreeSet<AgentId> {
+        let state = self.state();
+        state
+            .guardrails
+            .keys()
+            .filter(|agent| state.kill.blocking(agent).is_some())
+            .cloned()
+            .collect()
     }
 
     /// Takes the cancel effects queued by circuit-breaker trips.
@@ -1348,7 +1379,28 @@ impl GuardrailEngine {
             .resting
             .as_ref()
             .ok_or(Unevaluable::MissingRestingOrders)?;
-        let resting_szi = resting.szi_of(&intent.symbol);
+        let (resting_buys, resting_sells) = resting.sides(&intent.symbol);
+        let reduce_buys = resting
+            .reduce_buys
+            .get(&intent.symbol)
+            .copied()
+            .unwrap_or_default();
+        let reduce_sells = resting
+            .reduce_sells
+            .get(&intent.symbol)
+            .copied()
+            .unwrap_or_default();
+        if [resting_buys, resting_sells, reduce_buys, reduce_sells]
+            .iter()
+            .any(|size| *size < Decimal::ZERO)
+        {
+            return Err(Unevaluable::InputMismatch {
+                field: "resting size".into(),
+                expected: "non-negative sizes on both sides".into(),
+                supplied: format!("{resting_buys}/{resting_sells}/{reduce_buys}/{reduce_sells}"),
+            }
+            .into());
+        }
         if config.reduce_only {
             check_reduce_only(intent, position_szi, signed_sz, sz)?;
         }
@@ -1362,23 +1414,45 @@ impl GuardrailEngine {
             });
         }
 
-        // Spec item 24, max position size, measured after this order and
-        // every order already working on the symbol fills.
-        let position_after = checked(
-            position_szi
-                .checked_add(resting_szi)
-                .and_then(|n| n.checked_add(signed_sz)),
-            "post-fill position",
-        )?;
+        // A clipped reduction may remove the starting position's offset
+        // before opening orders fill. For each extreme, opposite-side fills
+        // cannot help: reduce the initial offset, then fill the opening side.
+        let worst_position = |buys: Decimal, sells: Decimal, rb: Decimal, rs: Decimal| {
+            let long = checked(
+                position_szi
+                    .checked_add(rb.min((-position_szi).max(Decimal::ZERO)))
+                    .and_then(|p| p.checked_add(buys)),
+                "post-fill long",
+            )?;
+            let short = checked(
+                position_szi
+                    .checked_sub(rs.min(position_szi.max(Decimal::ZERO)))
+                    .and_then(|p| p.checked_sub(sells)),
+                "post-fill short",
+            )?;
+            Ok::<_, Refusal>(long.abs().max(short.abs()))
+        };
+        let position_before =
+            worst_position(resting_buys, resting_sells, reduce_buys, reduce_sells)?;
+        let mut sides = [resting_buys, resting_sells, reduce_buys, reduce_sells];
+        let side = usize::from(!intent.is_buy) + if intent.reduce_only { 2 } else { 0 };
+        sides[side] = checked(sides[side].checked_add(sz), "candidate working size")?;
+        let position_after = worst_position(sides[0], sides[1], sides[2], sides[3])?;
+        let genuine_reduction = intent.reduce_only
+            && !position_szi.is_zero()
+            && position_szi.is_sign_negative() != signed_sz.is_sign_negative()
+            && position_after <= position_before;
         let position_after_usd = checked(
             position_after.abs().checked_mul(reference_px),
             "post-fill position notional",
         )?;
         let resting_usd = checked(
-            resting_szi.abs().checked_mul(reference_px),
+            resting_buys
+                .checked_add(resting_sells)
+                .and_then(|s| s.checked_mul(reference_px)),
             "resting notional",
         )?;
-        if position_after_usd > config.max_position_usd {
+        if !genuine_reduction && position_after_usd > config.max_position_usd {
             return Err(Refusal::PositionNotional {
                 symbol: intent.symbol.clone(),
                 observed_usd: position_after_usd,
@@ -1402,11 +1476,12 @@ impl GuardrailEngine {
         // risk-reducing order can only raise risk, which is the same reason
         // item 26 lets cancels through while the kill switch is engaged.
         //
-        // Measured against the position *including* working orders, so the
-        // comparison is between two "everything fills" readings and cancelling
-        // into the cap is a reduction like any other.
-        let position_before = checked(position_szi.checked_add(resting_szi), "pre-order position")?;
-        let reduces_position = position_after.abs() < position_before.abs();
+        // Working orders remain reserved even if this reduction has not filled.
+        let filled_position = checked(position_szi.checked_add(signed_sz), "filled position")?;
+        let reduces_position = genuine_reduction
+            || (!intent.reduce_only
+                && position_after <= position_before
+                && filled_position.abs() < position_szi.abs());
         if let Some(cap) = vol_scaled
             && !reduces_position
             && position_after_usd > cap.effective_cap_usd
@@ -1428,11 +1503,26 @@ impl GuardrailEngine {
         // replaced by the post-fill number; every other symbol's positions
         // and working orders stay in, which is why the account total and the
         // resting total are added before the subtraction.
+        // Remove exactly what the producer added, not size times today's
+        // mark. Missing attribution gives no subtraction credit.
+        let opening_notional = resting
+            .notional_by_symbol
+            .get(&intent.symbol)
+            .copied()
+            .unwrap_or_default();
+        if opening_notional < Decimal::ZERO || opening_notional > resting.notional_usd {
+            return Err(Unevaluable::InputMismatch {
+                field: "resting notional".into(),
+                expected: format!("symbol contribution between 0 and {}", resting.notional_usd),
+                supplied: opening_notional.to_string(),
+            }
+            .into());
+        }
         let symbol_before_usd = checked(
             position_szi
                 .abs()
                 .checked_mul(reference_px)
-                .and_then(|n| n.checked_add(resting_usd)),
+                .and_then(|n| n.checked_add(opening_notional)),
             "current symbol notional",
         )?;
         let account_before_usd = checked(
@@ -1450,7 +1540,7 @@ impl GuardrailEngine {
         .max(Decimal::ZERO);
         let leverage = checked(total_after_usd.checked_div(account.equity_usd), "leverage")?;
         let leverage_cap = config.risk.max_leverage.min(asset.info.max_leverage);
-        if leverage > Decimal::from(leverage_cap) {
+        if !genuine_reduction && leverage > Decimal::from(leverage_cap) {
             return Err(Refusal::Leverage {
                 observed: leverage,
                 limit: leverage_cap,
@@ -1586,7 +1676,7 @@ impl GuardrailEngine {
                 global_tokens_remaining,
             },
         };
-        Ok(Cleared::new(action, clearance))
+        Ok(Cleared::new(action, clearance, state.policy_revision))
     }
 
     /// Clears a cancel by order id.
@@ -1681,6 +1771,7 @@ impl GuardrailEngine {
                 kind: ClearedKind::Cancel { count },
                 utilization: Utilization::none_with_global(global_tokens_remaining),
             },
+            state.policy_revision,
         ))
     }
 
@@ -1752,6 +1843,7 @@ impl GuardrailEngine {
                 kind: ClearedKind::ScheduleCancel { cancel_at_ms },
                 utilization: Utilization::none_with_global(global_tokens_remaining),
             },
+            state.policy_revision,
         ))
     }
 
@@ -1800,11 +1892,12 @@ impl GuardrailEngine {
         expires_after: Option<u64>,
         now_ms: u64,
     ) -> Result<(ExchangeRequest, Clearance), SignClearedError> {
-        let (action, clearance) = cleared.into_parts();
+        let (action, clearance, policy_revision) = cleared.into_parts();
         let key: AgentKey = self.keys.load_agent_key(&clearance.agent)?;
         let gate = PreSignGate {
             engine: self,
             clearance: &clearance,
+            policy_revision,
             now_ms,
         };
         let request = ExchangeRequest::sign_checked(
@@ -1911,6 +2004,7 @@ struct PreSignGate<'a> {
     /// The evaluation that authorises this signature, and the only place the
     /// gate reads an identity from.
     clearance: &'a Clearance,
+    policy_revision: u64,
     now_ms: u64,
 }
 
@@ -1942,6 +2036,9 @@ impl PreSignCheck for PreSignGate<'_> {
         // answer here to "what does this clearance's age make untrue?".
         match &self.clearance.kind {
             ClearedKind::Order { .. } => {
+                if self.policy_revision != state.policy_revision {
+                    return Err(Unevaluable::PolicyChanged.into());
+                }
                 let evaluated_at_ms = self.clearance.evaluated_at_ms;
                 if self.now_ms < evaluated_at_ms {
                     return Err(Unevaluable::ClockWentBackwards {

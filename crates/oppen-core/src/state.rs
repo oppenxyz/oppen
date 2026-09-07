@@ -549,7 +549,7 @@ mod tests {
     }
 
     #[test]
-    fn resting_orders_are_signed_and_summed_per_symbol() {
+    fn resting_orders_preserve_both_sides_per_symbol() {
         use oppen_hl::types::{OpenOrder, Side};
         let order = |coin: &str, buy: bool, sz: &str, px: &str| OpenOrder {
             coin: coin.into(),
@@ -572,6 +572,14 @@ mod tests {
         let orders = [
             order("BTC", true, "2", "100"),
             order("BTC", false, "0.5", "100"),
+            OpenOrder {
+                reduce_only: true,
+                ..order("BTC", false, "1", "90")
+            },
+            OpenOrder {
+                reduce_only: true,
+                ..order("ETH", true, "3", "20")
+            },
         ];
         let state = assemble(
             Network::Testnet,
@@ -587,12 +595,13 @@ mod tests {
         );
         let exposure = exposure_from(&state, Decimal::ZERO, None, true, 0);
         let resting = exposure.agent.resting.expect("resting supplied");
-        assert_eq!(
-            resting.szi.get("BTC"),
-            Some(&d("1.5")),
-            "buys and sells net per symbol"
-        );
-        // Notional is the everything-fills reading and does not net.
+        assert_eq!(resting.buys.get("BTC"), Some(&d("2")));
+        assert_eq!(resting.sells.get("BTC"), Some(&d("0.5")));
+        assert_eq!(resting.reduce_sells.get("BTC"), Some(&d("1")));
+        assert_eq!(resting.reduce_buys.get("ETH"), Some(&d("3")));
+        assert_eq!(resting.notional_by_symbol.get("BTC"), Some(&d("250")));
+        assert!(!resting.notional_by_symbol.contains_key("ETH"));
+        // Opening notional does not net and excludes clipped reductions.
         assert_eq!(resting.notional_usd, d("250"));
     }
 
@@ -821,19 +830,25 @@ pub fn exposure_from(
         .map(|p| (p.symbol.clone(), PositionSnapshot { szi: p.size }))
         .collect();
 
-    let mut resting_szi: BTreeMap<String, Decimal> = BTreeMap::new();
-    let mut resting_notional = Decimal::ZERO;
+    let mut resting = RestingExposure::default();
     for order in &state.orders {
-        // Signed: a working buy adds, a working sell subtracts. This is the
-        // "everything fills" reading, which is what a cap must be measured
-        // against.
-        let signed = if order.is_buy {
-            order.size
-        } else {
-            -order.size
+        let side = match (order.is_buy, order.reduce_only) {
+            (true, false) => &mut resting.buys,
+            (false, false) => &mut resting.sells,
+            (true, true) => &mut resting.reduce_buys,
+            (false, true) => &mut resting.reduce_sells,
         };
-        *resting_szi.entry(order.symbol.clone()).or_default() += signed;
-        resting_notional += (order.size * order.limit_px).abs();
+        let size = side.entry(order.symbol.clone()).or_default();
+        *size = size.saturating_add(order.size.abs());
+        if !order.reduce_only {
+            let notional = order.size.saturating_mul(order.limit_px).abs();
+            resting.notional_usd = resting.notional_usd.saturating_add(notional);
+            let symbol = resting
+                .notional_by_symbol
+                .entry(order.symbol.clone())
+                .or_default();
+            *symbol = symbol.saturating_add(notional);
+        }
     }
 
     let agent = AccountSnapshot {
@@ -850,10 +865,7 @@ pub fn exposure_from(
             .map(|p| p.position_value_usd.abs())
             .sum(),
         positions,
-        resting: Some(RestingExposure {
-            szi: resting_szi,
-            notional_usd: resting_notional,
-        }),
+        resting: Some(resting),
     };
 
     // One container per agent (D1 as revised), so the fleet aggregate is the

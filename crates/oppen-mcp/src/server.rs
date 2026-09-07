@@ -8,9 +8,14 @@
 //! a tool, so an unauthenticated request never reaches the protocol layer, let
 //! alone a tool.
 
+use std::future::{Future, IntoFuture};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::pin::Pin;
 use std::sync::{Arc, RwLock};
+use std::task::{Context, Poll, ready};
+use std::time::Duration;
 
+use axum::body::{Body, Bytes, HttpBody};
 use axum::extract::{Request, State};
 use axum::http::{StatusCode, header};
 use axum::middleware::Next;
@@ -18,6 +23,8 @@ use axum::response::{IntoResponse, Response};
 use rmcp::transport::streamable_http_server::{
     StreamableHttpService, session::local::LocalSessionManager,
 };
+use tokio::io::{AsyncRead, ReadBuf};
+use tokio_util::io::ReaderStream;
 
 use crate::auth::TokenStore;
 use crate::guard::{Refusal, bearer_token, check_host, check_origin};
@@ -64,9 +71,50 @@ pub async fn serve(
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(%addr, path = MCP_PATH, "MCP gateway listening on loopback");
 
-    axum::serve(listener, router(gateway, pairings))
-        .with_graceful_shutdown(async move { shutdown.cancelled().await })
-        .await
+    let enforcement_gateway = gateway.clone();
+    let enforcement_pairings = pairings.clone();
+    let enforcement_shutdown = shutdown.child_token();
+    // Also stop enforcement if the caller drops the serve future.
+    let _enforcement_guard = enforcement_shutdown.clone().drop_guard();
+    let enforcement = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(5));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                biased;
+                () = enforcement_shutdown.cancelled() => break,
+                () = async {
+                    interval.tick().await;
+                    let bindings = match enforcement_pairings.read() {
+                        Ok(store) => store.bindings(),
+                        Err(error) => {
+                            tracing::warn!(%error, "pause enforcement could not read pairings");
+                            return;
+                        }
+                    };
+                    if let Err(error) = enforcement_gateway.enforce_pauses(&bindings).await {
+                        tracing::warn!(%error, "pause enforcement failed; will retry");
+                    }
+                } => {}
+            }
+        }
+    });
+
+    let server = axum::serve(listener, router(gateway, pairings))
+        .with_graceful_shutdown(shutdown.clone().cancelled_owned());
+    // Notify HTTP connections of shutdown, but do not wait for an indefinitely
+    // open SSE response before returning control to the operator.
+    let result = tokio::select! {
+        result = server.into_future() => result,
+        () = shutdown.cancelled() => Ok(()),
+    };
+    enforcement.abort();
+    if let Err(error) = enforcement.await {
+        if !error.is_cancelled() {
+            tracing::warn!(%error, "pause enforcement task failed");
+        }
+    }
+    result
 }
 
 /// Refuse anything that is not a paired agent on this machine.
@@ -97,8 +145,8 @@ async fn guard_middleware(
         Err(refusal) => return refuse(refusal),
     };
 
-    // The read guard is released before the request is forwarded, so a tool
-    // that pairs or revokes cannot deadlock against its own session.
+    // Release the read guard before forwarding so the operator can revoke a
+    // pairing while its authenticated requests are still in flight.
     let authenticated = {
         let store = match pairings.read() {
             Ok(store) => store,
@@ -106,24 +154,74 @@ async fn guard_middleware(
             // it. Fail closed rather than reason about what it left behind.
             Err(_) => return refuse(Refusal::Auth(crate::auth::AuthError::Unauthenticated)),
         };
-        store
-            .authenticate(&token)
-            .map(|session| (session.id, session.binding))
+        store.authenticate(&token)
     };
 
     match authenticated {
-        Ok((id, binding)) => {
-            tracing::debug!(pairing = %id, agent = %binding.agent, "authenticated");
+        Ok(mut session) => {
+            tracing::debug!(pairing = %session.id, agent = %session.binding.agent, "authenticated");
             // The tools read this back out of `RequestContext::extensions`,
             // where `rmcp` republishes the request's `http::request::Parts`.
             // It is the only place a tool learns which agent it is acting as,
             // so an unauthenticated request cannot reach one: there would be
             // nothing here to find.
             let mut request = request;
-            request.extensions_mut().insert(binding);
-            next.run(request).await
+            request.extensions_mut().insert(session.binding.clone());
+            let mut closed: Pin<Box<dyn Future<Output = ()> + Send>> =
+                Box::pin(async move { session.closed().await });
+            let response = tokio::select! {
+                biased;
+                () = &mut closed => return refuse(Refusal::Auth(crate::auth::AuthError::Revoked)),
+                response = next.run(request) => response,
+            };
+            let (parts, body) = response.into_parts();
+            Response::from_parts(
+                parts,
+                Body::from_stream(ReaderStream::new(SessionReader {
+                    body,
+                    buffered: Bytes::new(),
+                    closed,
+                })),
+            )
         }
         Err(error) => refuse(Refusal::Auth(error)),
+    }
+}
+
+// rmcp emits data frames (JSON or SSE), with no trailers. The reader keeps the
+// revocation future owned by the response body, so client disconnects drop it
+// and an idle SSE stream registers a wakeup without a detached watcher task.
+struct SessionReader {
+    body: Body,
+    buffered: Bytes,
+    closed: Pin<Box<dyn Future<Output = ()> + Send>>,
+}
+
+impl AsyncRead for SessionReader {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        if self.closed.as_mut().poll(cx).is_ready() || buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+        loop {
+            if !self.buffered.is_empty() {
+                let count = buf.remaining().min(self.buffered.len());
+                buf.put_slice(&self.buffered.split_to(count));
+                return Poll::Ready(Ok(()));
+            }
+            match ready!(Pin::new(&mut self.body).poll_frame(cx)) {
+                Some(Ok(frame)) => {
+                    if let Ok(data) = frame.into_data() {
+                        self.buffered = data;
+                    }
+                }
+                Some(Err(error)) => return Poll::Ready(Err(std::io::Error::other(error))),
+                None => return Poll::Ready(Ok(())),
+            }
+        }
     }
 }
 

@@ -4,6 +4,37 @@ Everything mapped so far, from the v1 MVP through the versions after it. Numbers
 
 Legend: `[x]` shipped on `main` or in an open PR · `[ ]` not started · **gate** = what proves the phase.
 
+## Execution audit follow-up (2026-09-07)
+
+The component checkboxes below are not production-readiness claims. The assembled
+execution path failed review despite its passing unit tests. Follow this order
+before expanding features:
+
+1. **Baseline:** repositories moved to `oppenxyz` with private visibility and
+   history preserved; local remotes updated. Corrected baseline `bb623d8` passes
+   every CI job in draft PR #40; the original `main` still needs that fix merged.
+2. **Guarded execution:** correct the production ledger adapter, independent
+   buy/sell exposure, per-container submission serialization, signing-time policy
+   checks, and cancellation delivery with retries. Local regressions now cover
+   these repairs, including the real SQLite sink and test signer, clipped fill
+   permutations, dropped requests, revocation, and cancellation failures. The
+   complete fixture-exchange lifecycle and explicitly authorized testnet run
+   remain open gates.
+3. **Operator supervision:** desktop MCP lifecycle, pairing/revocation, real
+   positions and orders, policy editing, approval decisions, and a working halt.
+4. **Recovery:** durable unknown-submission reconciliation across restarts,
+   reconnect/sleep/network races, feature freshness, config HMAC, and confirmed
+   dead-man behavior. A timeout or missing order status is not permission to retry.
+5. **Release gate:** measured first-run onboarding and a small supervised testnet
+   pilot. No live-trading readiness claim until these gates pass.
+
+Work in progress is not a completed phase. The P1 signed-order, live-disconnect,
+and supervised-agent gates remain open.
+
+Tracked gates: [execution #41](https://github.com/oppenxyz/oppen/issues/41),
+[supervision #42](https://github.com/oppenxyz/oppen/issues/42),
+[recovery #43](https://github.com/oppenxyz/oppen/issues/43).
+
 Status as of 2026-09-07: P0 and the P1 code are on `main`; the P1 gate is waiting on a funded testnet agent wallet. P2, P3, P4 and P6 code has been landing since 2026-09-04 (PRs #9–#34). **The P2 and P3 boxes were audited against the code on 2026-09-07** and are now accurate: the ws pool, the hash-chained ledger, the event taxonomy, the keychain, the per-agent guardrails, the loss breaker, the kill switch and invariant 1's property test are ticked with the module that implements each. Four bullets are deliberately still open and say what landed and what did not — the rate-budget manager (no batching), the container registry (no venue or container-kind keying), the guardrail-config HMAC (the key exists, nothing uses it) and the dead-man's switch (no daily trigger budget). **Spec F's v1 quant layer is complete** (PRs #28–#32), and the vol-scaled cap's σ-staleness caveat is closed down to a five-minute cache residue (B1–B4). Six feature specs are written, two more were commissioned by the 2026-09-04 venue audit ([onboarding.md](docs/specs/onboarding.md), [venue-containers.md](docs/specs/venue-containers.md)), and one hundred and twenty-nine product decisions are recorded in [docs/decisions.md](docs/decisions.md).
 
 **D1 was revised on 2026-09-04.** The unit of isolation is one venue *account* per agent — a sub-account where the venue grants one, a top-level account where it does not. Hyperliquid gates sub-accounts behind $100,000 of protocol-enforced traded volume, on testnet as well as mainnet, so v1 provisions one top-level account per agent. Where this roadmap used "sub-account" to mean the unit of isolation, it now says **container**; where it names the venue's own `subAccounts` endpoint, it still means a sub-account. Reasoning: [decisions.md](docs/decisions.md) V1–V6.
@@ -20,7 +51,7 @@ Status as of 2026-09-07: P0 and the P1 code are on `main`; the P1 gate is waitin
 - [x] Testnet-default `Network` type, every network constant selected by it [13, D4]
 - [x] Design system in `docs/design/`, ASCII primitives and the shared 90 ms motion clock in the app shell [36]
 - [x] Ink ladder raised so labels and rules clear WCAG AA
-- **Gate:** app launches, CI green ✔
+- **Gate:** app launches; CI must be re-established on the corrected baseline.
 
 ### P1 · Hyperliquid protocol crate — code merged, gate pending
 
@@ -54,7 +85,7 @@ Status as of 2026-09-07: P0 and the P1 code are on `main`; the P1 gate is waitin
 - [x] Per-agent guardrails: symbol allowlist, max position, notional cap, order-rate cap, reduce-only mode, max slippage, leverage cap; leverage and margin mode operator-set [24, D3] — all eight on `AgentGuardrails`, with D-c's near-zero defaults, plus spec F's `max_risk_usd` vol-scaled cap (N1–N5), whose σ is corrected by the last hour's realised vol so a twenty-four-bar statistic cannot leave the cap wide through a regime change (B1–B4)
 - [ ] Guardrail config HMAC-checked with a keychain key [3] — **the key exists and nothing uses it.** `keys::HmacKey` has `sign`/`verify`, zeroizes on drop and redacts its own `Debug`, but no call site outside its definition: the config store neither writes a tag nor checks one. The primitive is done; the wiring is the work
 - [x] Loss circuit breaker: max daily loss / drawdown per agent and account-wide trips the kill switch [25] — `guardrail::breaker`, exhausted **at** the limit rather than past it, plus spec F's continuous gauge over the same predicate (L1–L4)
-- [x] Kill switch per agent and global: pauses new orders, cancels resting, persists across restart, typed `trading_paused` [26] — `guardrail::kill`, persisted through `GuardrailStore`; risk-reducing actions still clear while engaged
+- [ ] Kill switch per agent and global: pauses new orders, cancels resting, persists across restart, typed `trading_paused` [26] — core pause predicates exist; runtime cancellation delivery/retry and restart behavior must pass the assembled gate before this is complete
 - [ ] Dead-man's switch: `scheduleCancel` armed while any agent is active; quit dialog with cancel-all when positions are open [27] — **it is a daily budget, not a standing net**: minimum 5 s ahead, maximum 10 triggers per day resetting 00:00 UTC, so the arming policy is deliberate and the remaining count is shown in the risk console [decisions.md O1] — **the lead-time half landed** in `guardrail::deadman` (`DEAD_MAN_MIN_LEAD_MS`, a 60 s arm refreshed at 20 s remaining) and `clear_schedule_cancel` clears it. **The daily budget has not**: nothing counts triggers or resets at 00:00 UTC, so O1's central claim — that this is a budget and not a standing net — is the part still to build
 - [x] Property test proving there is no signer path without a guardrail check [invariant 1] — `no_input_produces_a_signable_value_without_passing_every_predicate`, 20,000 fuzzed cases with a vacuity guard, each cleared case re-derived predicate by predicate in `verify_every_predicate`
 - **Gate:** no signer path without a guardrail check — **met.** `no_input_produces_a_signable_value_without_passing_every_predicate` searches 20,000 fuzzed configurations and re-derives every predicate on each cleared case; `sign_cleared` takes a `Cleared` whose only constructor is the success branch of `decide`

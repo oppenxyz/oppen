@@ -377,6 +377,9 @@ pub enum Unevaluable {
     #[error("this clearance was evaluated {age_ms}ms ago, past the {max_age_ms}ms limit")]
     StaleClearance { age_ms: u64, max_age_ms: u64 },
 
+    #[error("operator policy changed after evaluation; evaluate the order again")]
+    PolicyChanged,
+
     /// The asset or the market tick the caller supplied is not the one the
     /// order names. Measuring an order against another instrument's price is
     /// the worst silent failure available to this module, so it is a refusal
