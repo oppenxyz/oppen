@@ -282,7 +282,7 @@ impl std::fmt::Debug for KeyStoreError {
 /// Public because it appears in [`KeyStore`]'s signatures, but opaque: every
 /// constructor and accessor is `pub(crate)`, so no caller outside this crate
 /// can assemble a name that crosses networks (`docs/decisions.md` R4).
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct EntryName {
     service: &'static str,
     account: String,

@@ -1362,12 +1362,12 @@ impl GuardrailEngine {
         // Checking it here keeps that unreachable and gives the cap below the
         // number it needs.
         let notional_usd = checked(px.checked_mul(sz), "order notional")?;
+        let position_szi = account.position_szi(&intent.symbol);
         let wire = spec
-            .to_wire(asset)
+            .to_wire_for_position(asset, position_szi)
             .map_err(|e| Refusal::VenueRule(VenueRule::from(e)))?;
 
         let signed_sz = if intent.is_buy { sz } else { -sz };
-        let position_szi = account.position_szi(&intent.symbol);
         // Spec item 24 measures a *position* cap, and an order that has not
         // filled yet is still exposure the agent has committed to. Without
         // the working book here, both this cap and the leverage cap below

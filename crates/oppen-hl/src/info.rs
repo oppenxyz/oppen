@@ -30,6 +30,18 @@ pub struct InfoClient {
 }
 
 impl InfoClient {
+    /// Loopback-only transport for cross-crate lifecycle tests.
+    #[cfg(feature = "test-support")]
+    pub fn loopback_fixture(port: u16) -> Result<Self, Error> {
+        Ok(Self {
+            http: Client::builder()
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()?,
+            url: format!("http://127.0.0.1:{port}/info"),
+        })
+    }
+
     pub fn new(network: Network) -> Result<Self, Error> {
         Ok(Self::with_client(network, Client::builder().build()?))
     }

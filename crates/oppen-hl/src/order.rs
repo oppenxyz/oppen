@@ -43,9 +43,28 @@ impl OrderSpec {
     /// the wire order. Rounding happens first so a caller can pass a raw
     /// mid-derived price.
     pub fn to_wire(&self, asset: &Asset) -> Result<OrderWire, OrderError> {
+        self.to_wire_for_position(asset, Decimal::ZERO)
+    }
+
+    /// A full reduce-only IOC close may leave the minimum-notional decision
+    /// to the venue. Partial reductions and opening orders keep the local
+    /// minimum; every other precision and delisting rule still applies.
+    pub fn to_wire_for_position(
+        &self,
+        asset: &Asset,
+        position: Decimal,
+    ) -> Result<OrderWire, OrderError> {
         let px = asset.round_price(self.px);
         let sz = asset.round_size(self.sz);
-        asset.validate_order(px, sz)?;
+        let full_close = self.reduce_only
+            && matches!(&self.kind, OrderKind::Limit { tif: Tif::Ioc })
+            && !position.is_zero()
+            && self.is_buy == position.is_sign_negative()
+            && sz == position.abs();
+        match asset.validate_order(px, sz) {
+            Err(ValidationError::MinNotional { .. }) if full_close => {}
+            result => result?,
+        }
         let t = match &self.kind {
             OrderKind::Limit { tif } => OrderType::Limit { tif: *tif },
             OrderKind::Trigger {
@@ -79,6 +98,92 @@ mod tests {
     use super::*;
     use crate::types::AssetInfo;
     use std::str::FromStr;
+
+    #[test]
+    fn only_an_exact_reduce_only_ioc_close_can_defer_the_minimum() {
+        let asset = Asset {
+            index: 0,
+            info: AssetInfo {
+                name: "TEST".into(),
+                sz_decimals: 2,
+                max_leverage: 10,
+                margin_table_id: 0,
+                is_delisted: false,
+                only_isolated: false,
+            },
+        };
+        let spec = OrderSpec {
+            is_buy: false,
+            px: Decimal::from(100),
+            sz: Decimal::new(5, 2),
+            kind: OrderKind::Limit { tif: Tif::Ioc },
+            reduce_only: true,
+            cloid: None,
+        };
+        assert!(matches!(
+            spec.to_wire(&asset),
+            Err(OrderError::Validation(ValidationError::MinNotional { .. }))
+        ));
+        for sign in [-1, 1] {
+            let position = Decimal::new(5 * sign, 2);
+            let close = OrderSpec {
+                is_buy: sign < 0,
+                ..spec.clone()
+            };
+            let wire = close.to_wire_for_position(&asset, position).unwrap();
+            assert_eq!(wire.s.as_str(), "0.05");
+            assert!(wire.r);
+            for invalid in [
+                OrderSpec {
+                    reduce_only: false,
+                    ..close.clone()
+                },
+                OrderSpec {
+                    is_buy: !close.is_buy,
+                    ..close.clone()
+                },
+                OrderSpec {
+                    sz: Decimal::new(4, 2),
+                    ..close.clone()
+                },
+                OrderSpec {
+                    sz: Decimal::new(6, 2),
+                    ..close.clone()
+                },
+                OrderSpec {
+                    kind: OrderKind::Limit { tif: Tif::Gtc },
+                    ..close.clone()
+                },
+            ] {
+                assert!(matches!(
+                    invalid.to_wire_for_position(&asset, position),
+                    Err(OrderError::Validation(ValidationError::MinNotional { .. }))
+                ));
+            }
+        }
+        let mut gone = asset.clone();
+        gone.info.is_delisted = true;
+        assert!(matches!(
+            spec.to_wire_for_position(&gone, spec.sz),
+            Err(OrderError::Validation(ValidationError::Delisted(_)))
+        ));
+        let bad_price = OrderSpec {
+            px: Decimal::ZERO,
+            ..spec.clone()
+        };
+        assert!(matches!(
+            bad_price.to_wire_for_position(&asset, spec.sz),
+            Err(OrderError::Validation(ValidationError::NonPositivePrice(_)))
+        ));
+        let no_size = OrderSpec {
+            sz: Decimal::ZERO,
+            ..spec
+        };
+        assert!(matches!(
+            no_size.to_wire_for_position(&asset, Decimal::ZERO),
+            Err(OrderError::Validation(ValidationError::NonPositiveSize(_)))
+        ));
+    }
 
     #[test]
     fn spec_rounds_then_validates() {

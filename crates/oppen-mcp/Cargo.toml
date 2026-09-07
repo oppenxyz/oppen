@@ -31,7 +31,7 @@ zeroize = "1"
 http-body-util = "0.1"
 oppen-core = { path = "../oppen-core" }
 tempfile = "3"
-oppen-hl = { path = "../oppen-hl" }
+oppen-hl = { path = "../oppen-hl", features = ["test-support"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
 tower = { version = "0.5", features = ["util"] }
 tracing-subscriber = "0.3"

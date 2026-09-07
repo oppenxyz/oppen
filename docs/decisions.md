@@ -16,6 +16,14 @@ decisions" section until then.
 These repairs implement spec items 7, 15, 19, 24, 26 and D6; they do not
 complete the live execution gate.
 
+The assembled loopback execution test exposed a local refusal of a full $5
+position close after a partial fill. The official Python SDK's
+[`market_close`](https://github.com/hyperliquid-dex/hyperliquid-python-sdk/blob/master/hyperliquid/exchange.py)
+submits the observed full position as reduce-only IOC without a local minimum
+check. ES12 follows that submission shape, not an assertion that every small
+close will be accepted: the [venue error contract](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/error-responses)
+still governs its response, and actual testnet acceptance remains unverified.
+
 | # | Decision | Choice | Why |
 |---|---|---|---|
 | ES1 | Submission ownership | One queue per container address, shared by all gateway sessions, acquired before exposure reads | Serializing only signatures or HTTP posts leaves concurrent evaluations spending the same headroom. |
@@ -28,6 +36,8 @@ complete the live execution gate.
 | ES8 | Durable submission reservation | Append a linked start before signing and a definite resolution to the existing event chain; serialize writes with SQLite and reject a changed account revision before signing | A memory-only queue loses unknown outcomes on restart. The restricted journal capability cannot change operator policy or registry. Reused account/cloid pairs, broken or redacted lifecycle evidence, and stale evaluations fail closed. Signing failures record `not_sent`; ambiguous exchange results keep the reservation. |
 | ES9 | Submission schema boundary | Advance the ledger to V3 with an additive lifecycle index; preserve existing rows and hashes | An older runtime must refuse the newer database instead of silently ignoring pending orders. Rollback requires a compatible runtime; do not lower `user_version` or remove lifecycle records from a used ledger. No new dependency or second event store. |
 | ES10 | Cross-process anchor ordering | Hold a canonical-path OS file lock across ledger operations, including commit, anchor publication, verification and initialization; bound acquisition by the existing five-second busy timeout | SQLite releases its write lock at commit, allowing independent handles to publish anchors out of order. The coordination file contains no events and must not be deleted while any runtime is open. All cooperating runtimes must be upgraded together. Use [standard file locking](https://doc.rust-lang.org/std/fs/struct.File.html#method.try_lock), available since Rust 1.89, instead of adding a locking dependency or hand-written platform calls; raise the declared minimum Rust version accordingly. |
+| ES11 | Assembled execution proof | Use real MCP dispatch, guardrail evaluation/signing, HTTP serializers and the startup reconciliation pump against a loopback venue | Unit seams missed a small-position close failure. Cross-crate loopback constructors live behind a dev-only `test-support` feature, disable proxies and redirects, and accept only a port on literal 127.0.0.1. No general endpoint override or new dependency. Opaque key entry names become clonable/hashable so the test key store uses their identity without opening the OS keychain or widening name construction. |
+| ES12 | Small full-position closes | Defer only the minimum-notional precheck for a reduce-only IOC whose side opposes and whose rounded size exactly equals the nonzero observed position | Do not trap a partial-fill residual behind the opening-order minimum. Keep the minimum for openings, partial/oversized reductions, non-IOC orders and unknown positions; keep all precision, delisting, feed, policy, risk, approval and signing checks. The wire retains reduce-only protection if the position changes before venue processing. Venue rejection remains typed; no claim of live acceptance before the pilot gate. |
 
 ## 2026-09-07 · The console's own socket
 

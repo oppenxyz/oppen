@@ -49,6 +49,10 @@ const BPS: Decimal = Decimal::from_parts(10_000, 0, 0, false, 0);
 use crate::outcome::{self, CancelFailure, Reply, ToolError};
 use rmcp::RoleServer;
 use rmcp::service::RequestContext;
+
+#[cfg(test)]
+#[path = "execution_fixture.rs"]
+mod execution_fixture;
 use rmcp::{
     ErrorData, ServerHandler,
     handler::server::wrapper::Parameters,
