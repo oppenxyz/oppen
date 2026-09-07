@@ -10,6 +10,7 @@ import {
   stopAccountPolling,
   type View,
 } from "./stores/shell";
+import { startMarketFeed, stopMarketFeed } from "./stores/market";
 import AgentsView from "./views/AgentsView.vue";
 import BuilderView from "./views/BuilderView.vue";
 import OnboardingView from "./views/OnboardingView.vue";
@@ -30,10 +31,17 @@ const current = computed(() => VIEWS[shell.view]);
 
 onMounted(() => {
   startAccountPolling();
+  // The socket, the rail poll and the staleness clock (items 31, 34). Started
+  // here rather than in TradeView: the status bar reads the feed from every
+  // view, so it must not stop when the operator opens Agents.
+  void startMarketFeed();
   // Asked once, not polled: see `refreshKeychain`.
   void refreshKeychain();
 });
-onUnmounted(() => stopAccountPolling());
+onUnmounted(() => {
+  stopAccountPolling();
+  stopMarketFeed();
+});
 </script>
 
 <template>

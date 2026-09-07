@@ -11,6 +11,34 @@ decisions" section until then.
 
 ---
 
+## 2026-09-07 · The console's own socket
+
+Item 34 asks for per-feed status, last-tick timestamps and a stale overlay. The
+console could answer none of it: `account_state` passed `last_tick_ms: None`
+with a comment saying there was no socket, so the overlay read "never
+connected" forever and every number on screen was a REST read taken once at
+mount and never again. Measured before the change: the app opened two
+connections at t=3 s, one more at t=8 s, and then made no network call at all
+for the next thirty-six seconds. The panels were not frozen in the sense of a
+hang — the process sat at 0% CPU, correctly idle. Nothing was feeding them.
+
+| # | Decision | Choice | Why |
+|---|---|---|---|
+| W1 | Which runtime folds the events | **`FeedSession::apply` in a loop the console owns, not `FeedPump`** | The pump looks like the obvious reuse and is the wrong shape here. Its `run` owns the event stream in a `select!` over three arms the console has no use for — reconcile retry, alert feeds, quote leases — all of them the agent gateway's concerns, and sharing that stream would mean either a broadcast in `oppen-hl` or an observer trait in the pump with one implementation (leanness rule 2). `FeedSession` was already `pub` and already folds a market frame to a tick, so the console needed no change to `oppen-core` at all beyond W5. **What this gives up:** the console's session never sets `reconciled`, because `FeedSession::reconciled` is `pub(crate)` and only the pump drives it. Nothing in the console reads that flag today — `VenueReadings` carries `last_tick_ms` and not `reconciled` — but the moment the console grows its own order path it needs the pump, and that is the point to move rather than now. |
+| W2 | What moves the forming bar | **The `trades` tape, with the venue's `candle` frame as the reconcile** | The first version subscribed `candle` and dropped `trades`, on the reasoning that the venue's own aggregation is authoritative. It is authoritative and it is not timely. Measured on testnet BTC over sixty seconds: eight candle frames, the last at t=43 s, then seventeen seconds of silence while the tape kept printing — a chart driven by that channel alone sits still through prints the operator can watch on the tape beside it. So each print extends the bar optimistically and the venue's bar overwrites it when it lands, which is the same optimistic-first / reconcile shape the rest of the real-time surface uses. **What this gives up:** between reconciles the bar's OHLCV is oppen's composition, not the venue's. A print the tape drops is a bar that is wrong until the next candle frame corrects it, and on a quiet market that can be tens of seconds. |
+| W3 | What streams and what polls | **The selected symbol streams; the rail polls every 10 s** | No Hyperliquid channel answers for the whole universe at once — `activeAssetCtx` is per coin, so a live rail means one subscription per listed perp, roughly two hundred of them, spent on rows nobody is looking at and against a per-IP subscription ceiling the pool already clamps to. The symbol the operator selected gets five channels; everything else gets a timer. **What this gives up:** a row the operator is not looking at can be ten seconds stale, and the rail is ordered by day volume so that ordering is stale with it. Re-sorting on every tick was rejected separately: rows jumping under the pointer is worse than a slightly stale order. |
+| W4 | Who owns the market feed's freshness | **The socket, not the account poll** | `refreshAccount` previously set `wsMarket` and `wsUser` from the same `feed` field, which was one indicator wearing two hats. Item 34 says staleness is surfaced *per feed*, and now the two genuinely have different clocks: the account is four REST reads on a five-second poll, the market is a socket. A live socket beside a failed account read is a real state and the operator has to be able to see which half is down, so `feedTick` owns `wsMarket` and the account poll no longer touches it. A frame going quiet announces nothing, so a one-second timer ages the indicator to `stale` after five seconds — a handful of missed `activeAssetCtx` frames rather than a threshold a quiet market trips on its own. |
+| W5 | What a context frame puts on the wire | **A whole `MarketRow`, which made `MarketRow::of` public** | The frame carries every field the REST universe read carries, so the alternative was to emit three loose fields and convert the hour-to-date funding to bps a second time in the desktop crate. That is the drift Z1 already refused once: two statements of one rule, in two crates, where a rail fed by REST and a rail fed by the socket could disagree about what "0.125 bp" means. `pub` here is earned under leanness rule 3 — it has a caller now — and the rail row for the watched symbol goes live as a side effect. |
+| W6 | How this is proved | **An ignored-by-default test that opens a real socket and asserts per channel** | The unit tests over the translation are worth having and could not have caught the failure that matters: a wrong channel name or an interval the venue rejects produces an identically green suite and a console that sits at "—". So `tests/live_feed.rs` subscribes all five channels and asserts each one delivered, separately — `bbo` at nine frames a second would otherwise mask a silently refused `candle`, and the chart is exactly the panel that would then never move. Venue error frames are collected and printed, never branched on (invariant 8): the first run reported `Already subscribed` for three channels, which is the pool re-sending and costs the console nothing. **What this gives up:** the test needs the network and a live venue, so it is not a CI gate. `tokio` enters the desktop crate as a dev-dependency for it (leanness rule 9) — the same runtime Tauri's `async_runtime` already is, not a second choice. |
+
+**What this revises elsewhere.** Z4 said `micro_tilt_bps` is absent from the
+Features panel because "the console holds no socket of its own". That reason is
+now gone: the console subscribes `bbo` for the selected symbol at its ~0.11 s
+cadence, which is the source §14.4 correction 4 requires. The row is still
+absent, because nothing yet computes the microprice on the console side — but it
+is now an unbuilt panel row rather than a missing input, and it is a small piece
+of work rather than a blocked one.
+
 ## 2026-09-07 · The chart panel
 
 `lib/candles.ts` has been a finished 707-line renderer with a golden-frame test

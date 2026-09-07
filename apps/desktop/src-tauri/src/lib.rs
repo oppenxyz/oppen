@@ -6,11 +6,17 @@
 //! The MCP `get_state` tool reads the same [`oppen_core::state::assemble`], so
 //! the operator and the agent cannot be shown different accounts (A3).
 
+mod feed;
+
+use std::sync::Mutex;
+
+use feed::ConsoleFeed;
 use oppen_core::candles::Interval;
 use oppen_core::keys::{KeyStore, KeychainKeyStore};
 use oppen_core::market::{ChartSeries, MarketRow, MarketSnapshot, chart, rows, snapshot};
 use oppen_core::state::{AccountState, VenueReadings, assemble};
 use oppen_hl::{Address, InfoClient, Network};
+use tauri::{Manager, State};
 
 /// Why the console has nothing to show.
 ///
@@ -207,7 +213,10 @@ async fn chart_series(
 /// Four venue reads rather than one, because Hyperliquid publishes no single
 /// endpoint that answers it and spot is load-bearing under unified margin.
 #[tauri::command]
-async fn account_state(network: String) -> Result<AccountState, ConsoleError> {
+async fn account_state(
+    feeds: State<'_, Feeds>,
+    network: String,
+) -> Result<AccountState, ConsoleError> {
     let network = network_of(&network);
     let account = configured_account()?;
     let info = InfoClient::new(network).map_err(|e| ConsoleError::Venue(e.to_string()))?;
@@ -242,11 +251,66 @@ async fn account_state(network: String) -> Result<AccountState, ConsoleError> {
             spot: &spot,
             orders: &orders,
             mids: &mids,
-            // No socket in the console yet. Reported as never-connected rather
-            // than live, so the staleness overlay tells the truth.
-            last_tick_ms: None,
+            // The live socket's own clock (item 34). Still `None` before the
+            // first `watch_market` builds the feed, which is the honest answer
+            // then: nothing has connected, so there is no last-good value
+            // behind the overlay.
+            last_tick_ms: feeds
+                .0
+                .lock()
+                .ok()
+                .and_then(|slot| slot.as_ref().filter(|f| f.serves(network))?.last_tick_ms()),
         },
     ))
+}
+
+/// The console's live socket, once something has asked for one.
+///
+/// Lazily built and rebuilt on a network switch: the pool is bound to one
+/// network's endpoint, and invariant 5 makes that switch explicit rather than
+/// something a socket can straddle. Dropping the old feed closes its sockets.
+#[derive(Default)]
+struct Feeds(Mutex<Option<ConsoleFeed>>);
+
+/// Point the live feed at the symbol the operator selected (items 31, 34).
+///
+/// Called on selection and on an interval change, and it is what makes the
+/// console real-time: everything the panels draw for the selected symbol
+/// arrives on the socket from here on, and the REST reads beside it are only
+/// the seed and the history a socket cannot supply.
+#[tauri::command]
+async fn watch_market(
+    app: tauri::AppHandle,
+    feeds: State<'_, Feeds>,
+    network: String,
+    coin: String,
+    interval: String,
+) -> Result<(), ConsoleError> {
+    // Parsed and re-rendered, exactly as `chart_series` does. The venue takes
+    // the interval as a string and answers an unknown one by refusing the
+    // subscription, which arrives as a feed that silently never delivers — the
+    // chart would then sit still with every other channel healthy, which is
+    // the failure this whole change is about. Canonicalising here also means
+    // `120s` reaches the socket as `2m`, so the streamed bucket width is the
+    // one the chart's REST seed was drawn at.
+    let interval = Interval::parse(&interval)
+        .map_err(|e| ConsoleError::Venue(format!("{interval} is not an interval: {e}")))?
+        .to_string();
+    let network = network_of(&network);
+    let mut slot = feeds
+        .0
+        .lock()
+        .map_err(|_| ConsoleError::Venue("the feed lock is poisoned".into()))?;
+    if !slot.as_ref().is_some_and(|feed| feed.serves(network)) {
+        // The account is optional: market data needs none, and a console with
+        // no account configured still has a chart to draw.
+        let account = configured_account().ok().map(|a| a.to_string());
+        *slot = Some(ConsoleFeed::start(&app, network, account).map_err(ConsoleError::Venue)?);
+    }
+    slot.as_ref()
+        .expect("the feed was just built")
+        .watch(&coin, &interval)
+        .map_err(ConsoleError::Venue)
 }
 
 fn now_ms() -> u64 {
@@ -260,12 +324,17 @@ fn now_ms() -> u64 {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .setup(|app| {
+            app.manage(Feeds::default());
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             account_state,
             keychain_status,
             markets,
             market_snapshot,
-            chart_series
+            chart_series,
+            watch_market
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

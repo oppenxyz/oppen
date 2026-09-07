@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from "vue";
+import { computed, ref } from "vue";
 import CandleChart from "../components/CandleChart.vue";
 import ColumnHeader from "../components/housing/ColumnHeader.vue";
 import EmptyState from "../components/housing/EmptyState.vue";
@@ -9,7 +9,6 @@ import StatBlock from "../components/housing/StatBlock.vue";
 import {
   INTERVALS,
   market,
-  refreshMarkets,
   refreshSnapshot,
   select,
   selectedRow,
@@ -108,7 +107,9 @@ const asks = computed(() => market.snapshot?.asks.slice(0, 8) ?? []);
 const ledger = ref<Ledger>("positions");
 const ledgerEmpty = computed(() => LEDGER_TABS.find((tab) => tab.key === ledger.value)?.empty ?? "");
 
-onMounted(() => void refreshMarkets());
+// The rail is read and re-read by `startMarketFeed`, which App.vue owns
+// because the status bar reads the feed from every view. Nothing to do on
+// mount here any more.
 </script>
 
 <template>

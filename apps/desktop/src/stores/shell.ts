@@ -49,6 +49,14 @@ interface ShellState {
    * the same as unreachable, and the tracker distinguishes them.
    */
   keychain: KeychainStatus | null;
+  /**
+   * Newest frame off the market socket, ms. `null` before the first one —
+   * which item 34 distinguishes from having gone quiet, because there is no
+   * last-good value behind the overlay.
+   */
+  lastMarketTickMs: number | null;
+  /** The socket's own words when it dropped a feed. Display-only. */
+  feedDetail: string | null;
 }
 
 const state = reactive<ShellState>({
@@ -63,6 +71,8 @@ const state = reactive<ShellState>({
   account: null,
   accountError: null,
   keychain: null,
+  lastMarketTickMs: null,
+  feedDetail: null,
 });
 
 export const shell = readonly(state);
@@ -136,8 +146,12 @@ export async function refreshAccount(): Promise<void> {
     state.account = next;
     state.accountError = null;
     state.equityUsd = Number(next.balances.equity_usd);
+    // `wsMarket` is deliberately not set here. It is the socket's own
+    // indicator now and `feedTick` owns it; overwriting it on the account poll
+    // would make a market feed that is streaming read as whatever the account
+    // read last saw.
     state.feeds = {
-      wsMarket: next.feed === "live" ? "ok" : next.feed === "stale" ? "stale" : "unknown",
+      ...state.feeds,
       wsUser: next.feed === "live" ? "ok" : next.feed === "stale" ? "stale" : "unknown",
       rest: "ok",
     };
@@ -187,4 +201,50 @@ export function stopAccountPolling(): void {
   if (poll === null) return;
   clearInterval(poll);
   poll = null;
+}
+
+/**
+ * How long without a frame before the market feed reads stale (item 34).
+ *
+ * `activeAssetCtx` is the slowest channel the console subscribes at roughly
+ * one second, so five is a handful of missed frames rather than a threshold a
+ * quiet market trips on its own.
+ */
+const MARKET_STALE_AFTER_MS = 5_000;
+
+/**
+ * Record a frame off the socket (`docs/spec.md` item 34).
+ *
+ * The market feed's freshness is answered here rather than by `refreshAccount`
+ * because the two now have different clocks: the account is four REST reads on
+ * a five-second poll, and the market is a socket. Collapsing them into one
+ * indicator is what item 34 forbids — a live socket beside a failed account
+ * read is a real state, and the operator has to be able to see which half is
+ * down.
+ */
+export function feedTick(atMs: number): void {
+  state.lastMarketTickMs = Math.max(state.lastMarketTickMs ?? 0, atMs);
+  state.feeds = { ...state.feeds, wsMarket: "ok" };
+}
+
+/** The socket said what it is doing. A drop is not a stale feed: it is a drop. */
+export function feedStatus(connected: boolean, detail?: string): void {
+  state.feeds = { ...state.feeds, wsMarket: connected ? "ok" : "down" };
+  state.feedDetail = detail ?? null;
+}
+
+/**
+ * Age the market indicator off the clock.
+ *
+ * A socket that stops delivering does not announce it — that is the whole
+ * shape of item 34's "stale overlay after N seconds", and without this the
+ * indicator would sit on `ok` forever after the last frame.
+ */
+export function ageFeeds(nowMs: number): void {
+  if (state.feeds.wsMarket === "down") return;
+  if (state.lastMarketTickMs === null) return;
+  state.feeds = {
+    ...state.feeds,
+    wsMarket: nowMs - state.lastMarketTickMs > MARKET_STALE_AFTER_MS ? "stale" : "ok",
+  };
 }
