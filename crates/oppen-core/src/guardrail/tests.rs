@@ -1685,6 +1685,7 @@ fn leverage_replaces_the_exact_limit_notional_from_production_state() {
         cloid: None,
         is_buy,
         limit_px,
+        reference_px: Some(limit_px),
         size: Decimal::ONE,
         original_size: Decimal::ONE,
         reduce_only: false,
