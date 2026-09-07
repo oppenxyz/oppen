@@ -11,6 +11,21 @@ decisions" section until then.
 
 ---
 
+## 2026-09-07 · What execution actually cost
+
+Spec F's last v1 line asks for four things — `arrival_mid` on every order,
+`slip_bps` per fill, a PnL decomposition, and `get_execution_report` with `n=`
+and baselines. Reading the repo first found that two of them were already
+built under other names.
+
+| # | Decision | Choice | Why |
+|---|---|---|---|
+| Q1 | Where `arrival_mid` comes from | **It was already stamped: the clearance's `reference_px`** | Every `OrderIntent` row is the serialized `Clearance`, and `ClearedKind::Order` has carried `reference_px` — the price the guardrails measured the order against — since the engine was written. That *is* spec F's arrival mid: the market as it stood when the decision was taken, before anything was sent. So nothing new is stamped on the order; the fill row picks it up and records it under the spec's word. The clearance field is not renamed, because it is hashed into the chain and a rename would change every future payload's shape for a synonym. **What this gives up:** two names for one number, which is why both are documented as the same thing in the field docs and here. |
+| Q2 | Where `slip_bps` is computed | **In the reconciler, stamped on the fill row, from the join that already existed** | `Attributions` already reads every intent payload to find its cloid, so the arrival price rides along at no extra cost, and the fill row already carries `intent_seq` and `intent_hash`. Stamping beats deriving at read time for the reason the ledger exists: a chained row carrying the arrival price *and* the slippage can be audited on its own, where a number recomputed later asks the reader to trust that the intent it joined to has not moved. Both fields are written or neither — a slippage with no arrival price beside it is a figure nobody can check. |
+| Q3 | The sign of `slip_bps` | **Signed, and price improvement is reported rather than clamped** | The guardrail's own `adverse_slippage_bps` floors at zero, correctly: it is deciding whether to refuse, and only the costly direction can do that. A TCA statistic that floors at zero has a mean biased upward by every fill that went well — and the comparison the report exists for, crossing against resting, is precisely a comparison where one side is *expected* to be negative. Clamping would have made the maker column read zero and the whole baseline useless. |
+| Q4 | What the baseline is | **The maker/taker split, because `crossed` is on every fill** | Spec F says "baselines on every stat" and does not say against what. The honest answer is the comparison the data already supports: what crossing the spread cost, measured against what resting earned, per symbol and overall. It needs no model, no benchmark feed and no assumption — and it is the decision an agent can actually act on. Either side is absent when nothing landed on it, which is itself the finding for an agent that only ever crosses. **What this gives up:** an implementation-shortfall baseline against a decision-time snapshot, which is a v1.5 line and needs the `preflight` anchor that does not exist yet. |
+| Q5 | What the report refuses to claim | **Unscoreable fills are counted, and the funding leg is named as missing** | A fill with no arrival mid cannot be scored — an external trade, a manual ticket, or an order from before this change. The report publishes that count next to the scored one rather than dropping it, because a clean mean over half an account's trading is the most misleading artefact this product could ship. The PnL decomposition is price and fees only: both come off the fill rows the venue already gives us, but **funding** needs a `userFunding` read that does not exist in the client and would need auditing against the live API before being trusted — the same treatment C8 gave `preflight`'s fee estimate, and for the same reason. Named on the tool and in the contract rather than half-answered. |
+
 ## 2026-09-06 · Sizing against volatility
 
 Spec F gives this one nine-word line — `effective_cap = risk_budget / (2σ_day)`

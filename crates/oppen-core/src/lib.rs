@@ -24,6 +24,7 @@ pub mod keys;
 pub mod ledger;
 pub mod reconcile;
 pub mod state;
+pub mod tca;
 
 pub use oppen_hl::Network;
 

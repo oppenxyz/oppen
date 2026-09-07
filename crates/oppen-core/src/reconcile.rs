@@ -80,6 +80,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 
+use rust_decimal::Decimal;
 use serde_json::{Value, json};
 
 use oppen_hl::info::OrderRef;
@@ -139,6 +140,11 @@ const FILL_TS_FIELD: &str = "ts_ms";
 /// The payload key an intent or operator action carries its client order id
 /// under. See [`Attributions`] for why it is searched at any depth.
 const CLOID_FIELD: &str = "cloid";
+/// The guardrail clearance's name for the decision-time mark. Spec F calls
+/// the same number the *arrival mid*, and the fill row stamps it under that
+/// name — the clearance field is hashed into the chain and cannot be renamed,
+/// but nothing stops the row that consumes it from using the spec's word.
+const REFERENCE_PX_FIELD: &str = "reference_px";
 
 /// How deep [`find_cloid`] will search a payload.
 ///
@@ -146,6 +152,8 @@ const CLOID_FIELD: &str = "cloid";
 /// component: a stack overflow is a panic on an input path, which
 /// `AGENTS.md` forbids.
 const MAX_PAYLOAD_DEPTH: usize = 8;
+/// Basis points per unit, for [`slip_bps`].
+const BPS: Decimal = Decimal::from_parts(10_000, 0, 0, false, 0);
 
 /// How far either side of the anchor the outage is taken to reach.
 ///
@@ -390,6 +398,11 @@ enum Attribution {
         agent_id: String,
         intent_seq: u64,
         intent_hash: String,
+        /// Spec F's arrival mid: the price the guardrails measured the order
+        /// against, carried from the intent row so the fill can be scored
+        /// against the decision that caused it. `None` for an intent that
+        /// recorded no price.
+        arrival_mid: Option<Decimal>,
     },
     /// Matched to an [`EventKind::OperatorAction`] — the human's own ticket in
     /// oppen (`docs/spec.md` item 33).
@@ -730,6 +743,16 @@ struct IntentRef {
     seq: u64,
     hash: String,
     agent_id: Option<String>,
+    /// The price the guardrails measured this order against, which is spec F's
+    /// **arrival mid**: the market as it stood at the instant the decision was
+    /// taken, before anything was sent.
+    ///
+    /// Read here rather than looked up later because [`Attributions::read`]
+    /// already has the intent payload open to find the cloid, so the arrival
+    /// price costs nothing extra — and because a fill can only be measured
+    /// against the decision that caused it, which is the row this join is
+    /// about. `None` for a hand-written intent that carries no price.
+    arrival_mid: Option<Decimal>,
 }
 
 /// The join from a client order id to the row that explains it.
@@ -790,6 +813,7 @@ impl Attributions {
                         seq: event.seq,
                         hash: event.hash,
                         agent_id: event.agent_id,
+                        arrival_mid: find_reference_px(payload, 0),
                     },
                 );
             }
@@ -825,6 +849,7 @@ impl Attributions {
                     agent_id: agent_id.clone(),
                     intent_seq: intent.seq,
                     intent_hash: intent.hash.clone(),
+                    arrival_mid: intent.arrival_mid,
                 };
             }
         }
@@ -872,6 +897,68 @@ fn find_cloid(payload: &Value, depth: usize) -> Option<String> {
         Value::Array(items) => items.iter().find_map(|item| find_cloid(item, depth + 1)),
         _ => None,
     }
+}
+
+/// The decision-time reference price a payload carries, at any depth.
+///
+/// Same discipline as [`find_cloid`] and for the same reason: the field lives
+/// inside the serialized `Clearance`, nested under `kind`, and pinning that
+/// path here would make the join a hostage to the guardrail engine's struct
+/// layout. Root-first, then depth-first in sorted key order, so the answer
+/// never depends on `serde_json`'s map iteration order and the number a fill
+/// is measured against is reproducible from the row that recorded it.
+///
+/// Only a positive price is accepted. A zero or negative one is not a cheap
+/// arrival — it is a payload that cannot be measured against, and dividing by
+/// it would manufacture a slippage figure out of a broken row.
+fn find_reference_px(payload: &Value, depth: usize) -> Option<Decimal> {
+    if depth > MAX_PAYLOAD_DEPTH {
+        return None;
+    }
+    let read = |value: &Value| {
+        value
+            .as_str()
+            .and_then(|text| Decimal::from_str_exact(text).ok())
+            .filter(|px| *px > Decimal::ZERO)
+    };
+    match payload {
+        Value::Object(map) => {
+            if let Some(found) = map.get(REFERENCE_PX_FIELD).and_then(read) {
+                return Some(found);
+            }
+            let mut keys: Vec<&str> = map.keys().map(String::as_str).collect();
+            keys.sort_unstable();
+            keys.into_iter().find_map(|next| {
+                map.get(next)
+                    .and_then(|inner| find_reference_px(inner, depth + 1))
+            })
+        }
+        Value::Array(items) => items
+            .iter()
+            .find_map(|item| find_reference_px(item, depth + 1)),
+        _ => None,
+    }
+}
+
+/// Realized slippage against the arrival mid, in basis points, **signed**.
+///
+/// Positive is cost: a buy that filled above the decision-time price, or a
+/// sell that filled below it. Negative is price improvement, and it is
+/// reported rather than clamped — the guardrail's own
+/// `adverse_slippage_bps` floors at zero because it is deciding whether to
+/// refuse and only the costly direction can do that, but a TCA statistic that
+/// floors at zero has a mean biased upward by every fill that went well, which
+/// makes the whole report useless for the comparison it exists to support.
+///
+/// `None` when the arithmetic overflows, which leaves the field off the row
+/// rather than putting a wrong number in the chain.
+fn slip_bps(is_buy: bool, fill_px: Decimal, arrival_mid: Decimal) -> Option<Decimal> {
+    let moved = if is_buy {
+        fill_px.checked_sub(arrival_mid)
+    } else {
+        arrival_mid.checked_sub(fill_px)
+    }?;
+    moved.checked_div(arrival_mid)?.checked_mul(BPS)
 }
 
 /// Walk `userFillsByTime` from `start_ms` to the venue's own now, and return
@@ -1400,10 +1487,23 @@ fn fill_payload(
             agent_id,
             intent_seq,
             intent_hash,
+            arrival_mid,
         } => {
             payload["agent_id"] = json!(agent_id);
             payload["intent_seq"] = json!(intent_seq);
             payload["intent_hash"] = json!(intent_hash);
+            // Spec F's TCA foundation. Stamped rather than derived later: the
+            // arrival mid is a fact about the instant the decision was taken,
+            // and a chained row that carries it can be audited without
+            // re-reading the intent and trusting that nothing moved. Both
+            // fields or neither — a slippage with no arrival price to check it
+            // against is a number nobody can verify.
+            if let Some(arrival_mid) = arrival_mid
+                && let Some(slip) = slip_bps(fill.side.is_buy(), fill.px, *arrival_mid)
+            {
+                payload["arrival_mid"] = json!(arrival_mid.to_string());
+                payload["slip_bps"] = json!(slip.to_string());
+            }
         }
         Attribution::Manual { action_seq } => {
             payload["action_seq"] = json!(action_seq);
@@ -1481,6 +1581,60 @@ mod tests {
             tid,
             cloid,
         }
+    }
+
+    /// **The writer and the reader, against each other.** `fill_payload`
+    /// stamps the TCA fields and `tca::ScoredFill` reads them back, and the
+    /// two agreeing is the whole of spec F's per-fill measurement. Written
+    /// this way because the first version of the reader looked for `time`
+    /// where the writer stamps `ts_ms`, so every fill came back unscoreable
+    /// and a hand-written fixture agreed with the mistake — a test that
+    /// invents its own payload proves only that the test and the bug share an
+    /// author.
+    ///
+    /// The arithmetic is hand-computed, per P6's gate: a buy filled at
+    /// 2307.3 against an arrival mid of 2300 paid 7.3 on 2300, which is
+    /// 31.739130434782608695652173913 bps.
+    #[test]
+    fn what_fill_payload_stamps_is_what_the_execution_report_reads() {
+        let cloid = Cloid::parse("0x00000000000000000000000000000001").expect("cloid");
+        let fill = fill_at(1, T0 as u64, Some(cloid));
+        let attribution = Attribution::Attributed {
+            agent_id: "alpha".to_owned(),
+            intent_seq: 7,
+            intent_hash: "hash".to_owned(),
+            arrival_mid: Some(dec("2300")),
+        };
+        let payload = fill_payload(account(), &fill, &attribution, None);
+
+        let scored = crate::tca::ScoredFill::from_payload(&payload)
+            .expect("a payload this module wrote must be one the report can read");
+        assert_eq!(scored.symbol, "ETH");
+        assert_eq!(scored.agent_id, "alpha");
+        assert_eq!(scored.ts_ms, T0);
+        assert_eq!(scored.slip_bps.round_dp(6), dec("31.739130"));
+        assert_eq!(scored.fee_usd, dec("1.23"));
+        assert_eq!(scored.closed_pnl_usd, dec("-12.5"));
+        assert!(scored.crossed);
+        // 2307.3 x 1.5.
+        assert_eq!(scored.notional_usd, dec("3460.95"));
+
+        // And a fill with no arrival mid carries neither field, so the report
+        // counts it unscored rather than scoring it against nothing.
+        let blind = fill_payload(
+            account(),
+            &fill,
+            &Attribution::Attributed {
+                agent_id: "alpha".to_owned(),
+                intent_seq: 7,
+                intent_hash: "hash".to_owned(),
+                arrival_mid: None,
+            },
+            None,
+        );
+        assert!(blind.get("slip_bps").is_none());
+        assert!(blind.get("arrival_mid").is_none());
+        assert!(crate::tca::ScoredFill::from_payload(&blind).is_none());
     }
 
     fn open_order(oid: u64, cloid: Option<Cloid>) -> OpenOrder {

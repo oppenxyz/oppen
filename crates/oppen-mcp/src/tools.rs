@@ -26,6 +26,7 @@ use oppen_core::ledger::EventViews;
 use oppen_core::state::{
     AccountState, VenueReadings, assemble, exposure_from, realized_pnl_since, utc_day_start_ms,
 };
+use oppen_core::tca::{ExecutionReport, ScoredFill};
 use oppen_hl::info::OrderRef;
 use oppen_hl::types::{Candle, OrderStatusResponse, ReferencePrices};
 use oppen_hl::wire::{CancelWire, Cloid, Grouping, Tif, Tpsl};
@@ -35,6 +36,11 @@ use oppen_hl::{ExchangeClient, ExchangeResponse, NonceAllocator, OrderKind, Stat
 use crate::auth::Binding;
 
 /// Basis points per unit. A bound 1% wide is 100 bps.
+/// The execution report's default window. A day: long enough that a few
+/// fills accumulate into a sample worth reading, short enough that it
+/// describes how the agent is trading now rather than how it traded last
+/// week under different guardrails.
+const DEFAULT_REPORT_HOURS: u32 = 24;
 const BPS: Decimal = Decimal::from_parts(10_000, 0, 0, false, 0);
 use crate::outcome::{self, CancelFailure, Reply, ToolError};
 use rmcp::RoleServer;
@@ -387,6 +393,14 @@ pub struct RecallParams {
     /// One key, or absent for everything you have remembered.
     #[serde(default)]
     pub key: Option<String>,
+}
+
+/// What `get_execution_report` takes.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ExecutionReportParams {
+    /// How far back to look, in hours. Absent is 24.
+    #[serde(default)]
+    pub hours: Option<u32>,
 }
 
 /// What `get_events` takes.
@@ -1390,6 +1404,46 @@ impl Gateway {
         self.add_loss_budget(&mut state, &bound, now).await;
         Ok(CallToolResult::success(vec![ContentBlock::text(
             serde_json::to_string(&state).expect("AccountState serializes"),
+        )]))
+    }
+
+    /// `get_execution_report` — what your execution actually cost
+    /// (`docs/spec.md` spec F).
+    #[tool(
+        description = "Transaction cost analysis of your own fills: slippage against the price \
+                       each order was decided at, split by whether you crossed the spread or \
+                       rested, plus realized PnL and fees. Every statistic carries the number of \
+                       fills behind it. Read it before concluding a strategy works: a good mean \
+                       over four fills is not evidence."
+    )]
+    async fn get_execution_report(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(params): Parameters<ExecutionReportParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let bound = Self::bound(&ctx)?;
+        let to_ms = now_ms() as i64;
+        let hours = i64::from(params.hours.unwrap_or(DEFAULT_REPORT_HOURS));
+        let from_ms = to_ms.saturating_sub(hours.saturating_mul(3_600_000));
+
+        let payloads = self
+            .inner
+            .events
+            .for_agent(bound.agent.as_str())
+            .fills_between(from_ms, to_ms)
+            .map_err(|e| ToolError::unavailable("ledger", e))?;
+        // A row that cannot be scored is counted, never dropped: a report
+        // whose denominator quietly excluded half the account's trading would
+        // be the most misleading artefact in the product.
+        let scored: Vec<ScoredFill> = payloads
+            .iter()
+            .filter_map(ScoredFill::from_payload)
+            .collect();
+        let unscored = payloads.len() - scored.len();
+        let report = ExecutionReport::of(&scored, from_ms, to_ms, unscored);
+
+        Ok(CallToolResult::success(vec![ContentBlock::text(
+            serde_json::to_string(&report).expect("ExecutionReport serializes"),
         )]))
     }
 
