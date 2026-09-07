@@ -111,7 +111,7 @@ describe('operator source reads', () => {
     expect(operator.policy.guardrails).toEqual({ alpha: {} });
     expect(operator.policyReadMs).toBe(policyRead);
     expect(operator.policyError).toBe('Policy file unavailable.');
-    operatorRead = async () => { throw { kind: 'local_state', detail: 'Reader failed.' }; };
+    operatorRead = async () => { throw { kind: 'local_status', detail: 'Reader failed.' }; };
     await refreshOperator();
     expect(operator.ledger.head_seq).toBe(2);
     expect(operator.error).toBe('Reader failed.');

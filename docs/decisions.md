@@ -40,6 +40,86 @@ still governs its response, and actual testnet acceptance remains unverified.
 | ES12 | Small full-position closes | Defer only the minimum-notional precheck for a reduce-only IOC whose side opposes and whose rounded size exactly equals the nonzero observed position | Do not trap a partial-fill residual behind the opening-order minimum. Keep the minimum for openings, partial/oversized reductions, non-IOC orders and unknown positions; keep all precision, delisting, feed, policy, risk, approval and signing checks. The wire retains reduce-only protection if the position changes before venue processing. Venue rejection remains typed; no claim of live acceptance before the pilot gate. |
 | ES13 | Account-wide open exposure | Add an operator-only optional gross notional cap, distinct from the per-symbol position cap and leverage | Implements item 24 and the supervised pilot's $25 total exposure requirement. Count all marked positions plus all marked opening resting orders plus the candidate opening order, without netting opposite orders. Genuine reduce-only reductions retain the existing unwind exemption; reduce-only orders add no opening commitment. Old policies default to unset; zero denies opening exposure and negative values are invalid. This guard is not the pilot's persistent executed-notional/loss budget or exhaustion latch, which must still stop execution and require renewed approval. No live pilot is authorized by this change. |
 
+### Supervised pilot cumulative accounting (ES14)
+
+Items 24, 25, 29 and D3/D6 require the approved pilot budgets to survive sessions.
+Record one operator-authorized testnet account/agent and baseline per ledger in the existing
+chain, with no renewal or reset API. Authorization requires confirmed identity,
+exclusive account use and a reconciled flat baseline; this implementation does
+not authorize the candidate account or replace that ceremony.
+
+Track actual executed notional separately from unfilled submission allocations.
+Both opening and closing fills count. Value the remaining signed size at the
+larger of its limit and reference price; an acknowledgement or terminal cancel
+does not establish that its unreported remainder never executed. Release only
+definitely unsent/rejected allocations or size accounted for by unique fills.
+Unmatched fills, late pre-baseline history, redacted evidence and invalid units
+block admission instead of restoring allowance.
+
+Missing order linkage is transient only while its durable fill awaits an
+authoritative account/OID binding. A duplicate's new client-order identity may
+not be discarded without that proof; unproven or conflicting enrichment stops
+the pilot permanently. Exhaustion and contradictory evidence do not clear when
+later data arrives. The venue's `fee` already includes builder fees, so those are
+not subtracted twice ([official fill fields](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint#retrieve-a-users-fills)).
+
+The pilot's $5 realized-loss threshold is net realized PnL including fees, not a
+daily window. Persist exhaustion with the fill transaction so a crash, midnight,
+ordinary resume or later profit cannot reset it. The $150 execution allowance and
+$15 order cap are distinct from the $25 gross exposure and 1x leverage policies.
+Recheck cumulative authority inside the Rust signing gate, including reduce-only
+orders, and retain its ledger coordination lock until cryptographic signing
+finishes so a fill cannot publish a halt between the check and signature.
+Cancellation remains available. Reserved allowance is not reported as
+executed turnover. Venue price movement and already-working orders can exceed a
+measured threshold before observation; a stop prevents subsequent submissions,
+not retroactive fills. The supervised live gate must report this residual.
+
+A fill that trips a stop commits the stop inside its own chained payload. The
+writer evaluates tentative rows under a savepoint and folds the stop into the
+fill before commit; no committed row is rewritten. Independent evidence faults,
+such as a conflicting duplicate trade ID, append a standalone stop. Both paths
+commit at most one new row, preserving the existing one-row anchor crash bound
+instead of accepting additional unanchored history.
+
+Advance the ledger to V4 as a reader-compatibility barrier without rewriting rows
+or adding a second store. Older runtimes must refuse it. Do not lower its version
+or discard pilot events to roll back; use a compatible runtime, or a pre-upgrade
+backup only if no subsequent activity occurred. Stop older runtimes before
+migration; already-open old processes do not acquire new enforcement logic.
+No new dependency.
+
+### Pilot stop supervision (ES15)
+
+Items 25, 29 and 34 require a stop to remain visible and actionable after restart
+or venue failure. Expose verified pilot identity and permanent halt separately
+from accounting projection: unavailable totals are never fabricated as zero.
+Invalid authority history returns an error rather than an invented identity.
+
+Reuse the existing bounded cancellation sweep for paused accounts and verified
+pilot accounts with a permanent stop or unavailable accounting. Recheck under
+the account queue and before submission. Transient reconciliation alone does
+not cancel; ordinary resume cannot clear a permanent pilot stop. Existing pause
+authority remains sufficient even if a pilot status read fails. Retained pairing
+bindings, not ledger identity alone, supply execution authority.
+
+Ledger verification runs off the async worker under a single-flight permit;
+status checks share the sweep's per-account deadline. A timed-out read cannot
+authorize a later cancellation and retains its permit until it finishes, so
+retries cannot accumulate blocking jobs. Shutdown drops the caller without
+waiting for read-only lock recovery; the residual read owns no signer or
+execution capability. Already-paused accounts bypass this reader.
+This bounds server shutdown, not process termination: Tokio runtime teardown
+may still wait for a permanently blocked filesystem read. Repeated Gateway
+recreation under stuck I/O and guaranteed process exit require a separate gate.
+
+The console polls this read-only local status independently of venue requests,
+discards responses from an obsolete network context, and retains a verified stop
+with an explicit stale/error indication when refresh fails. A stop banner is not
+proof that cancellation succeeded or positions closed. No automatic flattening,
+budget renewal, second event store, new worker or dependency is introduced.
+Account confirmation, runtime activation and supervised live proof remain gated.
+
 ## 2026-09-07 · The console's own socket
 
 Item 34 asks for per-feed status, last-tick timestamps and a stale overlay. The

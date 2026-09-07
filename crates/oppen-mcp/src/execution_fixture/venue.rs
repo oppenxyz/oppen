@@ -77,6 +77,10 @@ impl Venue {
 
     /// `size` is the incremental fill quantity, not cumulative filled size.
     pub(super) fn fill(&self, cloid: &str, size: Decimal) {
+        self.fill_with_fee(cloid, size, Decimal::new(1, 2));
+    }
+
+    pub(super) fn fill_with_fee(&self, cloid: &str, size: Decimal, fee: Decimal) {
         let mut book = self.state.lock().expect("fixture lock");
         let oid = book
             .orders
@@ -84,7 +88,8 @@ impl Venue {
             .find(|order| order.wire.c.as_ref().is_some_and(|c| c.as_str() == cloid))
             .map(|order| order.oid)
             .expect("fill names a known cloid");
-        book.fill(oid, size).expect("valid fixture fill");
+        book.fill_with_fee(oid, size, fee)
+            .expect("valid fixture fill");
     }
 
     pub(super) async fn shutdown(mut self) {
@@ -124,6 +129,7 @@ impl Drop for Venue {
 struct Book {
     orders: BTreeMap<u64, Order>,
     position: Decimal,
+    fees_paid: Decimal,
     fills: Vec<Value>,
     submissions: Vec<Value>,
     behaviors: VecDeque<Behavior>,
@@ -182,7 +188,7 @@ fn required<'a>(value: &'a Value, field: &str) -> Result<&'a str, String> {
 
 impl Book {
     fn equity(&self) -> Decimal {
-        Decimal::from(100) - Decimal::new(1, 2) * Decimal::from(self.fills.len() as u64)
+        Decimal::from(100) - self.fees_paid
     }
 
     fn info(&mut self, request: &Value) -> Result<Value, String> {
@@ -284,6 +290,15 @@ impl Book {
     }
 
     fn fill(&mut self, oid: u64, requested: Decimal) -> Result<Decimal, String> {
+        self.fill_with_fee(oid, requested, Decimal::new(1, 2))
+    }
+
+    fn fill_with_fee(
+        &mut self,
+        oid: u64,
+        requested: Decimal,
+        fee: Decimal,
+    ) -> Result<Decimal, String> {
         let order = self.orders.get_mut(&oid).ok_or("unknown fill oid")?;
         if order.status != "open" || requested <= Decimal::ZERO || requested > order.remaining {
             return Err("fill must be positive and within an open order's remaining size".into());
@@ -306,6 +321,7 @@ impl Book {
             order.status = "canceled";
         }
         let tid = self.fills.len() as u64 + 1;
+        self.fees_paid += fee;
         self.fills.push(json!({
             "coin": "TEST", "px": "100", "sz": size.to_string(),
             "side": if order.wire.b {"B"} else {"A"}, "time": order.updated,
@@ -314,7 +330,7 @@ impl Book {
                 (true, _, _) => "Open Long", _ => "Open Short"
             },
             "closedPnl": "0", "hash": format!("0x{tid:064x}"), "oid": oid,
-            "crossed": true, "fee": "0.01", "feeToken": "USDC", "builderFee": "0",
+            "crossed": true, "fee": fee.to_string(), "feeToken": "USDC", "builderFee": "0",
             "tid": tid, "cloid": order.wire.c
         }));
         Ok(size)

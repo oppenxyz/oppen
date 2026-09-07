@@ -60,7 +60,7 @@ export interface AccountState {
 
 /** What the Rust side returns instead of a state. */
 export interface ConsoleError {
-  kind: "not_configured" | "venue" | "local_state";
+  kind: "not_configured" | "venue" | "local_status";
   detail: string;
 }
 
@@ -120,6 +120,27 @@ export interface OperatorRead {
 }
 export async function fetchOperatorState(network: "testnet" | "mainnet"): Promise<OperatorRead> {
   return invoke<OperatorRead>("operator_state", { network });
+}
+
+export type PilotMetric = "order_notional" | "executed_notional" | "committed_notional" | "realized_loss";
+
+export type PilotStop =
+  | { reason: "awaiting_reconciliation" }
+  | { reason: "exhausted"; metric: PilotMetric; observed_usd: string; limit_usd: string }
+  | { reason: "unavailable"; detail: string };
+
+/** EventViews' verified identity and stop survive unavailable accounting totals. */
+export type PilotStatus = {
+  agent: string;
+  account: string;
+  halt: PilotStop | null;
+} & (
+  | { accounting: "known"; executed_usd: string; reserved_usd: string; net_realized_pnl_usd: string }
+  | { accounting: "unavailable"; detail: string }
+);
+
+export async function fetchPilotStatus(network: "testnet" | "mainnet"): Promise<PilotStatus | null> {
+  return invoke<PilotStatus | null>("pilot_status", { network });
 }
 
 /** What the keychain probe answers. */

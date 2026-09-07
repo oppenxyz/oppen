@@ -25,7 +25,8 @@ use oppen_core::feed::FeedSession;
 use oppen_core::guardrail::{Cleared, FeedQuality, GuardrailEngine, MarketRef, OrderIntent};
 use oppen_core::journal::Journal;
 use oppen_core::ledger::{
-    EventViews, SubmissionError, SubmissionJournal, SubmissionReceipt, SubmissionResolution,
+    EventViews, PilotAccounting, PilotStatus, PilotStop, SubmissionError, SubmissionJournal,
+    SubmissionReceipt, SubmissionResolution,
 };
 use oppen_core::state::{
     AccountState, VenueReadings, assemble, exposure_from, realized_pnl_since, utc_day_start_ms,
@@ -72,6 +73,9 @@ struct GatewayInner {
     // Serialize account reads within this gateway; the journal below retains
     // unresolved submissions across gateways and process restarts.
     execution: Mutex<HashMap<Address, Arc<tokio::sync::Mutex<()>>>>,
+    // A timed-out blocking replay may still be finishing. Never accumulate
+    // more replay tasks behind its ledger lock on subsequent sweeps.
+    pilot_reader: Arc<tokio::sync::Semaphore>,
     submissions: SubmissionJournal,
     network: Network,
     info: InfoClient,
@@ -132,6 +136,25 @@ struct ExecutionPermit {
 struct CancelAllResult {
     reply: Reply,
     complete: bool,
+}
+
+fn pilot_cancellation_needed(
+    bound: &Binding,
+    status: Option<PilotStatus>,
+) -> Result<bool, ToolError> {
+    let Some(status) = status else {
+        return Ok(false);
+    };
+    if status.agent != bound.agent || status.account != bound.account {
+        return Err(ToolError::unavailable(
+            "pilot cancellation identity",
+            "pilot status does not match the bound agent and account",
+        ));
+    }
+    Ok(matches!(
+        status.halt,
+        Some(PilotStop::Exhausted { .. } | PilotStop::Unavailable { .. })
+    ) || matches!(status.accounting, PilotAccounting::Unavailable { .. }))
 }
 
 /// What `place` takes.
@@ -491,6 +514,7 @@ impl Gateway {
         Ok(Self {
             inner: Arc::new(GatewayInner {
                 execution: Mutex::new(HashMap::new()),
+                pilot_reader: Arc::new(tokio::sync::Semaphore::new(1)),
                 submissions: events.submissions(),
                 network,
                 info: InfoClient::new(network)?,
@@ -557,7 +581,7 @@ impl Gateway {
         .await
     }
 
-    /// Runtime-only: retry from the persisted pause state, never from the
+    /// Runtime-only: retry from persisted pause and pilot state, never from the
     /// drainable kill-effect queue. This is not an MCP tool or an unpause path.
     pub(crate) async fn enforce_pauses(&self, bindings: &[Binding]) -> Result<(), ToolError> {
         self.enforce_pauses_with(bindings, |bound| async move {
@@ -566,7 +590,8 @@ impl Gateway {
                     &bound,
                     &SymbolActionParams {
                         symbol: None,
-                        reason: "cancel resting orders while trading is paused".to_owned(),
+                        reason: "cancel resting orders while trading is paused or pilot stopped"
+                            .to_owned(),
                     },
                     true,
                 )
@@ -583,6 +608,32 @@ impl Gateway {
         .await
     }
 
+    async fn runtime_cancellation_needed(&self, bound: &Binding) -> Result<bool, ToolError> {
+        if self.inner.engine.paused_agents().contains(&bound.agent) {
+            return Ok(true);
+        }
+        let permit = self
+            .inner
+            .pilot_reader
+            .clone()
+            .try_acquire_owned()
+            .map_err(|error| ToolError::unavailable("pilot cancellation reader busy", error))?;
+        let events = self.inner.events.clone();
+        let account = bound.account;
+        let status = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                events.pilot_status(account)
+            }),
+        )
+        .await
+        .map_err(|error| ToolError::unavailable("pilot cancellation status timeout", error))?
+        .map_err(|error| ToolError::unavailable("pilot cancellation reader", error))?
+        .map_err(|error| ToolError::unavailable("pilot cancellation status", error))?;
+        pilot_cancellation_needed(bound, status)
+    }
+
     async fn enforce_pauses_with<F, Fut>(
         &self,
         bindings: &[Binding],
@@ -592,20 +643,23 @@ impl Gateway {
         F: FnMut(Binding) -> Fut,
         Fut: Future<Output = Result<(), ToolError>>,
     {
-        let paused = self.inner.engine.paused_agents();
         let mut seen = HashSet::new();
         let mut failure = None;
         for bound in bindings {
-            if !paused.contains(&bound.agent) || !seen.insert((bound.agent.clone(), bound.account))
-            {
+            if !seen.insert((bound.agent.clone(), bound.account)) {
                 continue;
             }
-            let result =
-                tokio::time::timeout(std::time::Duration::from_secs(10), cancel(bound.clone()))
-                    .await
-                    .unwrap_or_else(|error| {
-                        Err(ToolError::unavailable("pause cancellation timeout", error))
-                    });
+            let result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                if self.runtime_cancellation_needed(bound).await? {
+                    cancel(bound.clone()).await
+                } else {
+                    Ok(())
+                }
+            })
+            .await
+            .unwrap_or_else(|error| {
+                Err(ToolError::unavailable("pause cancellation timeout", error))
+            });
             if let Err(error) = result {
                 tracing::warn!(agent = %bound.agent, account = %bound.account, %error, "paused agent cancellation failed; will retry");
                 failure.get_or_insert(error);
@@ -775,9 +829,16 @@ impl Gateway {
             Err(refusal) => return Ok(outcome::refused(refusal).into_result()),
         };
 
-        let response = self
+        let response = match self
             .submit(cleared, Some(&cloid), Some((&bound, &permit)))
-            .await?;
+            .await
+        {
+            Ok(response) => response,
+            Err(ToolError::GuardrailRefused { refusal }) => {
+                return Ok(outcome::refused(refusal).into_result());
+            }
+            Err(error) => return Err(error.into()),
+        };
         Ok(order_outcome(response, Some(cloid.as_str().to_owned()))?.into_result())
     }
 
@@ -919,15 +980,20 @@ impl Gateway {
         let inner = &self.inner;
         let queue = self.execution_queue(bound.account);
         let _execution = queue.lock().await;
-        let cancellation_needed =
-            || !paused_only || inner.engine.paused_agents().contains(&bound.agent);
+        let cancellation_needed = || async {
+            if paused_only {
+                self.runtime_cancellation_needed(bound).await
+            } else {
+                Ok(true)
+            }
+        };
         let skipped = || CancelAllResult {
             reply: outcome::canceled(0, Vec::new()),
             complete: true,
         };
         // The runtime's sweep snapshot may predate an operator resume while
         // this account was waiting for an in-flight execution.
-        if !cancellation_needed() {
+        if !cancellation_needed().await? {
             return Ok(skipped());
         }
         let now_ms = now_ms();
@@ -978,7 +1044,7 @@ impl Gateway {
 
         // Reads above yield; a resume during them also withdraws the runtime's
         // reason to cancel. Agent-requested cancels are independent of pause.
-        if !cancellation_needed() {
+        if !cancellation_needed().await? {
             return Ok(skipped());
         }
         let response = submit(cleared).await?;
@@ -1074,9 +1140,16 @@ impl Gateway {
         };
 
         let cloid = intent.cloid.clone();
-        let response = self
+        let response = match self
             .submit(cleared, cloid.as_ref(), Some((&bound, &permit)))
-            .await?;
+            .await
+        {
+            Ok(response) => response,
+            Err(ToolError::GuardrailRefused { refusal }) => {
+                return Ok(outcome::refused(refusal).into_result());
+            }
+            Err(error) => return Err(error.into()),
+        };
         Ok(order_outcome(response, cloid.map(|c| c.as_str().to_owned()))?.into_result())
     }
 
@@ -1698,7 +1771,12 @@ impl Gateway {
                         )
                         .map_err(submission_error)?;
                 }
-                return Err(ToolError::unavailable("signer", error));
+                return Err(match error {
+                    oppen_core::guardrail::SignClearedError::Refused(refusal) => {
+                        ToolError::GuardrailRefused { refusal }
+                    }
+                    other => ToolError::unavailable("signer", other),
+                });
             }
         };
 
@@ -2169,6 +2247,9 @@ where
 
 fn submission_error(error: SubmissionError) -> ToolError {
     match error {
+        SubmissionError::Pilot(error) => ToolError::GuardrailRefused {
+            refusal: error.into_refusal(),
+        },
         SubmissionError::Busy { cloid } => ToolError::TimeoutUnknownOutcome {
             cloid: Some(cloid),
             detail: "this account already has an unresolved durable submission".into(),
@@ -3285,6 +3366,220 @@ mod tests {
                 3,
             )
             .expect("resume");
+    }
+
+    #[test]
+    fn pilot_cancellation_requires_verified_identity_and_distinguishes_waiting() {
+        let bound = binding_for("alpha");
+        let status = PilotStatus {
+            agent: bound.agent.clone(),
+            account: bound.account,
+            halt: Some(PilotStop::AwaitingReconciliation),
+            accounting: PilotAccounting::Known {
+                executed_usd: Decimal::ZERO,
+                reserved_usd: Decimal::from(150),
+                net_realized_pnl_usd: Decimal::ZERO,
+            },
+        };
+        assert!(!pilot_cancellation_needed(&bound, None).unwrap());
+        assert!(!pilot_cancellation_needed(&bound, Some(status.clone())).unwrap());
+        let mut stopped = status.clone();
+        stopped.halt = Some(PilotStop::Unavailable {
+            detail: "contradictory fill".into(),
+        });
+        assert!(pilot_cancellation_needed(&bound, Some(stopped)).unwrap());
+        let mut unavailable = status.clone();
+        unavailable.halt = None;
+        unavailable.accounting = PilotAccounting::Unavailable {
+            detail: "invalid fee unit".into(),
+        };
+        assert!(pilot_cancellation_needed(&bound, Some(unavailable.clone())).unwrap());
+        unavailable.agent = oppen_core::guardrail::AgentId::new("other");
+        assert!(pilot_cancellation_needed(&bound, Some(unavailable)).is_err());
+        let mut wrong_account = status;
+        wrong_account.account = Address::from_bytes([7; 20]);
+        assert!(pilot_cancellation_needed(&bound, Some(wrong_account)).is_err());
+    }
+
+    #[derive(Debug, Default)]
+    struct BlockingPilotAnchor {
+        head: Mutex<Option<oppen_core::ledger::Anchor>>,
+        wait: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+        entered: tokio::sync::Notify,
+    }
+
+    #[derive(Debug)]
+    struct PilotAnchorHandle(Arc<BlockingPilotAnchor>);
+
+    impl oppen_core::ledger::HeadAnchor for PilotAnchorHandle {
+        fn load(
+            &self,
+        ) -> Result<Option<oppen_core::ledger::Anchor>, oppen_core::ledger::LedgerError> {
+            if let Some(wait) = self.0.wait.lock().unwrap().take() {
+                self.0.entered.notify_one();
+                // Disconnection also releases the holder if the test panics.
+                let _ = wait.recv_timeout(std::time::Duration::from_secs(15));
+            }
+            Ok(self.0.head.lock().unwrap().clone())
+        }
+
+        fn store(
+            &self,
+            anchor: &oppen_core::ledger::Anchor,
+        ) -> Result<(), oppen_core::ledger::LedgerError> {
+            *self.0.head.lock().unwrap() = Some(anchor.clone());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn blocked_pilot_reads_are_single_flight_and_do_not_hold_server_shutdown() {
+        for same_handle in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let anchor = Arc::new(BlockingPilotAnchor::default());
+            let ledger = Arc::new(
+                oppen_core::ledger::Ledger::open_anchored(
+                    &dir.path().join("pilot.db"),
+                    Network::Testnet,
+                    Some(Box::new(PilotAnchorHandle(anchor.clone()))),
+                )
+                .unwrap(),
+            );
+            let mut gateway = gateway_over(&[]);
+            Arc::get_mut(&mut gateway.inner).unwrap().events = EventViews::new(ledger.clone());
+            let alpha = binding_for("alpha");
+            let beta = Binding {
+                account: Address::from_bytes([7; 20]),
+                ..binding_for("beta")
+            };
+            pause(&gateway, &beta);
+            let (release, wait) = std::sync::mpsc::channel();
+            let holder = if same_handle {
+                *anchor.wait.lock().unwrap() = Some(wait);
+                let ledger = ledger.clone();
+                let holder = tokio::task::spawn_blocking(move || {
+                    ledger.verify().unwrap();
+                });
+                anchor.entered.notified().await;
+                holder
+            } else {
+                let lock = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(dir.path().join("pilot.db.lock"))
+                    .unwrap();
+                lock.lock().unwrap();
+                tokio::task::spawn_blocking(move || {
+                    let _ = wait.recv_timeout(std::time::Duration::from_secs(15));
+                    drop(lock);
+                })
+            };
+            let mut pairings = crate::auth::TokenStore::new();
+            pairings.issue(alpha.clone()).unwrap();
+            let shutdown = tokio_util::sync::CancellationToken::new();
+            let server = tokio::spawn(crate::server::serve(
+                0,
+                gateway.clone(),
+                Arc::new(std::sync::RwLock::new(pairings)),
+                shutdown.clone(),
+            ));
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while gateway.inner.pilot_reader.available_permits() != 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("server started its status read");
+            shutdown.cancel();
+            tokio::time::timeout(std::time::Duration::from_millis(500), server)
+                .await
+                .expect("status read blocked server shutdown")
+                .unwrap()
+                .unwrap();
+            for _ in 0..3 {
+                let mut attempts = Vec::new();
+                let result = tokio::time::timeout(
+                    std::time::Duration::from_millis(500),
+                    gateway.enforce_pauses_with(&[alpha.clone(), beta.clone()], |bound| {
+                        attempts.push(bound);
+                        async { Ok(()) }
+                    }),
+                )
+                .await
+                .expect("blocked reader starved a paused account");
+                assert!(matches!(
+                    result,
+                    Err(ToolError::Unavailable {
+                        what: "pilot cancellation reader busy",
+                        ..
+                    })
+                ));
+                assert_eq!(attempts.as_slice(), std::slice::from_ref(&beta));
+                assert_eq!(gateway.inner.pilot_reader.available_permits(), 0);
+            }
+            release.send(()).unwrap();
+            holder.await.unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while gateway.inner.pilot_reader.available_permits() == 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("read releases its permit after lock recovery");
+            assert!(!gateway.runtime_cancellation_needed(&alpha).await.unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn busy_pilot_reader_reports_failure_but_does_not_block_paused_accounts_or_agent_cancels()
+    {
+        let gateway = gateway_over(&[]);
+        let alpha = binding_for("alpha");
+        gateway
+            .inner
+            .engine
+            .register_agent(&alpha.agent, None, 1)
+            .unwrap();
+        let beta = Binding {
+            account: Address::from_bytes([7; 20]),
+            ..binding_for("beta")
+        };
+        pause(&gateway, &beta);
+        let _busy = gateway
+            .inner
+            .pilot_reader
+            .clone()
+            .try_acquire_owned()
+            .unwrap();
+        let mut attempts = Vec::new();
+        let result = gateway
+            .enforce_pauses_with(&[alpha.clone(), beta.clone()], |bound| {
+                attempts.push(bound);
+                async { Ok(()) }
+            })
+            .await;
+        assert!(matches!(
+            result,
+            Err(ToolError::Unavailable {
+                what: "pilot cancellation reader busy",
+                ..
+            })
+        ));
+        assert_eq!(attempts, [beta]);
+        let result = gateway
+            .cancel_all_with(
+                &alpha,
+                &SymbolActionParams {
+                    symbol: None,
+                    reason: "operator independent agent cancel".into(),
+                },
+                false,
+                async { Ok(cancel_fixture()) },
+                |_| async { Ok(response(vec![Status::Success])) },
+            )
+            .await
+            .unwrap();
+        assert!(result.complete);
     }
 
     fn cancel_fixture() -> (Vec<oppen_hl::types::OpenOrder>, Universe) {

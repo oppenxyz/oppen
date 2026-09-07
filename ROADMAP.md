@@ -27,11 +27,26 @@ before expanding features:
    after an applied-but-malformed response. An optional operator-set gross
    account exposure cap counts positions and opening commitments across symbols
    without opposite-side netting; it is separate from the per-symbol cap and
-   leverage. Transport-interruption variants,
-   persistent pilot budgets, and the explicitly authorized testnet run remain
-   open gates; loopback acceptance is not venue acceptance.
+   leverage. Cumulative pilot accounting now distinguishes executed turnover
+   from unfilled reservations, persists exhaustion inside the fill's chained
+   record, and retains the ledger lock through signing. Local lifecycle tests
+   cover $150 across opening/closing fills, canceled-order liability, and a $5
+   fee-driven stop that survives restart and blocks reduce-only orders.
+   Pilot stops now drive the existing cancellation sweep, including retries and
+   retained revoked bindings. Loopback checks cover a fee-driven stop with a
+   resting remainder, failed cancellation followed by retry, ordinary resume,
+   and unchanged positions; a stop is not automatic flattening. Local status
+   preserves verified halt evidence when accounting projection fails.
+   Transport-interruption variants, operator activation/baseline verification,
+   end-to-end delivery reporting, and the authorized testnet run remain open
+   gates; loopback acceptance is not venue acceptance.
 3. **Operator supervision:** desktop MCP lifecycle, pairing/revocation, real
    positions and orders, policy editing, approval decisions, and a working halt.
+   The shell now reads local pilot evidence independently of venue requests and
+   shows a persistent stopped/reconciling/unavailable banner. Browser fixtures
+   cover view changes, venue outage, stale local reads and network isolation;
+   the safety banner fits narrow windows, while the wider console layout remains
+   desktop-only. This read-only surface does not start or authorize execution.
 4. **Recovery:** PR #44 merged as `06fc0e3` after green CI and separate automated
    review. The durable submission journal has SQLite reopen, independent
    handle, stale-revision, corruption and dropped-request regressions. Starts and

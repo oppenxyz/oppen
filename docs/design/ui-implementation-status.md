@@ -24,8 +24,8 @@ Branch: `design/app-ui-refinement`, isolated worktree `oppen-app-ui` from `28fbf
 ## Verification completed
 
 - Desktop TypeScript/Vite build passes.
-- 69 Bun tests pass, including chart width, exact rounding, account failures, out-of-order market snapshots and independent derived-feature freshness and book-level deduplication. Network-save failure preserves the existing session; decorative pause/reduced-motion/visibility leave independent data timers running; operator actions are not attributed to agents.
-- Core suite: 481 passed, 5 ignored, including disconnect/reconcile and the new read-only operator tests.
+- 85 Bun tests pass, including chart width, exact rounding, account failures, out-of-order market snapshots and independent derived-feature freshness and book-level deduplication. Network-save failure preserves the existing session; decorative pause/reduced-motion/visibility leave independent data timers running; operator actions are not attributed to agents.
+- Core suite after merging current main: 508 passed, 5 ignored; 10 desktop Rust tests passed, including disconnect/reconcile and the new read-only operator tests.
 - `cargo clippy -p oppen-desktop -p oppen-core --all-targets -- -D warnings` passes.
 - Browser checks at 1280×720: Setup scroll layout, unclipped shell, readable walkthrough spotlight, Enter advances exactly once, Tab cycles within modal, Escape restores Setup focus.
 
@@ -33,6 +33,8 @@ Branch: `design/app-ui-refinement`, isolated worktree `oppen-app-ui` from `28fbf
 
 - The rebuilt native app reads an isolated, explicitly labelled fixture through the real Rust/Tauri bridge. Agents displays exact stored caps, a refusal with observed/limit values, and literal HTML-like text without rendering markup. Builder displays the same recorded activity. Settings distinguishes stored halts from live cancel completion. Setup renders the complete terrain and framed wordmark with decorative motion paused.
 - Fixture reproduction: `cargo run -p oppen-core --example ui_fixture -- /tmp/NEW-DIRECTORY`; launch the isolated review bundle with `OPPEN_DATA_DIR` pointing there. The example refuses an existing directory and never creates an engine, loads keys or contacts a venue. Public market reads in the review app remain separate. Fixtures are not testnet execution evidence.
+
+- Integrated merged main `2ea98ab` (durable pilot budgets and stop supervision). Preserved the new banner/polling, independent operator reads, network-specific account selection, and tour inert behavior. Both local read failures use main's `local_status` error variant.
 
 ## Remaining work
 

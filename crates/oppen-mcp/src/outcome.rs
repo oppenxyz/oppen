@@ -242,6 +242,9 @@ pub(crate) fn canceled(requested: usize, failed: Vec<CancelFailure>) -> Reply {
 /// and retryability as structured data on the error rather than as prose.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum ToolError {
+    /// A durable predicate changed after evaluation but before signing.
+    #[error("{refusal}")]
+    GuardrailRefused { refusal: Refusal },
     /// The venue refused the signed request. The message is the venue's own,
     /// stored and rendered verbatim and **display-only** — nothing branches on
     /// it (`AGENTS.md` conventions). Split from `venue_reject`, which is
@@ -276,6 +279,7 @@ pub(crate) enum ToolError {
 impl ToolError {
     fn code(&self) -> &'static str {
         match self {
+            ToolError::GuardrailRefused { .. } => "guardrail_reject",
             ToolError::VenueError { .. } => "venue_error",
             ToolError::TimeoutUnknownOutcome { .. } => "timeout_unknown_outcome",
             ToolError::Unavailable { .. } => "unavailable",
@@ -292,7 +296,9 @@ impl ToolError {
                 *http_status == 429 || (500..600).contains(http_status)
             }
             ToolError::Unavailable { .. } => true,
-            ToolError::TimeoutUnknownOutcome { .. } | ToolError::InvalidParams { .. } => false,
+            ToolError::TimeoutUnknownOutcome { .. }
+            | ToolError::InvalidParams { .. }
+            | ToolError::GuardrailRefused { .. } => false,
         }
     }
 
@@ -322,11 +328,12 @@ impl ToolError {
 
 impl From<ToolError> for ErrorData {
     fn from(e: ToolError) -> Self {
-        let data = serde_json::json!({
+        let mut data = serde_json::json!({
             "contract_version": CONTRACT_VERSION,
             "code": e.code(),
             "retryable": e.retryable(),
             "detail": match &e {
+                ToolError::GuardrailRefused { refusal } => refusal.to_string(),
                 ToolError::VenueError { venue_message, .. } => venue_message.clone(),
                 ToolError::TimeoutUnknownOutcome { detail, .. }
                 | ToolError::Unavailable { detail, .. }
@@ -339,6 +346,9 @@ impl From<ToolError> for ErrorData {
                 _ => serde_json::Value::Null,
             },
         });
+        if let ToolError::GuardrailRefused { refusal } = &e {
+            data["refusal"] = serde_json::to_value(refusal).expect("Refusal serializes");
+        }
         // `invalid_params` is the caller's mistake and the JSON-RPC layer has
         // a code for it; everything else is oppen or the venue failing to
         // answer, which is what `internal_error` means. The taxonomy an agent

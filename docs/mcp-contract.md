@@ -66,6 +66,24 @@ order. Opposite orders do not net. Its `open_exposure` refusal carries
 exemption. This is separate from per-symbol `max_position_usd`, leverage, and
 cumulative execution or loss budgets.
 
+An operator-authorized supervised pilot also enforces non-resetting cumulative
+budgets before submission and inside the signer. A `pilot_budget` refusal carries
+`metric`, `observed_usd` and `limit_usd`; metrics distinguish an order's notional,
+executed turnover, executed-plus-reserved commitment, and realized loss. These
+refusals are normal non-retryable `guardrail_reject` replies, including for closes.
+Missing or contradictory budget evidence is `pilot_budget_unavailable` within an
+`unevaluable` refusal. A fill awaiting its authoritative order linkage blocks new
+orders until reconciliation proves that link; it does not erase consumption.
+No MCP method authorizes, renews or resets a pilot.
+
+The runtime retries cancellation of resting orders for a verified permanent
+pilot stop or unavailable accounting, using the same bounded sweep as an
+operator pause. Transient reconciliation alone does not trigger cancellation.
+Cancellation cannot flatten positions or undo fills that race the stop. If
+required authority history cannot be verified, pilot cancellation reports an
+error instead of inventing a binding; a separate operator pause remains
+available. The desktop's local stop status is not a cancellation receipt.
+
 ## Error codes
 
 Protocol errors, carrying the taxonomy in the JSON-RPC error's `data` — `{contract_version, code, retryable, detail, cloid}` — rather than only in the message.
@@ -161,7 +179,7 @@ Cancelling frees a slot against the per-agent cap and releases the market feed t
 
 The durable record. Returns `{contract_version, events[], next_cursor, resync_required, head_seq}`; pass `next_cursor` back to continue. `limit` is clamped to the ledger's page cap (1000) rather than refused.
 
-Each event carries `seq`, `ts_ms`, `kind`, `agent_id`, `payload`, `payload_hash`, `prev_hash`, `hash`, and the snapshot reference where one exists. `kind` is item 18's taxonomy: `order_intent`, `agent_decision`, `refusal`, `fill`, `order_state_change`, `operator_action`, `approval_decision`, `kill_switch_changed`, `guardrail_trip`, `ws_disconnected`, `ws_reconnected`, `alert`, `agent_wallet_expiry_warning`, `payload_redacted`.
+Each event carries `seq`, `ts_ms`, `kind`, `agent_id`, `payload`, `payload_hash`, `prev_hash`, `hash`, and the snapshot reference where one exists. `kind` is item 18's taxonomy: `order_intent`, `agent_decision`, `refusal`, `fill`, `order_state_change`, `submission_started`, `submission_resolved`, `pilot_authorized`, `pilot_halted`, `operator_action`, `approval_decision`, `kill_switch_changed`, `guardrail_trip`, `ws_disconnected`, `ws_reconnected`, `alert`, `agent_wallet_expiry_warning`, `payload_redacted`. A pilot stop caused by a new fill is embedded in that fill's `pilot_stop` payload; independent evidence faults use `pilot_halted`.
 
 **`resync_required: true` means the cursor cannot be served** — it is older than what the ledger retains, or ahead of the head, which is what a mainnet cursor presented to a testnet file looks like (R4). Discard local state and re-read from `get_state`. Never treat it as an empty gap: item 18 makes this explicit precisely so a hole is never silent.
 
