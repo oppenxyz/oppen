@@ -1531,6 +1531,25 @@ impl GuardrailEngine {
                 .checked_add(resting.notional_usd),
             "current account notional",
         )?;
+        if let Some(limit_usd) = config.risk.max_open_exposure_usd
+            && !genuine_reduction
+        {
+            let opening_usd = if intent.reduce_only {
+                Decimal::ZERO
+            } else {
+                checked(sz.checked_mul(reference_px), "candidate opening notional")?
+            };
+            let observed_usd = checked(
+                account_before_usd.checked_add(opening_usd),
+                "gross account open exposure",
+            )?;
+            if observed_usd > limit_usd {
+                return Err(Refusal::OpenExposure {
+                    observed_usd,
+                    limit_usd,
+                });
+            }
+        }
         let total_after_usd = checked(
             account_before_usd
                 .checked_sub(symbol_before_usd)

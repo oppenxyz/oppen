@@ -7,7 +7,7 @@
 //! to obtain one. That the file compiles is itself part of the proof.
 //!
 //! The centrepiece is [`no_input_produces_a_signable_value_without_passing_every_predicate`]:
-//! twenty thousand pseudo-random cases, each re-checked against every
+//! twenty-four thousand pseudo-random cases, each re-checked against every
 //! predicate independently of the engine that produced it, and against the
 //! bytes of the action that would actually be signed rather than the request
 //! that was made.
@@ -172,6 +172,7 @@ fn permissive(symbols: &[&str]) -> AgentGuardrails {
         risk: RiskSettings {
             max_leverage: 50,
             margin_mode: MarginMode::Cross,
+            max_open_exposure_usd: None,
             max_risk_usd: None,
         },
         loss: LossLimits::UNSET,
@@ -257,6 +258,22 @@ struct Fixture {
 }
 
 impl Fixture {
+    fn without_keys(config: AgentGuardrails) -> Self {
+        let engine = GuardrailEngine::new(
+            Arc::new(MemoryStore::new()),
+            Arc::new(NullAuditSink),
+            Arc::new(crate::keys::MemoryKeyStore::new(Network::Testnet)),
+            Network::Testnet,
+        )
+        .expect("engine without signing credentials");
+        let agent = AgentId::new("alpha");
+        engine.register_agent(&agent, None, NOW_MS).unwrap();
+        engine
+            .operator_set_guardrails(&agent, config, NOW_MS)
+            .unwrap();
+        Self { engine, agent }
+    }
+
     fn new(config: AgentGuardrails) -> Self {
         Self::with(
             config,
@@ -1852,6 +1869,300 @@ fn genuine_reduce_only_orders_can_unwind_above_fixed_and_leverage_caps() {
             ));
         }
     }
+}
+
+/// ES13 / D3: all symbols and both working sides consume the account cap.
+/// Prices deliberately differ from the reference; sizes round to 0.20.
+#[test]
+fn open_exposure_counts_gross_cross_symbol_orders_at_rounded_reference_value() {
+    let btc = asset("BTC", 2, 40);
+    let market = MarketRef::fresh("BTC", d("100"), NOW_MS);
+    let mut cases = 0;
+    for btc_long in [false, true] {
+        for eth_long in [false, true] {
+            let mut state = exposure(d("1000"));
+            state.agent.positions.insert(
+                "BTC".into(),
+                PositionSnapshot {
+                    szi: if btc_long { d("1") } else { d("-1") },
+                },
+            );
+            state.agent.positions.insert(
+                "ETH".into(),
+                PositionSnapshot {
+                    szi: if eth_long { d("2") } else { d("-2") },
+                },
+            );
+            state.agent.total_position_notional_usd = d("400");
+            let book = state.agent.resting.as_mut().unwrap();
+            book.buys.insert("BTC".into(), d("0.2"));
+            book.sells.insert("BTC".into(), d("0.3"));
+            book.buys.insert("ETH".into(), d("1"));
+            book.notional_by_symbol.insert("BTC".into(), d("50"));
+            book.notional_by_symbol.insert("ETH".into(), d("150"));
+            book.notional_usd = d("200");
+            for is_buy in [false, true] {
+                for px in [d("50"), d("150")] {
+                    for cap in [None, Some(d("619.99")), Some(d("620")), Some(d("620.01"))] {
+                        cases += 1;
+                        let mut config = permissive(&["BTC", "ETH"]);
+                        config.risk.max_open_exposure_usd = cap;
+                        let f = Fixture::without_keys(config.clone());
+                        let candidate = intent("BTC", is_buy, px, d("0.204"));
+                        let result = f.evaluate(&candidate, &btc, &market, &state);
+                        if cap == Some(d("619.99")) {
+                            assert!(
+                                matches!(result, Err(Refusal::OpenExposure { observed_usd, limit_usd })
+                                if observed_usd == d("620") && limit_usd == d("619.99"))
+                            );
+                        } else {
+                            let cleared =
+                                result.expect("equality or an unset cap permits the order");
+                            assert_eq!(wire_sz(&wire_of(&cleared)), d("0.2"));
+                            verify_every_predicate(
+                                cases, &cleared, &config, &candidate, &btc, &market, &state, NOW_MS,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(cases, 64);
+}
+
+#[test]
+fn open_exposure_zero_cap_exempts_only_genuine_reductions() {
+    let btc = asset("BTC", 2, 40);
+    let market = MarketRef::fresh("BTC", d("100"), NOW_MS);
+    let mut config = permissive(&["BTC"]);
+    config.risk.max_open_exposure_usd = Some(Decimal::ZERO);
+    let f = Fixture::without_keys(config.clone());
+    for long in [false, true] {
+        let mut state = exposure(d("1000"));
+        state.agent.positions.insert(
+            "BTC".into(),
+            PositionSnapshot {
+                szi: if long { d("1") } else { d("-1") },
+            },
+        );
+        state.agent.total_position_notional_usd = d("100");
+        for is_buy in [false, true] {
+            for reduce_only in [false, true] {
+                for size in [d("0.5"), d("1"), d("2")] {
+                    let mut candidate = intent("BTC", is_buy, d("100"), size);
+                    candidate.reduce_only = reduce_only;
+                    let result = f.evaluate(&candidate, &btc, &market, &state);
+                    if reduce_only && is_buy != long {
+                        let cleared = result.expect("clipped RO unwind above a zero cap");
+                        verify_every_predicate(
+                            0, &cleared, &config, &candidate, &btc, &market, &state, NOW_MS,
+                        );
+                    } else {
+                        let expected = d("100")
+                            + if reduce_only {
+                                Decimal::ZERO
+                            } else {
+                                size * d("100")
+                            };
+                        assert!(
+                            matches!(result, Err(Refusal::OpenExposure { observed_usd, limit_usd })
+                            if observed_usd == expected && limit_usd.is_zero()),
+                            "long={long}, candidate={candidate:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    let empty = exposure(d("1000"));
+    let opening = intent("BTC", true, d("100"), d("1"));
+    assert!(matches!(f.evaluate(&opening, &btc, &market, &empty),
+        Err(Refusal::OpenExposure { observed_usd, limit_usd }) if observed_usd == d("100") && limit_usd.is_zero()));
+    let mut no_position_ro = opening;
+    no_position_ro.reduce_only = true;
+    assert!(
+        f.evaluate(&no_position_ro, &btc, &market, &empty).is_ok(),
+        "RO adds no opening commitment even when the venue would have nothing to reduce"
+    );
+}
+
+#[test]
+fn open_exposure_ro_that_removes_an_offset_is_not_exempt_and_adds_no_notional() {
+    let btc = asset("BTC", 2, 40);
+    let market = MarketRef::fresh("BTC", d("100"), NOW_MS);
+    for long in [false, true] {
+        let mut state = exposure(d("1000"));
+        state.agent.positions.insert(
+            "BTC".into(),
+            PositionSnapshot {
+                szi: if long { d("1") } else { d("-1") },
+            },
+        );
+        state.agent.total_position_notional_usd = d("100");
+        state = with_resting(state, "BTC", if long { d("-2") } else { d("2") }, d("100"));
+        let mut candidate = intent("BTC", !long, d("100"), d("0.5"));
+        candidate.reduce_only = true;
+        for cap in [d("299.99"), d("300")] {
+            let mut config = permissive(&["BTC"]);
+            config.risk.max_open_exposure_usd = Some(cap);
+            let f = Fixture::without_keys(config.clone());
+            match f.evaluate(&candidate, &btc, &market, &state) {
+                Err(Refusal::OpenExposure {
+                    observed_usd,
+                    limit_usd,
+                }) => {
+                    assert_eq!(observed_usd, d("300"));
+                    assert_eq!(limit_usd, d("299.99"));
+                    assert_eq!(cap, d("299.99"));
+                }
+                Ok(cleared) => {
+                    assert_eq!(cap, d("300"));
+                    verify_every_predicate(
+                        0, &cleared, &config, &candidate, &btc, &market, &state, NOW_MS,
+                    );
+                }
+                other => panic!("unexpected offset-removal result: {other:?}"),
+            }
+        }
+    }
+}
+
+#[test]
+fn open_exposure_fails_closed_on_missing_book_and_checked_arithmetic() {
+    let mut config = permissive(&["BTC"]);
+    config.risk.max_open_exposure_usd = Some(Decimal::MAX);
+    let f = Fixture::without_keys(config);
+    let btc = asset("BTC", 2, 40);
+    let market = MarketRef::fresh("BTC", d("100"), NOW_MS);
+    let candidate = intent("BTC", true, d("100"), d("1"));
+    let mut state = exposure(d("1000"));
+    state
+        .agent
+        .positions
+        .insert("BTC".into(), PositionSnapshot { szi: d("-1") });
+    state.agent.total_position_notional_usd = d("100");
+    state.agent.resting = None;
+    for reduce_only in [false, true] {
+        let mut candidate = candidate.clone();
+        candidate.reduce_only = reduce_only;
+        assert!(matches!(
+            f.evaluate(&candidate, &btc, &market, &state),
+            Err(Refusal::Unevaluable(Unevaluable::MissingRestingOrders))
+        ));
+    }
+    for overflow in ["current_sum", "candidate_sum", "candidate_mark"] {
+        let mut state = exposure(d("1000"));
+        let mut candidate = candidate.clone();
+        let mut market = market.clone();
+        match overflow {
+            "current_sum" => {
+                state.agent.total_position_notional_usd = Decimal::MAX;
+                state = with_resting(state, "ETH", d("1"), d("1"));
+            }
+            "candidate_sum" => state.agent.total_position_notional_usd = Decimal::MAX,
+            "candidate_mark" => {
+                market.reference_px = Some(Decimal::MAX);
+                candidate.sz = d("2");
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            matches!(
+                f.evaluate(&candidate, &btc, &market, &state),
+                Err(Refusal::Unevaluable(Unevaluable::ArithmeticOverflow { .. }))
+            ),
+            "{overflow}"
+        );
+    }
+}
+
+#[test]
+fn open_exposure_config_defaults_validation_and_sqlite_round_trip() {
+    assert_eq!(RiskSettings::default().max_open_exposure_usd, None);
+    let mut config = permissive(&["BTC"]);
+    let mut legacy = serde_json::to_value(&config).unwrap();
+    legacy["risk"]
+        .as_object_mut()
+        .unwrap()
+        .remove("max_open_exposure_usd");
+    let decoded: AgentGuardrails = serde_json::from_value(legacy.clone()).unwrap();
+    assert_eq!(decoded, config);
+    config.risk.max_open_exposure_usd = Some(d("-0.01"));
+    assert_eq!(
+        config.validate().unwrap_err().0,
+        "risk.max_open_exposure_usd"
+    );
+    config.risk.max_open_exposure_usd = Some(Decimal::ZERO);
+    assert!(config.validate().is_ok());
+    let f = Fixture::without_keys(config.clone());
+    let mut invalid = config.clone();
+    invalid.risk.max_open_exposure_usd = Some(d("-1"));
+    assert!(
+        f.engine
+            .operator_set_guardrails(&f.agent, invalid, NOW_MS)
+            .is_err()
+    );
+    assert_eq!(f.engine.guardrails(&f.agent), Some(config.clone()));
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.db");
+    {
+        let store = SqliteGuardrailStore::open(&path).unwrap();
+        store
+            .save_guardrails(&AgentId::new("zero"), &config)
+            .unwrap();
+        config.risk.max_open_exposure_usd = Some(d("125.50"));
+        store
+            .save_guardrails(&AgentId::new("bounded"), &config)
+            .unwrap();
+    }
+    {
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute(
+                "INSERT INTO guardrail_config (agent, config_json) VALUES (?1, ?2)",
+                rusqlite::params!["legacy", serde_json::to_string(&legacy).unwrap()],
+            )
+            .unwrap();
+    }
+    let store = SqliteGuardrailStore::open(&path).unwrap();
+    let loaded = store.load().unwrap();
+    assert_eq!(loaded.guardrails[&AgentId::new("bounded")], config);
+    assert_eq!(
+        loaded.guardrails[&AgentId::new("zero")]
+            .risk
+            .max_open_exposure_usd,
+        Some(Decimal::ZERO)
+    );
+    assert_eq!(loaded.guardrails[&AgentId::new("legacy")], decoded);
+    let engine = GuardrailEngine::new(
+        Arc::new(store),
+        Arc::new(NullAuditSink),
+        Arc::new(crate::keys::MemoryKeyStore::new(Network::Testnet)),
+        Network::Testnet,
+    )
+    .unwrap();
+    let candidate = intent("BTC", true, d("100"), d("2"));
+    let btc = asset("BTC", 2, 40);
+    let market = MarketRef::fresh("BTC", d("100"), NOW_MS);
+    let state = exposure(d("1000"));
+    assert!(
+        matches!(engine.evaluate(&AgentId::new("bounded"), &candidate, &btc, &market, &state, NOW_MS),
+        Err(Refusal::OpenExposure { observed_usd, limit_usd }) if observed_usd == d("200") && limit_usd == d("125.50"))
+    );
+    assert!(
+        engine
+            .evaluate(
+                &AgentId::new("legacy"),
+                &candidate,
+                &btc,
+                &market,
+                &state,
+                NOW_MS
+            )
+            .is_ok()
+    );
 }
 
 #[test]
@@ -3710,7 +4021,7 @@ impl Rng {
 
 /// The whole invariant, stated as a property.
 ///
-/// For twenty thousand pseudo-random combinations of configuration, market
+/// For twenty-four thousand pseudo-random combinations of configuration, market
 /// state, account state, clock and intent: if the engine produced a
 /// [`Cleared`], then every predicate holds when re-derived here from the
 /// action that would actually be signed. Nothing in this function calls back
@@ -3722,7 +4033,9 @@ impl Rng {
 /// produces clearances is not testing the guardrails.
 #[test]
 fn no_input_produces_a_signable_value_without_passing_every_predicate() {
-    const CASES: usize = 20_000;
+    // The additional cap refuses more samples; keep the existing positive
+    // coverage floor by extending the deterministic stream.
+    const CASES: usize = 24_000;
     let symbols = ["BTC", "ETH", "SOL"];
     let sizes = ["0.25", "0.5", "1", "2", "5"];
     // Order prices are derived from the market reference, so the generated
@@ -3733,9 +4046,13 @@ fn no_input_produces_a_signable_value_without_passing_every_predicate() {
     let leverages = [2u32, 5, 40, 50];
 
     let mut rng = Rng(0x0DDB_1A5E_5BAD_5EED);
+    // Keep the original input stream stable while sampling the new policy.
+    let mut exposure_cap_rng = Rng(0xE513_0A11_CAFE_0042);
     let mut cleared_count = 0usize;
     let mut refused_count = 0usize;
     let mut unevaluable_count = 0usize;
+    let mut capped_clearances = 0usize;
+    let mut open_exposure_refusals = 0usize;
 
     for case in 0..CASES {
         let symbol = *rng.pick(&symbols);
@@ -3761,6 +4078,9 @@ fn no_input_produces_a_signable_value_without_passing_every_predicate() {
             risk: RiskSettings {
                 max_leverage: *rng.pick(&leverages),
                 margin_mode: MarginMode::Cross,
+                max_open_exposure_usd: exposure_cap_rng
+                    .chance(6)
+                    .then(|| d(exposure_cap_rng.pick(&["0", "25", "100", "1000", "100000"]))),
                 // Mostly unset, because that is the default and the fuzz
                 // should spend most of its budget on the paths every agent
                 // takes. When set, it is paired below with a sigma that is
@@ -3781,7 +4101,7 @@ fn no_input_produces_a_signable_value_without_passing_every_predicate() {
             mark_divergence_window_ms: 30_000,
         };
 
-        let f = Fixture::new(config.clone());
+        let f = Fixture::without_keys(config.clone());
         let sz_decimals = rng.below(4) as u32;
         let asset = asset(symbol, sz_decimals, *rng.pick(&leverages));
 
@@ -3912,12 +4232,18 @@ fn no_input_produces_a_signable_value_without_passing_every_predicate() {
         {
             Err(refusal) => {
                 refused_count += 1;
+                if matches!(refusal, Refusal::OpenExposure { .. }) {
+                    open_exposure_refusals += 1;
+                }
                 if refusal.is_unevaluable() {
                     unevaluable_count += 1;
                 }
             }
             Ok(cleared) => {
                 cleared_count += 1;
+                if config.risk.max_open_exposure_usd.is_some() {
+                    capped_clearances += 1;
+                }
                 verify_every_predicate(
                     case, &cleared, &config, &order, &asset, &market, &exposure, now_ms,
                 );
@@ -3925,6 +4251,14 @@ fn no_input_produces_a_signable_value_without_passing_every_predicate() {
         }
     }
 
+    assert!(
+        capped_clearances > 0,
+        "no clearance exercised the exposure cap oracle"
+    );
+    assert!(
+        open_exposure_refusals > 0,
+        "no generated case hit the exposure cap"
+    );
     assert!(
         cleared_count > 1_000,
         "only {cleared_count} of {CASES} cases cleared; the property would be vacuous"
@@ -4099,6 +4433,18 @@ fn verify_every_predicate(
     let after = reachable_worst(position_szi, &fills);
     let genuine_reduction =
         order.reduce_only && position_szi * signed_sz < Decimal::ZERO && after <= before;
+    if let Some(limit) = config.risk.max_open_exposure_usd {
+        let candidate_opening = if wire.r {
+            Decimal::ZERO
+        } else {
+            sz * reference_px
+        };
+        let gross = account.total_position_notional_usd + resting.notional_usd + candidate_opening;
+        assert!(
+            genuine_reduction || gross <= limit,
+            "{ctx}: gross open exposure {gross} exceeds cap {limit}"
+        );
+    }
     assert!(
         genuine_reduction || after * reference_px <= config.max_position_usd,
         "{ctx}: position notional past the cap"

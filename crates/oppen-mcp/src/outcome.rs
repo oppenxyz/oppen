@@ -395,6 +395,17 @@ mod tests {
     }
 
     #[test]
+    fn account_open_exposure_refusal_is_typed_and_not_retryable() {
+        assert_eq!(
+            json(refused(Refusal::OpenExposure {
+                observed_usd: d("26"),
+                limit_usd: d("25"),
+            })),
+            r#"{"contract_version":0,"status":"rejected","retryable":false,"code":"guardrail_reject","refusal":{"refusal":"open_exposure","observed_usd":"26","limit_usd":"25"}}"#
+        );
+    }
+
+    #[test]
     fn a_partial_cancel_reports_the_count_and_names_each_failure() {
         let body = json(canceled(
             3,

@@ -24,7 +24,10 @@ before expanding features:
    `oppen-mcp::tools::execution_fixture` now exercises actual MCP dispatch,
    guarded signing, loopback HTTP, partial fills, cancellation, exact small
    position closes, deduplicated startup reconciliation, and physical restart
-   after an applied-but-malformed response. Transport-interruption variants,
+   after an applied-but-malformed response. An optional operator-set gross
+   account exposure cap counts positions and opening commitments across symbols
+   without opposite-side netting; it is separate from the per-symbol cap and
+   leverage. Transport-interruption variants,
    persistent pilot budgets, and the explicitly authorized testnet run remain
    open gates; loopback acceptance is not venue acceptance.
 3. **Operator supervision:** desktop MCP lifecycle, pairing/revocation, real
