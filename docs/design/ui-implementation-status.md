@@ -73,7 +73,7 @@ Branch: `design/app-ui-refinement`, isolated worktree `oppen-app-ui` from `28fbf
 
 The review explicitly conditions operator workflows on existing backend capabilities and says “once wired” for live controls. The UI implementation is accepted against that scope. A clarification about expanding into a new runtime lifecycle received no answer; this is not treated as authorization for such expansion. Live pairing, approval execution and kill/cancel commands remain unavailable in the console, with explicit explanations. The earlier remaining-work wording incorrectly elevated those backend capabilities into unconditional UI acceptance requirements; this table corrects that interpretation.
 
-The branch integrates main through `2ea98ab`. Main subsequently advanced to `4966e50` (persistent pairing authority); that independent backend change is not removed or overwritten by this branch. Reconcile it at merge time. No app merge, push or production release is part of this UI review handoff.
+For the owner-authorized production promotion, merged current main `4966e50` (persistent pairing authority) cleanly into this branch. The V5 reader barrier and durable pairing implementation remain intact. This repository currently has no release artifacts or deployment workflow; promotion targets main through the existing CI gates.
 
 ## Build recovery
 
