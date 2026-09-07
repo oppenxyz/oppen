@@ -25,6 +25,43 @@ const COMPLETION_TIMEOUT: Duration = Duration::from_secs(10);
 const CHILD_DATABASE: &str = "OPPEN_LEDGER_COORDINATION_TEST_DATABASE";
 const CHILD_READY: &str = "OPPEN_LEDGER_COORDINATION_LOCK_HELD";
 
+#[cfg(unix)]
+#[test]
+fn opening_an_alias_cannot_discard_its_legacy_anchor() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("legacy.db");
+    File::create(&path).unwrap();
+    let alias = dir.path().join("alias.db");
+    std::os::unix::fs::symlink(&path, &alias).unwrap();
+    let old_anchor = FileAnchor::beside(&alias);
+    let ledger = Ledger::open_anchored(
+        &alias,
+        crate::Network::Testnet,
+        Some(Box::new(old_anchor.clone())),
+    )
+    .unwrap();
+    ledger
+        .append(&NewEvent {
+            kind: EventKind::OperatorAction,
+            ts_ms: 1,
+            agent_id: None,
+            payload: &json!({"action": "legacy alias fixture"}),
+            snapshot: None,
+        })
+        .unwrap();
+    let before = old_anchor.load().unwrap();
+    drop(ledger);
+    assert!(FileAnchor::beside(&path).load().unwrap().is_none());
+    assert!(
+        matches!(Ledger::open_at(&alias, crate::Network::Testnet), Err(LedgerError::Io(error)) if error.kind() == std::io::ErrorKind::InvalidInput)
+    );
+    assert!(
+        FileAnchor::beside(&path).load().unwrap().is_none(),
+        "no fresh anchor may be adopted over legacy evidence"
+    );
+    assert_eq!(old_anchor.load().unwrap(), before);
+}
+
 fn alternate_path(path: &Path) -> PathBuf {
     #[cfg(unix)]
     {

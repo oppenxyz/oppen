@@ -693,8 +693,26 @@ impl Ledger {
             .create(true)
             .truncate(false)
             .open(path)?;
-        let path = std::fs::canonicalize(path)?;
-        Self::open_anchored(&path, network, Some(Box::new(FileAnchor::beside(&path))))
+        let canonical = std::fs::canonicalize(path)?;
+        let anchor = FileAnchor::beside(&canonical);
+        match std::fs::canonicalize(FileAnchor::beside(path).path()) {
+            Ok(legacy) => {
+                let target = match std::fs::canonicalize(anchor.path()) {
+                    Ok(target) => target,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        anchor.path().to_owned()
+                    }
+                    Err(error) => return Err(error.into()),
+                };
+                if legacy != target {
+                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput,
+                        "legacy anchor beside a database alias requires explicit migration; refusing to discard it").into());
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        Self::open_anchored(&canonical, network, Some(Box::new(anchor)))
     }
 
     /// Open a ledger with a chosen head anchor, or with none.
