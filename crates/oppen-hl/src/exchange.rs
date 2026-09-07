@@ -229,15 +229,10 @@ pub struct ExchangeResponse {
 
 impl ExchangeResponse {
     pub fn parse(json: &str) -> Result<Self, Error> {
-        let raw: RawResponse = serde_json::from_str(json).map_err(|e| Error::Venue {
-            status: 200,
-            message: format!("unparseable exchange response: {e}; body: {json}"),
-        })?;
+        let raw: RawResponse = serde_json::from_str(json)
+            .map_err(|e| Error::InvalidExchangeResponse(format!("{e}; body: {json}")))?;
         match raw {
-            RawResponse::Err(message) => Err(Error::Venue {
-                status: 200,
-                message,
-            }),
+            RawResponse::Err(message) => Err(Error::ExchangeRejected { message }),
             RawResponse::Ok(ResponseBody::Order { data } | ResponseBody::Cancel { data }) => {
                 Ok(ExchangeResponse {
                     statuses: data.statuses,
@@ -274,7 +269,13 @@ impl ExchangeClient {
     /// `timeout_unknown_outcome` case and the caller must reconcile by
     /// cloid, never resend.
     pub async fn post(&self, request: &ExchangeRequest) -> Result<ExchangeResponse, Error> {
-        let response = self.http.post(&self.url).json(request).send().await?;
+        let response = self
+            .http
+            .post(&self.url)
+            .timeout(crate::REQUEST_TIMEOUT)
+            .json(request)
+            .send()
+            .await?;
         let status = response.status();
         let body = response.text().await?;
         if !status.is_success() {
@@ -325,6 +326,45 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn requests_cannot_hold_an_execution_lock_forever() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let peer = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+            drop(socket);
+        });
+        let mut exchange = ExchangeClient::with_client(Network::Testnet, Client::new());
+        exchange.url = format!("http://{address}/exchange");
+        let key =
+            AgentKey::from_hex("0123456789012345678901234567890123456789012345678901234567890123")
+                .unwrap();
+        let request = ExchangeRequest::sign_unchecked(
+            &key,
+            Action::ClaimRewards,
+            1,
+            None,
+            None,
+            Network::Testnet,
+        )
+        .unwrap();
+        let result = tokio::time::timeout(
+            crate::REQUEST_TIMEOUT + std::time::Duration::from_secs(3),
+            exchange.post(&request),
+        )
+        .await;
+        peer.abort();
+        let _ = peer.await;
+        let error = result
+            .expect("the client deadline must release the request")
+            .unwrap_err();
+        assert!(
+            matches!(error, Error::Http(ref error) if error.is_timeout()),
+            "{error:?}"
+        );
+    }
 
     #[test]
     fn nonces_are_strictly_increasing_within_one_millisecond() {
@@ -381,8 +421,23 @@ mod tests {
         let rejected = r#"{"status":"err","response":"User or API Wallet 0x0123 does not exist."}"#;
         assert!(matches!(
             ExchangeResponse::parse(rejected),
-            Err(Error::Venue { status: 200, .. })
+            Err(Error::ExchangeRejected { .. })
         ));
+    }
+
+    #[test]
+    fn malformed_exchange_bodies_do_not_prove_rejection() {
+        for body in [
+            "",
+            "<html>upstream failed</html>",
+            r#"{"status":"err"}"#,
+            r#"{"status":"ok","response":null}"#,
+        ] {
+            assert!(matches!(
+                ExchangeResponse::parse(body),
+                Err(Error::InvalidExchangeResponse(_))
+            ));
+        }
     }
 
     #[test]
