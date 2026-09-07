@@ -81,3 +81,22 @@ export function inTauri(): boolean {
 export async function fetchAccountState(network: "testnet" | "mainnet"): Promise<AccountState> {
   return invoke<AccountState>("account_state", { network });
 }
+
+/** What the keychain probe answers. */
+export interface KeychainStatus {
+  reachable: boolean;
+  /** Absent when reachable; the store's own message when not. */
+  detail?: string;
+}
+
+/**
+ * Whether this machine's keychain answers at all.
+ *
+ * Read-only on the Rust side, and deliberately the only key-related command
+ * the console has: it reports that the store responded, never what is in it.
+ */
+export async function fetchKeychainStatus(
+  network: "testnet" | "mainnet",
+): Promise<KeychainStatus> {
+  return invoke<KeychainStatus>("keychain_status", { network });
+}

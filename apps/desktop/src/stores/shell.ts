@@ -5,7 +5,14 @@
  */
 
 import { reactive, readonly } from "vue";
-import { fetchAccountState, inTauri, isConsoleError, type AccountState } from "../lib/bridge";
+import {
+  fetchAccountState,
+  fetchKeychainStatus,
+  inTauri,
+  isConsoleError,
+  type AccountState,
+  type KeychainStatus,
+} from "../lib/bridge";
 
 export type View = "trade" | "agents" | "builder" | "portfolio" | "settings" | "onboarding";
 export type Network = "testnet" | "mainnet";
@@ -37,6 +44,11 @@ interface ShellState {
   account: AccountState | null;
   /** Why the last refresh failed, shown beside the stale reading. */
   accountError: string | null;
+  /**
+   * Whether the OS keychain answers. `null` until asked once — which is not
+   * the same as unreachable, and the tracker distinguishes them.
+   */
+  keychain: KeychainStatus | null;
 }
 
 const state = reactive<ShellState>({
@@ -50,6 +62,7 @@ const state = reactive<ShellState>({
   refusedToday: 0,
   account: null,
   accountError: null,
+  keychain: null,
 });
 
 export const shell = readonly(state);
@@ -142,6 +155,28 @@ export async function refreshAccount(): Promise<void> {
 let poll: ReturnType<typeof setInterval> | null = null;
 
 /** Start polling. Idempotent, so a remount does not stack timers. */
+/**
+ * Asks the keychain once whether it answers.
+ *
+ * Once rather than on the polling tick: reachability changes when an operator
+ * unlocks a keychain or installs a keyring, not second to second, and each ask
+ * can raise an OS prompt. Polling it would train the operator to dismiss the
+ * dialog that matters.
+ *
+ * Outside Tauri there is no keychain to ask, so the state stays `null` — the
+ * tracker reads that as "not asked", not as "unreachable".
+ */
+export async function refreshKeychain(): Promise<void> {
+  if (!inTauri()) return;
+  try {
+    state.keychain = await fetchKeychainStatus(state.network);
+  } catch (error) {
+    // A command that threw is itself an unreachable store, reported the same
+    // way the Rust side reports one.
+    state.keychain = { reachable: false, detail: String(error) };
+  }
+}
+
 export function startAccountPolling(everyMs = 5000): void {
   if (poll !== null) return;
   void refreshAccount();

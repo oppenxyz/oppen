@@ -11,6 +11,22 @@ decisions" section until then.
 
 ---
 
+## 2026-09-07 · The console can see the keychain
+
+W4 shipped a tracker that reports what it cannot check. Two of its three
+"cannot" reasons were wrong: they said the keychain phase was not built, when
+`oppen-core::keys` implements the whole store — records, rotation, address
+retirement, expiry. What is missing is narrower, and the vague version sent me
+looking in the wrong crate.
+
+| # | Decision | Choice | Why |
+|---|---|---|---|
+| X1 | Correcting a shipped claim | **Name the missing read, not the missing "phase"** | "The keychain phase is not built" was false about the core and true only about the console's bridge to it. The corrected reasons are specific: the console has no *agent registry* to enumerate, so it does not know which agent to ask about; and the venue publishes no read confirming an `approveAgent` landed. A blocked reason exists to tell the next reader where to look, and a wrong one costs them the search. |
+| X2 | What the console may ask the keychain | **Whether it answers, and nothing else** | `KeyStore::reachable` probes one entry and discards what it read. There is deliberately no console command that reads a key — the console never needs one, and a command that *could* is a command that can be called. The status crossing the boundary is a boolean plus, on failure, the store's own message. |
+| X3 | Why reachability is worth its own milestone | **It is the first thing that breaks, and it is currently invisible** | A locked login keychain, a headless box with no keyring daemon, a denied prompt: each makes every later step fail for a reason unrelated to what the operator was doing. The probe treats "reachable and empty" as success, because what is being established is that the store *answered* — a fresh machine has nothing in it and that is not a fault. |
+| X4 | How often to ask | **Once, not on the polling tick** | Reachability changes when an operator unlocks a keychain or installs a keyring, not second to second, and each ask can raise an OS prompt. Polling it would train the operator to dismiss the dialog that matters. **What this gives up:** unlocking a keychain mid-session is not noticed until the next launch. A refresh control is the fix when someone wants one; a poll is not. |
+| X5 | An unasked store versus an unreachable one | **`unverifiable`, not `pending`** | Outside the desktop app there is no keychain to ask, and collapsing that into `pending` would send an operator to fix something that is not broken. Only a store that answered "no" is pending. Same distinction W4 drew for the tracker as a whole, applied to the one milestone that now has a real check behind it. |
+
 ## 2026-09-07 · Showing the operator the product
 
 Item 4 asks for a fresh machine to reach a testnet trade in ten minutes, and

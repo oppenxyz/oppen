@@ -3,7 +3,13 @@ import { computed, onMounted, onUnmounted, type Component } from "vue";
 import AppHeader from "./components/shell/AppHeader.vue";
 import AppStatusBar from "./components/shell/AppStatusBar.vue";
 import TourSpotlight from "./components/tour/TourSpotlight.vue";
-import { shell, startAccountPolling, stopAccountPolling, type View } from "./stores/shell";
+import {
+  refreshKeychain,
+  shell,
+  startAccountPolling,
+  stopAccountPolling,
+  type View,
+} from "./stores/shell";
 import AgentsView from "./views/AgentsView.vue";
 import BuilderView from "./views/BuilderView.vue";
 import OnboardingView from "./views/OnboardingView.vue";
@@ -22,7 +28,11 @@ const VIEWS: Record<View, Component> = {
 
 const current = computed(() => VIEWS[shell.view]);
 
-onMounted(() => startAccountPolling());
+onMounted(() => {
+  startAccountPolling();
+  // Asked once, not polled: see `refreshKeychain`.
+  void refreshKeychain();
+});
 onUnmounted(() => stopAccountPolling());
 </script>
 

@@ -19,6 +19,7 @@
 
 import { computed, reactive, readonly } from "vue";
 
+import type { KeychainStatus } from "../lib/bridge";
 import { shell, setView, type View } from "./shell";
 
 /** Where a callout sits relative to the element it points at. */
@@ -226,6 +227,26 @@ export function endTour(): void {
  * from what the console is actually showing — a checklist that remembers being
  * satisfied is one that keeps saying so after the thing stops being true.
  */
+/**
+ * A keychain nobody has asked about is not an unreachable one.
+ *
+ * `null` means the question has not been put — outside Tauri there is no store
+ * to ask. Collapsing that into `pending` would tell an operator to go and fix
+ * something that is not broken.
+ */
+export function keychainState(status: KeychainStatus | null): MilestoneState {
+  if (status === null) return "unverifiable";
+  return status.reachable ? "done" : "pending";
+}
+
+export function keychainDetail(status: KeychainStatus | null): string {
+  if (status === null) return "The OS keychain that holds agent keys and the guardrail HMAC key.";
+  if (status.reachable) return "The store answered. Nothing need be in it yet.";
+  // The store's own words, because "the keychain is locked" is actionable
+  // where "unreachable" is not.
+  return `The store did not answer: ${status.detail ?? "no reason given"}`;
+}
+
 export const milestones = computed<Milestone[]>(() => {
   const account = shell.account;
   // Equity crosses the bridge as a decimal *string* — the workspace never puts
@@ -265,18 +286,34 @@ export const milestones = computed<Milestone[]>(() => {
       state: funded ? "done" : "pending",
     },
     {
+      id: "keychain",
+      label: "Keychain reachable",
+      detail: keychainDetail(shell.keychain),
+      state: keychainState(shell.keychain),
+      blocked:
+        shell.keychain === null
+          ? "Only askable inside the desktop app; a browser dev server has no OS keychain."
+          : undefined,
+    },
+    {
       id: "wallet",
       label: "Agent wallet generated",
       detail: "A key for the agent to sign with, held in the OS keychain.",
       state: "unverifiable",
-      blocked: "The keychain phase is not built, so the console cannot see whether a key exists.",
+      // Corrected: `oppen-core::keys` implements the whole store — records,
+      // rotation, address retirement. What is missing is narrower and worth
+      // naming precisely, because the vague version sent me looking in the
+      // wrong crate.
+      blocked:
+        "The keystore exists, but the console has no agent registry to enumerate, so it does not know which agent to ask about.",
     },
     {
       id: "approve",
       label: "Approvals signed",
       detail: "Three signatures in your own wallet: fund, authorise the agent, approve the builder fee.",
       state: "unverifiable",
-      blocked: "Needs the keychain phase and a live `approveAgent` read to confirm against.",
+      blocked:
+        "The venue publishes no read that confirms an `approveAgent` landed, so this can only be inferred from a signature the console did not witness.",
     },
     {
       id: "paired",

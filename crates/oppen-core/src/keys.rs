@@ -608,6 +608,25 @@ pub trait KeyStore: Send + Sync {
     /// cleanup after a partial write is idempotent.
     fn remove(&self, entry: &EntryName) -> Result<(), KeyStoreError>;
 
+    /// Whether this machine's keychain can be read at all.
+    ///
+    /// The first thing that breaks on a fresh machine is not a missing wallet
+    /// but an unreachable store: a locked login keychain on macOS, no keyring
+    /// daemon on a headless Linux box, a denied prompt. Every other call here
+    /// then fails for a reason that has nothing to do with what the operator
+    /// was trying to do, so the console asks this first and says so plainly.
+    ///
+    /// **A read, and only a read.** It probes the guardrail HMAC entry —
+    /// present on any configured machine, absent on a fresh one — and treats
+    /// both answers as success, because what is being established is that the
+    /// store *answered*, not that anything is in it. Nothing is written, so
+    /// asking cannot create the state it reports on, and no secret leaves the
+    /// crate: the probe discards what it read.
+    fn reachable(&self) -> Result<(), KeyStoreError> {
+        self.read(&EntryName::guardrail_hmac(self.network()))?;
+        Ok(())
+    }
+
     /// The agent's wallet record, or `None` if it has no wallet.
     fn agent_wallet(&self, agent: &AgentId) -> Result<Option<AgentWallet>, KeyStoreError> {
         let entry = EntryName::agent_record(self.network(), agent)?;
@@ -1563,6 +1582,45 @@ mod tests {
                 "with the record {name} the revoke returned Ok and left {keys:?}"
             );
         }
+    }
+
+    /// A store whose every read fails, standing in for a locked keychain or a
+    /// machine with no keyring daemon.
+    struct UnreachableStore;
+
+    impl KeyStore for UnreachableStore {
+        fn network(&self) -> Network {
+            Network::Testnet
+        }
+        fn write(&self, _: &EntryName, _: &str) -> Result<(), KeyStoreError> {
+            Ok(())
+        }
+        fn read(&self, _: &EntryName) -> Result<Option<SecretText>, KeyStoreError> {
+            Err(KeyStoreError::Corrupt {
+                detail: "the keychain is locked".to_owned(),
+            })
+        }
+        fn remove(&self, _: &EntryName) -> Result<(), KeyStoreError> {
+            Ok(())
+        }
+    }
+
+    /// **An empty store is a reachable one.** The probe establishes that the
+    /// keychain *answered*, not that anything is in it — a fresh machine has
+    /// nothing stored and that is the normal first-run state, not a fault. Get
+    /// this backwards and the console tells every new operator their keychain
+    /// is broken.
+    #[test]
+    fn a_keychain_that_answers_is_reachable_even_with_nothing_in_it() {
+        let store = MemoryKeyStore::default();
+        assert!(store.reachable().is_ok(), "an empty store still answered");
+
+        // And one that refuses is not, carrying its own reason for the
+        // operator rather than a generic failure.
+        let error = UnreachableStore
+            .reachable()
+            .expect_err("a store that cannot be read is not reachable");
+        assert!(error.to_string().contains("locked"), "{error}");
     }
 
     /// A store whose `agent_wallet` reports a generation this module's write
