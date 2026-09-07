@@ -74,7 +74,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub use anchor::{Anchor, FileAnchor, HeadAnchor};
-pub use pilot::{PilotError, PilotJournal, PilotState, PilotStop};
+pub use pilot::{PilotAccounting, PilotError, PilotJournal, PilotState, PilotStatus, PilotStop};
 pub use submission::{
     SubmissionError, SubmissionJournal, SubmissionReceipt, SubmissionResolution, SubmissionState,
 };
@@ -1867,6 +1867,14 @@ impl EventViews {
     /// Execution-only capability: no registry, redaction or policy mutations.
     pub fn submissions(&self) -> SubmissionJournal {
         SubmissionJournal::new(self.0.clone())
+    }
+
+    /// Verified operator safety status without authorization or reset capability.
+    pub fn pilot_status(
+        &self,
+        account: oppen_hl::Address,
+    ) -> std::result::Result<Option<PilotStatus>, PilotError> {
+        pilot::status(&self.0, account)
     }
 
     /// The read-only slice belonging to `agent_id`.

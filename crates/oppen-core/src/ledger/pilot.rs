@@ -95,6 +95,31 @@ pub struct PilotState {
     pub halt: Option<PilotStop>,
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct PilotStatus {
+    pub agent: AgentId,
+    pub account: Address,
+    pub halt: Option<PilotStop>,
+    #[serde(flatten)]
+    pub accounting: PilotAccounting,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "accounting", rename_all = "snake_case")]
+pub enum PilotAccounting {
+    Known {
+        #[serde(with = "rust_decimal::serde::str")]
+        executed_usd: Decimal,
+        #[serde(with = "rust_decimal::serde::str")]
+        reserved_usd: Decimal,
+        #[serde(with = "rust_decimal::serde::str")]
+        net_realized_pnl_usd: Decimal,
+    },
+    Unavailable {
+        detail: String,
+    },
+}
+
 /// Operator capability. Never expose this constructor through an agent view.
 #[derive(Clone, Debug)]
 pub struct PilotJournal(Arc<Ledger>);
@@ -224,6 +249,47 @@ impl PilotJournal {
             .map(|authority| project(&history, authority))
             .transpose()
     }
+}
+
+pub(super) fn status(ledger: &Ledger, account: Address) -> Result<Option<PilotStatus>> {
+    let guard = ledger.lock()?;
+    let history = history(ledger, &guard, true)?;
+    let Some(authority) = history
+        .authorities
+        .iter()
+        .find(|a| a.data.account == account)
+    else {
+        return Ok(None);
+    };
+    if history
+        .fills
+        .iter()
+        .any(|fill| fill.seq > authority.seq && fill.payload.is_none())
+    {
+        return Err(unavailable("required pilot fill history redacted"));
+    }
+    let (halt, accounting) = match project(&history, authority) {
+        Ok(state) => (
+            state.halt,
+            PilotAccounting::Known {
+                executed_usd: state.executed_usd,
+                reserved_usd: state.reserved_usd,
+                net_realized_pnl_usd: state.net_realized_pnl_usd,
+            },
+        ),
+        Err(error) => (
+            authority.halt.clone(),
+            PilotAccounting::Unavailable {
+                detail: error.to_string(),
+            },
+        ),
+    };
+    Ok(Some(PilotStatus {
+        agent: authority.data.agent.clone(),
+        account: authority.data.account,
+        halt,
+        accounting,
+    }))
 }
 
 pub(super) fn before_sign<'a>(

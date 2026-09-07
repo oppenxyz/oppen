@@ -125,6 +125,157 @@ fn halt_count(ledger: &Ledger) -> usize {
 }
 
 #[test]
+fn status_reports_known_accounting_and_verified_stops_without_writes() {
+    for scenario in ["empty", "awaiting", "embedded", "standalone"] {
+        let (_dir, ledger, journal) = fixture();
+        let views = EventViews::new(ledger.clone());
+        assert!(views.pilot_status(account()).unwrap().is_none());
+        journal.authorize(agent(), account(), BASE).unwrap();
+        if scenario != "empty" {
+            begin(&ledger, &order(1, "1"));
+            let mut value = payload(1, 1, "1", "0", "0", BASE + 10);
+            match scenario {
+                "awaiting" => value["cloid"] = Value::Null,
+                "embedded" => value["fee"] = json!("5"),
+                _ => {}
+            }
+            record(&ledger, 1, &value);
+            if scenario == "standalone" {
+                value["fee"] = json!("1");
+                assert!(record(&ledger, 1, &value).is_none());
+            }
+        }
+        let head = ledger.chain_head().unwrap();
+        let view = views.pilot_status(account()).unwrap().unwrap();
+        let state = journal.state(account()).unwrap().unwrap();
+        assert_eq!(view.agent, agent());
+        assert_eq!(view.account, account());
+        assert_eq!(view.halt, state.halt);
+        match &view.accounting {
+            PilotAccounting::Known {
+                executed_usd,
+                reserved_usd,
+                net_realized_pnl_usd,
+            } => {
+                assert_eq!(*executed_usd, state.executed_usd);
+                assert_eq!(*reserved_usd, state.reserved_usd);
+                assert_eq!(*net_realized_pnl_usd, state.net_realized_pnl_usd);
+            }
+            other => panic!("{scenario}: unexpected accounting {other:?}"),
+        }
+        match scenario {
+            "empty" => assert!(view.halt.is_none()),
+            "awaiting" => assert!(matches!(view.halt, Some(PilotStop::AwaitingReconciliation))),
+            "embedded" => assert!(matches!(
+                view.halt,
+                Some(PilotStop::Exhausted {
+                    metric: PilotMetric::RealizedLoss,
+                    ..
+                })
+            )),
+            "standalone" => assert!(matches!(view.halt, Some(PilotStop::Unavailable { .. }))),
+            _ => unreachable!(),
+        }
+        let encoded = serde_json::to_value(&view).unwrap();
+        assert_eq!(encoded["accounting"], json!("known"));
+        for field in ["executed_usd", "reserved_usd", "net_realized_pnl_usd"] {
+            assert!(encoded[field].is_string(), "{scenario}: {field}");
+        }
+        assert!(
+            views
+                .pilot_status(Address::from_bytes([2; 20]))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(ledger.chain_head().unwrap(), head);
+    }
+}
+
+#[test]
+fn status_retains_verified_halt_when_contradictory_fill_accounting_fails() {
+    let (dir, ledger, journal) = fixture();
+    journal.authorize(agent(), account(), BASE).unwrap();
+    let receipt = begin(&ledger, &order(1, "1"));
+    EventViews::new(ledger.clone())
+        .submissions()
+        .resolve(
+            &receipt,
+            SubmissionResolution::NotSent {
+                detail: "synthetic unsent".into(),
+            },
+            BASE + 3,
+        )
+        .unwrap();
+    record(&ledger, 1, &payload(1, 1, "1", "0", "0", BASE + 10));
+    assert!(journal.state(account()).is_err());
+    let view = status(&ledger, account()).unwrap().unwrap();
+    assert_eq!(view.agent, agent());
+    assert_eq!(view.account, account());
+    assert!(matches!(&view.halt, Some(PilotStop::Unavailable { detail }) if !detail.is_empty()));
+    assert!(
+        matches!(&view.accounting, PilotAccounting::Unavailable { detail } if !detail.is_empty())
+    );
+    let encoded = serde_json::to_value(&view).unwrap();
+    assert_eq!(encoded["accounting"], json!("unavailable"));
+    for field in ["executed_usd", "reserved_usd", "net_realized_pnl_usd"] {
+        assert!(
+            encoded.get(field).is_none(),
+            "unavailable accounting must not invent {field}"
+        );
+    }
+    assert!(
+        status(&ledger, Address::from_bytes([2; 20]))
+            .unwrap()
+            .is_none()
+    );
+    drop(journal);
+    drop(ledger);
+    let ledger = Ledger::open(dir.path(), Network::Testnet).unwrap();
+    assert_eq!(
+        serde_json::to_value(status(&ledger, account()).unwrap().unwrap()).unwrap(),
+        encoded
+    );
+}
+
+#[test]
+fn status_rejects_redacted_required_history_or_corrupt_chain() {
+    for target in ["authority", "intent", "start", "fill", "halt", "hash"] {
+        let (_dir, ledger, journal) = fixture();
+        journal.authorize(agent(), account(), BASE).unwrap();
+        let auth_seq = ledger.chain_head().unwrap().seq;
+        begin(&ledger, &order(1, "1"));
+        let start_seq = ledger.chain_head().unwrap().seq;
+        let mut value = payload(1, 1, "1", "0", "0", BASE + 10);
+        let fill_seq = record(&ledger, 1, &value).unwrap().seq;
+        value["fee"] = json!("1");
+        record(&ledger, 1, &value);
+        let halt_seq = ledger.chain_head().unwrap().seq;
+        let seq = match target {
+            "authority" => auth_seq,
+            "intent" => start_seq - 1,
+            "start" => start_seq,
+            "fill" => fill_seq,
+            _ => halt_seq,
+        };
+        if target == "hash" {
+            ledger
+                .lock()
+                .unwrap()
+                .execute(
+                    "UPDATE events SET hash = 'broken' WHERE seq = ?1",
+                    params![seq],
+                )
+                .unwrap();
+        } else {
+            ledger
+                .redact(seq, "synthetic retention", (BASE + 20) as i64)
+                .unwrap();
+        }
+        assert!(status(&ledger, account()).is_err(), "{target}");
+    }
+}
+
+#[test]
 fn authorization_is_immutable_testnet_bound_and_excludes_old_rows() {
     let (dir, ledger, journal) = fixture();
     record(&ledger, 1, &payload(99, 1, "100", "-100", "5", BASE - 10));
