@@ -1,10 +1,11 @@
 <script setup lang="ts">
-import { computed, ref } from "vue";
+import { computed, onMounted, ref } from "vue";
 import ColumnHeader from "../components/housing/ColumnHeader.vue";
 import EmptyState from "../components/housing/EmptyState.vue";
 import PanelHousing from "../components/housing/PanelHousing.vue";
 import ReadoutRows, { type ReadoutRow } from "../components/housing/ReadoutRows.vue";
 import StatBlock from "../components/housing/StatBlock.vue";
+import { market, refreshMarkets, refreshSnapshot, select, selectedRow } from "../stores/market";
 
 type Ledger = "positions" | "orders" | "fills";
 
@@ -19,23 +20,104 @@ const TIMEFRAMES = ["1M", "5M", "15M", "1H", "4H", "1D"] as const;
 const POSITION_COLUMNS = ["Market", "Side", "Size", "Entry", "Mark", "Liq", "PnL", "Agent · sub-acct"] as const;
 const POSITION_TEMPLATE = "1.2fr 0.8fr 1fr 1fr 1fr 1fr 1fr 1.2fr";
 
-const FEATURES: readonly ReadoutRow[] = [
-  { k: "depth ±10bps", v: "—" },
-  { k: "imbalance", v: "—" },
-  { k: "rv_1h", v: "—" },
-  { k: "vol_ratio", v: "—" },
-  { k: "basis", v: "—" },
+/** A missing number renders as an em dash. It never renders as zero. */
+const DASH = "—";
+
+function show(value: string | undefined, suffix = ""): string {
+  return value === undefined ? DASH : `${value}${suffix}`;
+}
+
+/**
+ * Spec F's packs, as the panel reads them.
+ *
+ * `micro_tilt_bps` is not here: it needs `bbo` at its ~0.11 s cadence and the
+ * console holds no socket, so `get_features` answers it for agents and this
+ * panel does not pretend to. Depth carries `covers_band` — a band the ladder
+ * never reached is marked rather than shown as if it were the band's contents.
+ */
+const FEATURES = computed<readonly ReadoutRow[]>(() => {
+  const snap = market.snapshot;
+  if (snap === null) return FEATURES_EMPTY;
+  const band = snap.book.depth.find((d) => d.band_bps === 10);
+  return [
+    {
+      k: band?.covers_band === false ? "depth ±10bps ·floor" : "depth ±10bps",
+      v: band === undefined ? DASH : `${band.bid_usd} / ${band.ask_usd}`,
+      tone: band?.covers_band === false ? "uranium" : undefined,
+    },
+    { k: "spread", v: show(snap.book.spread_bps, " bp") },
+    { k: "imbalance", v: show(snap.book.book_imbalance) },
+    { k: "rv_24h", v: show(snap.vol.rv_24h_bps, " bp") },
+    { k: "vol_ratio", v: show(snap.vol.vol_ratio) },
+    { k: "funding 1h", v: show(snap.funding.hour_to_date_bps, " bp") },
+    { k: "basis", v: show(snap.funding.basis_bps, " bp") },
+  ];
+});
+
+const FEATURES_EMPTY: readonly ReadoutRow[] = [
+  { k: "depth ±10bps", v: DASH },
+  { k: "spread", v: DASH },
+  { k: "imbalance", v: DASH },
+  { k: "rv_24h", v: DASH },
+  { k: "vol_ratio", v: DASH },
+  { k: "funding 1h", v: DASH },
+  { k: "basis", v: DASH },
 ];
+
+/** The strip above the chart, served by the rail rather than the snapshot. */
+const strip = computed(() => {
+  const row = selectedRow.value;
+  return {
+    symbol: row?.symbol ?? DASH,
+    mark: row?.mark_px ?? DASH,
+    // A market the venue has stopped quoting has no mid, and no substitute.
+    mid: row?.mid_px ?? DASH,
+    change: row?.change_24h_pct === undefined ? DASH : `${row.change_24h_pct}%`,
+    funding: row === null ? DASH : `${row.funding_1h_bps} bp`,
+    oi: row?.open_interest ?? DASH,
+  };
+});
+
+/** Book rows, deepest-first on the bid so the two sides mirror at the touch. */
+const bids = computed(() => market.snapshot?.bids.slice(0, 8) ?? []);
+const asks = computed(() => market.snapshot?.asks.slice(0, 8) ?? []);
 
 const ledger = ref<Ledger>("positions");
 const ledgerEmpty = computed(() => LEDGER_TABS.find((tab) => tab.key === ledger.value)?.empty ?? "");
+
+onMounted(() => void refreshMarkets());
 </script>
 
 <template>
   <div class="trade">
     <div class="trade__col trade__col--left">
-      <PanelHousing label="Markets">
-        <EmptyState line="No markets loaded." />
+      <PanelHousing label="Markets" :meta="`${market.rows.length}`">
+        <EmptyState v-if="market.rows.length === 0" :line="market.error ?? 'No markets loaded.'" />
+        <ul v-else class="rail">
+          <li v-for="row in market.rows" :key="row.symbol">
+            <button
+              type="button"
+              class="rail__row"
+              :class="{
+                'rail__row--on': row.symbol === market.selected,
+                'rail__row--dark': !row.has_book,
+              }"
+              :aria-pressed="row.symbol === market.selected"
+              :title="row.has_book ? undefined : 'The venue is quoting no book for this asset.'"
+              @click="select(row.symbol)"
+            >
+              <span class="rail__sym">{{ row.symbol }}</span>
+              <span class="rail__px">{{ row.mark_px }}</span>
+              <span
+                class="rail__chg"
+                :class="{
+                  'rail__chg--up': Number(row.change_24h_pct ?? 0) > 0,
+                  'rail__chg--down': Number(row.change_24h_pct ?? 0) < 0,
+                }"
+              >{{ row.change_24h_pct === undefined ? "—" : `${row.change_24h_pct}%` }}</span>
+            </button>
+          </li>
+        </ul>
       </PanelHousing>
       <PanelHousing label="Agents on —" meta="0">
         <EmptyState line="No agents paired." />
@@ -47,15 +129,15 @@ const ledgerEmpty = computed(() => LEDGER_TABS.find((tab) => tab.key === ledger.
       <PanelHousing inset>
         <div class="strip">
           <div>
-            <div class="label">Market</div>
-            <div class="strip__price">—</div>
+            <div class="label">{{ strip.symbol }}</div>
+            <div class="strip__price">{{ strip.mid }}</div>
           </div>
           <div class="strip__stats">
-            <StatBlock label="24h" />
-            <StatBlock label="Mark" />
-            <StatBlock label="Funding" />
-            <StatBlock label="OI" />
-            <StatBlock label="Spread" />
+            <StatBlock label="24h" :value="strip.change" />
+            <StatBlock label="Mark" :value="strip.mark" />
+            <StatBlock label="Funding" :value="strip.funding" />
+            <StatBlock label="OI" :value="strip.oi" />
+            <StatBlock label="Spread" :value="FEATURES[1]?.v ?? '—'" />
           </div>
         </div>
       </PanelHousing>
@@ -89,10 +171,27 @@ const ledgerEmpty = computed(() => LEDGER_TABS.find((tab) => tab.key === ledger.
     </div>
 
     <div class="trade__col trade__col--right">
-      <PanelHousing label="Book · Hyperliquid" meta="L2 · 5 sigfig">
-        <EmptyState line="No book subscribed." />
+      <PanelHousing label="Book · Hyperliquid" meta="L2">
+        <EmptyState
+          v-if="bids.length === 0 && asks.length === 0"
+          :line="market.snapshotError ?? 'No book subscribed.'"
+        />
+        <div v-else class="book">
+          <!-- Asks descend to the touch, bids fall away from it, so the two
+               best prices meet in the middle the way a book is read. -->
+          <div v-for="lvl in [...asks].reverse()" :key="`a${lvl.px}`" class="book__row book__row--ask">
+            <span>{{ lvl.px }}</span><span>{{ lvl.sz }}</span><span class="book__n">{{ lvl.n }}</span>
+          </div>
+          <div class="book__mid">{{ market.snapshot?.book.spread_bps ?? "—" }} bp</div>
+          <div v-for="lvl in bids" :key="`b${lvl.px}`" class="book__row book__row--bid">
+            <span>{{ lvl.px }}</span><span>{{ lvl.sz }}</span><span class="book__n">{{ lvl.n }}</span>
+          </div>
+        </div>
       </PanelHousing>
-      <PanelHousing inset label="Features" meta="get_features" :brackets="['tr']">
+      <PanelHousing inset label="Features" :brackets="['tr']">
+        <template #meta>
+          <button type="button" class="refresh" @click="refreshSnapshot">Re-read</button>
+        </template>
         <ReadoutRows :rows="FEATURES" />
       </PanelHousing>
       <PanelHousing inset label="Manual order" meta="Overrides policy" data-tour="ticket">
@@ -103,6 +202,117 @@ const ledgerEmpty = computed(() => LEDGER_TABS.find((tab) => tab.key === ledger.
 </template>
 
 <style scoped>
+.rail {
+  display: grid;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  overflow-y: auto;
+}
+
+.rail__row {
+  display: grid;
+  grid-template-columns: 1fr auto auto;
+  gap: var(--s-2);
+  width: 100%;
+  padding: var(--s-2) var(--s-3);
+  border: 0;
+  border-left: 2px solid transparent;
+  background: none;
+  font: inherit;
+  font-size: var(--fs-body);
+  color: var(--body);
+  text-align: left;
+  cursor: pointer;
+}
+
+.rail__row:hover {
+  background: var(--plate);
+}
+
+.rail__row--on {
+  border-left-color: var(--uranium);
+  color: var(--signal);
+}
+
+/* An asset the venue quotes no book for. Dimmed rather than hidden: 38.6% of
+   the mainnet universe has none, and an operator who cannot find an asset
+   learns less than one who finds it marked untradeable. */
+.rail__row--dark {
+  color: var(--bracket);
+}
+
+.rail__sym {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.rail__px {
+  color: var(--signal-dim);
+}
+
+.rail__chg {
+  min-width: 6ch;
+  text-align: right;
+}
+
+.rail__chg--up {
+  color: var(--up);
+}
+
+.rail__chg--down {
+  color: var(--down);
+}
+
+.book {
+  display: grid;
+  font-size: var(--fs-body);
+}
+
+.book__row {
+  display: grid;
+  grid-template-columns: 1fr 1fr auto;
+  gap: var(--s-2);
+  padding: 1px var(--s-3);
+}
+
+.book__row--ask {
+  color: var(--down);
+}
+
+.book__row--bid {
+  color: var(--up);
+}
+
+.book__n {
+  min-width: 3ch;
+  text-align: right;
+  color: var(--bracket);
+}
+
+.book__mid {
+  padding: var(--s-1) var(--s-3);
+  border-block: 1px solid var(--rule);
+  color: var(--bracket);
+  text-align: center;
+}
+
+.refresh {
+  border: 0;
+  background: none;
+  font: inherit;
+  font-size: var(--fs-label);
+  letter-spacing: var(--ls-chip);
+  text-transform: uppercase;
+  color: var(--bracket);
+  cursor: pointer;
+}
+
+.refresh:hover {
+  color: var(--signal);
+}
+
 .trade {
   display: grid;
   flex: 1;

@@ -100,3 +100,79 @@ export async function fetchKeychainStatus(
 ): Promise<KeychainStatus> {
   return invoke<KeychainStatus>("keychain_status", { network });
 }
+
+/** One row of the markets rail. Decimals arrive as strings. */
+export interface MarketRow {
+  symbol: string;
+  mark_px: string;
+  /** Absent on an asset the venue has stopped quoting. There is no substitute. */
+  mid_px?: string;
+  /** Absent when the previous close was zero. */
+  change_24h_pct?: string;
+  funding_1h_bps: string;
+  open_interest: string;
+  day_volume_usd: string;
+  has_book: boolean;
+}
+
+export interface BookLevel {
+  px: string;
+  sz: string;
+  n: number;
+}
+
+export interface DepthBand {
+  band_bps: number;
+  bid_usd: string;
+  ask_usd: string;
+  /** False when the ladder stopped short of the band — a floor, not the depth. */
+  covers_band: boolean;
+}
+
+export interface BookFeatures {
+  spread_bps?: string;
+  book_imbalance?: string;
+  /** Always absent from the console: it needs `bbo`, and there is no socket here. */
+  micro_tilt_bps?: string;
+  bid_reach_bps?: string;
+  ask_reach_bps?: string;
+  depth: DepthBand[];
+}
+
+export interface FundingFeatures {
+  hour_to_date_bps: string;
+  apr_pct: string;
+  predicted_apr_pct?: string;
+  next_funding_s: number;
+  basis_bps?: string;
+}
+
+export interface VolFeatures {
+  rv_1h_bps?: string;
+  rv_24h_bps?: string;
+  vol_ratio?: string;
+  bars_1h: number;
+  bars_24h: number;
+}
+
+/** One symbol in depth. Ages on its own clock — see `as_of_ms`. */
+export interface MarketSnapshot {
+  symbol: string;
+  as_of_ms: number;
+  bids: BookLevel[];
+  asks: BookLevel[];
+  book: BookFeatures;
+  funding: FundingFeatures;
+  vol: VolFeatures;
+}
+
+export async function fetchMarkets(network: "testnet" | "mainnet"): Promise<MarketRow[]> {
+  return invoke<MarketRow[]>("markets", { network });
+}
+
+export async function fetchMarketSnapshot(
+  network: "testnet" | "mainnet",
+  coin: string,
+): Promise<MarketSnapshot> {
+  return invoke<MarketSnapshot>("market_snapshot", { network, coin });
+}
