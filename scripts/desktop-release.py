@@ -72,10 +72,10 @@ def publish(run):
         gh("release", "create", tag, "--repo", REPO, "--target", sha, "--draft",
            "--title", f"Oppen {value}", "--notes", f"Private Apple Silicon build from {sha}. Tauri-signed; not Apple-notarized.")
     gh("release", "upload", tag, str(archive), str(signature), "--repo", REPO, "--clobber")
-    release = json.loads(gh("api", f"repos/{REPO}/releases/tags/{tag}"))
+    release = json.loads(gh("release", "view", tag, "--repo", REPO, "--json", "assets"))
     asset = next(a for a in release["assets"] if a["name"] == archive.name)
     manifest = bundle / "latest.json"
-    manifest.write_text(json.dumps(metadata(value, asset["url"], signature.read_text()), indent=2) + "\n")
+    manifest.write_text(json.dumps(metadata(value, asset["apiUrl"], signature.read_text()), indent=2) + "\n")
     gh("release", "upload", tag, str(manifest), "--repo", REPO, "--clobber")
     # This is the only visibility switch. Readers never see a partial release.
     gh("release", "edit", tag, "--repo", REPO, "--draft=false", "--latest")
