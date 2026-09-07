@@ -10,7 +10,7 @@ const feeds = computed(() => ({
 </script>
 
 <template>
-  <footer class="sb">
+  <footer class="sb" data-tour="statusbar">
     <span class="sb__k">Last decision</span>
     <template v-if="shell.lastDecision">
       <span>{{ shell.lastDecision.time }}</span>
@@ -32,7 +32,7 @@ const feeds = computed(() => ({
 
     <span>
       Feeds ·
-      <span class="sb__k">WS·MKT {{ feeds.market }} · WS·USER {{ feeds.user }} · REST {{ feeds.rest }}</span>
+      <span class="sb__k" data-tour="feeds">WS·MKT {{ feeds.market }} · WS·USER {{ feeds.user }} · REST {{ feeds.rest }}</span>
     </span>
     <span>{{ shell.decisionsToday }} decisions today · {{ shell.refusedToday }} refused</span>
   </footer>

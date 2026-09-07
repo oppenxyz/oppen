@@ -1,13 +1,10 @@
 <script setup lang="ts">
-import AsciiGauge from "../components/ascii/AsciiGauge.vue";
-import BootSequence from "../components/ascii/BootSequence.vue";
 import CharacterMatrix from "../components/ascii/CharacterMatrix.vue";
 import PanelHousing from "../components/housing/PanelHousing.vue";
 import WordMark from "../components/shell/WordMark.vue";
+import SetupTracker from "../components/tour/SetupTracker.vue";
 import UiButton from "../components/ui/UiButton.vue";
-
-const STEPS = ["Runtime", "Agent wallet", "Approve · master", "Pair agent"] as const;
-const ACTIVE_STEP = 0;
+import { startTour, TOUR } from "../stores/tour";
 </script>
 
 <template>
@@ -25,37 +22,23 @@ const ACTIVE_STEP = 0;
     </PanelHousing>
 
     <div class="onboarding__side">
-      <PanelHousing>
-        <ol class="steps">
-          <li
-            v-for="(step, index) in STEPS"
-            :key="step"
-            class="step"
-            :class="{ 'step--active': index === ACTIVE_STEP }"
-            :aria-current="index === ACTIVE_STEP ? 'step' : undefined"
-          >
-            <span class="step__n">0{{ index + 1 }}</span>
-            <span class="step__name">{{ step }}</span>
-          </li>
-        </ol>
-      </PanelHousing>
+      <SetupTracker />
 
-      <PanelHousing inset label="01 · Installing local runtime" :brackets="['tr']" class="stepbody">
-        <template #meta>
-          <AsciiGauge :value="(ACTIVE_STEP + 1) / STEPS.length" :cells="16" label="Setup" />
-          <span>01 / 04</span>
-        </template>
-        <BootSequence class="stepbody__boot" />
-        <p class="copy stepbody__copy">
-          Everything runs on this machine: your keys, your agents, the execution engine. Your master wallet signs three
-          approvals once, in your own wallet — it never enters oppen. You start on testnet; mainnet is an explicit
-          switch.
+      <PanelHousing inset label="Walkthrough" :brackets="['tr']" class="walk">
+        <template #meta><span>{{ TOUR.length }} stops</span></template>
+        <p class="copy walk__copy">
+          A guided pass over every screen, pointing at the real controls rather than a picture of
+          them. It names what each panel is for, and says plainly where something is not built yet.
+        </p>
+        <p class="copy walk__copy walk__copy--dim">
+          Arrow keys move between stops, Escape leaves. You can start it again any time from
+          SETUP in the header.
         </p>
       </PanelHousing>
 
       <div class="actions">
         <UiButton block disabled title="Arrives with the keychain phase">Import agent wallet</UiButton>
-        <UiButton block variant="primary" disabled title="Arrives with the keychain phase">Generate agent wallet →</UiButton>
+        <UiButton block variant="primary" @click="startTour">Take the walkthrough →</UiButton>
       </div>
     </div>
   </div>
@@ -107,59 +90,20 @@ const ACTIVE_STEP = 0;
 .onboarding__side {
   display: grid;
   grid-template-rows: auto 1fr auto;
+  overflow-y: auto;
   grid-template-columns: minmax(0, 1fr);
   gap: var(--panel-gap);
   min-height: 0;
 }
 
-.steps {
-  display: grid;
-  grid-template-columns: repeat(4, 1fr);
-}
-
-.step {
-  padding: var(--s-3);
-  border-right: 1px solid var(--rule);
-  border-bottom: 1px solid transparent;
-  margin-bottom: -1px;
-}
-
-.step:last-child {
-  border-right: 0;
-}
-
-.step--active {
-  border-bottom-color: var(--signal);
-}
-
-.step__n {
-  display: block;
-  font-size: var(--fs-label);
-  letter-spacing: var(--ls-chip);
-  color: var(--bracket);
-}
-
-.step__name {
-  display: block;
-  margin-top: var(--s-1);
-  color: var(--bracket);
-}
-
-.step--active .step__name {
-  color: var(--signal);
-}
-
-.stepbody {
-  padding: var(--s-5);
-}
-
-.stepbody__boot {
-  flex: 1;
-  margin-top: var(--s-1);
-}
-
-.stepbody__copy {
+.walk__copy {
   max-width: 52ch;
+  padding: var(--s-3);
+}
+
+.walk__copy--dim {
+  padding-top: 0;
+  color: var(--body-dim);
 }
 
 .actions {

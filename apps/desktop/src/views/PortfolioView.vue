@@ -67,7 +67,7 @@ const side = (size: string): string => (Number(size) >= 0 ? "LONG" : "SHORT");
 <template>
   <div class="portfolio">
     <div class="portfolio__tiles">
-      <PanelHousing inset label="Equity · unified margin" :brackets="['tl']">
+      <PanelHousing inset label="Equity · unified margin" :brackets="['tl']" data-tour="portfolio">
         <div class="tile__value tile__value--xl">{{ equity }}</div>
         <div class="tile__note">{{ available }} available</div>
       </PanelHousing>

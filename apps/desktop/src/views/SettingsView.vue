@@ -46,7 +46,7 @@ const LOCAL: readonly ReadoutRow[] = [
     </PanelHousing>
 
     <div class="settings__grid">
-      <PanelHousing inset label="Global limits — apply above every agent policy" :brackets="['tl']">
+      <PanelHousing inset label="Global limits — apply above every agent policy" :brackets="['tl']" data-tour="settings">
         <ReadoutRows size="md" :rows="GLOBAL_LIMITS" />
       </PanelHousing>
 
@@ -55,7 +55,7 @@ const LOCAL: readonly ReadoutRow[] = [
         <EmptyState matrix line="No agents paired." />
       </PanelHousing>
 
-      <PanelHousing inset label="Kill switch">
+      <PanelHousing inset label="Kill switch" data-tour="kill">
         <p class="copy copy--sm">
           Halts every agent, cancels resting orders, and locks the runtime until you unlock it locally. Positions are
           not closed. The halt survives restart, and a venue-side dead-man cancel is armed while any agent runs.

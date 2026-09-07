@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed } from "vue";
 import { formatLatency, formatUsd, NAV, setView, shell, venueLabel } from "../../stores/shell";
+import { progress } from "../../stores/tour";
 import UiButton from "../ui/UiButton.vue";
 import ApertureMark from "./ApertureMark.vue";
 import WordMark from "./WordMark.vue";
@@ -18,7 +19,7 @@ const network = computed(() => shell.network.toUpperCase());
       <WordMark />
     </button>
 
-    <nav class="hdr__nav" aria-label="Primary">
+    <nav class="hdr__nav" aria-label="Primary" data-tour="nav">
       <button
         v-for="item in NAV"
         :key="item.view"
@@ -37,7 +38,7 @@ const network = computed(() => shell.network.toUpperCase());
     <div class="hdr__status">
       <span>LOCAL · <span class="hdr__v">RUNTIME OK</span></span>
       <span>HYPERLIQUID · <span class="hdr__v">{{ venue }}</span></span>
-      <span class="hdr__chip" :class="`hdr__chip--${shell.network}`">{{ network }}</span>
+      <span class="hdr__chip" :class="`hdr__chip--${shell.network}`" data-tour="network">{{ network }}</span>
       <span>LAT · <span class="hdr__v">{{ latency }}</span></span>
       <span>EQUITY · <span class="hdr__v hdr__v--signal">{{ equity }}</span></span>
       <button
@@ -47,6 +48,12 @@ const network = computed(() => shell.network.toUpperCase());
         @click="setView('onboarding')"
       >
         SETUP
+        <!-- The count is of steps this console can actually verify, matching the
+             tracker exactly. It disappears when they are all done rather than
+             turning into a tick, so a finished setup is quiet. -->
+        <span v-if="progress.done < progress.total" class="hdr__setup-n">
+          {{ progress.done }}/{{ progress.total }}
+        </span>
       </button>
       <UiButton variant="hazard" size="sm" class="hdr__halt" disabled title="Kill switch arrives with the guardrail phase">
         HALT ALL
@@ -146,6 +153,11 @@ const network = computed(() => shell.network.toUpperCase());
 .hdr__setup--active {
   border-bottom-color: var(--signal);
   color: var(--signal);
+}
+
+.hdr__setup-n {
+  margin-left: var(--s-1);
+  color: var(--uranium);
 }
 
 .hdr__halt {

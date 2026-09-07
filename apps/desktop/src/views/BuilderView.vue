@@ -22,7 +22,7 @@ const SOURCES: readonly Source[] = [
 
 <template>
   <div class="builder">
-    <PanelHousing label="01 · Source">
+    <PanelHousing label="01 · Source" data-tour="builder">
       <ul class="sources">
         <li
           v-for="(source, index) in SOURCES"

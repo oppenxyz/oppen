@@ -11,6 +11,20 @@ decisions" section until then.
 
 ---
 
+## 2026-09-07 · Showing the operator the product
+
+Item 4 asks for a fresh machine to reach a testnet trade in ten minutes, and
+names a designed empty state for every panel. What it does not say is how an
+operator learns what the panels *are*. This is that, plus the honest half:
+saying how far setup has actually got.
+
+| # | Decision | Choice | Why |
+|---|---|---|---|
+| W1 | How the walkthrough points at things | **A spotlight over the live control, not a screenshot of one** | The overlay dims the console and casts an outward `box-shadow` from the target's own rectangle, so the element being explained keeps rendering itself — a stale feed still reads stale, a disabled button still reads disabled. A tour built from captured images teaches the product as it was on the day someone took the screenshots, and quietly stops matching. **What this gives up:** the highlight follows layout, so it re-measures on resize and scroll rather than being positioned once. |
+| W2 | What the tour covers | **Every screen, in one pass, each visited once** | Item 4's gate is a fresh machine to a first trade, and the surfaces an operator has not met are the ones they will not reach for when it matters — the kill switch above all. So it is one pass over all five screens rather than a three-stop highlights reel. Each view is entered once: an early ordering had the kill-switch stop under Agents when the control lives in Settings, which sent the tour bouncing between screens and made the product feel larger than it is. A test pins the run order, and it is what caught that. |
+| W3 | What the tour says about unfinished things | **Names them, in the callout, as "not yet"** | Several controls the tour points at are disabled pending the keychain phase. Skipping them would leave the operator to discover the gaps alone; presenting them as working would be worse. So a step may carry a `caveat`, rendered as a marked line under the body — the same posture the PR bodies in this repo take with "Not claimed". |
+| W4 | What the tracker may claim | **Three states, and the denominator is the checkable steps only** | A milestone the console cannot verify reads `unverifiable` and says which read is missing — never `pending`. The two are different facts, and an operator waiting on a box that nothing will ever tick is worse served than one told the check does not exist yet. The progress count is over the checkable steps alone, because counting the others would leave a fully-configured machine reading "2 / 7" forever, which asserts a failure the operator cannot fix. Every milestone is a predicate over live state rather than a stored flag, so the panel cannot keep saying a thing was true after it stops being. **What this gives up:** three of the seven steps are currently unverifiable, so the tracker is honest about being mostly unable to help — which is the accurate picture of a console whose keychain phase is not built. |
+
 ## 2026-09-07 · What execution actually cost
 
 Spec F's last v1 line asks for four things — `arrival_mid` on every order,
