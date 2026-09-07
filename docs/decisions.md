@@ -11,6 +11,20 @@ decisions" section until then.
 
 ---
 
+## 2026-09-07 · Auditing the roadmap against the code
+
+The status paragraph had said "**the P2 and P3 boxes are stale**" since
+2026-09-05 and named correcting them as a separate pass. It stayed unwritten
+through seventeen merges, and I flagged it four times without doing it. This is
+that pass.
+
+| # | Decision | Choice | Why |
+|---|---|---|---|
+| Y1 | How a box gets ticked | **A named module or test, checked by grep, never memory** | Every tick carries what implements it — `oppen-hl::ws`, `guardrail::breaker`, a test by name. The point is not decoration: a reader who doubts a box can go straight to the thing, and the next person to audit this does not have to redo the search. Two bullets I *expected* to tick did not survive the check, which is the whole argument for doing it this way. |
+| Y2 | What to do with a half-built bullet | **Leave it open and say which half** | Four bullets are neither done nor untouched. A tick would overclaim; a bare `[ ]` throws away what exists and invites someone to rebuild it. So each names both sides: the rate-budget manager reserves headroom and throttles but does not batch; the container registry has the store and the external bucket but not the venue or container-kind keying that exists so V5 needs no migration; the dead-man's switch has its lead time but no daily trigger budget, which is O1's central claim. |
+| Y3 | The finding worth the whole exercise | **`HmacKey` is built and nothing uses it** | Spec item 3 wants the guardrail config HMAC-checked so editing the SQLite file cannot silently raise a limit. `keys::HmacKey` signs, verifies, zeroizes on drop and redacts its own `Debug` — and has no call site outside its own definition. The config store neither writes a tag nor checks one. That is a security property the repo describes itself as having and does not, and no amount of reading the roadmap would have found it: the box was already unticked, for the wrong reason. |
+| Y4 | Gates get the same treatment as boxes | **Say which are met, and by what** | P3's gate is met and now names the property test that meets it. P2's is not: `no_fill_is_lost_across_a_disconnect` drives a real outage through the feed session and the ledger, but against a test double — the gate asks for a live 30 s drop, and a gate that quietly accepts a fixture is not a gate. |
+
 ## 2026-09-07 · The console can see the keychain
 
 W4 shipped a tracker that reports what it cannot check. Two of its three
