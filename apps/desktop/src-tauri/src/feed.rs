@@ -154,12 +154,11 @@ impl ConsoleFeed {
         network: Network,
         account: Option<String>,
     ) -> Result<Self, String> {
+        let dir = data_dir(app)?;
+        std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         let ledger = Arc::new(
-            Ledger::open_at(
-                &data_dir(app)?.join(oppen_core::db_file_name(network)),
-                network,
-            )
-            .map_err(|e| format!("ledger: {e}"))?,
+            Ledger::open_at(&dir.join(oppen_core::db_file_name(network)), network)
+                .map_err(|e| format!("ledger: {e}"))?,
         );
         let session = Arc::new(FeedSession::new());
         let (pool, mut events) = WsPool::new(WsPoolConfig {
@@ -287,7 +286,7 @@ impl ConsoleFeed {
 /// `OPPEN_DATA_DIR` first, because that is what `oppen-mcp`'s gateway reads and
 /// the two must land on the same file when they are pointed at the same
 /// account — R4 makes the database per network, not per process.
-fn data_dir(app: &AppHandle) -> Result<PathBuf, String> {
+pub(crate) fn data_dir(app: &AppHandle) -> Result<PathBuf, String> {
     let dir = match std::env::var("OPPEN_DATA_DIR") {
         Ok(dir) => PathBuf::from(dir),
         Err(_) => app
@@ -295,7 +294,6 @@ fn data_dir(app: &AppHandle) -> Result<PathBuf, String> {
             .app_data_dir()
             .map_err(|e| format!("no app data directory: {e}"))?,
     };
-    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     Ok(dir)
 }
 

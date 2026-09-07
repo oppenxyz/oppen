@@ -8,11 +8,12 @@
 
 mod feed;
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use feed::ConsoleFeed;
 use oppen_core::candles::Interval;
 use oppen_core::keys::{KeyStore, KeychainKeyStore};
+use oppen_core::ledger::{EventViews, Ledger, PilotStatus};
 use oppen_core::market::{ChartSeries, MarketRow, MarketSnapshot, chart, rows, snapshot};
 use oppen_core::state::{AccountState, VenueReadings, assemble};
 use oppen_hl::{Address, InfoClient, Network};
@@ -29,12 +30,16 @@ enum ConsoleError {
     NotConfigured(String),
     /// The venue did not answer.
     Venue(String),
+    /// Local pilot evidence could not be verified. Independent of venue health.
+    LocalStatus(String),
 }
 
 impl std::fmt::Display for ConsoleError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ConsoleError::NotConfigured(detail) | ConsoleError::Venue(detail) => {
+            ConsoleError::NotConfigured(detail)
+            | ConsoleError::Venue(detail)
+            | ConsoleError::LocalStatus(detail) => {
                 write!(f, "{detail}")
             }
         }
@@ -55,6 +60,63 @@ fn configured_account() -> Result<Address, ConsoleError> {
     raw.parse().map_err(|e| {
         ConsoleError::NotConfigured(format!("OPPEN_TESTNET_USER is not an address: {e}"))
     })
+}
+
+/// ES15: read verified pilot evidence without starting feeds or execution.
+#[derive(Default)]
+struct PilotReads(Arc<tauri::async_runtime::Mutex<()>>);
+
+impl PilotReads {
+    fn spawn<T: Send + 'static>(
+        &self,
+        read: impl FnOnce() -> T + Send + 'static,
+    ) -> Result<tauri::async_runtime::JoinHandle<T>, ConsoleError> {
+        let permit = self.0.clone().try_lock_owned().map_err(|_| {
+            ConsoleError::LocalStatus("A local pilot status read is still in progress.".into())
+        })?;
+        // The blocking closure owns the permit. Dropping the IPC future or
+        // reloading the window must not permit another read to queue behind it.
+        Ok(tauri::async_runtime::spawn_blocking(move || {
+            let _permit = permit;
+            read()
+        }))
+    }
+}
+
+#[tauri::command]
+async fn pilot_status(
+    app: tauri::AppHandle,
+    reads: State<'_, PilotReads>,
+    network: String,
+) -> Result<Option<PilotStatus>, ConsoleError> {
+    let account = configured_account()?;
+    let network = network_of(&network);
+    let dir = feed::data_dir(&app).map_err(ConsoleError::LocalStatus)?;
+    reads
+        .spawn(move || read_pilot_status(&dir, network, account))?
+        .await
+        .map_err(|e| ConsoleError::LocalStatus(format!("local status task: {e}")))?
+}
+
+fn read_pilot_status(
+    dir: &std::path::Path,
+    network: Network,
+    account: Address,
+) -> Result<Option<PilotStatus>, ConsoleError> {
+    let path = dir.join(oppen_core::db_file_name(network));
+    if !path
+        .try_exists()
+        .map_err(|e| ConsoleError::LocalStatus(e.to_string()))?
+    {
+        return Err(ConsoleError::LocalStatus(
+            "No local ledger is available for this network.".into(),
+        ));
+    }
+    let ledger = Ledger::open_at(&path, network)
+        .map_err(|e| ConsoleError::LocalStatus(format!("local ledger: {e}")))?;
+    EventViews::new(Arc::new(ledger))
+        .pilot_status(account)
+        .map_err(|e| ConsoleError::LocalStatus(format!("local pilot status: {e}")))
 }
 
 /// Whether this machine's keychain answers.
@@ -326,10 +388,12 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             app.manage(Feeds::default());
+            app.manage(PilotReads::default());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             account_state,
+            pilot_status,
             keychain_status,
             markets,
             market_snapshot,
@@ -338,4 +402,128 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod pilot_status_tests {
+    use super::*;
+
+    struct TestDir(std::path::PathBuf);
+
+    impl TestDir {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "oppen-desktop-pilot-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("clock")
+                    .as_nanos()
+            ));
+            std::fs::create_dir(&path).expect("isolated test directory");
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn account() -> Address {
+        "0x1111111111111111111111111111111111111111"
+            .parse()
+            .expect("public address")
+    }
+
+    #[test]
+    fn dropped_ipc_cannot_queue_another_read_before_blocking_work_finishes() {
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        let reads = PilotReads::default();
+        let (started, observing) = mpsc::channel();
+        let (release, waiting) = mpsc::channel();
+        let task = reads
+            .spawn(move || {
+                started.send(()).expect("observer");
+                waiting.recv().expect("release blocked read");
+            })
+            .expect("first read");
+        observing
+            .recv_timeout(Duration::from_secs(1))
+            .expect("read started");
+        drop(task);
+        assert!(matches!(
+            reads.spawn(|| panic!("overlapping read must never run")),
+            Err(ConsoleError::LocalStatus(_))
+        ));
+        release.send(()).expect("finish read");
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while reads.0.try_lock().is_err() {
+            assert!(
+                Instant::now() < deadline,
+                "finished read retained its permit"
+            );
+            std::thread::yield_now();
+        }
+        let next = reads.spawn(|| 7).expect("read after completion");
+        assert_eq!(
+            tauri::async_runtime::block_on(next).expect("completed read"),
+            7
+        );
+    }
+
+    #[test]
+    fn missing_ledger_is_a_local_error_and_is_not_created() {
+        let dir = TestDir::new();
+        let error =
+            read_pilot_status(&dir.0, Network::Testnet, account()).expect_err("missing ledger");
+        assert_eq!(
+            serde_json::to_value(error).expect("error JSON")["kind"],
+            "local_status"
+        );
+        assert!(
+            !dir.0
+                .join(oppen_core::db_file_name(Network::Testnet))
+                .exists()
+        );
+    }
+
+    #[test]
+    fn existing_ledger_without_authority_returns_no_pilot() {
+        let dir = TestDir::new();
+        drop(Ledger::open(&dir.0, Network::Testnet).expect("fixture ledger"));
+        assert!(
+            read_pilot_status(&dir.0, Network::Testnet, account())
+                .expect("local read")
+                .is_none()
+        );
+        assert!(matches!(
+            read_pilot_status(&dir.0, Network::Mainnet, account()),
+            Err(ConsoleError::LocalStatus(_))
+        ));
+        assert!(
+            !dir.0
+                .join(oppen_core::db_file_name(Network::Mainnet))
+                .exists()
+        );
+    }
+
+    #[test]
+    fn corrupt_local_ledger_is_not_a_venue_error() {
+        let dir = TestDir::new();
+        std::fs::write(
+            dir.0.join(oppen_core::db_file_name(Network::Testnet)),
+            b"not a SQLite ledger",
+        )
+        .expect("corrupt fixture");
+        let error =
+            read_pilot_status(&dir.0, Network::Testnet, account()).expect_err("corrupt ledger");
+        assert_eq!(
+            serde_json::to_value(error).expect("error JSON")["kind"],
+            "local_status"
+        );
+    }
 }

@@ -89,6 +89,37 @@ backup only if no subsequent activity occurred. Stop older runtimes before
 migration; already-open old processes do not acquire new enforcement logic.
 No new dependency.
 
+### Pilot stop supervision (ES15)
+
+Items 25, 29 and 34 require a stop to remain visible and actionable after restart
+or venue failure. Expose verified pilot identity and permanent halt separately
+from accounting projection: unavailable totals are never fabricated as zero.
+Invalid authority history returns an error rather than an invented identity.
+
+Reuse the existing bounded cancellation sweep for paused accounts and verified
+pilot accounts with a permanent stop or unavailable accounting. Recheck under
+the account queue and before submission. Transient reconciliation alone does
+not cancel; ordinary resume cannot clear a permanent pilot stop. Existing pause
+authority remains sufficient even if a pilot status read fails. Retained pairing
+bindings, not ledger identity alone, supply execution authority.
+
+Ledger verification runs off the async worker under a single-flight permit;
+status checks share the sweep's per-account deadline. A timed-out read cannot
+authorize a later cancellation and retains its permit until it finishes, so
+retries cannot accumulate blocking jobs. Shutdown drops the caller without
+waiting for read-only lock recovery; the residual read owns no signer or
+execution capability. Already-paused accounts bypass this reader.
+This bounds server shutdown, not process termination: Tokio runtime teardown
+may still wait for a permanently blocked filesystem read. Repeated Gateway
+recreation under stuck I/O and guaranteed process exit require a separate gate.
+
+The console polls this read-only local status independently of venue requests,
+discards responses from an obsolete network context, and retains a verified stop
+with an explicit stale/error indication when refresh fails. A stop banner is not
+proof that cancellation succeeded or positions closed. No automatic flattening,
+budget renewal, second event store, new worker or dependency is introduced.
+Account confirmation, runtime activation and supervised live proof remain gated.
+
 ## 2026-09-07 · The console's own socket
 
 Item 34 asks for per-feed status, last-tick timestamps and a stale overlay. The

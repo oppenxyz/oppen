@@ -76,6 +76,14 @@ Missing or contradictory budget evidence is `pilot_budget_unavailable` within an
 orders until reconciliation proves that link; it does not erase consumption.
 No MCP method authorizes, renews or resets a pilot.
 
+The runtime retries cancellation of resting orders for a verified permanent
+pilot stop or unavailable accounting, using the same bounded sweep as an
+operator pause. Transient reconciliation alone does not trigger cancellation.
+Cancellation cannot flatten positions or undo fills that race the stop. If
+required authority history cannot be verified, pilot cancellation reports an
+error instead of inventing a binding; a separate operator pause remains
+available. The desktop's local stop status is not a cancellation receipt.
+
 ## Error codes
 
 Protocol errors, carrying the taxonomy in the JSON-RPC error's `data` — `{contract_version, code, retryable, detail, cloid}` — rather than only in the message.
