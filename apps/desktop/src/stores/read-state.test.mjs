@@ -99,7 +99,7 @@ describe('operator source reads', () => {
     expect(operator.ledger).toBe(null);
     expect(operator.policy).toBe(null);
     const ledger = { events: [{ seq: 1, ts_ms: 1000, kind: 'refusal', agent_id: 'alpha', payload: { reason: '<b>claim</b>' } }], head_seq: 1, next_cursor: 1, resync_required: false };
-    const policy = { guardrails: { alpha: {} }, vaults: {}, account_limits: {}, kill: { global: null, agents: {} } };
+    const policy = { guardrails: { alpha: {} }, account_limits: {}, kill: { global: null, agents: {} } };
     operatorRead = async () => ({ network: 'testnet', ledger: { status: 'ready', value: ledger }, policy: { status: 'ready', value: policy } });
     await refreshOperator();
     expect(recordedAgents.value).toEqual(['alpha']);

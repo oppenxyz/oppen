@@ -60,8 +60,10 @@ before expanding features:
    passed. Review fixes now have local regressions for cancellation with
    unavailable pilot evidence, idempotent anchor-publication retries, legacy
    address aliases, expiry crossed during signing waits, and asynchronous
-   decision-worker shutdown/owner retention. The workspace run passed 822 tests
-   with 15 live-gated tests ignored; formatting and clippy passed. Final
+   decision-worker shutdown/owner retention. After integrating current main,
+   the workspace run passed 825 tests with 15 live-gated tests ignored; 89
+   desktop tests, the build, formatting and clippy passed. The roster renders
+   without the removed policy-vault cache and reports its route unavailable. Final
    independent review and exact-head CI remain required before merge.
    Authenticated policy storage and desktop ownership remain subsequent work.
 4. **Recovery:** PR #44 merged as `06fc0e3` after green CI and separate automated
