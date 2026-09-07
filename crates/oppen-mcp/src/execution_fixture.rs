@@ -136,7 +136,8 @@ impl Runtime {
             policy.symbols.insert("TEST".into());
             policy.approval_required = false;
             policy.max_order_usd = Decimal::from(15);
-            policy.max_position_usd = Decimal::from(25);
+            policy.max_position_usd = Decimal::from(100);
+            policy.risk.max_open_exposure_usd = Some(Decimal::from(25));
             policy.risk.max_leverage = 1;
             policy.order_rate.count = 100;
             engine
@@ -331,6 +332,8 @@ async fn real_mcp_signs_reconciles_partial_fill_cancels_and_closes() {
         .call("place", place(Cloid::from_bytes([8; 16]).as_str(), "0.14"))
         .await;
     assert_eq!(rejected["status"], "rejected", "{rejected}");
+    assert_eq!(rejected["refusal"]["refusal"], "open_exposure");
+    assert_eq!(rejected["refusal"]["observed_usd"], "26.00");
     assert_eq!(
         venue.submissions().len(),
         1,
@@ -420,6 +423,7 @@ async fn applied_but_malformed_response_survives_physical_restart() {
         .call("place", place(Cloid::from_bytes([11; 16]).as_str(), "0.14"))
         .await;
     assert_eq!(refused["status"], "rejected", "{refused}");
+    assert_eq!(refused["refusal"]["refusal"], "open_exposure");
     assert_eq!(
         venue.submissions().len(),
         1,

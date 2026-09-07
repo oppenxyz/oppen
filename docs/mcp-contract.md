@@ -59,6 +59,13 @@ Carried on `status: "rejected"`. Nothing was signed and nothing reached the venu
 
 `guardrail_reject` covers the fail-closed refusals too — a stale feed, a missing reference price, an unreconciled account. Those are **not** retryable even though the condition may pass on its own: telling an agent to retry into a degraded feed is how a quiet outage becomes a retry storm.
 
+The optional operator-set `risk.max_open_exposure_usd` caps gross marked positions
+plus opening resting orders across the container, including a proposed opening
+order. Opposite orders do not net. Its `open_exposure` refusal carries
+`observed_usd` and `limit_usd`; genuine reduce-only reductions retain their unwind
+exemption. This is separate from per-symbol `max_position_usd`, leverage, and
+cumulative execution or loss budgets.
+
 ## Error codes
 
 Protocol errors, carrying the taxonomy in the JSON-RPC error's `data` — `{contract_version, code, retryable, detail, cloid}` — rather than only in the message.

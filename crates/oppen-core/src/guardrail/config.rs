@@ -119,7 +119,7 @@ pub enum MarginMode {
     Isolated,
 }
 
-/// The two risk parameters D3 reserves to the operator. They live in the
+/// The risk parameters D3 reserves to the operator. They live in the
 /// guardrail config so `get_state` can show them and the leverage cap can be
 /// enforced pre-sign, and they are only ever written through
 /// [`super::GuardrailEngine::operator_set_guardrails`].
@@ -130,6 +130,12 @@ pub struct RiskSettings {
     /// number is a hard bound and the operator's may only be tighter.
     pub max_leverage: u32,
     pub margin_mode: MarginMode,
+    /// Gross marked positions plus opening resting orders across the account,
+    /// including the proposed opening order, without opposite-side netting.
+    /// Genuine reduce-only reductions remain permitted above this cap.
+    /// Unset preserves older policies; zero denies new opening exposure.
+    #[serde(default)]
+    pub max_open_exposure_usd: Option<Decimal>,
     /// Spec F's vol-scaled notional cap: the dollars an ordinary two-sigma
     /// day may move the position, from which the engine derives
     /// `effective_cap = max_risk_usd / (2 · sigma_day)`.
@@ -156,6 +162,7 @@ impl Default for RiskSettings {
         RiskSettings {
             max_leverage: DEFAULT_MAX_LEVERAGE,
             margin_mode: MarginMode::Cross,
+            max_open_exposure_usd: None,
             max_risk_usd: None,
         }
     }
@@ -297,6 +304,14 @@ impl AgentGuardrails {
         }
         if self.risk.max_leverage == 0 {
             return Err(("risk.max_leverage", "must be at least 1".to_owned()));
+        }
+        if let Some(limit) = self.risk.max_open_exposure_usd
+            && limit.is_sign_negative()
+        {
+            return Err((
+                "risk.max_open_exposure_usd",
+                "must not be negative".to_owned(),
+            ));
         }
         // Zero is rejected rather than treated as "no risk allowed": the cap
         // it derives is `budget / 2sigma`, so a zero budget is a zero cap,

@@ -73,6 +73,13 @@ pub enum Refusal {
         limit_usd: Decimal,
     },
 
+    /// Gross account positions and opening commitments, without netting.
+    #[error("open exposure ${observed_usd} exceeds the ${limit_usd} account cap")]
+    OpenExposure {
+        observed_usd: Decimal,
+        limit_usd: Decimal,
+    },
+
     /// Spec item 24, max position size. `observed_usd` is the notional the
     /// position would hold *after* this order and every working order on the
     /// symbol fills, valued at the reference price. `resting_usd` is how much
