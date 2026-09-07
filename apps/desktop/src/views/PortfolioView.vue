@@ -138,7 +138,8 @@ const nearestLiq = computed(() => {
 
 .portfolio__side {
   display: grid;
-  grid-template-rows: auto auto;
+  grid-template-rows: max-content max-content;
+  overflow: auto;
   align-content: start;
   gap: var(--panel-gap);
   min-height: 0;

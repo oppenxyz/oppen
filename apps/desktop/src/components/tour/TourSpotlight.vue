@@ -28,7 +28,10 @@ let returnFocus: HTMLElement | null = null;
 let cardObserver: ResizeObserver | null = null;
 watch(isOpen, async (open) => {
   if (open) {
-    returnFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    // WebKit may leave focus on body after a mouse click. Body is not a
+    // useful return target; use the persistent Setup control in that case.
+    returnFocus = document.activeElement instanceof HTMLElement && document.activeElement !== document.body
+      ? document.activeElement : null;
     await nextTick();
     dialog.value?.querySelector<HTMLButtonElement>("button")?.focus();
     cardObserver = new ResizeObserver(() => {

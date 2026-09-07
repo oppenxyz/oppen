@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref } from "vue";
+import { computed, nextTick, ref } from "vue";
 import EmptyState from "../components/housing/EmptyState.vue";
 import PanelHousing from "../components/housing/PanelHousing.vue";
 import ReadoutRows from "../components/housing/ReadoutRows.vue";
@@ -13,6 +13,19 @@ const SECTIONS = ["Permissions & limits", "Keys & venues", "Models & API keys", 
 const section = ref<(typeof SECTIONS)[number]>("Permissions & limits");
 const pendingNetwork = ref<Network | null>(null);
 const networkError = ref("");
+const networkChoices = ref<HTMLElement | null>(null);
+const networkConfirmation = ref<HTMLElement | null>(null);
+async function chooseNetwork(network: Network): Promise<void> {
+  networkError.value = "";
+  pendingNetwork.value = network;
+  await nextTick();
+  networkConfirmation.value?.querySelector<HTMLButtonElement>("button")?.focus();
+}
+async function cancelNetwork(): Promise<void> {
+  pendingNetwork.value = null;
+  await nextTick();
+  networkChoices.value?.querySelector<HTMLButtonElement>("button:not(:disabled)")?.focus();
+}
 function switchNetwork(): void {
   if (!pendingNetwork.value) return;
   try { setNetwork(pendingNetwork.value); }
@@ -52,12 +65,12 @@ const local = computed(() => [
           <ReadoutRows :rows="local" size="md" />
           <UiButton @click="refreshKeychain">Recheck keychain</UiButton>
           <p v-if="shell.keychain?.detail" class="copy">{{ shell.keychain.detail }}</p>
-          <fieldset class="network"><legend>Network · saved on this device</legend>
-            <UiButton v-for="network in (['testnet', 'mainnet'] as const)" :key="network" :disabled="shell.network === network" @click="pendingNetwork = network">{{ network }}</UiButton>
+          <fieldset ref="networkChoices" class="network"><legend>Network · saved on this device</legend>
+            <UiButton v-for="network in (['testnet', 'mainnet'] as const)" :key="network" :disabled="shell.network === network" @click="chooseNetwork(network)">{{ network }}</UiButton>
           </fieldset>
-          <div v-if="pendingNetwork" class="confirmation" role="group" aria-label="Confirm network change">
+          <div v-if="pendingNetwork" ref="networkConfirmation" class="confirmation" @keydown.esc.stop.prevent="cancelNetwork" role="group" aria-label="Confirm network change">
             <p>Switch to {{ pendingNetwork.toUpperCase() }} and reload the console? {{ pendingNetwork === 'mainnet' ? 'Mainnet uses real funds.' : 'Testnet uses test funds.' }} The network choice persists after restart.</p>
-            <UiButton @click="pendingNetwork = null">Keep {{ shell.network }}</UiButton>
+            <UiButton @click="cancelNetwork">Keep {{ shell.network }}</UiButton>
             <UiButton variant="primary" @click="switchNetwork">Switch to {{ pendingNetwork }}</UiButton>
             <p v-if="networkError" role="alert">{{ networkError }}</p>
           </div>
@@ -114,7 +127,7 @@ const local = computed(() => [
 
 <style scoped>
 .settings { display: grid; flex: 1; grid-template-columns: 220px minmax(0, 1fr); gap: var(--panel-gap); min-width: 0; min-height: 0; padding: var(--panel-gap); }
-.settings__content { display: grid; grid-template-columns: minmax(0, 1fr); align-content: start; gap: var(--panel-gap); min-height: 0; overflow: auto; }
+.settings__content { display: grid; grid-template-columns: minmax(0, 1fr); grid-auto-rows: max-content; align-content: start; gap: var(--panel-gap); min-height: 0; overflow: auto; }
 .snav { display: grid; }
 .snav button { padding: var(--s-3); border-bottom: 1px solid var(--rule); border-left: 2px solid transparent; font: inherit; font-size: var(--fs-body); text-align: left; color: var(--body); }
 .snav button[aria-current] { border-left-color: var(--signal); color: var(--signal); background: var(--void); }

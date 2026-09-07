@@ -36,12 +36,28 @@ Branch: `design/app-ui-refinement`, isolated worktree `oppen-app-ui` from `28fbf
 
 - Integrated merged main `2ea98ab` (durable pilot budgets and stop supervision). Preserved the new banner/polling, independent operator reads, network-specific account selection, and tour inert behavior. Both local read failures use main's `local_status` error variant.
 
+## Compact-window verification — 7 September, later pass
+
+- Merged current main `2ea98ab` into this branch as `5d8301b`; preserved durable pilot supervision and its tests.
+- Native 1280×720 pass with the supervision banner caught shrinking auto rows in Trade, Agents and Settings. The book, policy and settings stacks now use content-sized rows and bounded scrolling. Verified the complete book, expanded feature definitions, all policy caps and Settings refresh control after rebuilding. Portfolio's side stack uses the same content-sizing correction for longer exposure lists.
+- All six views inspected at minimum size. Builder instructions/activity and Setup's lower walkthrough action remain scrollable and separated. Default 1440×900 native Trade, Portfolio and Setup also inspected.
+- Corrected “volume ratio” to **volatility ratio** from the core definition. A keyboard-accessible disclosure gives definitions, sample counts and exact feature values.
+- Native network confirmation opens without persisting a switch. Focus enters Keep Testnet; Escape cancels and returns to the original choice. Separate isolated startup checks proved saved mainnet restoration, invalid-value testnet fallback and unavailable-storage testnet fallback. The native session stayed on testnet.
+- Decorative pause survived native restarts while public market updates continued. Contrast calculations on panel background: labels 4.87:1, body 8.67:1, primary values 15.77:1.
+- Native walkthrough: focus enters Skip; Tab wraps; Enter advances exactly one step. A WebKit mouse-focus case originally returned to body; fixed and reverified that Escape returns to Setup.
+- A fixed QA address (`0x111…111`, not an operator-selected account) returned a public testnet balance and no positions/orders. Verified successful account values and genuine zero position counts, distinct from the previously inspected unknown account state. No key, order, cancellation, or funding action was involved; the QA session was closed after inspection. “Account has equity” now describes only the observed account balance, without implying a paired container or trading permission.
+- Empty recorded-agent views now distinguish an actual initial read with the sweep pattern and busy text. Once read, empty apertures remain static; unavailable sources retain explicit text.
+
 ## Remaining work
 
-- Native visual verification of live chart/book, every screen, minimum/default window geometry, and decorative motion behavior.
-- Complete UI regression checks for persisted network behavior, accessible controls and populated account views.
+- Finish the remaining populated-position/order and larger-text checks; verify the last initial-read visual cue and final default-size bundle. Minimum-size, live chart/book, unknown/successful-empty account, and decorative-pause verification is recorded above.
+- Persisted-network behavior, confirmation keyboard behavior and walkthrough keyboard behavior are verified. Populated position/order layout still needs direct visual evidence.
 - The gateway's in-memory pairing registry and live policy/approval/kill/dead-man controls are not yet connected to the console. Existing ledger and persisted policy reads are now implemented. Honest unavailable states and the current development setup path are implemented, but they do **not** satisfy the recommendation to wire those operator workflows. Continue with existing core/gateway read models, preserving the signing and operator-only boundaries.
 - Review all changed code, remove any newly orphaned styling, document actual verification evidence and commit coherent milestones. Do not mark the overall goal complete while the workflow recommendation remains open.
+
+## Scope clarification pending
+
+The approved review describes operator workflows “using existing read models,” says acceptance depends on backend capabilities, and uses “once wired” for live agent controls. A clarification was sent asking whether completion includes building the runtime/pairing/approval/kill lifecycle or completing the UI pass against available capabilities. No answer was received during this verification pass. The goal remains active; no runtime lifecycle was invented or claimed complete.
 
 ## Build recovery
 

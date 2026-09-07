@@ -34,7 +34,7 @@ const policyRows = computed(() => policy.value ? [
           <strong>{{ agent }}</strong><span>{{ storedPolicy?.vaults[agent] ?? 'Container address not recorded' }}</span>
         </button>
       </div>
-      <EmptyState v-else matrix size="sm" :line="operator.error ?? operator.policyError ?? operator.ledgerError ?? (operator.policy && operator.ledger ? 'No agents in stored policies or recent events.' : 'No agent records have been read.')" action="Open MCP setup" @action="setView('builder')" />
+      <EmptyState v-else matrix size="sm" :reading="operator.reading && !operator.policy && !operator.ledger" :line="operator.error ?? operator.policyError ?? operator.ledgerError ?? (operator.policy && operator.ledger ? 'No agents in stored policies or recent events.' : 'No agent records have been read.')" action="Open MCP setup" @action="setView('builder')" />
       <template #footer>From stored policies and recent events. A record does not prove an active pairing.</template>
     </PanelHousing>
     <div class="agents__main">
@@ -104,7 +104,7 @@ const policyRows = computed(() => policy.value ? [
 
 .agents__side {
   display: grid;
-  grid-template-rows: auto auto auto;
+  grid-template-rows: max-content max-content max-content;
   align-content: start;
   overflow: auto;
   gap: var(--panel-gap);

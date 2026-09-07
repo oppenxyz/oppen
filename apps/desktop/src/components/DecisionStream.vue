@@ -27,7 +27,7 @@ const loaded = computed(() => operator.ledger !== null);
       <details v-else><summary>Recorded event fields</summary><pre>{{ JSON.stringify(event.payload, null, 2) }}</pre></details>
       <button v-if="event.kind === 'refusal' || event.kind === 'guardrail_trip'" @click="setView('settings')">Inspect stored limits</button>
     </article>
-    <EmptyState v-if="!rows.length" :line="loaded ? (fillsOnly ? 'No fills in the latest 200 ledger events.' : 'No matching events in this ledger window.') : 'Decision history is unknown until the gateway ledger is connected.'" />
+    <EmptyState v-if="!rows.length" :reading="operator.reading && !loaded" :line="loaded ? (fillsOnly ? 'No fills in the latest 200 ledger events.' : 'No matching events in this ledger window.') : 'Decision history is unknown until the gateway ledger is connected.'" />
   </div>
 </template>
 

@@ -281,10 +281,10 @@ export const milestones = computed<Milestone[]>(() => {
     },
     {
       id: "funded",
-      label: "Container funded",
+      label: "Account has equity",
       detail: funded
-        ? "Equity is positive, so an order has something to be sized against."
-        : (account ? `Fund the ${shell.network} container address, then refresh.` : "Configure an account before checking its funding."),
+        ? "The configured account has positive equity. Agent binding and trading approvals are separate checks."
+        : (account ? `No positive equity reported for the configured ${shell.network} account.` : "Configure an account before checking its funding."),
       state: funded ? "done" : "pending",
     },
     {

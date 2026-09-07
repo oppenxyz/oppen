@@ -70,9 +70,9 @@ const FEATURES = computed<readonly ReadoutRow[]>(() => {
       detail: band ? `Bid ${band.bid_usd} USD; ask ${band.ask_usd} USD. ${band.covers_band ? "Ladder covers the band." : `Observed depth is a floor. Bid reach ${snap.book.bid_reach_bps ?? "unknown"} bp; ask reach ${snap.book.ask_reach_bps ?? "unknown"} bp.`}` : "Depth unavailable",
     },
     { k: "spread", v: decimal(snap.book.spread_bps, 2, " bp"), detail: snap.book.spread_bps ?? "Unavailable" },
-    { k: "imbalance · −1 to 1", v: decimal(snap.book.book_imbalance, 4), detail: snap.book.book_imbalance ?? "Unavailable" },
-    { k: "volatility · 24h", v: decimal(snap.vol.rv_24h_bps, 2, " bp"), detail: snap.vol.rv_24h_bps ?? "Unavailable" },
-    { k: "volume ratio", v: decimal(snap.vol.vol_ratio), detail: snap.vol.vol_ratio ?? "Unavailable" },
+    { k: "imbalance · −1 to 1", v: decimal(snap.book.book_imbalance, 4), detail: `Touch notional (bid − ask) / (bid + ask), from −1 to 1. Positive means more notional on the best bid. Exact: ${snap.book.book_imbalance ?? "unavailable"}.` },
+    { k: "volatility · 24h", v: decimal(snap.vol.rv_24h_bps, 2, " bp"), detail: `Realized volatility from ${snap.vol.bars_24h} hourly bars. Exact: ${snap.vol.rv_24h_bps ?? "unavailable"} bp.` },
+    { k: "volatility ratio", v: decimal(snap.vol.vol_ratio), detail: `1h volatility / (24h volatility / √24). One means the hour matches the day’s implied hourly volatility. Minute bars: ${snap.vol.bars_1h}; hourly bars: ${snap.vol.bars_24h}. Exact: ${snap.vol.vol_ratio ?? "unavailable"}.` },
     { k: "funding 1h", v: decimal(snap.funding.hour_to_date_bps, 2, " bp"), detail: snap.funding.hour_to_date_bps ?? "Unavailable" },
     { k: "basis", v: decimal(snap.funding.basis_bps, 2, " bp"), detail: snap.funding.basis_bps ?? "Unavailable" },
   ];
@@ -83,7 +83,7 @@ const FEATURES_EMPTY: readonly ReadoutRow[] = [
   { k: "spread", v: DASH },
   { k: "imbalance", v: DASH },
   { k: "volatility · 24h", v: DASH },
-  { k: "volume ratio", v: DASH },
+  { k: "volatility ratio", v: DASH },
   { k: "funding 1h", v: DASH },
   { k: "basis", v: DASH },
 ];
@@ -262,6 +262,10 @@ const ledger = ref<Ledger>("positions");
         <p class="features-time">Derived snapshot · {{ market.featuresReadMs ? new Date(market.featuresReadMs).toLocaleTimeString() : 'Not read' }}</p>
         <p v-if="market.snapshotError" class="features-time" role="status">{{ market.snapshotError }}</p>
         <ReadoutRows :rows="FEATURES" />
+        <details class="feature-details">
+          <summary>Definitions &amp; exact readings</summary>
+          <dl><template v-for="feature in FEATURES" :key="feature.k"><dt>{{ feature.k }}</dt><dd>{{ feature.detail ?? 'Not read' }}</dd></template></dl>
+        </details>
       </PanelHousing>
       <PanelHousing inset label="Manual order" meta="Operator initiated" data-tour="ticket">
         <EmptyState line="Manual ticket is not available yet. Orders use the shared execution checks." />
@@ -271,6 +275,11 @@ const ledger = ref<Ledger>("positions");
 </template>
 
 <style scoped>
+.feature-details { padding-top: var(--s-3); font-size: var(--fs-body-sm); line-height: 1.6; }
+.feature-details summary { cursor: pointer; color: var(--body); }
+.feature-details dt { margin-top: var(--s-3); color: var(--signal); }
+.feature-details dd { color: var(--body); overflow-wrap: anywhere; }
+
 .ledger__body { min-height: 0; overflow: auto; }
 .orders { width: 100%; border-collapse: collapse; font-size: var(--fs-body); }
 .orders th, .orders td { padding: var(--s-2); text-align: right; font-weight: 400; border-bottom: 1px solid var(--rule); }
@@ -420,10 +429,13 @@ const ledger = ref<Ledger>("positions");
 
 .trade__col--center {
   grid-template-rows: auto minmax(180px, 1fr) minmax(130px, 25vh);
+  overflow: auto;
 }
 
 .trade__col--right {
-  grid-template-rows: 1fr auto auto;
+  grid-template-rows: max-content max-content max-content;
+  align-content: start;
+  overflow: auto;
 }
 
 .strip {
