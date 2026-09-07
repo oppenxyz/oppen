@@ -53,7 +53,13 @@ pub struct MarketRow {
 }
 
 impl MarketRow {
-    fn of(symbol: &str, ctx: &AssetCtx) -> Self {
+    /// One row from one asset context.
+    ///
+    /// Public because the console builds a row from an `activeAssetCtx` frame
+    /// as well as from the REST universe: the socket carries every field this
+    /// needs, and a second conversion in the desktop crate would be a second
+    /// statement of the hour-to-date bps rule that could drift from this one.
+    pub fn of(symbol: &str, ctx: &AssetCtx) -> Self {
         MarketRow {
             symbol: symbol.to_owned(),
             mark_px: ctx.mark_px.to_string(),
