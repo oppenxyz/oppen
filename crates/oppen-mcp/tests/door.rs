@@ -313,6 +313,11 @@ async fn durable_writer_contention_refuses_http_and_startup_without_holding_shut
         Network::Testnet,
         Some(Box::new(MutationAnchorHandle(anchor.clone()))),
     );
+    // Isolate the transport's pairing lock from tracked policy work. A sweep
+    // already holding a binding snapshot may legitimately wait on a shared
+    // ledger and must drain before shutdown; the blocked-supervisor policy
+    // refresh regression in execution_fixture::decision covers that case.
+    let gateway_fixture = Fixture::new(Network::Testnet);
     let mut store = fixture.store();
     let token = store.issue(binding("agent-alpha")).unwrap();
     let pairings = Arc::new(RwLock::new(store));
@@ -322,7 +327,7 @@ async fn durable_writer_contention_refuses_http_and_startup_without_holding_shut
     let shutdown = tokio_util::sync::CancellationToken::new();
     let server = tokio::spawn(serve(
         addr.port(),
-        fixture.gateway.clone(),
+        gateway_fixture.gateway.clone(),
         pairings.clone(),
         shutdown.clone(),
     ));
@@ -355,7 +360,7 @@ async fn durable_writer_contention_refuses_http_and_startup_without_holding_shut
         Duration::from_millis(500),
         serve(
             0,
-            fixture.gateway.clone(),
+            gateway_fixture.gateway.clone(),
             pairings.clone(),
             tokio_util::sync::CancellationToken::new(),
         ),
