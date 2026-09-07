@@ -21,7 +21,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           path-to-signatures: ".github/cla-signatures.json"
-          path-to-document: "https://github.com/gkssxf/oppen/blob/main/CLA.md"
+          path-to-document: "https://github.com/oppenxyz/oppen/blob/main/CLA.md"
           branch: "cla-signatures"
           allowlist: gkssxf,dependabot[bot]
           custom-notsigned-prcomment: "Thanks for the contribution. Before we can merge, please sign the CLA by commenting exactly: **I have read the CLA Document and I hereby sign the CLA**"

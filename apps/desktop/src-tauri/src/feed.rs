@@ -149,10 +149,17 @@ impl ConsoleFeed {
     /// The account channels are subscribed only when an account is configured.
     /// Market data does not need one, and a console with no account still has
     /// a chart to draw — item 34's status is about the socket, not the wallet.
-    pub fn start(app: &AppHandle, network: Network, account: Option<String>) -> Result<Self, String> {
+    pub fn start(
+        app: &AppHandle,
+        network: Network,
+        account: Option<String>,
+    ) -> Result<Self, String> {
         let ledger = Arc::new(
-            Ledger::open_at(&data_dir(app)?.join(oppen_core::db_file_name(network)), network)
-                .map_err(|e| format!("ledger: {e}"))?,
+            Ledger::open_at(
+                &data_dir(app)?.join(oppen_core::db_file_name(network)),
+                network,
+            )
+            .map_err(|e| format!("ledger: {e}"))?,
         );
         let session = Arc::new(FeedSession::new());
         let (pool, mut events) = WsPool::new(WsPoolConfig {
@@ -373,11 +380,7 @@ fn translate(event: &WsEvent, last_tick_ms: Option<u64>) -> Option<FeedUpdate> {
             let (high, low, volume) = trades.iter().skip(1).fold(
                 (trades[0].px, trades[0].px, trades[0].sz),
                 |(high, low, volume), trade| {
-                    (
-                        high.max(trade.px),
-                        low.min(trade.px),
-                        volume + trade.sz,
-                    )
+                    (high.max(trade.px), low.min(trade.px), volume + trade.sz)
                 },
             );
             FeedUpdate::Trade {
@@ -539,7 +542,8 @@ mod tests {
             ]
         }))
         .expect("a book fixture");
-        let Some(FeedUpdate::Book { bids, asks, .. }) = translate(&WsEvent::L2Book(Box::new(book)), None)
+        let Some(FeedUpdate::Book { bids, asks, .. }) =
+            translate(&WsEvent::L2Book(Box::new(book)), None)
         else {
             panic!("a book frame must reach the ladder");
         };
