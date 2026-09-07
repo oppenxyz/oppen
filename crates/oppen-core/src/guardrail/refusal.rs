@@ -95,12 +95,19 @@ pub enum Refusal {
     /// trading something that moves less.
     ///
     /// Every input to the arithmetic is reported — the budget, the volatility
-    /// it was divided by, and the cap that came out — because the cap is
-    /// *derived* and a number an agent cannot reconstruct is one it will
-    /// treat as arbitrary and retry against.
+    /// it was divided by, the factor the last hour tightened that volatility
+    /// by, and the cap that came out — because the cap is *derived* and a
+    /// number an agent cannot reconstruct is one it will treat as arbitrary
+    /// and retry against.
+    ///
+    /// `sigma_day_pct` stays the *measured* daily volatility and `vol_scale`
+    /// is reported beside it rather than folded in, so an agent can tell a
+    /// coin that simply moves a lot from a coin that started moving an hour
+    /// ago. The two call for different responses: one is the asset, the other
+    /// will pass.
     #[error(
         "post-fill position ${observed_usd} on {symbol} exceeds the ${effective_cap_usd} vol-scaled cap \
-         (${risk_budget_usd} of risk at {sigma_day_pct}% daily volatility)"
+         (${risk_budget_usd} of risk at {sigma_day_pct}% daily volatility, scaled {vol_scale}x by the last hour)"
     )]
     VolScaledPositionNotional {
         symbol: String,
@@ -108,6 +115,10 @@ pub enum Refusal {
         effective_cap_usd: Decimal,
         risk_budget_usd: Decimal,
         sigma_day_pct: Decimal,
+        /// `max(1, vol_ratio)`. One means the last hour is ordinary for this
+        /// day, or that nobody measured it — the cap is then what the day
+        /// alone buys.
+        vol_scale: Decimal,
     },
 
     /// Spec item 24, order-rate cap. `retry_after_ms` is how long until one

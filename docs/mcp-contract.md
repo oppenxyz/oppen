@@ -177,13 +177,17 @@ Returns `{contract_version, symbol, is_buy, notional_usd, guardrail, book, book_
 
 **A clear verdict is not a promise.** The book is a snapshot the venue has already moved past, nothing reserves depth, and the rate token this did not spend may be gone by the time the order is sent. `exhausts_book: true` means the resting depth could not cover the size at all.
 
-**The vol-scaled cap, if your operator set one.** When `max_risk_usd` is configured, the position is bounded by `max_risk_usd / (2 × σ_day)` as well as by the fixed `max_position_usd` — the tighter of the two binds, and `utilization.vol_scaled_position_pct` says where you sit against it. It is absent when no such cap is set, which is the default.
+**The vol-scaled cap, if your operator set one.** When `max_risk_usd` is configured, the position is bounded by `max_risk_usd / (2 × σ_day × vol_scale)` as well as by the fixed `max_position_usd` — the tighter of the two binds, and `utilization.vol_scaled_position_pct` says where you sit against it. It is absent when no such cap is set, which is the default.
 
 The point is that one budget means different sizes on different markets: $5 of risk buys $125 of position on something that moves 2% a day and $62.50 on something that moves 4%. So a refusal on a volatile symbol is not the venue being arbitrary — trading something calmer, or asking your operator to raise `max_risk_usd`, are different remedies and the refusal names which knob it was. `vol_scaled_position_notional` and `position_notional` are separate refusals for exactly that reason.
 
+**`vol_scale` is what the last hour is doing, and it only ever tightens.** `σ_day` is measured over twenty-four hourly bars, so a market that started moving an hour ago has barely shifted it — one bar in twenty-four — and a cap derived from it alone stays wide for most of a day after the market changed. `vol_scale` is `max(1, vol_ratio)`, the same realised-volatility measurement taken over the last hour against what the day implies for one hour. A quiet hour does **not** widen your cap: a sixty-bar sample is not evidence to loosen a guardrail with, so the scale floors at one, and so does an hour nobody could measure.
+
+The refusal reports `sigma_day_pct` and `vol_scale` separately rather than multiplied together, because they call for different responses. A coin with 6% daily volatility is an asset fact and will still be true tomorrow; a coin with 2% daily volatility moving at `vol_scale: 3` is a market that is busy right now and will likely not be in an hour. Waiting is a remedy for one and not the other.
+
 **This cap moves, and trimming into it is always allowed.** Volatility doubles and the cap halves, so a position that was inside it can be over it with you having done nothing. Any order that leaves you holding *less* than before clears regardless — you never have to exit all at once to get back under. Adding to the position is what the cap refuses.
 
-If the volatility cannot be measured, an order on that symbol is **refused**, not sized against a guess: `missing_volatility` names the symbol. A configured cap that cannot be computed is a cap that is not enforced.
+If the volatility cannot be measured, an order on that symbol is **refused**, not sized against a guess: `missing_volatility` names the symbol. A configured cap that cannot be computed is a cap that is not enforced. That applies to `σ_day`, which is the cap's denominator; an unmeasurable `vol_ratio` is not a refusal, because the cap still computes and only its tightening is lost — you get `vol_scale: 1` and the size the day alone allows.
 
 **Not included: estimated fees.** Item 20 names them; oppen has no fee schedule yet, and guessing a tier would be worse than omitting one. It needs a `userFees` read audited against the live API, which is its own change.
 

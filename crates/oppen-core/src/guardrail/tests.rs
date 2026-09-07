@@ -1223,6 +1223,150 @@ fn the_same_risk_budget_buys_less_size_on_a_more_volatile_market() {
     ));
 }
 
+/// The correction the day's sigma cannot make for itself.
+///
+/// `sigma_day` is measured over twenty-four hourly bars, so an hour of
+/// tripled volatility moves it by one bar in twenty-four — the cap it derives
+/// stays wide for most of a day after the market changed. `vol_ratio` is the
+/// same measurement taken over the last hour, and multiplying by it is what
+/// makes the cap notice.
+///
+/// Hand-computed: $5 of risk at 2% daily volatility is $125 of position, and
+/// the same budget when the last hour is moving like three normal hours is
+/// `5 / (2 * 0.02 * 3)` = $41.66…, so 0.41 units at $100 clears and 0.42 does
+/// not.
+#[test]
+fn an_hour_moving_three_times_normal_buys_a_third_of_the_size() {
+    let sized = |ratio: Option<Decimal>, sz: &str| {
+        let mut config = permissive(&["BTC"]);
+        config.risk.max_risk_usd = Some(d("5"));
+        let f = Fixture::new(config);
+        let market = MarketRef {
+            sigma_day: Some(d("0.02")),
+            vol_ratio: ratio,
+            ..MarketRef::fresh("BTC", d("100"), NOW_MS)
+        };
+        f.engine.evaluate(
+            &f.agent,
+            &intent("BTC", true, d("100"), d(sz)),
+            &asset("BTC", 2, 40),
+            &market,
+            &exposure(d("100000")),
+            NOW_MS,
+        )
+    };
+
+    // The day alone buys $125 — the size #31 cleared and this still does.
+    assert!(sized(None, "1.25").is_ok());
+
+    // The same day, with the last hour moving three times normal: $41.66.
+    assert!(sized(Some(d("3")), "0.41").is_ok());
+    assert!(matches!(
+        sized(Some(d("3")), "0.42"),
+        Err(Refusal::VolScaledPositionNotional { .. })
+    ));
+
+    // And the size the day alone allowed is now refused, which is the whole
+    // point: nothing about the configuration changed, only the market.
+    assert!(matches!(
+        sized(Some(d("3")), "1.25"),
+        Err(Refusal::VolScaledPositionNotional { .. })
+    ));
+}
+
+/// **The clamp, which is the safety half of the correction.**
+///
+/// A ratio below one says the last hour was quieter than the day. Honouring
+/// it would *widen* a guardrail on the strength of a sixty-bar sample — a
+/// cap loosened by a statistic far noisier than the one it is correcting. An
+/// unmeasured ratio lands on the same floor, and for the sharper reason: it
+/// must leave the cap exactly where it was before this correction existed,
+/// because a fetch that failed is not evidence that the market is calm.
+#[test]
+fn a_quiet_hour_and_an_unmeasured_one_both_leave_the_cap_where_the_day_puts_it() {
+    let sized = |ratio: Option<Decimal>, sz: &str| {
+        let mut config = permissive(&["BTC"]);
+        config.risk.max_risk_usd = Some(d("5"));
+        let f = Fixture::new(config);
+        let market = MarketRef {
+            sigma_day: Some(d("0.02")),
+            vol_ratio: ratio,
+            ..MarketRef::fresh("BTC", d("100"), NOW_MS)
+        };
+        f.engine.evaluate(
+            &f.agent,
+            &intent("BTC", true, d("100"), d(sz)),
+            &asset("BTC", 2, 40),
+            &market,
+            &exposure(d("100000")),
+            NOW_MS,
+        )
+    };
+
+    // A tenth of a normal hour does not buy ten times the size: the cap is
+    // still the day's $125, so 1.25 clears and 1.26 does not.
+    for ratio in [Some(d("0.1")), Some(d("0.9")), Some(Decimal::ONE), None] {
+        assert!(
+            sized(ratio, "1.25").is_ok(),
+            "ratio {ratio:?} should still buy the day's size"
+        );
+        assert!(
+            matches!(
+                sized(ratio, "1.26"),
+                Err(Refusal::VolScaledPositionNotional { .. })
+            ),
+            "ratio {ratio:?} should not buy more than the day's size"
+        );
+    }
+}
+
+/// The refusal reports the measured volatility and the scale **separately**.
+///
+/// Folding them into one number would tell an agent its cap is $41 on a coin
+/// with 6% daily volatility, which is false — the coin moves 2% a day and
+/// happens to be moving now. The two facts call for different responses: one
+/// is the asset and will not change, the other will pass within the hour.
+#[test]
+fn the_refusal_separates_the_days_volatility_from_the_hours_scale() {
+    let mut config = permissive(&["BTC"]);
+    config.risk.max_risk_usd = Some(d("5"));
+    let f = Fixture::new(config);
+    let market = MarketRef {
+        sigma_day: Some(d("0.02")),
+        vol_ratio: Some(d("3")),
+        ..MarketRef::fresh("BTC", d("100"), NOW_MS)
+    };
+
+    let verdict = f.engine.evaluate(
+        &f.agent,
+        &intent("BTC", true, d("100"), d("1.25")),
+        &asset("BTC", 2, 40),
+        &market,
+        &exposure(d("100000")),
+        NOW_MS,
+    );
+
+    match verdict {
+        Err(Refusal::VolScaledPositionNotional {
+            sigma_day_pct,
+            vol_scale,
+            effective_cap_usd,
+            risk_budget_usd,
+            ..
+        }) => {
+            assert_eq!(sigma_day_pct, d("2"), "the day's measured volatility");
+            assert_eq!(vol_scale, d("3"), "what the hour multiplied it by");
+            assert_eq!(risk_budget_usd, d("5"));
+            // $5 / (2 * 0.02 * 3), to the precision the division carries.
+            assert!(
+                effective_cap_usd > d("41.66") && effective_cap_usd < d("41.67"),
+                "cap was {effective_cap_usd}"
+            );
+        }
+        other => panic!("expected a vol-scaled refusal, got {other:?}"),
+    }
+}
+
 /// **The fail-closed branch.** A configured cap that cannot be computed is a
 /// cap that is not enforced, which is the failure this module exists to
 /// prevent. A missing sigma refuses; so does a zero one, which is not "an
@@ -3083,6 +3227,15 @@ fn no_input_produces_a_signable_value_without_passing_every_predicate() {
             } else {
                 Some(d(rng.pick(&["0", "0.005", "0.02", "0.08", "0.5"])))
             },
+            // Absent, below one, at one, and well above it — the four cases
+            // the clamp has to tell apart. A ratio the search never takes
+            // below one would leave the widening branch unexplored, which is
+            // the direction being wrong costs money in.
+            vol_ratio: if rng.chance(3) {
+                None
+            } else {
+                Some(d(rng.pick(&["0.25", "0.9", "1", "1.4", "3", "12"])))
+            },
         };
 
         let mut positions = BTreeMap::new();
@@ -3280,6 +3433,13 @@ fn verify_every_predicate(
     // Spec F's vol-scaled cap, re-derived rather than re-read. Unlike every
     // other cap here it binds only when the order grows the position, so the
     // direction is part of the property and not an exemption from it.
+    //
+    // The sigma re-derived against is the day's *corrected by the hour*. That
+    // matters more than it looks: the correction only ever tightens, so a
+    // property that divided by the raw `sigma_day` would be satisfied by
+    // every order the engine clears whether or not the scaling exists at all
+    // — it would pass against the code as it stood before this line, which is
+    // the definition of proving nothing.
     if let Some(budget) = config.risk.max_risk_usd {
         let sigma = market
             .sigma_day
@@ -3288,10 +3448,11 @@ fn verify_every_predicate(
             sigma > Decimal::ZERO,
             "{ctx}: cleared against a non-positive volatility"
         );
+        let scale = market.vol_ratio.unwrap_or(Decimal::ONE).max(Decimal::ONE);
         let before = position_szi + resting_szi;
         if after.abs() >= before.abs() {
             assert!(
-                after.abs() * reference_px <= budget / (Decimal::from(2) * sigma),
+                after.abs() * reference_px <= budget / (Decimal::from(2) * sigma * scale),
                 "{ctx}: position past the vol-scaled cap"
             );
         }

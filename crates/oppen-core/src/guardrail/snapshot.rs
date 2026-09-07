@@ -100,6 +100,25 @@ pub struct MarketRef {
     /// [`Exposure::fleet`] already gets. Unset costs nothing when no
     /// vol-scaled cap is configured, which is the default.
     pub sigma_day: Option<Decimal>,
+    /// The last hour's realised volatility against what
+    /// [`MarketRef::sigma_day`] implies for one hour — `oppen_core::features`'
+    /// `vol_ratio`. Three means the last hour moved like three normal hours
+    /// of this day.
+    ///
+    /// It exists because `sigma_day` is measured over twenty-four hourly
+    /// bars, so a market that started moving an hour ago has barely shifted
+    /// it — one bar in twenty-four — and the cap derived from it stays too
+    /// wide for hours. This is the fast half of the same measurement, and the
+    /// engine multiplies `sigma_day` by it rather than replacing it, so both
+    /// numbers reach the refusal and neither is inferred from the other.
+    ///
+    /// **It can only tighten.** A ratio below one is a quiet hour, and
+    /// widening a cap on a sixty-bar statistic is not something a guardrail
+    /// should do, so the engine clamps at one. `None` — nobody measured it —
+    /// is the same clamp, not a refusal: unlike [`MarketRef::sigma_day`],
+    /// whose absence leaves the cap with no denominator, an unmeasured ratio
+    /// leaves a cap that still computes and is merely untightened.
+    pub vol_ratio: Option<Decimal>,
 }
 
 /// A reference to a stored book snapshot, in the shape the ledger's own
@@ -126,6 +145,7 @@ impl MarketRef {
             mark_divergent_since_ms: None,
             snapshot: None,
             sigma_day: None,
+            vol_ratio: None,
         }
     }
 }
