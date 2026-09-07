@@ -62,6 +62,9 @@ pub struct OrderView {
     pub cloid: Option<String>,
     pub is_buy: bool,
     pub limit_px: Decimal,
+    /// Quoted mark for risk valuation; the visible order price stays the limit.
+    #[serde(skip)]
+    pub(crate) reference_px: Option<Decimal>,
     pub size: Decimal,
     pub original_size: Decimal,
     pub reduce_only: bool,
@@ -223,6 +226,7 @@ pub fn assemble(
             cloid: order.cloid.as_ref().map(|cloid| cloid.as_str().to_owned()),
             is_buy: order.side.is_buy(),
             limit_px: order.limit_px,
+            reference_px: mids.get(&order.coin),
             size: order.sz,
             original_size: order.orig_sz,
             reduce_only: order.reduce_only,
@@ -548,10 +552,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn resting_orders_preserve_both_sides_per_symbol() {
-        use oppen_hl::types::{OpenOrder, Side};
-        let order = |coin: &str, buy: bool, sz: &str, px: &str| OpenOrder {
+    fn resting_order(coin: &str, buy: bool, sz: &str, px: &str) -> OpenOrder {
+        use oppen_hl::types::Side;
+        OpenOrder {
             coin: coin.into(),
             side: if buy { Side::B } else { Side::A },
             limit_px: d(px),
@@ -566,19 +569,35 @@ mod tests {
             trigger_condition: None,
             is_position_tpsl: false,
             cloid: None,
-        };
+        }
+    }
+
+    fn references(symbol: &str, mark: &str, quoted: bool) -> ReferencePrices {
+        let contexts: oppen_hl::types::MetaAndAssetCtxs =
+            serde_json::from_value(serde_json::json!([
+                { "universe": [{ "name": symbol, "szDecimals": 2, "maxLeverage": 40 }] },
+                [{ "funding": "0", "openInterest": "1", "prevDayPx": "100",
+                   "dayNtlVlm": "0", "oraclePx": "100", "markPx": mark,
+                   "midPx": quoted.then_some("100") }]
+            ]))
+            .expect("market contexts");
+        contexts.reference_pxs()
+    }
+
+    #[test]
+    fn resting_orders_preserve_both_sides_per_symbol() {
         let perps = perps("0.0", "0.0", "0.0");
         let spot = spot("999.0", "0.0");
         let orders = [
-            order("BTC", true, "2", "100"),
-            order("BTC", false, "0.5", "100"),
+            resting_order("BTC", true, "2", "50"),
+            resting_order("BTC", false, "0.5", "150"),
             OpenOrder {
                 reduce_only: true,
-                ..order("BTC", false, "1", "90")
+                ..resting_order("BTC", false, "1", "90")
             },
             OpenOrder {
                 reduce_only: true,
-                ..order("ETH", true, "3", "20")
+                ..resting_order("ETH", true, "3", "20")
             },
         ];
         let state = assemble(
@@ -589,7 +608,7 @@ mod tests {
                 perps: &perps,
                 spot: &spot,
                 orders: &orders,
-                mids: &ReferencePrices::default(),
+                mids: &references("BTC", "200", true),
                 last_tick_ms: None,
             },
         );
@@ -599,10 +618,166 @@ mod tests {
         assert_eq!(resting.sells.get("BTC"), Some(&d("0.5")));
         assert_eq!(resting.reduce_sells.get("BTC"), Some(&d("1")));
         assert_eq!(resting.reduce_buys.get("ETH"), Some(&d("3")));
-        assert_eq!(resting.notional_by_symbol.get("BTC"), Some(&d("250")));
+        assert_eq!(resting.notional_by_symbol.get("BTC"), Some(&d("500")));
         assert!(!resting.notional_by_symbol.contains_key("ETH"));
         // Opening notional does not net and excludes clipped reductions.
-        assert_eq!(resting.notional_usd, d("250"));
+        assert_eq!(resting.notional_usd, d("500"));
+        assert_eq!(state.orders[0].reference_px, Some(d("200")));
+        assert_eq!(
+            serde_json::to_value(&state.orders[0]).expect("order JSON"),
+            serde_json::json!({
+                "symbol": "BTC", "oid": 1, "cloid": null, "is_buy": true,
+                "limit_px": "50", "size": "2", "original_size": "2",
+                "reduce_only": false, "is_trigger": false, "trigger_px": null,
+                "placed_ts_ms": 0
+            })
+        );
+    }
+
+    #[test]
+    fn cross_symbol_marks_reach_the_engine_and_missing_marks_fail_closed() {
+        use crate::guardrail::{
+            AgentGuardrails, AgentId, FeedQuality, GuardrailEngine, MarketRef, OrderIntent,
+            Refusal, SqliteGuardrailStore, Unevaluable,
+        };
+        use crate::ledger::{Ledger, LedgerAuditSink};
+        use oppen_hl::wire::{Grouping, Tif};
+        use std::sync::Arc;
+
+        let now = 1_788_544_667_000;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ledger = Arc::new(
+            Ledger::open_at(&dir.path().join("ledger.db"), Network::Testnet).expect("ledger"),
+        );
+        let engine = GuardrailEngine::new(
+            Arc::new(SqliteGuardrailStore::open(dir.path().join("policy.db")).expect("policy")),
+            Arc::new(LedgerAuditSink::new(ledger)),
+            Arc::new(crate::keys::MemoryKeyStore::new(Network::Testnet)),
+            Network::Testnet,
+        )
+        .expect("engine");
+        let agent = AgentId::new("mark-test");
+        engine.register_agent(&agent, None, now).expect("register");
+        let mut config = AgentGuardrails {
+            symbols: ["BTC".to_owned()].into(),
+            max_order_usd: d("100"),
+            max_position_usd: d("1000"),
+            approval_required: false,
+            ..AgentGuardrails::default()
+        };
+        config.risk.max_leverage = 2;
+        config.order_rate.count = 100;
+        engine
+            .operator_set_guardrails(&agent, config, now)
+            .expect("policy");
+        let meta = serde_json::from_value(serde_json::json!({
+            "universe": [{"name": "BTC", "szDecimals": 2, "maxLeverage": 40}]
+        }))
+        .expect("meta");
+        let universe = oppen_hl::Universe::from_meta(&meta).expect("universe");
+        let asset = universe.get("BTC").expect("BTC");
+        let market = MarketRef {
+            symbol: "BTC".into(),
+            reference_px: Some(d("100")),
+            as_of_ms: now,
+            quality: FeedQuality::Ok,
+            mark_divergence_bps: None,
+            mark_divergent_since_ms: None,
+            snapshot: None,
+            sigma_day: None,
+            vol_ratio: None,
+        };
+        let intent = OrderIntent {
+            symbol: "BTC".into(),
+            is_buy: true,
+            px: d("100"),
+            sz: Decimal::ONE,
+            kind: oppen_hl::OrderKind::Limit { tif: Tif::Gtc },
+            reduce_only: false,
+            cloid: None,
+            grouping: Grouping::Na,
+            builder: None,
+            max_slippage_bps: None,
+            reason: "cross-symbol valuation".into(),
+        };
+        let evaluate = |orders: &[OpenOrder], refs: &ReferencePrices| {
+            let state = assemble(
+                Network::Testnet,
+                addr(),
+                now,
+                &VenueReadings {
+                    perps: &perps("0", "0", "0"),
+                    spot: &spot("100", "0"),
+                    orders,
+                    mids: refs,
+                    last_tick_ms: Some(now),
+                },
+            );
+            let exposure = exposure_from(&state, Decimal::ZERO, None, true, utc_day_start_ms(now));
+            let result = engine.evaluate(&agent, &intent, asset, &market, &exposure, now);
+            (exposure, result)
+        };
+
+        for buy in [true, false] {
+            for limit in ["10", "1000"] {
+                let orders = [resting_order("ETH", buy, "1.5", limit)];
+                let (exposure, result) = evaluate(&orders, &references("ETH", "100", true));
+                let resting = exposure.agent.resting.expect("valued book");
+                assert_eq!(resting.notional_usd, d("150"));
+                assert_eq!(resting.notional_by_symbol["ETH"], d("150"));
+                assert!(
+                    matches!(result, Err(Refusal::Leverage { observed, position_notional_usd, .. })
+                    if observed == d("2.5") && position_notional_usd == d("250"))
+                );
+                // A lower mark creates real headroom even with a high limit.
+                assert!(evaluate(&orders, &references("ETH", "50", true)).1.is_ok());
+            }
+        }
+
+        for refs in [
+            ReferencePrices::default(),
+            references("ETH", "100", false),
+            references("ETH", "0", true),
+            references("ETH", "-100", true),
+        ] {
+            // BTC's candidate reference is independently valid in `market`.
+            let (exposure, result) = evaluate(&[resting_order("ETH", true, "1.5", "10")], &refs);
+            assert!(exposure.agent.resting.is_none());
+            assert!(matches!(
+                result,
+                Err(Refusal::Unevaluable(Unevaluable::MissingRestingOrders))
+            ));
+        }
+        // A priced order before the missing symbol must not yield a partial total.
+        let orders = [
+            resting_order("BTC", true, "0.1", "100"),
+            resting_order("ETH", true, "1.5", "10"),
+        ];
+        let (exposure, result) = evaluate(&orders, &references("BTC", "100", true));
+        assert!(exposure.agent.resting.is_none());
+        assert!(matches!(
+            result,
+            Err(Refusal::Unevaluable(Unevaluable::MissingRestingOrders))
+        ));
+        let empty = ReferencePrices::default();
+        assert!(evaluate(&[], &empty).1.is_ok());
+        assert!(
+            evaluate(&[resting_order("ETH", true, "0", "10")], &empty)
+                .1
+                .is_ok()
+        );
+        let reductions = [OpenOrder {
+            reduce_only: true,
+            ..resting_order("ETH", false, "3", "10")
+        }];
+        let (exposure, result) = evaluate(&reductions, &empty);
+        assert!(result.is_ok());
+        let resting = exposure
+            .agent
+            .resting
+            .expect("reductions need no opening valuation");
+        assert_eq!(resting.reduce_sells["ETH"], d("3"));
+        assert_eq!(resting.notional_usd, Decimal::ZERO);
     }
 
     /// The bridge feeds the real engine, and the refusal it produces changes
@@ -830,26 +1005,32 @@ pub fn exposure_from(
         .map(|p| (p.symbol.clone(), PositionSnapshot { szi: p.size }))
         .collect();
 
-    let mut resting = RestingExposure::default();
-    for order in &state.orders {
-        let side = match (order.is_buy, order.reduce_only) {
-            (true, false) => &mut resting.buys,
-            (false, false) => &mut resting.sells,
-            (true, true) => &mut resting.reduce_buys,
-            (false, true) => &mut resting.reduce_sells,
-        };
-        let size = side.entry(order.symbol.clone()).or_default();
-        *size = size.saturating_add(order.size.abs());
-        if !order.reduce_only {
-            let notional = order.size.saturating_mul(order.limit_px).abs();
-            resting.notional_usd = resting.notional_usd.saturating_add(notional);
-            let symbol = resting
-                .notional_by_symbol
-                .entry(order.symbol.clone())
-                .or_default();
-            *symbol = symbol.saturating_add(notional);
-        }
-    }
+    let resting = state
+        .orders
+        .iter()
+        .try_fold(RestingExposure::default(), |mut resting, order| {
+            let side = match (order.is_buy, order.reduce_only) {
+                (true, false) => &mut resting.buys,
+                (false, false) => &mut resting.sells,
+                (true, true) => &mut resting.reduce_buys,
+                (false, true) => &mut resting.reduce_sells,
+            };
+            let size = side.entry(order.symbol.clone()).or_default();
+            *size = size.saturating_add(order.size.abs());
+            if !order.reduce_only && !order.size.is_zero() {
+                // One unpriced opening order invalidates the whole valuation;
+                // publishing a partial total would invent leverage headroom.
+                let reference_px = order.reference_px.filter(|px| *px > Decimal::ZERO)?;
+                let notional = order.size.saturating_mul(reference_px).abs();
+                resting.notional_usd = resting.notional_usd.saturating_add(notional);
+                let symbol = resting
+                    .notional_by_symbol
+                    .entry(order.symbol.clone())
+                    .or_default();
+                *symbol = symbol.saturating_add(notional);
+            }
+            Some(resting)
+        });
 
     let agent = AccountSnapshot {
         as_of_ms: state.as_of_ms,
@@ -865,7 +1046,7 @@ pub fn exposure_from(
             .map(|p| p.position_value_usd.abs())
             .sum(),
         positions,
-        resting: Some(resting),
+        resting,
     };
 
     // One container per agent (D1 as revised), so the fleet aggregate is the

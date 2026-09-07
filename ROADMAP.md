@@ -18,11 +18,15 @@ before expanding features:
    checks, and cancellation delivery with retries. Local regressions now cover
    these repairs, including the real SQLite sink and test signer, clipped fill
    permutations, dropped requests, revocation, and cancellation failures. The
+   state bridge now values every symbol's opening orders at quoted reference
+   marks and refuses incomplete valuation; limit prices remain display-only.
+   Cross-symbol buy/sell regressions exercise the real engine. The
    complete fixture-exchange lifecycle and explicitly authorized testnet run
    remain open gates.
 3. **Operator supervision:** desktop MCP lifecycle, pairing/revocation, real
    positions and orders, policy editing, approval decisions, and a working halt.
-4. **Recovery:** the durable submission journal now has SQLite reopen, independent
+4. **Recovery:** PR #44 merged as `06fc0e3` after green CI and separate automated
+   review. The durable submission journal has SQLite reopen, independent
    handle, stale-revision, corruption and dropped-request regressions. Starts and
    resolutions use the existing hash chain; unknown outcomes still block after
    restart. Complete exchange/restart reconciliation, reconnect/sleep/network

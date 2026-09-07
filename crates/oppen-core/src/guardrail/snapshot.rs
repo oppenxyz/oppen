@@ -227,9 +227,10 @@ pub struct RestingExposure {
     /// Exact contribution to `notional_usd`, so replacing one symbol's
     /// contribution cannot subtract a different valuation from the total.
     pub notional_by_symbol: BTreeMap<String, Decimal>,
-    /// Sum of size times limit price across opening orders in the account,
+    /// Sum of size times quoted mark across opening orders in the account,
     /// including symbols the current order does not touch, for the leverage
-    /// cap.
+    /// cap. A missing or nonpositive mark on a nonzero opening order makes
+    /// `AccountSnapshot::resting` absent, never a partially valued book.
     pub notional_usd: Decimal,
 }
 
