@@ -33,6 +33,7 @@ const TOKEN: Record<string, string> = {
 const host = ref<HTMLElement | null>(null);
 const cell = ref<HTMLElement | null>(null);
 const cols = ref(0);
+const width = ref(0);
 const rows = ref(0);
 const frame = ref<CandleFrame | null>(null);
 const renderer = createCandleRenderer();
@@ -50,7 +51,8 @@ function measure(): void {
   const lineHeight = probe.getBoundingClientRect().height;
   if (charWidth <= 0 || lineHeight <= 0) return;
   // Four characters per candle slot: three body columns and a gap.
-  cols.value = Math.floor(box.clientWidth / charWidth / 4);
+  width.value = Math.floor(box.clientWidth / charWidth);
+  cols.value = Math.floor(width.value / 4);
   rows.value = Math.floor(box.clientHeight / lineHeight);
   paint();
 }
@@ -65,6 +67,7 @@ function paint(): void {
     closed: data.closed,
     forming: data.forming,
     cols: cols.value,
+    maxWidth: width.value,
     rows: rows.value,
     intervalMs: data.intervalMs,
     priceDecimals: data.priceDecimals,
@@ -78,6 +81,11 @@ function paint(): void {
 
 /** One array of runs per row, which is what the template iterates. */
 const lines = computed(() => (frame.value ? frameRuns(frame.value) : []));
+const summary = computed(() => {
+  const data = props.data;
+  const last = data?.forming ?? data?.closed[data.closed.length - 1];
+  return last ? `Candlestick chart. Last close ${last.close}. High ${last.high}, low ${last.low}. ${data!.forming ? 'Last candle is forming.' : 'Last candle is closed.'}` : 'Candlestick chart. No bars read yet.';
+});
 
 /**
  * Why the panel is blank, in the renderer's own words. Three different
@@ -104,11 +112,14 @@ onMounted(() => {
   measure();
   observer = new ResizeObserver(measure);
   if (host.value) observer.observe(host.value);
+  document.fonts.addEventListener("loadingdone", measure);
+  void document.fonts.ready.then(() => { if (observer) measure(); });
 });
 
 onBeforeUnmount(() => {
   observer?.disconnect();
   observer = null;
+  document.fonts.removeEventListener("loadingdone", measure);
 });
 
 watch(() => props.data, paint);
@@ -118,7 +129,7 @@ watch(() => props.data, paint);
   <div ref="host" class="candles">
     <span ref="cell" class="candles__probe" aria-hidden="true">M</span>
     <p v-if="blank" class="candles__blank">{{ blank }}</p>
-    <pre v-else class="candles__grid"><span
+    <pre v-else class="candles__grid" role="img" :aria-label="summary"><span
       v-for="(runs, y) in lines"
       :key="y"
       class="candles__line"
@@ -144,14 +155,14 @@ watch(() => props.data, paint);
 .candles__probe {
   position: absolute;
   visibility: hidden;
-  font-family: var(--font-mono);
+  font-family: Menlo, Consolas, "Liberation Mono", monospace;
   font-size: var(--fs-body-sm);
   line-height: 1.1;
 }
 
 .candles__grid {
   margin: 0;
-  font-family: var(--font-mono);
+  font-family: Menlo, Consolas, "Liberation Mono", monospace;
   font-size: var(--fs-body-sm);
   line-height: 1.1;
   white-space: pre;

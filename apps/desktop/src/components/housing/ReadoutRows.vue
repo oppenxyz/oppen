@@ -2,6 +2,7 @@
 export interface ReadoutRow {
   k: string;
   v: string;
+  detail?: string;
   tone?: "body" | "signal" | "uranium" | "hazard";
 }
 
@@ -16,7 +17,7 @@ withDefaults(
 
 <template>
   <dl class="readout" :class="`readout--${size}`">
-    <div v-for="row in rows" :key="row.k" class="readout__row">
+    <div v-for="row in rows" :key="row.k" class="readout__row" :title="row.detail">
       <dt class="readout__k">{{ row.k }}</dt>
       <dd class="readout__v" :class="`readout__v--${row.tone ?? 'body'}`">
         <slot name="value" :row="row">{{ row.v }}</slot>

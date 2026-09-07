@@ -86,7 +86,7 @@
 
   /* Fields render at bracket grey or below. Never at body brightness. */
   --ink-field: #262a2e;
-  --ink-matrix: #4a5057;
+  --ink-matrix: #7a8188;
 
   /* Type */
   --font-mono: "Space Mono", ui-monospace, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
@@ -94,15 +94,15 @@
 
   --fs-label: 10px;
   --fs-label-lg: 11px;
-  --ls-label: 0.24em;
-  --ls-label-tight: 0.16em;
+  --ls-label: 0.12em;
+  --ls-label-tight: 0.10em;
   --ls-nav: 0.18em;
   --ls-chip: 0.2em;
   --ls-button: 0.22em;
   --ls-tagline: 0.3em;
 
   --fs-body-sm: 10px;
-  --fs-body: 11px;
+  --fs-body: 12px;
   --fs-copy-sm: 12px;
   --fs-copy: 13px;
 

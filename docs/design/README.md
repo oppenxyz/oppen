@@ -20,10 +20,10 @@ Type: **Space Mono** 400/700 for display, numerals, labels and the character mat
 ## Rules
 
 - Four-tier contrast ladder: structure → content → primary → live. One live element per view. Skipping a tier is what makes the system look generic.
-- Direction is carried by weight and outline, not by a green/red pair.
+- Chart direction uses both glyph and green/red ink under decision U3; decorative art remains monochrome.
 - No shadows, glows, gradients, or radius. Panels are housings: 1px rule, 14px bracket corners, tick ribbons only where data actually flows.
-- Everything the brand draws is sampled onto a monospace grid first. Five-glyph ramp `+ * : - .` near → far; space is the sixth step. Never add a glyph.
-- Motion is resampling, not easing. One 90ms clock, steps only, nothing translates or scales. Reduced motion = freeze on frame 0.
+- Everything the brand draws is sampled onto a monospace grid first. Five-glyph ramp `+ * : - .` near → far; space is the sixth step. Chart structural glyphs follow the chart spec rather than this decorative ramp.
+- Motion is resampling, not easing. One 90ms clock, steps only, nothing translates or scales. Reduced motion = freeze decoration on frame 0. Explicit pause and hidden-window gating affect decoration only; market data and freshness remain live.
 - Voice: short declaratives. Venue names, latencies and mechanics stated outright. "Agent" is a plain noun. No hype verbs, no emoji, no mascots, no safety claims we cannot audit, never a bomb joke.
 
 ## Motifs in the app

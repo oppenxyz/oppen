@@ -21,6 +21,29 @@ interface Rect {
 }
 
 const rect = ref<Rect | null>(null);
+const dialog = ref<HTMLElement | null>(null);
+const card = ref<HTMLElement | null>(null);
+const cardSize = ref({ width: 380, height: 190 });
+let returnFocus: HTMLElement | null = null;
+let cardObserver: ResizeObserver | null = null;
+watch(isOpen, async (open) => {
+  if (open) {
+    // WebKit may leave focus on body after a mouse click. Body is not a
+    // useful return target; use the persistent Setup control in that case.
+    returnFocus = document.activeElement instanceof HTMLElement && document.activeElement !== document.body
+      ? document.activeElement : null;
+    await nextTick();
+    dialog.value?.querySelector<HTMLButtonElement>("button")?.focus();
+    cardObserver = new ResizeObserver(() => {
+      if (card.value) cardSize.value = { width: card.value.offsetWidth, height: card.value.offsetHeight };
+    });
+    if (card.value) cardObserver.observe(card.value);
+  } else {
+    cardObserver?.disconnect();
+    await nextTick();
+    (returnFocus?.isConnected ? returnFocus : document.querySelector<HTMLElement>('[data-tour="setup"]'))?.focus();
+  }
+});
 /** Padding around the target so the highlight does not clip its own border. */
 const PAD = 6;
 
@@ -55,8 +78,18 @@ watch(currentStep, async () => {
 
 function onKey(event: KeyboardEvent): void {
   if (!isOpen.value) return;
+  if (event.key === "Tab") {
+    const buttons = [...(dialog.value?.querySelectorAll<HTMLButtonElement>("button:not(:disabled)") ?? [])];
+    const index = buttons.indexOf(document.activeElement as HTMLButtonElement);
+    const next = event.shiftKey ? (index <= 0 ? buttons.length - 1 : index - 1) : (index + 1) % buttons.length;
+    event.preventDefault();
+    buttons[next]?.focus();
+    return;
+  }
+  // Enter belongs to the focused native button; a global handler would advance twice.
+  if (["Escape", "ArrowRight", "ArrowLeft"].includes(event.key)) event.preventDefault();
   if (event.key === "Escape") endTour();
-  if (event.key === "ArrowRight" || event.key === "Enter") nextStep();
+  if (event.key === "ArrowRight") nextStep();
   if (event.key === "ArrowLeft") prevStep();
 }
 
@@ -68,6 +101,7 @@ onMounted(() => {
 });
 
 onBeforeUnmount(() => {
+  cardObserver?.disconnect();
   window.removeEventListener("resize", measure);
   window.removeEventListener("scroll", measure, true);
   window.removeEventListener("keydown", onKey);
@@ -96,8 +130,8 @@ const calloutStyle = computed(() => {
     return { top: "50%", left: "50%", transform: "translate(-50%, -50%)" };
   }
   const GAP = 14;
-  const W = 380;
-  const H = 190;
+  const W = cardSize.value.width;
+  const H = cardSize.value.height;
   let top = box.top;
   let left = box.left;
 
@@ -133,11 +167,11 @@ const isLast = computed(() => tour.step === TOUR.length - 1);
 </script>
 
 <template>
-  <div v-if="isOpen" class="tour" role="dialog" aria-modal="true" aria-label="oppen walkthrough">
-    <div class="tour__scrim" @click="endTour" />
+  <div v-if="isOpen" ref="dialog" class="tour" role="dialog" aria-modal="true" aria-label="oppen walkthrough">
+    <div class="tour__scrim" :class="{ 'tour__scrim--fallback': !rect }" @click="endTour" />
     <div class="tour__hole" :style="holeStyle" aria-hidden="true" />
 
-    <div v-if="currentStep" class="tour__card" :style="calloutStyle">
+    <div v-if="currentStep" ref="card" class="tour__card" :style="calloutStyle">
       <div class="tour__head">
         <span class="tour__pos">{{ position }}</span>
         <button type="button" class="tour__skip" @click="endTour">Skip</button>
@@ -163,8 +197,9 @@ const isLast = computed(() => tour.step === TOUR.length - 1);
 .tour__scrim {
   position: absolute;
   inset: 0;
-  background: rgb(10 11 12 / 78%);
 }
+
+.tour__scrim--fallback { background: rgb(10 11 12 / 78%); }
 
 /* The spotlight: an outward shadow big enough to cover any viewport, so the
    target keeps its own live rendering rather than being copied. */
@@ -177,7 +212,9 @@ const isLast = computed(() => tour.step === TOUR.length - 1);
 
 .tour__card {
   position: absolute;
-  width: 380px;
+  width: min(380px, calc(100vw - 28px));
+  max-height: calc(100vh - 28px);
+  overflow-y: auto;
   padding: var(--s-4);
   border: 1px solid var(--rule-strong);
   background: var(--plate);

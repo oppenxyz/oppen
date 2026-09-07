@@ -23,6 +23,7 @@ pub mod journal;
 pub mod keys;
 pub mod ledger;
 pub mod market;
+pub mod operator;
 pub mod reconcile;
 pub mod state;
 pub mod tca;

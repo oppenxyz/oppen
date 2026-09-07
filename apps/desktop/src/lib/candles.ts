@@ -111,6 +111,8 @@ export interface CandleInput {
   forming?: Readonly<Bar> | null;
   /** Candle slots across the plot. Plot width is `cols * 4` characters. */
   cols: number;
+  /** Host width in character cells, including the price gutter (chart spec §2.2). */
+  maxWidth?: number;
   /** Total grid rows, including the axis rule, the volume row and the time-label row. */
   rows: number;
   /** Bar interval in milliseconds. Selects the X-axis label family (§2.2). */
@@ -492,6 +494,14 @@ function paint(grid: Grid, input: CandleInput): FrameStatus {
   let gutterText = lastLabel.length;
   for (const label of tickLabels) if (label.length > gutterText) gutterText = label.length;
   const gutterX = plotWidth + 1;
+
+  // The visible price range changes as slots are removed, so measure the actual
+  // gutter again after narrowing. Slots strictly decrease; the minimum-grid
+  // branch terminates even when a host cannot fit a single price label.
+  if (input.maxWidth !== undefined && plotWidth + 1 + gutterText > input.maxWidth) {
+    const fitted = Math.max(0, Math.floor((input.maxWidth - 1 - gutterText) / PITCH));
+    return paint(grid, { ...input, cols: Math.min(cols - 1, fitted) });
+  }
 
   grid.reset(plotWidth + 1 + gutterText, rows);
 

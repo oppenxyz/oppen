@@ -624,3 +624,25 @@ describe("frameRuns", () => {
     }
   });
 });
+
+
+describe("host width including the price gutter", () => {
+  it("fits full labels across narrow hosts and price scales", () => {
+    for (const scale of [0.000001, 1, 10000000]) {
+      for (const width of [24, 39, 64, 120]) {
+        const data = fixture();
+        const frame = renderCandles({ ...data, cols: Math.floor(width / 4), maxWidth: width,
+          priceDecimals: scale < 1 ? 8 : 1,
+          closed: data.closed.map(b => ({ ...b, open: b.open * scale, high: b.high * scale, low: b.low * scale, close: b.close * scale })),
+          forming: { ...FORMING, open: FORMING.open * scale, high: FORMING.high * scale, low: FORMING.low * scale, close: FORMING.close * scale },
+        });
+        expect(frame.status).toBe("ok");
+        expect(frame.width).toBeLessThanOrEqual(width);
+        expect(frame.text.join("\n")).toContain("◄");
+      }
+    }
+  });
+  it("reports insufficient room instead of clipping a long price", () => {
+    expect(renderCandles({ ...fixture(), maxWidth: 8 }).status).toBe("grid_too_small");
+  });
+});

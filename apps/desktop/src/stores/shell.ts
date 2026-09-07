@@ -24,22 +24,12 @@ export interface FeedsHealth {
   rest: FeedHealth;
 }
 
-export interface Decision {
-  time: string;
-  agent: string;
-  /** Agent-authored. Untrusted text: render as plain text only. */
-  text: string;
-}
-
 interface ShellState {
   view: View;
   network: Network;
   feeds: FeedsHealth;
   equityUsd: number | null;
   latencyMs: number | null;
-  lastDecision: Decision | null;
-  decisionsToday: number;
-  refusedToday: number;
   /** Last good reading. Kept across a failed refresh so a position stays visible. */
   account: AccountState | null;
   /** Why the last refresh failed, shown beside the stale reading. */
@@ -59,15 +49,17 @@ interface ShellState {
   feedDetail: string | null;
 }
 
+function savedNetwork(): Network {
+  try { return localStorage.getItem("oppen.network") === "mainnet" ? "mainnet" : "testnet"; }
+  catch { return "testnet"; }
+}
+
 const state = reactive<ShellState>({
   view: "trade",
-  network: "testnet",
+  network: savedNetwork(),
   feeds: { wsMarket: "unknown", wsUser: "unknown", rest: "unknown" },
   equityUsd: null,
   latencyMs: null,
-  lastDecision: null,
-  decisionsToday: 0,
-  refusedToday: 0,
   account: null,
   accountError: null,
   keychain: null,
@@ -81,9 +73,12 @@ export function setView(view: View): void {
   state.view = view;
 }
 
-/** Mainnet is an explicit switch (D4). Persistence arrives with the Rust settings store. */
+/** D4: persist the explicit operator choice and restart all network-scoped reads together. */
 export function setNetwork(network: Network): void {
-  state.network = network;
+  if (network === state.network) return;
+  // Write before changing anything. If persistence fails, keep the current network.
+  localStorage.setItem("oppen.network", network);
+  window.location.reload();
 }
 
 export const NAV: ReadonlyArray<{ view: View; label: string }> = [
@@ -141,8 +136,10 @@ export async function refreshAccount(): Promise<void> {
     state.accountError = "Not running in the desktop app — start it with `bun run tauri dev`.";
     return;
   }
+  const network = state.network;
   try {
-    const next = await fetchAccountState(state.network);
+    const next = await fetchAccountState(network);
+    if (state.network !== network) return;
     state.account = next;
     state.accountError = null;
     state.equityUsd = Number(next.balances.equity_usd);
@@ -156,6 +153,9 @@ export async function refreshAccount(): Promise<void> {
       rest: "ok",
     };
   } catch (error) {
+    if (state.network !== network) return;
+    const unconfigured = isConsoleError(error) && error.kind === "not_configured";
+    state.feeds = { ...state.feeds, rest: unconfigured ? "unknown" : "down", wsUser: state.account ? "stale" : "unknown" };
     state.accountError = isConsoleError(error)
       ? error.detail
       : error instanceof Error
