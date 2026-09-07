@@ -82,13 +82,22 @@ describe("parseBar", () => {
  * the socket path pins.
  */
 describe("mergeTop", () => {
+  it("removes duplicate and outranked cached levels when the touch worsens", () => {
+    const bids = [{ px: "100", sz: "1", n: 1 }, { px: "99", sz: "2", n: 1 }, { px: "98", sz: "3", n: 1 }];
+    expect(mergeTop(bids, { px: "99", sz: "4", n: 1 }, "bid")).toEqual([
+      { px: "99", sz: "4", n: 1 }, { px: "98", sz: "3", n: 1 },
+    ]);
+    const asks = [{ px: "100", sz: "1", n: 1 }, { px: "101", sz: "2", n: 1 }, { px: "102", sz: "3", n: 1 }];
+    expect(mergeTop(asks, { px: "102", sz: "4", n: 1 }, "ask")).toEqual([{ px: "102", sz: "4", n: 1 }]);
+  });
+
   const LEVELS = [
     { px: "100", sz: "1", n: 1 },
     { px: "99", sz: "2", n: 2 },
   ];
 
   it("replaces the touch and leaves the depth behind it", () => {
-    expect(mergeTop(LEVELS, { px: "100.5", sz: "3", n: 1 })).toEqual([
+    expect(mergeTop(LEVELS, { px: "100.5", sz: "3", n: 1 }, "bid")).toEqual([
       { px: "100.5", sz: "3", n: 1 },
       { px: "99", sz: "2", n: 2 },
     ]);
@@ -97,7 +106,7 @@ describe("mergeTop", () => {
   it("leaves an empty side exactly as it was rather than zeroing it", () => {
     // §5.2: an absent side is stale, never zero. Splicing a hole in here would
     // let the strip quote a spread against a price the venue never showed.
-    expect(mergeTop(LEVELS, undefined)).toEqual(LEVELS);
+    expect(mergeTop(LEVELS, undefined, "bid")).toEqual(LEVELS);
   });
 });
 

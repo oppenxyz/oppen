@@ -1,9 +1,10 @@
 <script setup lang="ts">
-import CharacterMatrix from "../components/ascii/CharacterMatrix.vue";
+import TerrainField from "../components/ascii/TerrainField.vue";
 import PanelHousing from "../components/housing/PanelHousing.vue";
 import WordMark from "../components/shell/WordMark.vue";
 import SetupTracker from "../components/tour/SetupTracker.vue";
 import UiButton from "../components/ui/UiButton.vue";
+import { setView, shell } from "../stores/shell";
 import { startTour, TOUR } from "../stores/tour";
 </script>
 
@@ -12,16 +13,20 @@ import { startTour, TOUR } from "../stores/tour";
     <PanelHousing class="cover">
       <div class="cover__inner">
         <div class="cover__field">
-          <CharacterMatrix size="xl" tone="field" />
+          <TerrainField />
         </div>
         <div class="cover__mark">
-          <WordMark size="cover" accent />
+          <div class="cover__plate"><i v-for="corner in ['tl', 'tr', 'bl', 'br']" :key="corner" :class="`corner corner--${corner}`" aria-hidden="true" /><WordMark size="cover" accent /></div>
           <div class="cover__tagline">Local-first · Agentic · Perps</div>
         </div>
       </div>
     </PanelHousing>
 
     <div class="onboarding__side">
+      <PanelHousing inset label="Next step">
+        <p class="copy">{{ shell.account ? 'Continue with the external MCP setup. Agent registration and approvals are not yet available in this console.' : 'Connect an account to read balances and positions. Public market data is available without one.' }}</p>
+        <UiButton @click="setView('builder')">Open MCP setup</UiButton>
+      </PanelHousing>
       <SetupTracker />
 
       <PanelHousing inset label="Walkthrough" :brackets="['tr']" class="walk">
@@ -37,7 +42,7 @@ import { startTour, TOUR } from "../stores/tour";
       </PanelHousing>
 
       <div class="actions">
-        <UiButton block disabled title="Arrives with the keychain phase">Import agent wallet</UiButton>
+
         <UiButton block variant="primary" @click="startTour">Take the walkthrough →</UiButton>
       </div>
     </div>
@@ -79,6 +84,12 @@ import { startTour, TOUR } from "../stores/tour";
   text-align: center;
 }
 
+.cover__plate { position: relative; padding: 26px 32px; background: #000; }
+.corner { position: absolute; width: 14px; height: 14px; border-color: var(--signal); border-style: solid; border-width: 0; }
+.corner--tl { top: 0; left: 0; border-top-width: 1px; border-left-width: 1px; }
+.corner--tr { top: 0; right: 0; border-top-width: 1px; border-right-width: 1px; }
+.corner--bl { bottom: 0; left: 0; border-bottom-width: 1px; border-left-width: 1px; }
+.corner--br { bottom: 0; right: 0; border-bottom-width: 1px; border-right-width: 1px; }
 .cover__tagline {
   margin-top: var(--s-5);
   font-size: var(--fs-label-lg);
@@ -89,7 +100,8 @@ import { startTour, TOUR } from "../stores/tour";
 
 .onboarding__side {
   display: grid;
-  grid-template-rows: auto 1fr auto;
+  grid-auto-rows: max-content;
+  align-content: start;
   overflow-y: auto;
   grid-template-columns: minmax(0, 1fr);
   gap: var(--panel-gap);

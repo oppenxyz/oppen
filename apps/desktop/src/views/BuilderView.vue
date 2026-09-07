@@ -3,7 +3,7 @@ import EmptyState from "../components/housing/EmptyState.vue";
 import PanelHousing from "../components/housing/PanelHousing.vue";
 import StatBlock from "../components/housing/StatBlock.vue";
 import UiButton from "../components/ui/UiButton.vue";
-import { shell } from "../stores/shell";
+import { shell, setView } from "../stores/shell";
 
 interface Source {
   name: string;
@@ -14,7 +14,7 @@ interface Source {
 
 const SOURCES: readonly Source[] = [
   { name: "External via MCP", desc: "Claude Code or any MCP client. Agent lives elsewhere, keys stay here." },
-  { name: "oppen template", desc: "Policy + prompt file for your agent. basis-carry · funding-arb · momentum" },
+  { name: "oppen template", desc: "Prompt templates describe responsibilities; they do not prescribe trading thresholds.", planned: "planned" },
   { name: "Bring-your-own model", desc: "Hosted loop via API key. Planned.", planned: "v1.5" },
   { name: "Script strategy", desc: "Sandboxed Python/TS runtime. Planned.", planned: "v2" },
 ];
@@ -44,23 +44,36 @@ const SOURCES: readonly Source[] = [
       <PanelHousing inset>
         <div class="namebar">
           <span class="label">Name</span>
-          <span class="namebar__name">—</span>
+          <span class="namebar__name">External MCP setup</span>
           <span class="namebar__spacer" />
-          <span class="namebar__client">Client · <span class="namebar__v">—</span></span>
+          <span class="namebar__client">Client · <span class="namebar__v">Your MCP client</span></span>
         </div>
       </PanelHousing>
 
       <div class="builder__pair">
-        <PanelHousing label="02 · Policy — hard limits, enforced by runtime" :brackets="['tl']">
-          <EmptyState line="No draft policy." />
+        <PanelHousing label="02 · Connect the gateway" :brackets="['tl']">
+          <div class="guide">
+            <p>This development build runs the gateway separately. The console cannot create pairings or edit its active risk policy yet.</p>
+            <ol>
+              <li>Configure the testnet account in <code>OPPEN_TESTNET_USER</code>. Keep account-owner keys in your wallet.</li>
+              <li>From the repository, run:<pre>cargo run -p oppen-mcp --example serve</pre></li>
+              <li>The gateway prints a one-time pairing command for your MCP client. Use that command locally.</li>
+              <li>Ask the connected agent to read state and run preflight. Inspect any refusal before considering execution.</li>
+            </ol>
+            <p>This path binds <code>agent-alpha</code> to the configured testnet account. The gateway's default allowlist is empty; registration is not trading permission.</p>
+          </div>
           <template #footer>Policy is checked before every order. The model cannot change it.</template>
         </PanelHousing>
         <PanelHousing label="Instructions — what the model sees">
-          <EmptyState line="No instructions." />
+          <div class="guide">
+            <p>Start with a read-only briefing:</p>
+            <blockquote>Read the account state, open orders and feed freshness. Identify the account/container and network. Explain missing data and typed refusals. Do not place or cancel orders.</blockquote>
+            <p>Agent explanations are claims, not verified facts. The execution engine checks the active policy before signing.</p>
+          </div>
           <template #footer>
             <span class="split">
               <span>Tools · state, features, preflight, place, cancel, journal</span>
-              <span>— tokens</span>
+              <span>Operator briefing</span>
             </span>
           </template>
         </PanelHousing>
@@ -69,7 +82,7 @@ const SOURCES: readonly Source[] = [
 
     <div class="builder__right">
       <PanelHousing label="03 · Testnet run" :meta="shell.network">
-        <EmptyState matrix mode="sweep" line="No testnet run." />
+        <EmptyState matrix mode="sweep" line="Run history is not connected to this console." />
         <div class="run">
           <StatBlock label="Trades" size="md" />
           <StatBlock label="PnL" size="md" />
@@ -77,14 +90,12 @@ const SOURCES: readonly Source[] = [
         </div>
       </PanelHousing>
 
-      <PanelHousing inset label="04 · Arm">
+      <PanelHousing inset label="04 · Verify readiness">
         <p class="copy copy--sm">
-          Arming pairs the agent on testnet first. Promote to mainnet from the roster once it has earned it — approval
-          mode stays on until you turn it off.
+          Pairing, policy editing and arming are not available in this console yet. Follow the testnet gateway setup, then verify the account and active limits in your MCP client.
         </p>
         <div class="actions">
-          <UiButton block disabled title="Drafts arrive with the agent registry">Save draft</UiButton>
-          <UiButton block variant="primary" disabled title="Pairing arrives with the MCP gateway">Arm agent</UiButton>
+          <UiButton block @click="setView('onboarding')">Check setup</UiButton>
         </div>
       </PanelHousing>
     </div>
@@ -92,6 +103,13 @@ const SOURCES: readonly Source[] = [
 </template>
 
 <style scoped>
+.guide { overflow: auto; padding: var(--s-4); font-family: var(--font-sans); font-size: var(--fs-copy); line-height: 1.65; color: var(--body); }
+.guide p + p, .guide ol, .guide blockquote { margin-top: var(--s-3); }
+.guide ol { padding-left: var(--s-5); }
+.guide li + li { margin-top: var(--s-2); }
+.guide pre { white-space: pre-wrap; overflow-wrap: anywhere; padding: var(--s-2); margin-block: var(--s-2); border: 1px solid var(--rule); color: var(--signal); font: 11px/1.5 var(--font-mono); }
+.guide blockquote { padding-left: var(--s-3); border-left: 1px solid var(--bracket); color: var(--signal-dim); }
+
 .builder {
   display: grid;
   flex: 1;
@@ -113,7 +131,8 @@ const SOURCES: readonly Source[] = [
 
 .builder__pair {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1.2fr) minmax(0, 1fr);
   gap: var(--panel-gap);
   min-height: 0;
 }
@@ -171,7 +190,7 @@ const SOURCES: readonly Source[] = [
 }
 
 .source--planned .source__desc {
-  color: var(--rule-strong);
+  color: var(--bracket);
 }
 
 .namebar {

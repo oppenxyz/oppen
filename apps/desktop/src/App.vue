@@ -2,6 +2,7 @@
 import { computed, onMounted, onUnmounted, type Component } from "vue";
 import AppHeader from "./components/shell/AppHeader.vue";
 import AppStatusBar from "./components/shell/AppStatusBar.vue";
+import { isOpen as tourOpen } from "./stores/tour";
 import TourSpotlight from "./components/tour/TourSpotlight.vue";
 import {
   refreshKeychain,
@@ -46,11 +47,11 @@ onUnmounted(() => {
 
 <template>
   <div class="app">
-    <AppHeader />
-    <main class="app__main">
+    <AppHeader :inert="tourOpen" />
+    <main class="app__main" :inert="tourOpen">
       <component :is="current" />
     </main>
-    <AppStatusBar />
+    <AppStatusBar :inert="tourOpen" />
     <TourSpotlight />
   </div>
 </template>

@@ -607,6 +607,14 @@ An audit of the live Hyperliquid API settled this. See [specs/fair-value.md](spe
 - The five centralised-exchange feeds would break the local-first posture to buy
   a worse estimate of a number Hyperliquid already publishes for free.
 
+### Console visual refinement — 2026-09-07
+
+| # | Decision | Chosen | Why |
+|---|---|---|---|
+| UI1 | Website-to-app design direction | **Terrain on Setup; quantitative ASCII on trading surfaces** | The owner approved the full [UI review](design/ui-review-2026-09-07.md). Reuse the approved terrain sampler and inspection lighting on the arrival surface. Keep trading backgrounds quiet; add measured book depth, exposure and utilization detail. No new rendering dependency. U1–U3 chart geometry and directional ink remain authoritative. |
+| UI2 | Working-data hierarchy | **12px working numerals, compact readable labels, exact display rounding** | The review found clipped axes and long raw decimals. Reserve actual chart gutters, format decimal strings only at display, expose original values in details, and distinguish unknown/stale from zero. Spec #31/#34/F. |
+| UI3 | Console navigation and decoration | **Searchable markets, functional settings navigation, explicit decorative-motion control** | These complete the approved review without changing execution behavior. Motion settings affect decorative sampling only; live feeds and freshness clocks continue. Empty apertures are static, not fictional activity. Spec #4/#31/#36. |
+
 ### Still open
 
 Everything listed under "Open decisions" in each spec that is not resolved above.

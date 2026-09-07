@@ -1,7 +1,10 @@
 <script setup lang="ts">
 import { computed, ref } from "vue";
+import AsciiGauge from "../components/ascii/AsciiGauge.vue";
 import CandleChart from "../components/CandleChart.vue";
-import ColumnHeader from "../components/housing/ColumnHeader.vue";
+import AccountPositions from "../components/AccountPositions.vue";
+import AccountNotice from "../components/AccountNotice.vue";
+import { shell, setView } from "../stores/shell";
 import EmptyState from "../components/housing/EmptyState.vue";
 import PanelHousing from "../components/housing/PanelHousing.vue";
 import ReadoutRows, { type ReadoutRow } from "../components/housing/ReadoutRows.vue";
@@ -16,17 +19,15 @@ import {
   type ChartInterval,
 } from "../stores/market";
 
+import { decimal } from "../lib/display";
+
 type Ledger = "positions" | "orders" | "fills";
 
-const LEDGER_TABS: ReadonlyArray<{ key: Ledger; label: string; empty: string }> = [
-  { key: "positions", label: "Positions · 0", empty: "No open positions." },
-  { key: "orders", label: "Open orders · 0", empty: "No open orders." },
-  { key: "fills", label: "Fills", empty: "No fills." },
-];
-
-const POSITION_COLUMNS = ["Market", "Side", "Size", "Entry", "Mark", "Liq", "PnL", "Agent · sub-acct"] as const;
-const POSITION_TEMPLATE = "1.2fr 0.8fr 1fr 1fr 1fr 1fr 1fr 1.2fr";
-
+const LEDGER_TABS = computed(() => [
+  { key: "positions" as const, label: `Positions · ${shell.account?.positions.length ?? '—'}` },
+  { key: "orders" as const, label: `Open orders · ${shell.account?.orders.length ?? '—'}` },
+  { key: "fills" as const, label: "Fills" },
+]);
 /** A missing number renders as an em dash. It never renders as zero. */
 const DASH = "—";
 
@@ -45,9 +46,6 @@ const chartMeta = computed(() => {
   return `${chart.closed.length} closed${forming}`;
 });
 
-function show(value: string | undefined, suffix = ""): string {
-  return value === undefined ? DASH : `${value}${suffix}`;
-}
 
 /**
  * Spec F's packs, as the panel reads them.
@@ -64,15 +62,16 @@ const FEATURES = computed<readonly ReadoutRow[]>(() => {
   return [
     {
       k: band?.covers_band === false ? "depth ±10bps ·floor" : "depth ±10bps",
-      v: band === undefined ? DASH : `${band.bid_usd} / ${band.ask_usd}`,
+      v: band === undefined ? DASH : `${decimal(band.bid_usd, 0)} / ${decimal(band.ask_usd, 0)} USD`,
       tone: band?.covers_band === false ? "uranium" : undefined,
+      detail: band ? `Bid ${band.bid_usd} USD; ask ${band.ask_usd} USD. ${band.covers_band ? "Ladder covers the band." : `Observed depth is a floor. Bid reach ${snap.book.bid_reach_bps ?? "unknown"} bp; ask reach ${snap.book.ask_reach_bps ?? "unknown"} bp.`}` : "Depth unavailable",
     },
-    { k: "spread", v: show(snap.book.spread_bps, " bp") },
-    { k: "imbalance", v: show(snap.book.book_imbalance) },
-    { k: "rv_24h", v: show(snap.vol.rv_24h_bps, " bp") },
-    { k: "vol_ratio", v: show(snap.vol.vol_ratio) },
-    { k: "funding 1h", v: show(snap.funding.hour_to_date_bps, " bp") },
-    { k: "basis", v: show(snap.funding.basis_bps, " bp") },
+    { k: "spread", v: decimal(snap.book.spread_bps, 2, " bp"), detail: snap.book.spread_bps ?? "Unavailable" },
+    { k: "imbalance · −1 to 1", v: decimal(snap.book.book_imbalance, 4), detail: snap.book.book_imbalance ?? "Unavailable" },
+    { k: "volatility · 24h", v: decimal(snap.vol.rv_24h_bps, 2, " bp"), detail: snap.vol.rv_24h_bps ?? "Unavailable" },
+    { k: "volume ratio", v: decimal(snap.vol.vol_ratio), detail: snap.vol.vol_ratio ?? "Unavailable" },
+    { k: "funding 1h", v: decimal(snap.funding.hour_to_date_bps, 2, " bp"), detail: snap.funding.hour_to_date_bps ?? "Unavailable" },
+    { k: "basis", v: decimal(snap.funding.basis_bps, 2, " bp"), detail: snap.funding.basis_bps ?? "Unavailable" },
   ];
 });
 
@@ -80,8 +79,8 @@ const FEATURES_EMPTY: readonly ReadoutRow[] = [
   { k: "depth ±10bps", v: DASH },
   { k: "spread", v: DASH },
   { k: "imbalance", v: DASH },
-  { k: "rv_24h", v: DASH },
-  { k: "vol_ratio", v: DASH },
+  { k: "volatility · 24h", v: DASH },
+  { k: "volume ratio", v: DASH },
   { k: "funding 1h", v: DASH },
   { k: "basis", v: DASH },
 ];
@@ -95,17 +94,20 @@ const strip = computed(() => {
     // A market the venue has stopped quoting has no mid, and no substitute.
     mid: row?.mid_px ?? DASH,
     change: row?.change_24h_pct === undefined ? DASH : `${row.change_24h_pct}%`,
-    funding: row === null ? DASH : `${row.funding_1h_bps} bp`,
+    funding: row === null ? DASH : decimal(row.funding_1h_bps, 2, " bp"),
     oi: row?.open_interest ?? DASH,
   };
 });
 
 /** Book rows, deepest-first on the bid so the two sides mirror at the touch. */
+const search = ref("");
+const filteredMarkets = computed(() => market.rows.filter(row => row.symbol.toLowerCase().includes(search.value.trim().toLowerCase())));
 const bids = computed(() => market.snapshot?.bids.slice(0, 8) ?? []);
 const asks = computed(() => market.snapshot?.asks.slice(0, 8) ?? []);
 
+const maxBookSize = computed(() => Math.max(0, ...bids.value.concat(asks.value).map(level => Number(level.sz))));
 const ledger = ref<Ledger>("positions");
-const ledgerEmpty = computed(() => LEDGER_TABS.find((tab) => tab.key === ledger.value)?.empty ?? "");
+
 
 // The rail is read and re-read by `startMarketFeed`, which App.vue owns
 // because the status bar reads the feed from every view. Nothing to do on
@@ -116,9 +118,10 @@ const ledgerEmpty = computed(() => LEDGER_TABS.find((tab) => tab.key === ledger.
   <div class="trade">
     <div class="trade__col trade__col--left">
       <PanelHousing label="Markets" :meta="`${market.rows.length}`">
+        <input v-model="search" type="search" class="market-search" aria-label="Search markets" placeholder="Search markets" />
         <EmptyState v-if="market.rows.length === 0" :line="market.error ?? 'No markets loaded.'" />
         <ul v-else class="rail">
-          <li v-for="row in market.rows" :key="row.symbol">
+          <li v-for="row in filteredMarkets" :key="row.symbol">
             <button
               type="button"
               class="rail__row"
@@ -142,9 +145,10 @@ const ledgerEmpty = computed(() => LEDGER_TABS.find((tab) => tab.key === ledger.
             </button>
           </li>
         </ul>
+        <EmptyState v-if="market.rows.length > 0 && !filteredMarkets.length" line="No matching markets." />
       </PanelHousing>
-      <PanelHousing label="Agents on —" meta="0">
-        <EmptyState line="No agents paired." />
+      <PanelHousing label="Agents" meta="Not read">
+        <EmptyState line="Connect the gateway to inspect agents and their containers." action="Open MCP setup" @action="setView('builder')" />
         <template #footer>Autonomous · policy-bound</template>
       </PanelHousing>
     </div>
@@ -188,7 +192,13 @@ const ledgerEmpty = computed(() => LEDGER_TABS.find((tab) => tab.key === ledger.
           size="md"
           :line="market.chartError"
         />
-        <CandleChart v-else :data="market.chart" />
+        <div v-else class="chart__surface">
+          <p v-if="shell.feeds.wsMarket !== 'ok'" class="chart__status" role="status">
+            Market feed {{ shell.feeds.wsMarket === 'unknown' ? 'not connected' : shell.feeds.wsMarket }}.
+            {{ shell.lastMarketTickMs ? `Last tick ${new Date(shell.lastMarketTickMs).toLocaleTimeString()}.` : 'No live tick received.' }}
+          </p>
+          <CandleChart :data="market.chart" />
+        </div>
       </PanelHousing>
 
       <PanelHousing data-tour="positions">
@@ -205,9 +215,21 @@ const ledgerEmpty = computed(() => LEDGER_TABS.find((tab) => tab.key === ledger.
             {{ tab.label }}
           </button>
         </template>
-        <template #meta>0 agent-held · 0 manual</template>
-        <ColumnHeader :columns="POSITION_COLUMNS" :template="POSITION_TEMPLATE" />
-        <EmptyState :line="ledgerEmpty" />
+        <template #meta>Configured account</template>
+        <div class="ledger__body">
+          <AccountNotice />
+          <AccountPositions v-if="ledger === 'positions'" />
+          <template v-else-if="ledger === 'orders'">
+            <table v-if="shell.account?.orders.length" class="orders">
+              <thead><tr><th>Market</th><th>Side</th><th>Size</th><th>Limit · USD</th><th>Reduce only</th></tr></thead>
+              <tbody><tr v-for="order in shell.account.orders" :key="order.oid">
+                <th scope="row">{{ order.symbol }}</th><td>{{ order.is_buy ? 'BUY' : 'SELL' }}</td><td>{{ order.size }}</td><td>{{ order.limit_px }}</td><td>{{ order.reduce_only ? 'Yes' : 'No' }}</td>
+              </tr></tbody>
+            </table>
+            <EmptyState v-else :line="shell.account ? 'No open orders in this account.' : 'Orders are unknown until the account is read.'" />
+          </template>
+          <EmptyState v-else line="Fill history is not connected to this console yet." />
+        </div>
       </PanelHousing>
     </div>
 
@@ -218,14 +240,15 @@ const ledgerEmpty = computed(() => LEDGER_TABS.find((tab) => tab.key === ledger.
           :line="market.snapshotError ?? 'No book subscribed.'"
         />
         <div v-else class="book">
+          <div class="book__row book__head"><span>Price · USD</span><span>Size · {{ market.selected }}</span><span>Orders</span><span>Depth</span></div>
           <!-- Asks descend to the touch, bids fall away from it, so the two
                best prices meet in the middle the way a book is read. -->
           <div v-for="lvl in [...asks].reverse()" :key="`a${lvl.px}`" class="book__row book__row--ask">
-            <span>{{ lvl.px }}</span><span>{{ lvl.sz }}</span><span class="book__n">{{ lvl.n }}</span>
+            <span>{{ lvl.px }}</span><span>{{ lvl.sz }}</span><span class="book__n">{{ lvl.n }}</span><AsciiGauge :value="maxBookSize > 0 ? Number(lvl.sz) / maxBookSize : null" :cells="8" :label="`${lvl.sz} ${market.selected}; relative to largest visible level`" />
           </div>
-          <div class="book__mid">{{ market.snapshot?.book.spread_bps ?? "—" }} bp</div>
+          <div class="book__mid">Snapshot spread {{ decimal(market.snapshot?.book.spread_bps, 2, " bp") }}</div>
           <div v-for="lvl in bids" :key="`b${lvl.px}`" class="book__row book__row--bid">
-            <span>{{ lvl.px }}</span><span>{{ lvl.sz }}</span><span class="book__n">{{ lvl.n }}</span>
+            <span>{{ lvl.px }}</span><span>{{ lvl.sz }}</span><span class="book__n">{{ lvl.n }}</span><AsciiGauge :value="maxBookSize > 0 ? Number(lvl.sz) / maxBookSize : null" :cells="8" :label="`${lvl.sz} ${market.selected}; relative to largest visible level`" />
           </div>
         </div>
       </PanelHousing>
@@ -233,16 +256,30 @@ const ledgerEmpty = computed(() => LEDGER_TABS.find((tab) => tab.key === ledger.
         <template #meta>
           <button type="button" class="refresh" @click="refreshSnapshot">Re-read</button>
         </template>
+        <p class="features-time">Derived snapshot · {{ market.featuresReadMs ? new Date(market.featuresReadMs).toLocaleTimeString() : 'Not read' }}</p>
+        <p v-if="market.snapshotError" class="features-time" role="status">{{ market.snapshotError }}</p>
         <ReadoutRows :rows="FEATURES" />
       </PanelHousing>
-      <PanelHousing inset label="Manual order" meta="Overrides policy" data-tour="ticket">
-        <EmptyState line="Ticket opens with a venue connection." />
+      <PanelHousing inset label="Manual order" meta="Operator initiated" data-tour="ticket">
+        <EmptyState line="Manual ticket is not available yet. Orders use the shared execution checks." />
       </PanelHousing>
     </div>
   </div>
 </template>
 
 <style scoped>
+.ledger__body { min-height: 0; overflow: auto; }
+.orders { width: 100%; border-collapse: collapse; font-size: var(--fs-body); }
+.orders th, .orders td { padding: var(--s-2); text-align: right; font-weight: 400; border-bottom: 1px solid var(--rule); }
+.orders th:first-child { text-align: left; }
+.orders thead { color: var(--bracket); }
+.chart__surface { position: relative; flex: 1; min-height: 0; }
+.chart__status { position: absolute; z-index: 2; inset: var(--s-2) auto auto var(--s-2); max-width: calc(100% - 24px); padding: var(--s-2); background: var(--void); border: 1px solid var(--uranium); color: var(--signal); font-size: var(--fs-body); }
+
+.features-time { font-size: var(--fs-body-sm); color: var(--bracket); margin-bottom: var(--s-2); line-height: 1.4; }
+
+.market-search { margin: var(--s-2); padding: var(--s-2); min-width: 0; border: 1px solid var(--rule-strong); background: var(--void); color: var(--signal); font: inherit; font-size: var(--fs-body); }
+
 .rail {
   display: grid;
   margin: 0;
@@ -313,7 +350,7 @@ const ledgerEmpty = computed(() => LEDGER_TABS.find((tab) => tab.key === ledger.
 
 .book__row {
   display: grid;
-  grid-template-columns: 1fr 1fr auto;
+  grid-template-columns: 1fr 1fr auto auto;
   gap: var(--s-2);
   padding: 1px var(--s-3);
 }
@@ -325,6 +362,8 @@ const ledgerEmpty = computed(() => LEDGER_TABS.find((tab) => tab.key === ledger.
 .book__row--bid {
   color: var(--up);
 }
+
+.book__head { color: var(--bracket); font-size: var(--fs-body-sm); padding-block: var(--s-2); }
 
 .book__n {
   min-width: 3ch;
@@ -357,7 +396,7 @@ const ledgerEmpty = computed(() => LEDGER_TABS.find((tab) => tab.key === ledger.
 .trade {
   display: grid;
   flex: 1;
-  grid-template-columns: 200px minmax(0, 1fr) 300px;
+  grid-template-columns: 210px minmax(0, 1fr) 330px;
   gap: var(--panel-gap);
   min-width: 0;
   min-height: 0;
@@ -373,11 +412,11 @@ const ledgerEmpty = computed(() => LEDGER_TABS.find((tab) => tab.key === ledger.
 }
 
 .trade__col--left {
-  grid-template-rows: 2fr 3fr;
+  grid-template-rows: minmax(0, 1fr) auto;
 }
 
 .trade__col--center {
-  grid-template-rows: auto 1fr 240px;
+  grid-template-rows: auto minmax(180px, 1fr) minmax(130px, 25vh);
 }
 
 .trade__col--right {
@@ -387,7 +426,7 @@ const ledgerEmpty = computed(() => LEDGER_TABS.find((tab) => tab.key === ledger.
 .strip {
   display: flex;
   align-items: center;
-  gap: var(--s-7);
+  gap: var(--s-4);
   min-width: 0;
   overflow: hidden;
 }
@@ -403,8 +442,8 @@ const ledgerEmpty = computed(() => LEDGER_TABS.find((tab) => tab.key === ledger.
 
 .strip__stats {
   display: grid;
-  grid-template-columns: repeat(6, auto);
-  gap: var(--s-6);
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: var(--s-2) var(--s-4);
 }
 
 .chart__tf {

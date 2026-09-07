@@ -5,7 +5,7 @@
  * Reduced motion freezes the clock on frame 0.
  */
 
-import { onScopeDispose, ref, type Ref } from "vue";
+import { computed, onScopeDispose, ref, type Ref } from "vue";
 
 export const TICK_MS = 90;
 
@@ -14,12 +14,27 @@ const reducedQuery = window.matchMedia("(prefers-reduced-motion: reduce)");
 
 /** True while the OS asks for reduced motion. Surfaces may render a complete frame instead. */
 export const motionReduced = ref(reducedQuery.matches);
+function savedPause(): boolean {
+  try { return localStorage.getItem("oppen.decorative-motion") === "paused"; } catch { return false; }
+}
+export const motionPaused = ref(savedPause());
+export const motionStill = computed(() => motionReduced.value || motionPaused.value);
+export function setMotionPaused(paused: boolean): void {
+  motionPaused.value = paused;
+  try { localStorage.setItem("oppen.decorative-motion", paused ? "paused" : "playing"); } catch { /* Session setting still applies. */ }
+  stop();
+  if (subscribers > 0) start();
+}
+document.addEventListener("visibilitychange", () => {
+  stop();
+  if (subscribers > 0) start();
+});
 
 let timer: ReturnType<typeof setInterval> | null = null;
 let subscribers = 0;
 
 function start(): void {
-  if (timer !== null || motionReduced.value) return;
+  if (timer !== null || motionStill.value || document.hidden) return;
   timer = setInterval(() => {
     tick.value += 1;
   }, TICK_MS);
