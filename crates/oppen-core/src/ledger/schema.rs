@@ -168,17 +168,7 @@ const MIGRATIONS: &[&str] = &[V1, V2, V3];
 /// forward-migrated ledger opened by an older oppen would drop columns from the
 /// hash preimage and report the whole chain as broken.
 pub(crate) fn migrate(conn: &Connection) -> Result<()> {
-    let current: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    let current = usize::try_from(current).map_err(|_| LedgerError::SchemaTooNew {
-        found: current,
-        supported: MIGRATIONS.len(),
-    })?;
-    if current > MIGRATIONS.len() {
-        return Err(LedgerError::SchemaTooNew {
-            found: current as i64,
-            supported: MIGRATIONS.len(),
-        });
-    }
+    let current = supported_version(conn)?;
     for (index, statements) in MIGRATIONS.iter().enumerate().skip(current) {
         conn.execute_batch("BEGIN IMMEDIATE")?;
         match apply(conn, statements, index + 1) {
@@ -190,6 +180,22 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Shared by the writer/migrator and the console's read-only opener.
+pub(super) fn supported_version(conn: &Connection) -> Result<usize> {
+    let current: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    let current = usize::try_from(current).map_err(|_| LedgerError::SchemaTooNew {
+        found: current,
+        supported: MIGRATIONS.len(),
+    })?;
+    if current > MIGRATIONS.len() {
+        return Err(LedgerError::SchemaTooNew {
+            found: current as i64,
+            supported: MIGRATIONS.len(),
+        });
+    }
+    Ok(current)
 }
 
 /// Apply one migration and stamp the version it produces.

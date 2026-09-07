@@ -24,22 +24,12 @@ export interface FeedsHealth {
   rest: FeedHealth;
 }
 
-export interface Decision {
-  time: string;
-  agent: string;
-  /** Agent-authored. Untrusted text: render as plain text only. */
-  text: string;
-}
-
 interface ShellState {
   view: View;
   network: Network;
   feeds: FeedsHealth;
   equityUsd: number | null;
   latencyMs: number | null;
-  lastDecision: Decision | null;
-  decisionsToday: number;
-  refusedToday: number;
   /** Last good reading. Kept across a failed refresh so a position stays visible. */
   account: AccountState | null;
   /** Why the last refresh failed, shown beside the stale reading. */
@@ -70,9 +60,6 @@ const state = reactive<ShellState>({
   feeds: { wsMarket: "unknown", wsUser: "unknown", rest: "unknown" },
   equityUsd: null,
   latencyMs: null,
-  lastDecision: null,
-  decisionsToday: 0,
-  refusedToday: 0,
   account: null,
   accountError: null,
   keychain: null,

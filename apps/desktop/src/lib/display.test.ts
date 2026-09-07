@@ -1,4 +1,4 @@
-import { decimal } from "./display";
+import { decimal, eventText } from "./display";
 declare const describe: (name: string, body: () => void) => void;
 declare const it: (name: string, body: () => void) => void;
 declare const expect: (value: unknown) => { toBe(expected: unknown): void };
@@ -15,4 +15,19 @@ describe("display decimals", () => {
     expect(decimal("-0.00001")).toBe("0.00");
     expect(decimal("999.6", 0)).toBe("1,000");
   });
+});
+
+it("event claims accept only text and preserve it without interpretation", () => {
+  expect(eventText({ reason: "<b>claim</b>" }, "reason")).toBe("<b>claim</b>");
+  expect(eventText({ reason: { html: "claim" } }, "reason")).toBe(null);
+  expect(eventText(["claim"], "reason")).toBe(null);
+  expect(eventText(null, "reason")).toBe(null);
+});
+
+// Agent IDs also appear on operator actions; do not attribute those reasons to agents.
+it('does not label an operator action as an agent decision', async () => {
+  const { isAgentDecision } = await import('./display');
+  expect(isAgentDecision({ kind: 'operator_action', agent_id: 'alpha' })).toBe(false);
+  expect(isAgentDecision({ kind: 'refusal', agent_id: 'alpha' })).toBe(true);
+  expect(isAgentDecision({ kind: 'refusal', agent_id: null })).toBe(false);
 });

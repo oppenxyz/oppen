@@ -1,7 +1,6 @@
 <script setup lang="ts">
-import EmptyState from "../components/housing/EmptyState.vue";
 import PanelHousing from "../components/housing/PanelHousing.vue";
-import StatBlock from "../components/housing/StatBlock.vue";
+import DecisionStream from "../components/DecisionStream.vue";
 import UiButton from "../components/ui/UiButton.vue";
 import { shell, setView } from "../stores/shell";
 
@@ -57,6 +56,7 @@ const SOURCES: readonly Source[] = [
             <ol>
               <li>Configure the testnet account in <code>OPPEN_TESTNET_USER</code>. Keep account-owner keys in your wallet.</li>
               <li>From the repository, run:<pre>cargo run -p oppen-mcp --example serve</pre></li>
+              <li>Set <code>OPPEN_DATA_DIR</code> to the same directory for the gateway and desktop app, then restart the app to read its ledger and stored limits.</li>
               <li>The gateway prints a one-time pairing command for your MCP client. Use that command locally.</li>
               <li>Ask the connected agent to read state and run preflight. Inspect any refusal before considering execution.</li>
             </ol>
@@ -81,13 +81,9 @@ const SOURCES: readonly Source[] = [
     </div>
 
     <div class="builder__right">
-      <PanelHousing label="03 · Testnet run" :meta="shell.network">
-        <EmptyState matrix mode="sweep" line="Run history is not connected to this console." />
-        <div class="run">
-          <StatBlock label="Trades" size="md" />
-          <StatBlock label="PnL" size="md" />
-          <StatBlock label="Refused" size="md" />
-        </div>
+      <PanelHousing label="03 · Recorded activity" :meta="shell.network">
+        <DecisionStream />
+        <template #footer>Recent events, not a validated testnet run report.</template>
       </PanelHousing>
 
       <PanelHousing inset label="04 · Verify readiness">
@@ -225,15 +221,6 @@ const SOURCES: readonly Source[] = [
   display: flex;
   justify-content: space-between;
   gap: var(--s-3);
-}
-
-.run {
-  display: grid;
-  flex: none;
-  grid-template-columns: repeat(3, 1fr);
-  gap: var(--s-3);
-  padding: var(--s-3);
-  border-top: 1px solid var(--rule);
 }
 
 .actions {

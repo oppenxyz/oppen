@@ -10,3 +10,15 @@ export function decimal(value: string | null | undefined, digits = 2, suffix = "
   const tail = digits ? `.${(rounded % scale).toString().padStart(digits, "0")}` : "";
   return `${negative && rounded !== 0n ? "−" : ""}${integer}${tail}${suffix}`;
 }
+
+/** Event bodies are heterogeneous and untrusted. Only a string can become a text claim. */
+export function eventText(payload: unknown, field: string): string | null {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return null;
+  const value = (payload as Record<string, unknown>)[field];
+  return typeof value === "string" ? value : null;
+}
+
+/** An operator action may name an agent; that does not make its text agent-authored. */
+export function isAgentDecision(event: { kind: string; agent_id: string | null }): boolean {
+  return event.agent_id !== null && ["agent_decision", "order_intent", "refusal"].includes(event.kind);
+}

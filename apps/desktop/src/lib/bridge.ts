@@ -60,7 +60,7 @@ export interface AccountState {
 
 /** What the Rust side returns instead of a state. */
 export interface ConsoleError {
-  kind: "not_configured" | "venue";
+  kind: "not_configured" | "venue" | "local_state";
   detail: string;
 }
 
@@ -80,6 +80,46 @@ export function inTauri(): boolean {
 
 export async function fetchAccountState(network: "testnet" | "mainnet"): Promise<AccountState> {
   return invoke<AccountState>("account_state", { network });
+}
+
+export type SourceRead<T> = { status: "ready"; value: T } | { status: "unavailable"; detail: string };
+export interface LedgerEvent {
+  seq: number;
+  ts_ms: number;
+  kind: string;
+  agent_id: string | null;
+  payload: unknown;
+}
+export interface EventPage {
+  events: LedgerEvent[];
+  next_cursor: number;
+  head_seq: number;
+  resync_required: boolean;
+}
+export interface AgentPolicy {
+  symbols: string[];
+  max_order_usd: string;
+  max_position_usd: string;
+  max_slippage_bps: string;
+  order_rate: { count: number; per_ms: number };
+  reduce_only: boolean;
+  approval_required: boolean;
+  risk: { max_leverage: number; margin_mode: string; max_open_exposure_usd: string | null; max_risk_usd: string | null };
+  loss: { max_daily_loss_usd: string | null; max_drawdown_usd: string | null };
+}
+export interface StoredPolicy {
+  guardrails: Record<string, AgentPolicy>;
+  vaults: Record<string, string>;
+  account_limits: { max_daily_loss_usd: string | null; max_drawdown_usd: string | null };
+  kill: { global: { engaged_at_ms: number; reason: unknown } | null; agents: Record<string, { engaged_at_ms: number; reason: unknown }> };
+}
+export interface OperatorRead {
+  network: "testnet" | "mainnet";
+  ledger: SourceRead<EventPage>;
+  policy: SourceRead<StoredPolicy>;
+}
+export async function fetchOperatorState(network: "testnet" | "mainnet"): Promise<OperatorRead> {
+  return invoke<OperatorRead>("operator_state", { network });
 }
 
 /** What the keychain probe answers. */

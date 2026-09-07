@@ -1,5 +1,7 @@
 <script setup lang="ts">
 import { computed, ref } from "vue";
+import { operator, recordedAgents } from "../stores/operator";
+import DecisionStream from "../components/DecisionStream.vue";
 import AsciiGauge from "../components/ascii/AsciiGauge.vue";
 import CandleChart from "../components/CandleChart.vue";
 import AccountPositions from "../components/AccountPositions.vue";
@@ -21,12 +23,13 @@ import {
 
 import { decimal } from "../lib/display";
 
-type Ledger = "positions" | "orders" | "fills";
+type Ledger = "positions" | "orders" | "fills" | "activity";
 
 const LEDGER_TABS = computed(() => [
   { key: "positions" as const, label: `Positions · ${shell.account?.positions.length ?? '—'}` },
   { key: "orders" as const, label: `Open orders · ${shell.account?.orders.length ?? '—'}` },
   { key: "fills" as const, label: "Fills" },
+  { key: "activity" as const, label: "Activity" },
 ]);
 /** A missing number renders as an em dash. It never renders as zero. */
 const DASH = "—";
@@ -147,9 +150,9 @@ const ledger = ref<Ledger>("positions");
         </ul>
         <EmptyState v-if="market.rows.length > 0 && !filteredMarkets.length" line="No matching markets." />
       </PanelHousing>
-      <PanelHousing label="Agents" meta="Not read">
-        <EmptyState line="Connect the gateway to inspect agents and their containers." action="Open MCP setup" @action="setView('builder')" />
-        <template #footer>Autonomous · policy-bound</template>
+      <PanelHousing label="Recorded agents" :meta="operator.policy || operator.ledger ? String(recordedAgents.length) : 'Not read'">
+        <EmptyState :line="recordedAgents.length ? recordedAgents.join(', ') : 'Connect the gateway to inspect agents and their containers.'" :action="recordedAgents.length ? 'Inspect records' : 'Open MCP setup'" @action="setView(recordedAgents.length ? 'agents' : 'builder')" />
+        <template #footer>Records do not prove active pairing</template>
       </PanelHousing>
     </div>
 
@@ -228,7 +231,7 @@ const ledger = ref<Ledger>("positions");
             </table>
             <EmptyState v-else :line="shell.account ? 'No open orders in this account.' : 'Orders are unknown until the account is read.'" />
           </template>
-          <EmptyState v-else line="Fill history is not connected to this console yet." />
+          <DecisionStream v-else :fills-only="ledger === 'fills'" />
         </div>
       </PanelHousing>
     </div>

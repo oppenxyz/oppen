@@ -5,6 +5,8 @@ import PanelHousing from "../components/housing/PanelHousing.vue";
 import ReadoutRows from "../components/housing/ReadoutRows.vue";
 import UiButton from "../components/ui/UiButton.vue";
 import { setNetwork, shell, refreshKeychain, type Network } from "../stores/shell";
+import { decimal } from "../lib/display";
+import { operator, storedPolicy, refreshOperator } from "../stores/operator";
 import { motionPaused, motionReduced, setMotionPaused } from "../lib/clock";
 
 const SECTIONS = ["Permissions & limits", "Keys & venues", "Models & API keys", "Local data", "MCP server", "Display"] as const;
@@ -35,14 +37,15 @@ const local = computed(() => [
     <div class="settings__content">
       <PanelHousing inset :label="section" :brackets="['tl']" data-tour="settings">
         <template v-if="section === 'Permissions & limits'">
-          <p class="copy">Risk limits and approval settings are enforced by Rust. This console does not yet read or edit the gateway's active policies.</p>
+          <p class="copy">Risk limits and approval settings are enforced by Rust. These are persisted policy readings; editing requires a live operator connection. Inspect per-agent caps in Agents.</p>
           <ReadoutRows size="md" :rows="[
-            { k: 'Total notional cap · USD', v: 'Not read' },
-            { k: 'Daily loss halt · USD', v: 'Not read' },
-            { k: 'Margin utilization limit · %', v: 'Not read' },
-            { k: 'Running agent limit', v: 'Not read' },
-            { k: 'Human approval setting', v: 'Not read' },
+            { k: 'Account daily loss halt · USD', v: storedPolicy ? (storedPolicy.account_limits.max_daily_loss_usd === null ? 'Unset' : decimal(storedPolicy.account_limits.max_daily_loss_usd)) : 'Not read' },
+            { k: 'Account drawdown halt · USD', v: storedPolicy ? (storedPolicy.account_limits.max_drawdown_usd === null ? 'Unset' : decimal(storedPolicy.account_limits.max_drawdown_usd)) : 'Not read' },
+            { k: 'Stored agent policies', v: storedPolicy ? String(Object.keys(storedPolicy.guardrails).length) : 'Not read' },
           ]" />
+          <p v-if="operator.error || operator.policyError" class="copy" role="status">{{ operator.error ?? operator.policyError }}</p>
+          <p class="copy">{{ operator.policyReadMs ? `Last successful policy read: ${new Date(operator.policyReadMs).toLocaleString()}.` : 'Policy has not been read.' }} {{ operator.policy && (operator.error || operator.policyError) ? 'Showing that saved reading after a failed refresh.' : '' }}</p>
+          <UiButton @click="refreshOperator" :disabled="operator.reading">Refresh stored policy</UiButton>
         </template>
         <template v-else-if="section === 'Keys & venues'">
           <p class="copy">Agent signing keys stay in the OS keychain. The console reads reachability only; private keys never enter the interface.</p>
@@ -63,7 +66,14 @@ const local = computed(() => [
           <EmptyState line="External MCP agents manage their own models and provider credentials. Hosted model loops are planned for v1.5." />
         </template>
         <template v-else-if="section === 'Local data'">
-          <p class="copy">The gateway owns its append-only event ledger. This console has no ledger path configured and does not claim an empty history.</p>
+          <p class="copy">The gateway owns its append-only event ledger. The console reads its existing files without creating or migrating them. Launch both with the same OPPEN_DATA_DIR to connect stored policies and history.</p>
+          <ReadoutRows size="md" :rows="[
+            { k: 'Ledger head', v: operator.ledger ? `#${operator.ledger.head_seq}` : 'Not read' },
+            { k: 'Events in current window', v: operator.ledger ? String(operator.ledger.events.length) : 'Unknown' },
+            { k: 'Last ledger read', v: operator.ledgerReadMs ? new Date(operator.ledgerReadMs).toLocaleString() : 'Never' },
+          ]" />
+          <p v-if="operator.error || operator.ledgerError" class="copy" role="status">{{ operator.error ?? operator.ledgerError }}</p>
+          <UiButton @click="refreshOperator" :disabled="operator.reading">Refresh gateway files</UiButton>
           <p class="copy">Display and network preferences are stored locally. No telemetry is configured.</p>
         </template>
         <template v-else-if="section === 'MCP server'">
@@ -77,7 +87,8 @@ const local = computed(() => [
           <p class="copy">{{ motionReduced ? 'Your system requests reduced motion. Decoration stays still.' : 'Terrain and decorative sampling pause when the window is hidden.' }} Market data, orders and freshness tracking continue.</p>
         </template>
       </PanelHousing>
-      <PanelHousing v-if="section === 'Permissions & limits'" inset label="Kill switch · status not read" data-tour="kill">
+      <PanelHousing v-if="section === 'Permissions & limits'" inset label="Kill switch · stored state" data-tour="kill">
+        <p class="copy">Stored global halt: {{ storedPolicy ? (storedPolicy.kill.global ? 'engaged' : 'not engaged') : 'not read' }}. Agent-specific stored halts: {{ storedPolicy ? Object.keys(storedPolicy.kill.agents).length : 'unknown' }}. A stored state does not prove cancel completion.</p>
         <p class="copy">A halt pauses new orders and cancels resting orders; it does not close positions. The console has no connection to the gateway's halt control yet.</p>
         <p class="copy">Dead-man protection must be verified per container. This interface has no arming or coverage reading.</p>
         <UiButton variant="hazard" disabled>Halt control unavailable</UiButton>

@@ -1,7 +1,10 @@
 <script setup lang="ts">
 import { computed, ref } from "vue";
-import { feedLabel, shell } from "../../stores/shell";
+import { feedLabel, shell, setView } from "../../stores/shell";
 
+import { events, operator } from "../../stores/operator";
+import { eventText, isAgentDecision } from "../../lib/display";
+const lastDecision = computed(() => [...events.value].reverse().find(event => isAgentDecision(event) && eventText(event.payload, "reason")));
 const detailsOpen = ref(false);
 
 const feeds = computed(() => ({
@@ -14,13 +17,10 @@ const feeds = computed(() => ({
 <template>
   <footer class="sb" data-tour="statusbar">
     <span class="sb__k">Last decision</span>
-    <template v-if="shell.lastDecision">
-      <span>{{ shell.lastDecision.time }}</span>
-      <span class="sb__k">{{ shell.lastDecision.agent }}</span>
-      <!-- Agent-authored text. Plain text only. -->
-      <span class="sb__text">{{ shell.lastDecision.text }}</span>
-    </template>
-    <span v-else>—</span>
+    <button v-if="lastDecision" class="sb__text" @click="setView('agents')" :title="`Agent-authored: ${eventText(lastDecision.payload, 'reason')}`">
+      {{ lastDecision.agent_id }} · {{ eventText(lastDecision.payload, 'reason') }}
+    </button>
+    <span v-else>{{ operator.ledger ? 'None in this ledger window' : 'Not read' }}</span>
 
     <span class="sb__spacer" />
 
@@ -37,7 +37,7 @@ const feeds = computed(() => ({
       Feeds ·
       <span class="sb__k" data-tour="feeds">WS·MKT {{ feeds.market }} · WS·USER {{ feeds.user }} · REST {{ feeds.rest }}</span>
     </span>
-    <span>Decision log · not connected</span>
+    <span>Ledger · {{ operator.error || operator.ledgerError ? (operator.ledger ? 'last read' : 'unavailable') : operator.ledger ? `#${operator.ledger.head_seq}` : 'not read' }}</span>
   </footer>
 </template>
 
@@ -66,6 +66,7 @@ const feeds = computed(() => ({
 }
 
 .sb__text {
+  max-width: 35vw;
   overflow: hidden;
   text-overflow: ellipsis;
   text-transform: none;

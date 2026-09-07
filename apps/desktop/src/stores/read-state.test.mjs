@@ -1,6 +1,7 @@
 import { describe, it, expect, mock } from 'bun:test';
 import * as bridge from '../lib/bridge';
 let accountRead;
+let operatorRead;
 const pendingSnapshots = new Map();
 const account = {
   contract_version: 1, network: 'testnet', address: '0x0000000000000000000000000000000000000001',
@@ -9,13 +10,37 @@ const account = {
   positions: [], orders: [],
 };
 mock.module('../lib/bridge', () => ({
-  ...bridge, inTauri: () => true, fetchAccountState: () => accountRead(), watchMarket: async () => {},
+  ...bridge, inTauri: () => true, fetchOperatorState: () => operatorRead(), fetchAccountState: () => accountRead(), watchMarket: async () => {},
   fetchMarketSnapshot: (_network, symbol) => new Promise(resolve => pendingSnapshots.set(symbol, resolve)),
   fetchChartSeries: async (_network, symbol, interval) => ({ symbol, interval, interval_ms: 3600000, price_decimals: 2, closed: [] }),
 }));
-const { shell, refreshAccount } = await import('./shell');
+const { operator, refreshOperator, recordedAgents } = await import('./operator');
+const { shell, refreshAccount, setNetwork } = await import('./shell');
 const { market, select, refreshSnapshot, applyFeed } = await import('./market');
 const snapshot = (symbol, at) => ({ symbol, as_of_ms: at, bids: [], asks: [], book: { depth: [] }, funding: {}, vol: {} });
+it('persists an explicit network choice before reload and leaves the session intact if saving fails', () => {
+  const previousWindow = globalThis.window;
+  const previousStorage = globalThis.localStorage;
+  const calls = [];
+  try {
+    globalThis.window = { location: { reload: () => calls.push('reload') } };
+    globalThis.localStorage = { setItem: (key, value) => calls.push([key, value]) };
+    expect(shell.network).toBe('testnet');
+    setNetwork('testnet');
+    expect(calls).toEqual([]);
+    setNetwork('mainnet');
+    expect(calls).toEqual([['oppen.network', 'mainnet'], 'reload']);
+    expect(shell.network).toBe('testnet'); // The new session owns the new network.
+    calls.length = 0;
+    globalThis.localStorage.setItem = () => { throw new Error('storage unavailable'); };
+    expect(() => setNetwork('mainnet')).toThrow('storage unavailable');
+    expect(calls).toEqual([]);
+    expect(shell.network).toBe('testnet');
+  } finally {
+    globalThis.window = previousWindow;
+    globalThis.localStorage = previousStorage;
+  }
+});
 async function untilSnapshot(symbol) {
   for (let i = 0; i < 20 && !pendingSnapshots.has(symbol); i++) await Promise.resolve();
   expect(pendingSnapshots.has(symbol)).toBe(true);
@@ -63,5 +88,32 @@ describe('market selection and derived freshness', () => {
     pendingSnapshots.get('ETH')(snapshot('ETH', 4000)); await reading;
     expect(market.chart).toBe(chart);
     expect(market.featuresReadMs).toBe(4000);
+  });
+});
+
+
+describe('operator source reads', () => {
+  it('keeps independent last-good sources and never turns a failed read into an empty ledger', async () => {
+    operatorRead = async () => { throw { kind: 'not_configured', detail: 'Choose gateway data.' }; };
+    await refreshOperator();
+    expect(operator.ledger).toBe(null);
+    expect(operator.policy).toBe(null);
+    const ledger = { events: [{ seq: 1, ts_ms: 1000, kind: 'refusal', agent_id: 'alpha', payload: { reason: '<b>claim</b>' } }], head_seq: 1, next_cursor: 1, resync_required: false };
+    const policy = { guardrails: { alpha: {} }, vaults: {}, account_limits: {}, kill: { global: null, agents: {} } };
+    operatorRead = async () => ({ network: 'testnet', ledger: { status: 'ready', value: ledger }, policy: { status: 'ready', value: policy } });
+    await refreshOperator();
+    expect(recordedAgents.value).toEqual(['alpha']);
+    expect(operator.ledger.events[0].payload.reason).toBe('<b>claim</b>');
+    const policyRead = operator.policyReadMs;
+    operatorRead = async () => ({ network: 'testnet', ledger: { status: 'ready', value: { ...ledger, head_seq: 2 } }, policy: { status: 'unavailable', detail: 'Policy file unavailable.' } });
+    await refreshOperator();
+    expect(operator.ledger.head_seq).toBe(2);
+    expect(operator.policy.guardrails).toEqual({ alpha: {} });
+    expect(operator.policyReadMs).toBe(policyRead);
+    expect(operator.policyError).toBe('Policy file unavailable.');
+    operatorRead = async () => { throw { kind: 'local_state', detail: 'Reader failed.' }; };
+    await refreshOperator();
+    expect(operator.ledger.head_seq).toBe(2);
+    expect(operator.error).toBe('Reader failed.');
   });
 });

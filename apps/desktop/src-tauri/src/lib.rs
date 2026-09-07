@@ -29,16 +29,36 @@ enum ConsoleError {
     NotConfigured(String),
     /// The venue did not answer.
     Venue(String),
+    /// A local operator data source failed independently of the venue feed.
+    LocalState(String),
 }
 
 impl std::fmt::Display for ConsoleError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ConsoleError::NotConfigured(detail) | ConsoleError::Venue(detail) => {
+            ConsoleError::NotConfigured(detail)
+            | ConsoleError::Venue(detail)
+            | ConsoleError::LocalState(detail) => {
                 write!(f, "{detail}")
             }
         }
     }
+}
+
+/// The gateway's existing ledger and persisted policy, never a second store.
+#[tauri::command]
+async fn operator_state(
+    network: String,
+) -> Result<oppen_core::operator::OperatorRead, ConsoleError> {
+    let dir = std::env::var_os("OPPEN_DATA_DIR").ok_or_else(|| ConsoleError::NotConfigured(
+        "Gateway data is not configured. Launch the console with OPPEN_DATA_DIR pointing to the gateway's data directory.".into()
+    ))?;
+    let network = network_of(&network);
+    tauri::async_runtime::spawn_blocking(move || {
+        oppen_core::operator::read(std::path::Path::new(&dir), network)
+    })
+    .await
+    .map_err(|error| ConsoleError::LocalState(error.to_string()))
 }
 
 /// The configured account.
@@ -333,6 +353,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             account_state,
+            operator_state,
             keychain_status,
             markets,
             market_snapshot,
