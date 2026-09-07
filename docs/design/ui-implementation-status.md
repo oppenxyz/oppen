@@ -3,7 +3,7 @@
 Goal: complete the recommendations in [the review](ui-review-2026-09-07.md).
 Branch: `design/app-ui-refinement`, isolated worktree `oppen-app-ui` from `28fbf36`.
 
-## Implemented, verification in progress
+## Implemented
 
 - Chart host width includes dynamic price gutter; font-load remeasurement; consistent chart glyph font; accessible chart summary.
 - Exact decimal display formatting, null handling, compact feature units, original values in tooltips.
@@ -24,7 +24,7 @@ Branch: `design/app-ui-refinement`, isolated worktree `oppen-app-ui` from `28fbf
 ## Verification completed
 
 - Desktop TypeScript/Vite build passes.
-- 85 Bun tests pass, including chart width, exact rounding, account failures, out-of-order market snapshots and independent derived-feature freshness and book-level deduplication. Network-save failure preserves the existing session; decorative pause/reduced-motion/visibility leave independent data timers running; operator actions are not attributed to agents.
+- 88 Bun tests pass, including chart width, exact rounding, account failures, out-of-order market snapshots and independent derived-feature freshness and book-level deduplication. Network-save failure preserves the existing session; decorative pause/reduced-motion/visibility leave independent data timers running; operator actions are not attributed to agents.
 - Core suite after merging current main: 508 passed, 5 ignored; 10 desktop Rust tests passed, including disconnect/reconcile and the new read-only operator tests.
 - `cargo clippy -p oppen-desktop -p oppen-core --all-targets -- -D warnings` passes.
 - Browser checks at 1280×720: Setup scroll layout, unclipped shell, readable walkthrough spotlight, Enter advances exactly once, Tab cycles within modal, Escape restores Setup focus.
@@ -48,16 +48,32 @@ Branch: `design/app-ui-refinement`, isolated worktree `oppen-app-ui` from `28fbf
 - A fixed QA address (`0x111…111`, not an operator-selected account) returned a public testnet balance and no positions/orders. Verified successful account values and genuine zero position counts, distinct from the previously inspected unknown account state. No key, order, cancellation, or funding action was involved; the QA session was closed after inspection. “Account has equity” now describes only the observed account balance, without implying a paired container or trading permission.
 - Empty recorded-agent views now distinguish an actual initial read with the sweep pattern and busy text. Once read, empty apertures remain static; unavailable sources retain explicit text.
 
-## Remaining work
+## Populated and enlarged-text verification
 
-- Finish the remaining populated-position/order and larger-text checks; verify the last initial-read visual cue and final default-size bundle. Minimum-size, live chart/book, unknown/successful-empty account, and decorative-pause verification is recorded above.
-- Persisted-network behavior, confirmation keyboard behavior and walkthrough keyboard behavior are verified. Populated position/order layout still needs direct visual evidence.
-- The gateway's in-memory pairing registry and live policy/approval/kill/dead-man controls are not yet connected to the console. Existing ledger and persisted policy reads are now implemented. Honest unavailable states and the current development setup path are implemented, but they do **not** satisfy the recommendation to wire those operator workflows. Continue with existing core/gateway read models, preserving the signing and operator-only boundaries.
-- Review all changed code, remove any newly orphaned styling, document actual verification evidence and commit coherent milestones. Do not mark the overall goal complete while the workflow recommendation remains open.
+- Separate development-only preview uses the real Vue views/stores with twelve local positions and orders, long market names, small prices and full decimal inputs. Run `bun run dev -- --config vite.review.config.ts` in `apps/desktop`, then open `http://127.0.0.1:1431/review.html`. An iframe supplies actual 1280×720 and 1440×900 CSS viewports. The toolbar labels every scenario as a fixture without a venue/execution connection.
+- Inspected populated Portfolio at 1280×720 with normal and 150% working text; table overflow remains scrollable. The larger text exposed clipped gauge endpoints, now corrected by measuring glyph width and reducing cells to the available panel width.
+- Forced an account-read failure after a successful populated read: twelve positions and balances remain, with the last-success timestamp, complete wrapped diagnostic and Retry action. Inspected populated Trade positions and orders at 1440×900.
+- Inspected Settings and Setup at 1280×720 with 150% working text. Sections stay separated and the checklist scrolls independently of the complete framed terrain.
+- Verified the initial recorded-agent read displays its busy text and ASCII read pattern; completed empty reads use the static state.
+- Portfolio aggregate PnL and gross exposure now sum decimal strings exactly before rounding. Regression tests cover large balances beyond the safe integer range, sub-cent accumulation, signed PnL, absolute exposure and invalid inputs.
+- Final isolated native bundle rebuilt and launched successfully: public testnet chart, full price axis, book/gauge endpoints, recorded fixture activity and unknown account state render correctly.
+- Production TypeScript/Vite build and separate fixture typecheck pass; 88 frontend tests pass. The fixture config deliberately rejects builds, and the normal production output contains no fixture transport/entry markers.
 
-## Scope clarification pending
+## Review acceptance and scope
 
-The approved review describes operator workflows “using existing read models,” says acceptance depends on backend capabilities, and uses “once wired” for live agent controls. A clarification was sent asking whether completion includes building the runtime/pairing/approval/kill lifecycle or completing the UI pass against available capabilities. No answer was received during this verification pass. The goal remains active; no runtime lifecycle was invented or claimed complete.
+| Review recommendation | Result |
+|---|---|
+| 1. Complete chart housing | Dynamic gutter/font measurement, geometry tests, native live chart proof |
+| 2. Display precision | Exact source-string formatting and totals, missing values, definitions and book headings |
+| 3. Unknown/empty/stale/unavailable | Independent read state, last-good retention, timestamps/errors and actual recorded activity |
+| 4. Capability language/navigation | Factual status, explicit unavailable actions, working settings and persisted network confirmation |
+| 5. Compact window/walkthrough | Both supported sizes, enlarged text, bounded scrolling, spotlight and native keyboard proof |
+| Operator surfaces | Existing ledger/policy data connected read-only; actionable External MCP setup; current controls labelled by actual capability |
+| Brand/ASCII/motion | Terrain arrival, framed wordmark, quantitative gauges, state-specific apertures, chart semantics preserved, decorative pause independent of feeds |
+
+The review explicitly conditions operator workflows on existing backend capabilities and says “once wired” for live controls. The UI implementation is accepted against that scope. A clarification about expanding into a new runtime lifecycle received no answer; this is not treated as authorization for such expansion. Live pairing, approval execution and kill/cancel commands remain unavailable in the console, with explicit explanations. The earlier remaining-work wording incorrectly elevated those backend capabilities into unconditional UI acceptance requirements; this table corrects that interpretation.
+
+The branch integrates main through `2ea98ab`. Main subsequently advanced to `4966e50` (persistent pairing authority); that independent backend change is not removed or overwritten by this branch. Reconcile it at merge time. No app merge, push or production release is part of this UI review handoff.
 
 ## Build recovery
 

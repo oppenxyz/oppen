@@ -1,4 +1,4 @@
-import { decimal, eventText } from "./display";
+import { decimal, eventText, sumDecimals } from "./display";
 declare const describe: (name: string, body: () => void) => void;
 declare const it: (name: string, body: () => void) => void;
 declare const expect: (value: unknown) => { toBe(expected: unknown): void };
@@ -30,4 +30,20 @@ it('does not label an operator action as an agent decision', async () => {
   expect(isAgentDecision({ kind: 'operator_action', agent_id: 'alpha' })).toBe(false);
   expect(isAgentDecision({ kind: 'refusal', agent_id: 'alpha' })).toBe(true);
   expect(isAgentDecision({ kind: 'refusal', agent_id: null })).toBe(false);
+});
+
+describe("portfolio decimal totals", () => {
+  it("keeps cents beyond the safe integer range and rounds only the total", () => {
+    expect(sumDecimals(["9007199254740993.99", "0.02"])).toBe("9007199254740994.01");
+    expect(decimal(sumDecimals(["0.004", "0.004"]))).toBe("0.01");
+  });
+  it("supports signed PnL and absolute gross exposure", () => {
+    expect(sumDecimals(["24.56789", "-12.345"])).toBe("12.22289");
+    expect(sumDecimals(["-20.1", "10.01"], true)).toBe("30.11");
+    expect(sumDecimals(["-2", "0.1"])).toBe("-1.9");
+  });
+  it("distinguishes invalid values from an empty total", () => {
+    expect(sumDecimals([])).toBe("0");
+    expect(sumDecimals(["1", "NaN"])).toBe(null);
+  });
 });

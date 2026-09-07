@@ -5,7 +5,7 @@ import AccountPositions from "../components/AccountPositions.vue";
 import AccountNotice from "../components/AccountNotice.vue";
 import EmptyState from "../components/housing/EmptyState.vue";
 import PanelHousing from "../components/housing/PanelHousing.vue";
-import { decimal } from "../lib/display";
+import { decimal, sumDecimals } from "../lib/display";
 import { shell } from "../stores/shell";
 
 const account = computed(() => shell.account);
@@ -36,17 +36,12 @@ const marginFraction = computed(() => {
   return eq > 0 && Number.isFinite(used) ? used / eq : null;
 });
 
-const exposure = computed(() => {
-  const total = positions.value.reduce((sum, p) => sum + Math.abs(Number(p.position_value_usd) || 0), 0);
-  return account.value ? usd(String(total)) : dash;
-});
-
-const totalExposure = computed(() => positions.value.reduce((sum, p) => sum + Math.abs(Number(p.position_value_usd)), 0));
-const unrealised = computed(() => {
-  if (!account.value) return dash;
-  const total = positions.value.reduce((sum, p) => sum + (Number(p.unrealized_pnl_usd) || 0), 0);
-  return usd(String(total));
-});
+const exactExposure = computed(() => sumDecimals(positions.value.map(p => p.position_value_usd), true));
+const exposure = computed(() => account.value ? usd(exactExposure.value) : dash);
+// Approximation is only used for the visual fill fraction, never monetary totals.
+const totalExposure = computed(() => Number(exactExposure.value));
+const unrealised = computed(() => account.value
+  ? usd(sumDecimals(positions.value.map(p => p.unrealized_pnl_usd))) : dash);
 
 /** The position closest to liquidation, which is the one that matters. */
 const nearestLiq = computed(() => {
