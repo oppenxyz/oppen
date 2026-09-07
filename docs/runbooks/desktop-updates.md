@@ -59,7 +59,7 @@ approval. Never remove quarantine recursively from unrelated files.
   and reinstall a verified release bundle if necessary. Tauri handles bundle
   replacement; this is not a database rollback mechanism.
 - Roll forward with a corrective main commit. Do not downgrade across ledger
-  reader barriers (currently V5). Restoring an older app does not downgrade data.
+  reader barriers (currently V6). Restoring an older app does not downgrade data.
 
 ## Validation
 

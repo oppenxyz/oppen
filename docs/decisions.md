@@ -761,3 +761,9 @@ the depth measurement problem in §14, and whether the sub-account owner rule
 | UP2 | Use the official `tauri-plugin-updater` in Rust; check/download automatically, install only on explicit operator restart. | Reuse signature verification and bundle installation instead of a custom installer. Plugin is a necessary dependency; no JavaScript updater API or credential exposure. Binary updates do not touch keychain, ledger or preferences; no downgrade across reader barriers. |
 | UP3 | First private channel reuses the owner's existing GitHub CLI login, explicitly authorized. | No embedded repository token and no new OAuth service. Read credentials only in Rust, accept release asset URLs only from oppenxyz/oppen, and expose static errors to the UI. Homebrew GitHub CLI is required on this personal Mac. |
 | UP4 | Personal macOS builds use ad-hoc Apple code signing plus mandatory Tauri update signatures. | Owner has no Apple Developer account. These builds are not Apple-notarized; public distribution requires a separate Developer ID/notarization setup. Keep the installed identifier `xyz.oppen.desktop` so preferences survive. |
+
+### Numeric change cue
+
+| ID | Decision | Rationale |
+|---|---|---|
+| UI6 | Yellow only on changed digits in live numeric readouts; brief return to underlying ink. | Owner explicitly requested digit-level change highlighting as a general UX guide. The [design guide](design/README.md#live-numeric-changes) specifies comparison, timing and initial-read behavior. U3 candle geometry/directional colors remain intact. Runtime rollout is separate from recording this rule. |
