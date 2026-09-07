@@ -2,6 +2,7 @@
 import { computed, onMounted, onUnmounted, type Component } from "vue";
 import AppHeader from "./components/shell/AppHeader.vue";
 import AppStatusBar from "./components/shell/AppStatusBar.vue";
+import TourSpotlight from "./components/tour/TourSpotlight.vue";
 import { shell, startAccountPolling, stopAccountPolling, type View } from "./stores/shell";
 import AgentsView from "./views/AgentsView.vue";
 import BuilderView from "./views/BuilderView.vue";
@@ -32,6 +33,7 @@ onUnmounted(() => stopAccountPolling());
       <component :is="current" />
     </main>
     <AppStatusBar />
+    <TourSpotlight />
   </div>
 </template>
 

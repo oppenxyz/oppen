@@ -14,7 +14,7 @@ const RUNTIME: readonly ReadoutRow[] = [
 
 <template>
   <div class="agents">
-    <PanelHousing label="Agents · 0 · local runtime">
+    <PanelHousing label="Agents · 0 · local runtime" data-tour="agents">
       <template #meta>
         <UiButton size="sm" @click="setView('builder')">+ New</UiButton>
       </template>

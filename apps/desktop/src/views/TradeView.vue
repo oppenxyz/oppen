@@ -60,7 +60,7 @@ const ledgerEmpty = computed(() => LEDGER_TABS.find((tab) => tab.key === ledger.
         </div>
       </PanelHousing>
 
-      <PanelHousing :brackets="['tl', 'br']">
+      <PanelHousing :brackets="['tl', 'br']" data-tour="chart">
         <template #label>
           <span v-for="tf in TIMEFRAMES" :key="tf" class="chart__tf">{{ tf }}</span>
         </template>
@@ -68,7 +68,7 @@ const ledgerEmpty = computed(() => LEDGER_TABS.find((tab) => tab.key === ledger.
         <EmptyState matrix mode="sweep" size="md" line="No market feed." />
       </PanelHousing>
 
-      <PanelHousing>
+      <PanelHousing data-tour="positions">
         <template #label>
           <button
             v-for="tab in LEDGER_TABS"
@@ -95,7 +95,7 @@ const ledgerEmpty = computed(() => LEDGER_TABS.find((tab) => tab.key === ledger.
       <PanelHousing inset label="Features" meta="get_features" :brackets="['tr']">
         <ReadoutRows :rows="FEATURES" />
       </PanelHousing>
-      <PanelHousing inset label="Manual order" meta="Overrides policy">
+      <PanelHousing inset label="Manual order" meta="Overrides policy" data-tour="ticket">
         <EmptyState line="Ticket opens with a venue connection." />
       </PanelHousing>
     </div>
