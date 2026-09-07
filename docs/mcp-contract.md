@@ -23,6 +23,33 @@ A token is not an anonymous key to the gateway: it names **one agent bound to on
 
 Every tool call resolves its identity from the token presented (C10), so one gateway serves every paired agent and each acts as itself: its own guardrails, its own container, its own events. Revoking a pairing closes its live sessions and leaves every other pairing untouched.
 
+Pairing identity and revocation persist as authenticated operator records in the
+network's existing audit chain (ES16). IDs carry network and issuance sequence;
+only a SHA3-256 digest of the random bearer is retained. A bearer is revealed
+only after issuance commits and its anchor is published. Revoked bindings remain
+available for resting-order cancellation after restart. Pairing lifecycle rows
+are operator-only and are not included in an agent's scoped event view.
+
+One live owner holds the durable token cache. Ownership remains held by actual
+tool tasks as well as HTTP sessions, and a network-mismatched store cannot serve
+the gateway. Missing task authority fails closed. A revocation interrupts
+asynchronous tool work but cannot retract already-admitted signing or exchange
+work; an interrupted submission must be reconciled rather than blindly retried.
+
+If a pairing mutation fails or panics, every session in that store is closed and
+new authentication is denied until verified reopen. This is broader than a
+successful single-pairing revoke. Failed durable publication is reported as an
+error, not a promise that revocation survived a crash. Missing authentication
+keys, invalid MACs, corrupt or redacted required records never fall back to an
+empty credential store. Key provisioning, registry validation and pilot
+activation remain separate operator steps.
+
+Authentication fails closed while a durable pairing mutation holds the store
+lock. Cancellation supervision retries on its next interval rather than
+blocking the server's async workers or reporting delivery during contention.
+Operator commands must run synchronous pairing persistence off async workers
+and await its result; abandoning a waiter does not roll back a durable mutation.
+
 ## The result envelope
 
 Every acting tool answers with one JSON object. `contract_version` first, then `status`, then the fields that status implies.

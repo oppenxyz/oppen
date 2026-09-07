@@ -16,9 +16,12 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use oppen_core::guardrail::AgentId;
-use oppen_hl::Address;
+pub use oppen_core::ledger::{PairingBinding as Binding, PairingId};
+use oppen_core::ledger::{PairingError, PairingJournal};
+use oppen_hl::Network;
 
 use sha3::{Digest, Sha3_256};
 use subtle::ConstantTimeEq;
@@ -28,32 +31,6 @@ use zeroize::Zeroizing;
 /// Bytes of entropy in a pairing token. 256 bits: the token is a bearer
 /// credential with nothing but the OS accept queue in front of it.
 const TOKEN_BYTES: usize = 32;
-
-/// The stable public name of a pairing. Appears in the ledger and the
-/// approvals UI; safe to log, unlike the token itself.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct PairingId(u64);
-
-impl fmt::Display for PairingId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "pairing-{}", self.0)
-    }
-}
-
-/// What a pairing token names (`docs/spec.md` item 15).
-///
-/// A token is not an anonymous key to the gateway: it names one agent, bound
-/// to one venue account (D1 as revised — one container per agent). Every tool
-/// call resolves this from the token presented, so two paired agents on the
-/// same gateway act as themselves, under their own guardrails, and see only
-/// their own events (`docs/decisions.md` C6). Assigning the guardrails is the
-/// operator's half of the approve dialog and lives on the engine; this is the
-/// identity those guardrails are keyed by.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Binding {
-    pub agent: AgentId,
-    pub account: Address,
-}
 
 /// A freshly minted token, returned once at pairing time and never recoverable
 /// afterwards — the store keeps only its digest.
@@ -107,6 +84,16 @@ pub enum AuthError {
 #[error("OS entropy unavailable, refusing to mint a pairing token: {0}")]
 pub struct EntropyUnavailable(String);
 
+#[derive(Debug, thiserror::Error)]
+pub enum TokenStoreError {
+    #[error(transparent)]
+    Entropy(#[from] EntropyUnavailable),
+    #[error(transparent)]
+    Persistence(#[from] PairingError),
+    #[error("pairing authority is closed or its clock is invalid; reopen required")]
+    Closed,
+}
+
 struct Record {
     digest: [u8; 32],
     /// Flips to `true` on revoke. Every live session for this pairing holds a
@@ -120,15 +107,47 @@ struct Record {
 
 /// The set of pairings the gateway will accept, and the authority that revokes
 /// them.
-#[derive(Default)]
 pub struct TokenStore {
     records: HashMap<PairingId, Record>,
-    next_id: u64,
+    journal: Arc<PairingJournal>,
+    closed: bool,
+    #[cfg(test)]
+    before_publish: Option<fn()>,
 }
 
 impl TokenStore {
-    pub fn new() -> Self {
-        Self::default()
+    /// Consume the exclusive durable owner. Cached records are valid under
+    /// that lease; this is not detection of out-of-band database tampering.
+    ///
+    /// Performs synchronous disk I/O. Async operator callers must run this
+    /// off async worker threads and await completion before publishing the store.
+    pub fn open(journal: PairingJournal) -> Result<Self, PairingError> {
+        let records = journal
+            .records()?
+            .into_iter()
+            .map(|record| {
+                let (revoked_tx, _) = watch::channel(record.revoked_at_ms.is_some());
+                (
+                    record.id,
+                    Record {
+                        digest: record.digest,
+                        revoked_tx,
+                        binding: record.binding,
+                    },
+                )
+            })
+            .collect();
+        Ok(Self {
+            records,
+            journal: Arc::new(journal),
+            closed: false,
+            #[cfg(test)]
+            before_publish: None,
+        })
+    }
+
+    pub fn network(&self) -> Network {
+        self.journal.network()
     }
 
     /// Owned bindings for pause enforcement, including revoked pairings whose
@@ -148,24 +167,30 @@ impl TokenStore {
     /// container, and assigns the guardrails on the engine before the token
     /// exists. There is no unbound token — default-deny means an agent oppen
     /// has not been told about has no credential to present.
-    pub fn issue(&mut self, binding: Binding) -> Result<IssuedToken, EntropyUnavailable> {
+    ///
+    /// Performs synchronous disk I/O. Async operator callers must run this
+    /// off async worker threads and await completion before publishing a result.
+    /// Canceling the awaiting future does not cancel or roll back durable issuance.
+    pub fn issue(&mut self, binding: Binding) -> Result<IssuedToken, TokenStoreError> {
+        let mut mutation = Mutation::begin(self)?;
         let mut raw = Zeroizing::new([0u8; TOKEN_BYTES]);
         getrandom::getrandom(raw.as_mut()).map_err(|e| EntropyUnavailable(e.to_string()))?;
         let secret = Zeroizing::new(hex_of(raw.as_ref()));
-
-        self.next_id += 1;
-        let id = PairingId(self.next_id);
-
+        let digest = digest_of(secret.as_bytes());
+        let persisted = mutation.store.journal.issue(binding, digest, now_ms()?)?;
+        #[cfg(test)]
+        mutation.before_publish();
+        let id = persisted.id;
         let (revoked_tx, _) = watch::channel(false);
-        self.records.insert(
+        mutation.store.records.insert(
             id,
             Record {
-                digest: digest_of(secret.as_bytes()),
+                digest: persisted.digest,
                 revoked_tx,
-                binding,
+                binding: persisted.binding,
             },
         );
-
+        mutation.complete = true;
         Ok(IssuedToken { id, secret })
     }
 
@@ -176,6 +201,9 @@ impl TokenStore {
     /// would make the response time depend on the matching pairing's position
     /// in the map.
     pub fn authenticate(&self, presented: &str) -> Result<Session, AuthError> {
+        if self.closed {
+            return Err(AuthError::Unauthenticated);
+        }
         let candidate = digest_of(presented.as_bytes());
 
         let mut matched: Option<(PairingId, &Record)> = None;
@@ -192,7 +220,12 @@ impl TokenStore {
         Ok(Session {
             id,
             binding: record.binding.clone(),
-            revoked: record.revoked_tx.subscribe(),
+            authority: SessionAuthority {
+                id,
+                binding: record.binding.clone(),
+                revoked: record.revoked_tx.subscribe(),
+                _journal: self.journal.clone(),
+            },
         })
     }
 
@@ -207,15 +240,73 @@ impl TokenStore {
     /// so the console can say which it was — that is
     /// [`AuthError::Revoked`], and removing the record would make the variant
     /// unconstructible.
-    pub fn revoke(&mut self, id: PairingId) -> bool {
-        match self.records.get(&id) {
-            Some(record) => {
+    ///
+    /// Performs synchronous disk I/O. Async operator callers must run this
+    /// off async worker threads and await completion before publishing a result.
+    /// Canceling the awaiting future does not cancel or roll back durable revocation.
+    pub fn revoke(&mut self, id: PairingId) -> Result<bool, TokenStoreError> {
+        let mut mutation = Mutation::begin(self)?;
+        let changed = mutation.store.journal.revoke(id, now_ms()?)?;
+        #[cfg(test)]
+        mutation.before_publish();
+        if changed {
+            if let Some(record) = mutation.store.records.get(&id) {
                 // `send_replace`, not `send`: `send` returns `Err` and leaves
                 // the value untouched when no receiver is alive, so a pairing
                 // with no session open at this instant would stay live.
-                !record.revoked_tx.send_replace(true)
+                record.revoked_tx.send_replace(true);
+            } else {
+                return Err(TokenStoreError::Closed);
             }
-            None => false,
+        }
+        mutation.complete = true;
+        Ok(changed)
+    }
+}
+
+impl fmt::Debug for TokenStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TokenStore")
+            .field("network", &self.network())
+            .field("records", &self.records.len())
+            .field("closed", &self.closed)
+            .finish()
+    }
+}
+
+/// Errors and unwinding between durable commit and publication revoke all
+/// current in-memory authority. Only a verified reopen may recover it.
+struct Mutation<'a> {
+    store: &'a mut TokenStore,
+    complete: bool,
+}
+
+impl<'a> Mutation<'a> {
+    fn begin(store: &'a mut TokenStore) -> Result<Self, TokenStoreError> {
+        if store.closed {
+            return Err(TokenStoreError::Closed);
+        }
+        Ok(Self {
+            store,
+            complete: false,
+        })
+    }
+
+    #[cfg(test)]
+    fn before_publish(&mut self) {
+        if let Some(hook) = self.store.before_publish.take() {
+            hook();
+        }
+    }
+}
+
+impl Drop for Mutation<'_> {
+    fn drop(&mut self) {
+        if !self.complete {
+            self.store.closed = true;
+            for record in self.store.records.values() {
+                record.revoked_tx.send_replace(true);
+            }
         }
     }
 }
@@ -226,14 +317,49 @@ pub struct Session {
     pub id: PairingId,
     /// Who the presented token names. Every tool acts as this agent.
     pub binding: Binding,
-    revoked: watch::Receiver<bool>,
+    authority: SessionAuthority,
 }
 
 impl Session {
+    pub(crate) fn authority(&self) -> SessionAuthority {
+        self.authority.clone()
+    }
+
     /// Resolves when the pairing is revoked. A streaming handler selects on
     /// this so revocation closes the connection instead of waiting for the
     /// agent's next request.
     pub async fn closed(&mut self) {
+        self.authority.closed().await;
+    }
+}
+
+/// A live task retains the journal's exclusive lease, never its mutators.
+#[derive(Clone)]
+pub(crate) struct SessionAuthority {
+    pub(crate) id: PairingId,
+    binding: Binding,
+    revoked: watch::Receiver<bool>,
+    _journal: Arc<PairingJournal>,
+}
+
+impl fmt::Debug for SessionAuthority {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SessionAuthority")
+            .field("id", &self.id)
+            .field("binding", &self.binding)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SessionAuthority {
+    pub(crate) fn binding(&self) -> &Binding {
+        &self.binding
+    }
+
+    pub(crate) async fn closed(&mut self) {
+        if *self.revoked.borrow() {
+            return;
+        }
         // `changed()` errors only once every sender is dropped, which happens
         // when the store drops the record — also a reason to close.
         while self.revoked.changed().await.is_ok() {
@@ -242,6 +368,13 @@ impl Session {
             }
         }
     }
+}
+
+fn now_ms() -> Result<u64, TokenStoreError> {
+    let elapsed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| TokenStoreError::Closed)?;
+    u64::try_from(elapsed.as_millis()).map_err(|_| TokenStoreError::Closed)
 }
 
 fn digest_of(bytes: &[u8]) -> [u8; 32] {
@@ -262,6 +395,271 @@ fn hex_of(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use oppen_core::guardrail::AgentId;
+    use oppen_core::keys::HmacKey;
+    use oppen_core::ledger::Ledger;
+
+    fn fixture() -> (tempfile::TempDir, TokenStore) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = reopen(dir.path(), Network::Testnet);
+        (dir, store)
+    }
+
+    #[test]
+    fn authentication_and_revocation_survive_physical_reopen() {
+        let (dir, mut store) = fixture();
+        let issued = store.issue(binding("alpha")).unwrap();
+        let id = issued.id;
+        assert_eq!(store.network(), Network::Testnet);
+        assert_eq!(id.network, Network::Testnet);
+        assert!(id.issued_seq > 0);
+        drop(store);
+
+        let mut store = reopen(dir.path(), Network::Testnet);
+        let session = store.authenticate(issued.reveal()).unwrap();
+        assert_eq!(session.id, id);
+        assert_eq!(session.binding, binding("alpha"));
+        drop(session);
+        assert!(store.revoke(id).unwrap());
+        assert!(!store.revoke(id).unwrap());
+        drop(store);
+
+        let store = reopen(dir.path(), Network::Testnet);
+        assert_eq!(
+            store.authenticate(issued.reveal()).err(),
+            Some(AuthError::Revoked)
+        );
+        assert_eq!(store.bindings(), [binding("alpha")]);
+    }
+
+    #[test]
+    fn durable_ids_and_authority_are_network_scoped() {
+        for network in [Network::Testnet, Network::Mainnet] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut store = reopen(dir.path(), network);
+            let issued = store.issue(binding("alpha")).unwrap();
+            assert_eq!(store.network(), network);
+            assert_eq!(issued.id.network, network);
+            drop(store);
+            assert!(
+                reopen(dir.path(), network)
+                    .authenticate(issued.reveal())
+                    .is_ok()
+            );
+        }
+    }
+
+    fn owner_is_locked(path: &std::path::Path) -> bool {
+        let ledger = Arc::new(Ledger::open_at(&path.join("ledger.db"), Network::Testnet).unwrap());
+        PairingJournal::open(ledger, Arc::new(HmacKey::from_bytes([42; 32]))).is_err()
+    }
+
+    #[tokio::test]
+    async fn session_and_task_authority_hold_the_lease_after_store_drop() {
+        let (dir, mut store) = fixture();
+        let issued = store.issue(binding("alpha")).unwrap();
+        let mut session = store.authenticate(issued.reveal()).unwrap();
+        let mut task = session.authority();
+        assert_eq!(task.id, issued.id);
+        assert_eq!(task.binding(), &binding("alpha"));
+        drop(store);
+        tokio::time::timeout(std::time::Duration::from_millis(50), session.closed())
+            .await
+            .unwrap();
+        assert!(owner_is_locked(dir.path()), "Session still owns the lease");
+        drop(session);
+        tokio::time::timeout(std::time::Duration::from_millis(50), task.closed())
+            .await
+            .unwrap();
+        assert!(
+            owner_is_locked(dir.path()),
+            "actual task still owns the lease"
+        );
+        drop(task);
+        let store = reopen(dir.path(), Network::Testnet);
+        assert!(
+            store.authenticate(issued.reveal()).is_ok(),
+            "store drop is not durable revocation"
+        );
+    }
+
+    #[tokio::test]
+    async fn authority_cloned_after_revocation_is_already_closed() {
+        let (_dir, mut store) = fixture();
+        let issued = store.issue(binding("alpha")).unwrap();
+        let session = store.authenticate(issued.reveal()).unwrap();
+        store.revoke(issued.id).unwrap();
+        let mut task = session.authority();
+        tokio::time::timeout(std::time::Duration::from_millis(50), task.closed())
+            .await
+            .unwrap();
+        // Polling a second time must not wait for a new watch version.
+        tokio::time::timeout(std::time::Duration::from_millis(50), task.closed())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn persistence_io_failure_closes_all_sessions_and_requires_reopen() {
+        for revoke in [false, true] {
+            let (dir, mut store) = fixture();
+            let alpha = store.issue(binding("alpha")).unwrap();
+            let beta = store.issue(binding("beta")).unwrap();
+            let mut a = store.authenticate(alpha.reveal()).unwrap();
+            let mut b = store.authenticate(beta.reveal()).unwrap();
+            // A directory where the coordination file must be makes the next
+            // ledger mutation fail with real I/O, before watch publication.
+            let lock = dir.path().join("ledger.db.lock");
+            std::fs::remove_file(&lock).unwrap();
+            std::fs::create_dir(&lock).unwrap();
+            let result = if revoke {
+                store.revoke(alpha.id).map(|_| ())
+            } else {
+                store.issue(binding("gamma")).map(drop)
+            };
+            assert!(matches!(result, Err(TokenStoreError::Persistence(_))));
+            assert!(store.authenticate(alpha.reveal()).is_err());
+            assert!(store.authenticate(beta.reveal()).is_err());
+            assert!(matches!(
+                store.issue(binding("gamma")),
+                Err(TokenStoreError::Closed)
+            ));
+            assert!(matches!(
+                store.revoke(beta.id),
+                Err(TokenStoreError::Closed)
+            ));
+            tokio::time::timeout(std::time::Duration::from_millis(50), a.closed())
+                .await
+                .unwrap();
+            tokio::time::timeout(std::time::Duration::from_millis(50), b.closed())
+                .await
+                .unwrap();
+            drop((a, b, store));
+            std::fs::remove_dir(&lock).unwrap();
+            let store = reopen(dir.path(), Network::Testnet);
+            assert!(store.authenticate(alpha.reveal()).is_ok());
+            assert!(store.authenticate(beta.reveal()).is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn panic_after_durable_commit_before_publication_poison_closes_every_session() {
+        for revoke in [false, true] {
+            let (dir, mut store) = fixture();
+            let alpha = store.issue(binding("alpha")).unwrap();
+            let beta = store.issue(binding("beta")).unwrap();
+            let mut a = store.authenticate(alpha.reveal()).unwrap();
+            let mut b = store.authenticate(beta.reveal()).unwrap();
+            store.before_publish = Some(|| panic!("test: committed but not published"));
+            let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if revoke {
+                    store.revoke(alpha.id).map(|_| ())
+                } else {
+                    store.issue(binding("gamma")).map(drop)
+                }
+            }));
+            assert!(panic.is_err());
+            assert!(store.authenticate(alpha.reveal()).is_err());
+            assert!(store.authenticate(beta.reveal()).is_err());
+            assert!(matches!(
+                store.issue(binding("delta")),
+                Err(TokenStoreError::Closed)
+            ));
+            assert!(matches!(
+                store.revoke(beta.id),
+                Err(TokenStoreError::Closed)
+            ));
+            tokio::time::timeout(std::time::Duration::from_millis(50), a.closed())
+                .await
+                .unwrap();
+            tokio::time::timeout(std::time::Duration::from_millis(50), b.closed())
+                .await
+                .unwrap();
+            drop((a, b, store));
+            let store = reopen(dir.path(), Network::Testnet);
+            assert!(store.authenticate(beta.reveal()).is_ok());
+            if revoke {
+                assert_eq!(
+                    store.authenticate(alpha.reveal()).err(),
+                    Some(AuthError::Revoked)
+                );
+            } else {
+                assert!(store.authenticate(alpha.reveal()).is_ok());
+                assert_eq!(store.bindings().len(), 3, "commit preceded the panic");
+            }
+        }
+    }
+
+    #[test]
+    fn persisted_digest_is_not_a_bearer_and_exports_and_debug_do_not_reveal_secrets() {
+        let (dir, mut store) = fixture();
+        let issued = store.issue(binding("alpha")).unwrap();
+        let records = store.journal.records().unwrap();
+        let digest = hex_of(&records[0].digest);
+        assert_eq!(
+            store.authenticate(&digest).err(),
+            Some(AuthError::Unauthenticated)
+        );
+        let session = store.authenticate(issued.reveal()).unwrap();
+        for rendered in [
+            format!("{store:?}"),
+            format!("{issued:?}"),
+            format!("{session:?}"),
+            format!("{:?}", store.bindings()),
+            format!("{records:?}"),
+        ] {
+            assert!(!rendered.contains(issued.reveal()), "bearer leaked");
+        }
+        let ledger = Ledger::open_at(&dir.path().join("ledger.db"), Network::Testnet).unwrap();
+        let mut jsonl = Vec::new();
+        ledger.export_jsonl(&mut jsonl).unwrap();
+        let mut csv = Vec::new();
+        ledger.export_csv(&mut csv).unwrap();
+        for exported in [jsonl, csv] {
+            assert!(
+                !String::from_utf8(exported)
+                    .unwrap()
+                    .contains(issued.reveal())
+            );
+        }
+        let agent_rows = Arc::new(ledger)
+            .agent_view("alpha")
+            .get_events(0, 100)
+            .unwrap();
+        assert!(
+            !serde_json::to_string(&agent_rows)
+                .unwrap()
+                .contains(&digest)
+        );
+    }
+
+    #[test]
+    fn opening_store_reverifies_journal_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger =
+            Arc::new(Ledger::open_at(&dir.path().join("ledger.db"), Network::Testnet).unwrap());
+        let journal =
+            PairingJournal::open(ledger.clone(), Arc::new(HmacKey::from_bytes([42; 32]))).unwrap();
+        let issued = journal.issue(binding("alpha"), [1; 32], 1).unwrap();
+        ledger
+            .redact(
+                issued.id.issued_seq,
+                "test invalidated authority evidence",
+                2,
+            )
+            .unwrap();
+        assert!(
+            TokenStore::open(journal).is_err(),
+            "open must not accept an old verified cache"
+        );
+    }
+
+    fn reopen(path: &std::path::Path, network: Network) -> TokenStore {
+        let ledger = Arc::new(Ledger::open_at(&path.join("ledger.db"), network).unwrap());
+        let journal =
+            PairingJournal::open(ledger, Arc::new(HmacKey::from_bytes([42; 32]))).unwrap();
+        TokenStore::open(journal).unwrap()
+    }
 
     /// A binding for a named agent. The pairing under test is about the token,
     /// not the identity, so every test that does not care uses this.
@@ -276,10 +674,10 @@ mod tests {
 
     #[test]
     fn bindings_keep_revoked_records_and_are_an_owned_snapshot() {
-        let mut store = TokenStore::new();
+        let (_dir, mut store) = fixture();
         let alpha = store.issue(binding("alpha")).expect("token");
         store.issue(binding("beta")).expect("token");
-        assert!(store.revoke(alpha.id));
+        assert!(store.revoke(alpha.id).unwrap());
         let snapshot = store.bindings();
         store.issue(binding("gamma")).expect("token");
         assert_eq!(snapshot.len(), 2);
@@ -294,7 +692,7 @@ mod tests {
 
     #[test]
     fn a_minted_token_authenticates_and_names_its_pairing() {
-        let mut store = TokenStore::new();
+        let (_dir, mut store) = fixture();
         let issued = store.issue(binding("agent-alpha")).expect("entropy");
         let session = store.authenticate(issued.reveal()).expect("authenticates");
         assert_eq!(session.id, issued.id);
@@ -313,7 +711,7 @@ mod tests {
     /// hands that back. Everything downstream acts as whoever this says.
     #[test]
     fn authenticating_returns_the_binding_the_pairing_was_minted_with() {
-        let mut store = TokenStore::new();
+        let (_dir, mut store) = fixture();
         let issued = store.issue(binding("agent-alpha")).expect("entropy");
         let session = store.authenticate(issued.reveal()).expect("authenticates");
         assert_eq!(session.binding, binding("agent-alpha"));
@@ -322,7 +720,7 @@ mod tests {
     /// Two pairings are two identities, not two keys to the same one.
     #[test]
     fn two_pairings_carry_their_own_agents() {
-        let mut store = TokenStore::new();
+        let (_dir, mut store) = fixture();
         let alpha = store.issue(binding("agent-alpha")).expect("entropy");
         let beta = store.issue(binding("agent-beta")).expect("entropy");
 
@@ -333,7 +731,7 @@ mod tests {
         assert_ne!(a.id, b.id);
 
         // Revoking one leaves the other acting as itself.
-        store.revoke(alpha.id);
+        store.revoke(alpha.id).unwrap();
         assert!(store.authenticate(alpha.reveal()).is_err());
         assert_eq!(
             store
@@ -348,7 +746,7 @@ mod tests {
 
     #[test]
     fn the_store_does_not_hold_the_token() {
-        let mut store = TokenStore::new();
+        let (_dir, mut store) = fixture();
         let issued = store.issue(binding("agent-alpha")).expect("entropy");
         let secret = issued.reveal().to_owned();
         let stored = store.records.values().next().expect("one record").digest;
@@ -368,7 +766,7 @@ mod tests {
 
     #[test]
     fn a_wrong_token_is_unauthenticated() {
-        let mut store = TokenStore::new();
+        let (_dir, mut store) = fixture();
         let _issued = store.issue(binding("agent-alpha")).expect("entropy");
         assert_eq!(
             store.authenticate(&"0".repeat(64)).err(),
@@ -378,7 +776,7 @@ mod tests {
 
     #[test]
     fn an_empty_and_a_short_token_do_not_panic() {
-        let mut store = TokenStore::new();
+        let (_dir, mut store) = fixture();
         let _issued = store.issue(binding("agent-alpha")).expect("entropy");
         for candidate in ["", "0x", "deadbeef", &"f".repeat(200)] {
             assert!(
@@ -390,11 +788,11 @@ mod tests {
 
     #[test]
     fn a_revoked_token_stops_authenticating() {
-        let mut store = TokenStore::new();
+        let (_dir, mut store) = fixture();
         let issued = store.issue(binding("agent-alpha")).expect("entropy");
         assert!(store.authenticate(issued.reveal()).is_ok());
         assert!(
-            store.revoke(issued.id),
+            store.revoke(issued.id).unwrap(),
             "revoke reports the pairing was live"
         );
         assert_eq!(
@@ -403,14 +801,14 @@ mod tests {
             "a revoked pairing must be distinguishable from one that never existed"
         );
         assert!(
-            !store.revoke(issued.id),
+            !store.revoke(issued.id).unwrap(),
             "revoking twice reports it was already revoked"
         );
     }
 
     #[tokio::test]
     async fn revocation_closes_a_live_session() {
-        let mut store = TokenStore::new();
+        let (_dir, mut store) = fixture();
         let issued = store.issue(binding("agent-alpha")).expect("entropy");
         let mut session = store.authenticate(issued.reveal()).expect("authenticates");
 
@@ -422,7 +820,7 @@ mod tests {
             "closed() resolved before the pairing was revoked"
         );
 
-        store.revoke(issued.id);
+        store.revoke(issued.id).unwrap();
 
         tokio::time::timeout(std::time::Duration::from_millis(50), session.closed())
             .await
@@ -431,7 +829,7 @@ mod tests {
 
     #[test]
     fn two_pairings_get_distinct_ids_and_distinct_tokens() {
-        let mut store = TokenStore::new();
+        let (_dir, mut store) = fixture();
         let a = store.issue(binding("agent-alpha")).expect("entropy");
         let b = store.issue(binding("agent-alpha")).expect("entropy");
         assert_ne!(a.id, b.id);
@@ -442,10 +840,10 @@ mod tests {
 
     #[test]
     fn revoking_one_pairing_leaves_the_other_working() {
-        let mut store = TokenStore::new();
+        let (_dir, mut store) = fixture();
         let a = store.issue(binding("agent-alpha")).expect("entropy");
         let b = store.issue(binding("agent-alpha")).expect("entropy");
-        store.revoke(a.id);
+        store.revoke(a.id).unwrap();
         assert!(store.authenticate(a.reveal()).is_err());
         assert!(
             store.authenticate(b.reveal()).is_ok(),
@@ -455,7 +853,7 @@ mod tests {
 
     #[test]
     fn the_debug_impl_redacts_the_secret() {
-        let mut store = TokenStore::new();
+        let (_dir, mut store) = fixture();
         let issued = store.issue(binding("agent-alpha")).expect("entropy");
         let rendered = format!("{issued:?}");
         assert!(
