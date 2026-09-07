@@ -38,3 +38,7 @@ export async function fetchChartSeries(): Promise<ChartSeries> { throw new Error
 export async function fetchMarketSnapshot(): Promise<MarketSnapshot> { throw new Error("UI fixture: market snapshot not supplied."); }
 export async function watchMarket() {}
 export async function onFeedUpdate() { return () => {}; }
+
+export async function checkUpdate() { throw { kind: "unavailable", detail: "Updates are unavailable in the UI fixture." }; }
+export async function downloadUpdate() { throw new Error("UI fixture: no updates."); }
+export async function installUpdate() { throw new Error("UI fixture: no installation."); }

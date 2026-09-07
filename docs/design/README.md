@@ -29,3 +29,23 @@ Type: **Space Mono** 400/700 for display, numerals, labels and the character mat
 ## Motifs in the app
 
 Character matrix (loading, empty states), stipple field (behind housings), tick ribbon (live data path), depth blocks (book texture, greyscale). ASCII gauges for cap utilization, funding countdown, approval TTL, exposure bars, margin.
+
+## Live numeric changes
+
+Owner direction, 7 September 2026 (UI6): highlight **only the digits that changed**
+in Oppen uranium (`#FFD400`), then restore their normal ink. Never highlight the
+whole number, row, housing, unit or separator to indicate a numeric tick.
+
+- Compare the displayed values by decimal place, so grouping/width changes do not
+  falsely highlight unchanged digits. Keep tabular alignment and existing precision.
+- Start with a 700 ms highlight, restarting the interval only for digits that
+  change again. First reads, missing values and switching to a different market
+  or account establish a baseline without flashing.
+- Use a direct color change, with no blink, fade, movement or size change. Keep
+  the numeric text accessible as one value and avoid per-tick live announcements.
+- This is a data-change cue, independent of decorative animation. Preserve the
+  deliberate green/red candle-body and wick semantics in U3. Restore each
+  readout's underlying directional/status ink after the highlight.
+- Apply this consistently through a shared numeric component when rolling the
+  behavior into live readouts; this guide records the rule, not a claim that all
+  existing numeric surfaces already implement it.
