@@ -26,8 +26,13 @@ tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
 serde.workspace = true
 serde_json.workspace = true
+# Reuse oppen-hl's reqwest/rustls provider; do not enable a second provider.
+tauri-plugin-updater = { version = "2", default-features = false }
+
+tokio = { workspace = true, features = ["process"] }
 
 [dev-dependencies]
+tauri = { version = "2", features = ["test"] }
 # The live feed test drives a real socket, so it needs a runtime of its own.
 # Tauri's `async_runtime` is tokio; this is the same one, not a second choice.
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }

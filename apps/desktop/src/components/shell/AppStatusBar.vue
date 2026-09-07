@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import AppUpdates from "./AppUpdates.vue";
 import { computed, ref } from "vue";
 import { feedLabel, shell, setView } from "../../stores/shell";
 
@@ -37,6 +38,7 @@ const feeds = computed(() => ({
       Feeds ·
       <span class="sb__k" data-tour="feeds">WS·MKT {{ feeds.market }} · WS·USER {{ feeds.user }} · REST {{ feeds.rest }}</span>
     </span>
+    <AppUpdates />
     <span>Ledger · {{ operator.error || operator.ledgerError ? (operator.ledger ? 'last read' : 'unavailable') : operator.ledger ? `#${operator.ledger.head_seq}` : 'not read' }}</span>
   </footer>
 </template>

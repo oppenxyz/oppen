@@ -32,3 +32,6 @@ Thumbs.db
 .claude/todo.md
 # the commit-hook bypass token; committing it would be a permanent bypass
 .claude/.commit-authorized
+
+# Python release-script tests
+__pycache__/
