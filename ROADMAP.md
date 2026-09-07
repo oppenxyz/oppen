@@ -20,9 +20,13 @@ before expanding features:
    permutations, dropped requests, revocation, and cancellation failures. The
    state bridge now values every symbol's opening orders at quoted reference
    marks and refuses incomplete valuation; limit prices remain display-only.
-   Cross-symbol buy/sell regressions exercise the real engine. The
-   complete fixture-exchange lifecycle and explicitly authorized testnet run
-   remain open gates.
+   Cross-symbol buy/sell regressions exercise the real engine (PR #45). The
+   `oppen-mcp::tools::execution_fixture` now exercises actual MCP dispatch,
+   guarded signing, loopback HTTP, partial fills, cancellation, exact small
+   position closes, deduplicated startup reconciliation, and physical restart
+   after an applied-but-malformed response. Transport-interruption variants,
+   persistent pilot budgets, and the explicitly authorized testnet run remain
+   open gates; loopback acceptance is not venue acceptance.
 3. **Operator supervision:** desktop MCP lifecycle, pairing/revocation, real
    positions and orders, policy editing, approval decisions, and a working halt.
 4. **Recovery:** PR #44 merged as `06fc0e3` after green CI and separate automated

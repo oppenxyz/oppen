@@ -3212,6 +3212,255 @@ fn a_venue_rule_breach_is_a_typed_subtype_not_a_string() {
     }
 }
 
+/// Spec 19 close_position / D3: only a complete, opposite-side reduce-only
+/// IOC can defer the local $10 check. This proves local policy, not live
+/// venue acceptance. Expected sizes are explicit, independent of rounding code.
+#[test]
+fn tiny_full_ioc_close_minimum_exception_matrix() {
+    let config = permissive(&["BTC"]);
+    let f = Fixture::new(config.clone());
+    let btc = asset("BTC", 2, 40);
+    let market = MarketRef::fresh("BTC", d("100"), NOW_MS);
+    let kinds = [
+        OrderKind::Limit { tif: Tif::Ioc },
+        OrderKind::Limit { tif: Tif::Gtc },
+        OrderKind::Limit { tif: Tif::Alo },
+        OrderKind::Trigger {
+            is_market: true,
+            trigger_px: d("100"),
+            tpsl: Tpsl::Sl,
+        },
+        OrderKind::Trigger {
+            is_market: false,
+            trigger_px: d("100"),
+            tpsl: Tpsl::Tp,
+        },
+    ];
+    let mut cases = 0;
+    let mut allowed = 0;
+    for position in [
+        None,
+        Some("0"),
+        Some("0.05"),
+        Some("-0.05"),
+        Some("0.055"),
+        Some("-0.055"),
+    ] {
+        let mut state = exposure(d("1000"));
+        if let Some(position) = position {
+            let szi = d(position);
+            state
+                .agent
+                .positions
+                .insert("BTC".into(), PositionSnapshot { szi });
+            state.agent.total_position_notional_usd = szi.abs() * d("100");
+        }
+        for is_buy in [false, true] {
+            for reduce_only in [false, true] {
+                for kind in &kinds {
+                    for (requested, rounded) in [
+                        ("0.04", "0.04"),
+                        ("0.05", "0.05"),
+                        ("0.0509", "0.05"),
+                        ("0.06", "0.06"),
+                    ] {
+                        cases += 1;
+                        let mut candidate = intent("BTC", is_buy, d("100"), d(requested));
+                        candidate.reduce_only = reduce_only;
+                        candidate.kind = kind.clone();
+                        let expected_close = position
+                            == Some(if is_buy { "-0.05" } else { "0.05" })
+                            && reduce_only
+                            && *kind == (OrderKind::Limit { tif: Tif::Ioc })
+                            && rounded == "0.05";
+                        let result = f.evaluate(&candidate, &btc, &market, &state);
+                        let context = format!("position={position:?}, order={candidate:?}");
+                        if expected_close {
+                            let cleared =
+                                result.unwrap_or_else(|error| panic!("{context}: {error}"));
+                            let wire = wire_of(&cleared);
+                            assert_eq!(wire_sz(&wire), d("0.05"), "{context}");
+                            assert_eq!(wire_px(&wire) * wire_sz(&wire), d("5"));
+                            assert_eq!(wire.b, is_buy);
+                            assert!(wire.r);
+                            assert!(matches!(
+                                wire.t,
+                                oppen_hl::wire::OrderType::Limit { tif: Tif::Ioc }
+                            ));
+                            verify_every_predicate(
+                                cases, &cleared, &config, &candidate, &btc, &market, &state, NOW_MS,
+                            );
+                            // Without known-position context the same spec must
+                            // retain the ordinary minimum, even with RO + IOC.
+                            let ordinary = oppen_hl::order::OrderSpec {
+                                is_buy,
+                                px: candidate.px,
+                                sz: candidate.sz,
+                                kind: candidate.kind.clone(),
+                                reduce_only,
+                                cloid: None,
+                            };
+                            assert!(matches!(
+                                ordinary.to_wire(&btc),
+                                Err(oppen_hl::order::OrderError::Validation(
+                                    oppen_hl::meta::ValidationError::MinNotional { .. }
+                                ))
+                            ));
+                            allowed += 1;
+                        } else {
+                            match result.expect_err(&context) {
+                                Refusal::VenueRule(VenueRule::MinNotional {
+                                    notional_usd,
+                                    minimum_usd,
+                                }) => {
+                                    assert_eq!(notional_usd, d("100") * d(rounded), "{context}");
+                                    assert_eq!(minimum_usd, d("10"), "{context}");
+                                }
+                                other => panic!("{context}: expected min-notional, got {other:?}"),
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(cases, 480);
+    assert_eq!(
+        allowed, 4,
+        "both position signs, exact and rounded full size"
+    );
+}
+
+/// Spec 19 / D3: bypassing one local venue minimum cannot bypass an operator
+/// limit, an unknown exposure, or another wire validation rule.
+#[test]
+fn tiny_full_ioc_close_still_obeys_every_other_guard() {
+    for long in [false, true] {
+        for case in [
+            "stale_market",
+            "stale_account",
+            "unreconciled",
+            "missing_book",
+            "symbol",
+            "order_cap",
+            "missing_volatility",
+            "loss",
+            "kill_global",
+            "kill_agent",
+            "approval",
+            "slippage",
+            "rate",
+            "delisted",
+            "zero_price",
+            "rounded_zero_size",
+        ] {
+            let mut config = permissive(&["BTC"]);
+            let mut btc = asset("BTC", 2, 40);
+            let mut market = MarketRef::fresh("BTC", d("100"), NOW_MS);
+            let mut state = exposure(d("1000"));
+            state.agent.positions.insert(
+                "BTC".into(),
+                PositionSnapshot {
+                    szi: if long { d("0.05") } else { d("-0.05") },
+                },
+            );
+            state.agent.total_position_notional_usd = d("5");
+            let mut candidate = intent("BTC", !long, d("100"), d("0.05"));
+            candidate.reduce_only = true;
+            candidate.kind = OrderKind::Limit { tif: Tif::Ioc };
+            match case {
+                "stale_market" => market.as_of_ms = NOW_MS - 2_001,
+                "stale_account" => state.agent.as_of_ms = NOW_MS - 5_001,
+                "unreconciled" => state.agent.reconciled = false,
+                "missing_book" => state.agent.resting = None,
+                "symbol" => config.symbols.clear(),
+                "order_cap" => config.max_order_usd = d("4"),
+                "missing_volatility" => config.risk.max_risk_usd = Some(d("1")),
+                "loss" => {
+                    config.loss.max_daily_loss_usd = Some(d("4"));
+                    state.agent.realized_pnl_today_usd = d("-5");
+                }
+                "approval" => config.approval_required = true,
+                "slippage" => {
+                    config.max_slippage_bps = Decimal::ZERO;
+                    candidate.px = if long { d("99") } else { d("101") };
+                }
+                "rate" => {
+                    config.order_rate = OrderRate {
+                        count: 1,
+                        per_ms: 300_000,
+                    }
+                }
+                "delisted" => btc.info.is_delisted = true,
+                "zero_price" => candidate.px = Decimal::ZERO,
+                "rounded_zero_size" => candidate.sz = d("0.001"),
+                "kill_global" | "kill_agent" => {}
+                _ => unreachable!(),
+            }
+            let f = Fixture::new(config);
+            if case == "kill_global" || case == "kill_agent" {
+                let scope = if case == "kill_global" {
+                    KillScope::Global
+                } else {
+                    KillScope::agent(f.agent.clone())
+                };
+                f.engine
+                    .operator_engage_kill(scope, KillReason::Operator, NOW_MS)
+                    .unwrap();
+            }
+            if case == "rate" {
+                f.evaluate(&candidate, &btc, &market, &state)
+                    .expect("first close spends the one token");
+            }
+            let refusal = f
+                .evaluate(&candidate, &btc, &market, &state)
+                .expect_err(&format!("{case}, long={long}"));
+            let correct = match case {
+                "stale_market" => matches!(
+                    refusal,
+                    Refusal::Unevaluable(Unevaluable::StaleMarketData { .. })
+                ),
+                "stale_account" => matches!(
+                    refusal,
+                    Refusal::Unevaluable(Unevaluable::StaleAccountState { .. })
+                ),
+                "unreconciled" => matches!(
+                    refusal,
+                    Refusal::Unevaluable(Unevaluable::UnreconciledAccount { .. })
+                ),
+                "missing_book" => matches!(
+                    refusal,
+                    Refusal::Unevaluable(Unevaluable::MissingRestingOrders)
+                ),
+                "symbol" => matches!(refusal, Refusal::SymbolNotAllowed { .. }),
+                "order_cap" => {
+                    matches!(refusal, Refusal::OrderNotional { observed_usd, limit_usd, .. } if observed_usd == d("5") && limit_usd == d("4"))
+                }
+                "missing_volatility" => matches!(
+                    refusal,
+                    Refusal::Unevaluable(Unevaluable::MissingVolatility { .. })
+                ),
+                "loss" => matches!(refusal, Refusal::LossLimit { .. }),
+                "kill_global" | "kill_agent" => matches!(refusal, Refusal::TradingPaused { .. }),
+                "approval" => matches!(refusal, Refusal::ApprovalRequired { .. }),
+                "slippage" => matches!(refusal, Refusal::Slippage { .. }),
+                "rate" => matches!(refusal, Refusal::OrderRate { .. }),
+                "delisted" => matches!(refusal, Refusal::VenueRule(VenueRule::Delisted { .. })),
+                "zero_price" => matches!(
+                    refusal,
+                    Refusal::VenueRule(VenueRule::NonPositivePrice { .. })
+                ),
+                "rounded_zero_size" => matches!(
+                    refusal,
+                    Refusal::VenueRule(VenueRule::NonPositiveSize { .. })
+                ),
+                _ => unreachable!(),
+            };
+            assert!(correct, "{case}, long={long}: wrong refusal {refusal:?}");
+        }
+    }
+}
+
 /// R4 calls a mainnet number that is actually a testnet number the worst bug
 /// this product can ship, and D1 makes each agent's sub-account the unit of
 /// capital segregation. Neither may be a signing parameter: the clearance
@@ -3740,10 +3989,27 @@ fn verify_every_predicate(
     assert_eq!(wire.b, order.is_buy, "{ctx}: wrong side");
     assert_eq!(px, asset.round_price(order.px), "{ctx}: price drifted");
     assert_eq!(sz, asset.round_size(order.sz), "{ctx}: size drifted");
-    assert!(
-        asset.validate_order(px, sz).is_ok(),
-        "{ctx}: the venue would reject this"
-    );
+    match asset.validate_order(px, sz) {
+        Ok(()) => {}
+        Err(oppen_hl::meta::ValidationError::MinNotional { .. }) => {
+            // Spec 19: the local minimum may defer only for the entire known
+            // position. Check actual wire fields, never the engine's helper.
+            let position = account.position_szi(&order.symbol);
+            assert!(wire.r, "{ctx}: tiny opening order");
+            assert!(
+                matches!(wire.t, oppen_hl::wire::OrderType::Limit { tif: Tif::Ioc }),
+                "{ctx}: tiny non-IOC"
+            );
+            assert!(!position.is_zero(), "{ctx}: tiny close without a position");
+            assert_eq!(
+                wire.b,
+                position.is_sign_negative(),
+                "{ctx}: wrong close side"
+            );
+            assert_eq!(sz, position.abs(), "{ctx}: tiny partial or oversized close");
+        }
+        Err(error) => panic!("{ctx}: local wire validation failed: {error}"),
+    }
 
     // Reason, agent, approval.
     assert!(!order.reason.trim().is_empty(), "{ctx}: no reason");
