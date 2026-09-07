@@ -211,3 +211,75 @@ export async function fetchMarketSnapshot(
 ): Promise<MarketSnapshot> {
   return invoke<MarketSnapshot>("market_snapshot", { network, coin });
 }
+
+// ---------------------------------------------------------------------------
+// The live feed (`docs/spec.md` items 31, 34)
+// ---------------------------------------------------------------------------
+
+/**
+ * One frame off the socket, as the console draws it.
+ *
+ * Tagged rather than five separate Tauri channels, so an unknown `kind` is
+ * ignored in one place instead of being a variant nobody subscribed to. Prices
+ * are strings here for the reason they are strings everywhere on this
+ * boundary: the renderer parses at its own edge and nothing between the venue
+ * and the pixel rounds.
+ */
+export type FeedUpdate =
+  | { kind: "ctx"; at_ms: number; row: MarketRow }
+  | { kind: "bbo"; coin: string; at_ms: number; bid?: BookLevel; ask?: BookLevel }
+  | { kind: "book"; coin: string; at_ms: number; bids: BookLevel[]; asks: BookLevel[] }
+  | {
+      kind: "candle";
+      coin: string;
+      interval: string;
+      time_ms: number;
+      open: string;
+      high: string;
+      low: string;
+      close: string;
+      volume: string;
+    }
+  | {
+      kind: "trade";
+      coin: string;
+      at_ms: number;
+      /** The last print in the frame: the bar's close. */
+      px: string;
+      /** The frame's own extremes. A batch can carry a spike `px` does not show. */
+      high: string;
+      low: string;
+      /** Every print in the frame, summed. */
+      sz: string;
+    }
+  | { kind: "status"; last_tick_ms?: number; connected: boolean; detail?: string };
+
+/**
+ * Point the socket at one symbol and interval.
+ *
+ * Called on selection and on an interval change. The REST reads beside it stay
+ * — they are the seed and the history a socket does not carry — but from here
+ * on the strip, the ladder and the forming bar move on their own.
+ */
+export async function watchMarket(
+  network: "testnet" | "mainnet",
+  coin: string,
+  interval: string,
+): Promise<void> {
+  return invoke<void>("watch_market", { network, coin, interval });
+}
+
+/**
+ * Subscribe to the feed. Returns the unsubscribe.
+ *
+ * Outside Tauri there is no socket, so this resolves to a no-op rather than
+ * throwing: the console renders in a browser for design work and must not need
+ * a venue to do it.
+ */
+export async function onFeedUpdate(
+  handler: (update: FeedUpdate) => void,
+): Promise<() => void> {
+  if (!inTauri()) return () => {};
+  const { listen } = await import("@tauri-apps/api/event");
+  return listen<FeedUpdate>("feed://update", (event) => handler(event.payload));
+}
