@@ -278,7 +278,7 @@ impl AccountSnapshot {
     /// today's loss, so the engine refuses rather than reinterpreting it.
     pub(super) fn covers_day_of(&self, now_ms: u64) -> bool {
         now_ms >= self.day_start_ms
-            && self.day_start_ms % DAY_MS == 0
+            && self.day_start_ms.is_multiple_of(DAY_MS)
             && now_ms - self.day_start_ms < DAY_MS
     }
 }

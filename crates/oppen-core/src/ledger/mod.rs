@@ -58,11 +58,15 @@ mod submission;
 mod verify;
 
 #[cfg(test)]
+mod coordination_tests;
+#[cfg(test)]
 mod tests;
 
-use std::path::Path;
+use std::fs::{File, TryLockError};
+use std::ops::{Deref, DerefMut};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
@@ -659,6 +663,7 @@ pub(crate) fn network_key(network: Network) -> &'static str {
 #[derive(Debug)]
 pub struct Ledger {
     connection: Mutex<Connection>,
+    coordination_path: PathBuf,
     network: Network,
     genesis: String,
     anchor: Option<Box<dyn HeadAnchor>>,
@@ -680,7 +685,16 @@ impl Ledger {
     /// for tests. Product code should use [`Ledger::open`] so the naming rule
     /// stays in one place.
     pub fn open_at(path: &Path, network: Network) -> Result<Self> {
-        Self::open_anchored(path, network, Some(Box::new(FileAnchor::beside(path))))
+        // The default anchor and lock must share an identity for symlink and
+        // relative-path aliases of the same database.
+        File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)?;
+        let path = std::fs::canonicalize(path)?;
+        Self::open_anchored(&path, network, Some(Box::new(FileAnchor::beside(&path))))
     }
 
     /// Open a ledger with a chosen head anchor, or with none.
@@ -700,22 +714,27 @@ impl Ledger {
         anchor: Option<Box<dyn HeadAnchor>>,
     ) -> Result<Self> {
         let mut connection = Connection::open(path)?;
+        let mut coordination_path = std::fs::canonicalize(path)?.into_os_string();
+        coordination_path.push(".lock");
+        let coordination_path = PathBuf::from(coordination_path);
+        let _coordination = acquire_coordination(&coordination_path)?;
         configure(&connection)?;
         schema::migrate(&connection)?;
         let genesis = hash::genesis_hash(network);
         bind_network(&mut connection, network, &genesis)?;
-        let ledger = Self {
+        if let Some(anchor) = &anchor
+            && anchor.load()?.is_none()
+        {
+            let (seq, hash) = head(&connection)?;
+            anchor.store(&Anchor { seq, hash })?;
+        }
+        Ok(Self {
             connection: Mutex::new(connection),
+            coordination_path,
             network,
             genesis,
             anchor,
-        };
-        if let Some(anchor) = &ledger.anchor
-            && anchor.load()?.is_none()
-        {
-            anchor.store(&ledger.chain_head()?)?;
-        }
-        Ok(ledger)
+        })
     }
 
     /// Which network this file's chain belongs to.
@@ -1190,8 +1209,8 @@ impl Ledger {
     /// ahead of the chain is the exact signature of truncation and would report
     /// a break every time a machine lost power mid-append.
     ///
-    /// Every caller holds the connection lock across this call. The lock is
-    /// already the ledger's write serialiser, and letting it go first would let
+    /// Every caller holds the connection and cross-process file locks across
+    /// this call. Letting either go first would let
     /// two appends commit in one order and anchor in the other, leaving the
     /// anchor pointing at the earlier of the two.
     ///
@@ -1612,8 +1631,53 @@ impl Ledger {
     ///
     /// `AGENTS.md` conventions forbid a panic on an input path, and a panic in
     /// one ledger call should not make every later call panic too.
-    fn lock(&self) -> Result<MutexGuard<'_, Connection>> {
-        self.connection.lock().map_err(|_| LedgerError::Poisoned)
+    fn lock(&self) -> Result<LedgerGuard<'_>> {
+        let connection = self.connection.lock().map_err(|_| LedgerError::Poisoned)?;
+        let coordination = acquire_coordination(&self.coordination_path)?;
+        Ok(LedgerGuard {
+            connection,
+            _coordination: coordination,
+        })
+    }
+}
+
+// SQLite releases its write lock at COMMIT, before the sidecar can be fsynced.
+// Keep a separate OS lock through both steps and verification. Never unlink
+// this lock file: a second inode would allow two cooperating writers through.
+struct LedgerGuard<'a> {
+    connection: MutexGuard<'a, Connection>,
+    _coordination: File,
+}
+
+impl Deref for LedgerGuard<'_> {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        &self.connection
+    }
+}
+
+impl DerefMut for LedgerGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Connection {
+        &mut self.connection
+    }
+}
+
+fn acquire_coordination(path: &Path) -> Result<File> {
+    let file = File::options()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)?;
+    let started = Instant::now();
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(TryLockError::WouldBlock) if started.elapsed() < BUSY_TIMEOUT => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => return Err(LedgerError::Io(error.into())),
+        }
     }
 }
 

@@ -2103,18 +2103,18 @@ async fn track_submission(
     // Only a structured rejection proves that this request cannot fill.
     // Successful submissions remain reserved until a later status read,
     // followed by fresh account reads under the same container lock.
-    if let [Status::Error(message)] = response.statuses.as_slice() {
-        if let Some((journal, receipt)) = durable {
-            journal
-                .resolve(
-                    receipt,
-                    SubmissionResolution::Rejected {
-                        message: message.clone(),
-                    },
-                    now_ms(),
-                )
-                .map_err(submission_error)?;
-        }
+    if let [Status::Error(message)] = response.statuses.as_slice()
+        && let Some((journal, receipt)) = durable
+    {
+        journal
+            .resolve(
+                receipt,
+                SubmissionResolution::Rejected {
+                    message: message.clone(),
+                },
+                now_ms(),
+            )
+            .map_err(submission_error)?;
     }
     Ok(response)
 }
