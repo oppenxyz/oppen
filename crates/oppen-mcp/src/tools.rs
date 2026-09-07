@@ -775,9 +775,16 @@ impl Gateway {
             Err(refusal) => return Ok(outcome::refused(refusal).into_result()),
         };
 
-        let response = self
+        let response = match self
             .submit(cleared, Some(&cloid), Some((&bound, &permit)))
-            .await?;
+            .await
+        {
+            Ok(response) => response,
+            Err(ToolError::GuardrailRefused { refusal }) => {
+                return Ok(outcome::refused(refusal).into_result());
+            }
+            Err(error) => return Err(error.into()),
+        };
         Ok(order_outcome(response, Some(cloid.as_str().to_owned()))?.into_result())
     }
 
@@ -1074,9 +1081,16 @@ impl Gateway {
         };
 
         let cloid = intent.cloid.clone();
-        let response = self
+        let response = match self
             .submit(cleared, cloid.as_ref(), Some((&bound, &permit)))
-            .await?;
+            .await
+        {
+            Ok(response) => response,
+            Err(ToolError::GuardrailRefused { refusal }) => {
+                return Ok(outcome::refused(refusal).into_result());
+            }
+            Err(error) => return Err(error.into()),
+        };
         Ok(order_outcome(response, cloid.map(|c| c.as_str().to_owned()))?.into_result())
     }
 
@@ -1698,7 +1712,12 @@ impl Gateway {
                         )
                         .map_err(submission_error)?;
                 }
-                return Err(ToolError::unavailable("signer", error));
+                return Err(match error {
+                    oppen_core::guardrail::SignClearedError::Refused(refusal) => {
+                        ToolError::GuardrailRefused { refusal }
+                    }
+                    other => ToolError::unavailable("signer", other),
+                });
             }
         };
 
@@ -2169,6 +2188,9 @@ where
 
 fn submission_error(error: SubmissionError) -> ToolError {
     match error {
+        SubmissionError::Pilot(error) => ToolError::GuardrailRefused {
+            refusal: error.into_refusal(),
+        },
         SubmissionError::Busy { cloid } => ToolError::TimeoutUnknownOutcome {
             cloid: Some(cloid),
             detail: "this account already has an unresolved durable submission".into(),

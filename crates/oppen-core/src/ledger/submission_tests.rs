@@ -511,7 +511,7 @@ fn receipt_must_match_chain_and_exact_start_row() {
 }
 
 #[test]
-fn v2_to_v3_preserves_existing_events_hashes_and_head() {
+fn v2_upgrade_preserves_existing_events_hashes_and_head() {
     fn stored_rows(ledger: &Ledger) -> Vec<Vec<rusqlite::types::Value>> {
         let guard = ledger.lock().unwrap();
         let mut statement = guard.prepare("SELECT * FROM events ORDER BY seq").unwrap();
@@ -578,7 +578,7 @@ fn v2_to_v3_preserves_existing_events_hashes_and_head() {
             .unwrap()
             .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0),)
             .unwrap(),
-        3
+        4
     );
     let index_count: i64 = upgraded.lock().unwrap().query_row(
         "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'index' AND name = 'events_submission_account'",

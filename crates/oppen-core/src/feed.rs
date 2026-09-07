@@ -270,11 +270,13 @@ impl FeedSession {
         // shape from `userFillsByTime`, so a fill that arrives twice — once
         // live, once in a backfill — is one row keyed by `tid`.
         let payload = json!({
+            "account": account,
+            "cloid": fill.cloid.as_ref().map(|cloid| cloid.as_str()),
             "coin": fill.coin,
             "px": fill.px.to_string(),
             "sz": fill.sz.to_string(),
-            "side": fill.side,
-            "time_ms": fill.time,
+            "side": if fill.side.is_buy() { "buy" } else { "sell" },
+            "ts_ms": fill.time,
             "start_position": fill.start_position.to_string(),
             "dir": fill.dir,
             "closed_pnl": fill.closed_pnl.to_string(),
@@ -446,6 +448,33 @@ mod tests {
             .expect("snapshot");
 
         assert_eq!(fill_rows(&ledger), 2, "tid 7 deduped, tid 8 appended");
+    }
+
+    #[test]
+    fn live_fill_keeps_account_and_order_identity_for_budget_reconciliation() {
+        let dir = TempDir::new().unwrap();
+        let ledger = ledger(&dir);
+        let mut trade = fill(7, NOW);
+        let cloid = oppen_hl::wire::Cloid::from_bytes([7; 16]);
+        trade.cloid = Some(cloid.clone());
+        FeedSession::new()
+            .apply(&ledger, account(), &user_fills(false, vec![trade]), NOW)
+            .unwrap();
+        let events = ledger.get_events(0, 10).unwrap().events;
+        let payload = events
+            .iter()
+            .find(|event| event.kind == crate::ledger::EventKind::Fill)
+            .unwrap()
+            .payload
+            .as_ref()
+            .unwrap();
+        assert_eq!(payload["account"], account());
+        assert_eq!(payload["cloid"], cloid.as_str());
+        assert_eq!(payload["side"], "buy");
+        assert_eq!(payload["ts_ms"], NOW);
+        assert_eq!(payload["fee_token"], "USDC");
+        assert_eq!(payload["fee"], "0.02");
+        assert!(ledger.verify().unwrap().is_intact());
     }
 
     /// The posture everything else rests on: nothing has been checked, so

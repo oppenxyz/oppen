@@ -27,8 +27,13 @@ before expanding features:
    after an applied-but-malformed response. An optional operator-set gross
    account exposure cap counts positions and opening commitments across symbols
    without opposite-side netting; it is separate from the per-symbol cap and
-   leverage. Transport-interruption variants,
-   persistent pilot budgets, and the explicitly authorized testnet run remain
+   leverage. Cumulative pilot accounting now distinguishes executed turnover
+   from unfilled reservations, persists exhaustion inside the fill's chained
+   record, and retains the ledger lock through signing. Local lifecycle tests
+   cover $150 across opening/closing fills, canceled-order liability, and a $5
+   fee-driven stop that survives restart and blocks reduce-only orders.
+   Transport-interruption variants, operator activation/baseline verification,
+   automatic stop cancellation/notification, and the authorized testnet run remain
    open gates; loopback acceptance is not venue acceptance.
 3. **Operator supervision:** desktop MCP lifecycle, pairing/revocation, real
    positions and orders, policy editing, approval decisions, and a working halt.

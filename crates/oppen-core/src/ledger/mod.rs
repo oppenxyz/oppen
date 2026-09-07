@@ -53,6 +53,7 @@
 mod anchor;
 mod export;
 mod hash;
+mod pilot;
 mod schema;
 mod submission;
 mod verify;
@@ -73,12 +74,33 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub use anchor::{Anchor, FileAnchor, HeadAnchor};
+pub use pilot::{PilotError, PilotJournal, PilotState, PilotStop};
 pub use submission::{
     SubmissionError, SubmissionJournal, SubmissionReceipt, SubmissionResolution, SubmissionState,
 };
 pub use verify::{BreakReason, ChainBreak, ChainReport};
 
 use crate::Network;
+
+impl PilotError {
+    pub fn into_refusal(self) -> crate::guardrail::Refusal {
+        match self {
+            Self::Exhausted {
+                metric,
+                observed_usd,
+                limit_usd,
+            } => crate::guardrail::Refusal::PilotBudget {
+                metric,
+                observed_usd,
+                limit_usd,
+            },
+            other => crate::guardrail::Unevaluable::PilotBudgetUnavailable {
+                detail: other.to_string(),
+            }
+            .into(),
+        }
+    }
+}
 
 /// Largest page [`Ledger::get_events`] will return.
 ///
@@ -182,6 +204,10 @@ pub enum LedgerError {
     UseRecordFill,
     #[error("submission lifecycle events must use SubmissionJournal")]
     UseSubmissionJournal,
+    #[error("pilot authority events must use PilotJournal")]
+    UsePilotJournal,
+    #[error("pilot accounting failed: {detail}")]
+    PilotBudget { detail: String },
     /// A [`EventKind::PayloadRedacted`] row was itself passed to
     /// [`Ledger::redact`]. Its payload is `{redacted_seq, reason}` — two
     /// operator-authored fields with no agent text in them, so there is no
@@ -276,6 +302,10 @@ pub enum EventKind {
     SubmissionStarted,
     /// Authoritative evidence that a reservation is no longer in flight.
     SubmissionResolved,
+    /// Operator-confirmed testnet pilot identity and cumulative authority.
+    PilotAuthorized,
+    /// Irreversible exhaustion of this pilot's cumulative authority.
+    PilotHalted,
     /// Something the human did: a manual ticket, a flatten, a setting change.
     OperatorAction,
     /// An approval-mode proposal was approved, rejected or expired
@@ -312,6 +342,8 @@ impl EventKind {
             EventKind::OrderStateChange => "order_state_change",
             EventKind::SubmissionStarted => "submission_started",
             EventKind::SubmissionResolved => "submission_resolved",
+            EventKind::PilotAuthorized => "pilot_authorized",
+            EventKind::PilotHalted => "pilot_halted",
             EventKind::OperatorAction => "operator_action",
             EventKind::ApprovalDecision => "approval_decision",
             EventKind::KillSwitchChanged => "kill_switch_changed",
@@ -337,6 +369,8 @@ impl std::str::FromStr for EventKind {
             "order_state_change" => Ok(EventKind::OrderStateChange),
             "submission_started" => Ok(EventKind::SubmissionStarted),
             "submission_resolved" => Ok(EventKind::SubmissionResolved),
+            "pilot_authorized" => Ok(EventKind::PilotAuthorized),
+            "pilot_halted" => Ok(EventKind::PilotHalted),
             "operator_action" => Ok(EventKind::OperatorAction),
             "approval_decision" => Ok(EventKind::ApprovalDecision),
             "kill_switch_changed" => Ok(EventKind::KillSwitchChanged),
@@ -825,6 +859,9 @@ impl Ledger {
             EventKind::SubmissionStarted | EventKind::SubmissionResolved => {
                 Err(LedgerError::UseSubmissionJournal)
             }
+            EventKind::PilotAuthorized | EventKind::PilotHalted => {
+                Err(LedgerError::UsePilotJournal)
+            }
             _ => Ok(()),
         }
     }
@@ -847,7 +884,20 @@ impl Ledger {
         let idem_key = fill_idem_key(fill.account, fill.tid);
         let mut guard = self.lock()?;
         let transaction = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let appended = append_keyed_in_tx(
+        let pilot_active: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM events WHERE kind IN ('pilot_authorized', 'pilot_halted'))",
+            [], |row| row.get(0),
+        )?;
+        if pilot_active {
+            // Verify before extending the transaction past the anchored head.
+            submission::replay_for_pilot(self, &transaction, true).map_err(|error| {
+                LedgerError::PilotBudget {
+                    detail: error.to_string(),
+                }
+            })?;
+            transaction.execute_batch("SAVEPOINT pilot_fill")?;
+        }
+        let mut appended = append_keyed_in_tx(
             &transaction,
             &NewEvent {
                 kind: EventKind::Fill,
@@ -858,8 +908,50 @@ impl Ledger {
             },
             &idem_key,
         )?;
+        let mut halt = if pilot_active {
+            pilot::latch_in_tx(self, &transaction, fill, fill.ts_ms).map_err(|error| {
+                LedgerError::PilotBudget {
+                    detail: error.to_string(),
+                }
+            })?
+        } else {
+            None
+        };
+        if let (Some(_), Some(stop)) = (&appended, &halt) {
+            let encoded: String = transaction.query_row(
+                "SELECT payload FROM events WHERE seq = ?1",
+                params![i64::try_from(stop.seq).map_err(|_| LedgerError::SeqOutOfRange)?],
+                |row| row.get(0),
+            )?;
+            let mut embedded: Value = serde_json::from_str(&encoded)?;
+            // A fill cannot contain its own hash. Its enclosing chained row
+            // binds the stop; standalone stops still bind an older fill hash.
+            embedded["trigger_hash"] = Value::Null;
+            let mut payload = fill.payload.clone();
+            if !payload.is_object() {
+                payload = serde_json::json!({"pilot_invalid_payload": payload});
+            }
+            payload["pilot_stop"] = embedded;
+            // Only tentative rows are rolled back. Commit the fill and stop
+            // as one row, preserving the existing one-row anchor crash bound.
+            transaction.execute_batch("ROLLBACK TO pilot_fill; RELEASE pilot_fill")?;
+            appended = append_keyed_in_tx(
+                &transaction,
+                &NewEvent {
+                    kind: EventKind::Fill,
+                    ts_ms: fill.ts_ms,
+                    agent_id: fill.agent_id,
+                    payload: &payload,
+                    snapshot: None,
+                },
+                &idem_key,
+            )?;
+            halt = None;
+        } else if pilot_active {
+            transaction.execute_batch("RELEASE pilot_fill")?;
+        }
         transaction.commit()?;
-        if let Some(appended) = &appended {
+        if let Some(appended) = halt.as_ref().or(appended.as_ref()) {
             self.note_head(appended)?;
         }
         Ok(appended)
@@ -1667,6 +1759,8 @@ struct LedgerGuard<'a> {
     _coordination: File,
 }
 
+impl crate::guardrail::SigningPermit for LedgerGuard<'_> {}
+
 impl Deref for LedgerGuard<'_> {
     type Target = Connection;
     fn deref(&self) -> &Connection {
@@ -2105,6 +2199,16 @@ impl std::fmt::Debug for LedgerAuditSink {
 }
 
 impl crate::guardrail::AuditSink for LedgerAuditSink {
+    fn before_sign(
+        &self,
+        clearance: &crate::guardrail::Clearance,
+    ) -> std::result::Result<Box<dyn crate::guardrail::SigningPermit + '_>, crate::guardrail::Refusal>
+    {
+        let permit =
+            pilot::before_sign(&self.ledger, clearance).map_err(PilotError::into_refusal)?;
+        Ok(Box::new(permit))
+    }
+
     fn record(
         &self,
         entry: &crate::guardrail::AuditEntry<'_>,

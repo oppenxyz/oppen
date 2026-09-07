@@ -399,6 +399,13 @@ pub struct AuditEntry<'a> {
     pub outcome: AuditOutcome<'a>,
 }
 
+/// Opaque authority retained until signing finishes. The ledger implementation
+/// holds its coordination lock; test sinks may use the unit implementation.
+pub trait SigningPermit {}
+
+#[cfg(test)]
+impl SigningPermit for () {}
+
 /// Where evaluations are recorded.
 ///
 /// D6 makes the hash-chained SQLite ledger the single source for
@@ -409,6 +416,8 @@ pub struct AuditEntry<'a> {
 /// the only honest way to test it is to make a write fail.
 pub trait AuditSink: Send + Sync {
     fn record(&self, entry: &AuditEntry<'_>) -> Result<(), AuditError>;
+    /// Revalidate durable execution authority inside the final signing gate.
+    fn before_sign(&self, clearance: &Clearance) -> Result<Box<dyn SigningPermit + '_>, Refusal>;
 }
 
 /// Records nothing and always succeeds.
@@ -422,6 +431,10 @@ pub(super) struct NullAuditSink;
 
 #[cfg(test)]
 impl AuditSink for NullAuditSink {
+    fn before_sign(&self, _clearance: &Clearance) -> Result<Box<dyn SigningPermit + '_>, Refusal> {
+        Ok(Box::new(()))
+    }
+
     fn record(&self, _entry: &AuditEntry<'_>) -> Result<(), AuditError> {
         Ok(())
     }
@@ -1918,8 +1931,9 @@ impl GuardrailEngine {
             clearance: &clearance,
             policy_revision,
             now_ms,
+            held_authority: std::cell::RefCell::new(None),
         };
-        let request = ExchangeRequest::sign_checked(
+        let signed = ExchangeRequest::sign_checked(
             &key,
             action,
             nonce,
@@ -1927,8 +1941,11 @@ impl GuardrailEngine {
             expires_after,
             clearance.network,
             &gate,
-        )
-        .map_err(|e| match e {
+        );
+        // Release durable authority only after signing, and before refusal
+        // auditing (which needs the same ledger lock).
+        drop(gate);
+        let request = signed.map_err(|e| match e {
             SignError::Refused(refusal) => {
                 self.record_pre_sign_refusal(&clearance.agent, now_ms, &refusal);
                 SignClearedError::Refused(refusal)
@@ -2025,6 +2042,7 @@ struct PreSignGate<'a> {
     clearance: &'a Clearance,
     policy_revision: u64,
     now_ms: u64,
+    held_authority: std::cell::RefCell<Option<Box<dyn SigningPermit + 'a>>>,
 }
 
 impl PreSignCheck for PreSignGate<'_> {
@@ -2055,6 +2073,7 @@ impl PreSignCheck for PreSignGate<'_> {
         // answer here to "what does this clearance's age make untrue?".
         match &self.clearance.kind {
             ClearedKind::Order { .. } => {
+                *self.held_authority.borrow_mut() = Some(engine.sink.before_sign(self.clearance)?);
                 if self.policy_revision != state.policy_revision {
                     return Err(Unevaluable::PolicyChanged.into());
                 }

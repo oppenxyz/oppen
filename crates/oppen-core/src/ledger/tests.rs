@@ -2331,5 +2331,58 @@ fn generic_writers_cannot_forge_submission_lifecycle_events() {
             Err(LedgerError::UseSubmissionJournal)
         ));
     }
+    for kind in [EventKind::PilotAuthorized, EventKind::PilotHalted] {
+        assert!(matches!(
+            ledger.append(&NewEvent {
+                kind,
+                ts_ms: 1,
+                agent_id: Some("alpha"),
+                payload: &json!({}),
+                snapshot: None,
+            }),
+            Err(LedgerError::UsePilotJournal)
+        ));
+        assert!(matches!(
+            ledger.record_outcome(&receipt, kind, 2, &json!({})),
+            Err(LedgerError::UsePilotJournal)
+        ));
+    }
     assert_eq!(ledger.get_events(0, 10).expect("events").events.len(), 1);
+}
+
+#[test]
+fn pilot_reader_barrier_preserves_the_existing_chain_on_upgrade() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("testnet.db");
+    let head = {
+        let ledger = Ledger::open_at(&path, Network::Testnet).unwrap();
+        let head = ledger
+            .append(&NewEvent {
+                kind: EventKind::AgentDecision,
+                ts_ms: 1,
+                agent_id: None,
+                payload: &json!({"reason": "prior history"}),
+                snapshot: None,
+            })
+            .unwrap();
+        ledger
+            .connection
+            .lock()
+            .unwrap()
+            .pragma_update(None, "user_version", 3)
+            .unwrap();
+        head
+    };
+    let upgraded = Ledger::open_at(&path, Network::Testnet).unwrap();
+    let report = upgraded.verify().unwrap();
+    assert!(report.is_intact());
+    assert_eq!(report.head_seq, head.seq);
+    assert_eq!(upgraded.event(head.seq).unwrap().unwrap().hash, head.hash);
+    let version: i64 = upgraded
+        .connection
+        .lock()
+        .unwrap()
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 4);
 }

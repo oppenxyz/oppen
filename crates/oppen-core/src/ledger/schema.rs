@@ -160,7 +160,9 @@ CREATE INDEX events_submission_account
 "#;
 
 /// Every migration in order. `MIGRATIONS.len()` is the version this build writes.
-const MIGRATIONS: &[&str] = &[V1, V2, V3];
+// Reader barrier: a V3 runtime cannot enforce the cumulative pilot budget.
+// No row rewrite or new table is needed for these additional chained events.
+const MIGRATIONS: &[&str] = &[V1, V2, V3, ""];
 
 /// Bring the database up to the schema this build expects.
 ///
