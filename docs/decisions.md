@@ -11,6 +11,19 @@ decisions" section until then.
 
 ---
 
+## 2026-09-07 · Market data into the console
+
+The console had one Tauri command against seventeen gateway tools, and four of
+TradeView's five panels were empty states over reads `oppen-core` already had.
+This is the first of those panels filled.
+
+| # | Decision | Choice | Why |
+|---|---|---|---|
+| Z1 | Where the projection lives | **`oppen-core::market`, not the Tauri layer** | The desktop crate's own module doc says it is "thin by construction: every command assembles nothing itself and calls into `oppen-core`". My first draft computed the day's move and the funding bps inside the command, which needed `rust_decimal` as a new desktop dependency — a dependency decision (leanness rule 9) taken to violate the crate's stated architecture. Moving it to core needed no new dependency, put the arithmetic where the tests are, and makes `market` the symmetric half of `state`: one projects the account from venue responses, the other the market. |
+| Z2 | Two reads on two clocks | **The rail refreshes on a tick; the snapshot only on selection** | The rail is one venue read and it drives the strip too, so refreshing it is cheap and serves two surfaces. The snapshot is three reads — contexts, book, candles — and polling it would triple the console's traffic for a book nobody is watching change. That is why `MarketSnapshot` carries `as_of_ms`: it ages on its own clock, and spec item 34's rule that staleness is surfaced *per feed* applies to a feed that happens to be a REST read. A "Re-read" control is the honest alternative to a timer. |
+| Z3 | What a bookless market looks like | **Listed, dimmed, and titled — never hidden** | 38.6% of the mainnet universe has no book (§14.4 correction 7). Filtering those rows away would leave an operator unable to find an asset they may already hold; showing them as ordinary rows would invite an order that cannot fill. So `has_book` dims the row and the title says why. Same posture for the mid: a market the venue has stopped quoting keeps its row and loses only its `mid_px`, because `allMids` answers for exactly those with a frozen last print and H1 exists to refuse it. |
+| Z4 | What the panel will not claim | **`micro_tilt_bps` is absent here, and says so** | Spec F's microprice tilt needs `bbo` at its ~0.11 s cadence (§14.4 correction 4). The console holds no socket of its own, and computing a microprice from a five-second-old REST book would be exactly the substitution that correction warns against. `get_features` answers it for agents; this panel omits the row rather than filling it from the wrong source. The vol pack is fetched from hourly candles only, so `rv_1h_bps` is absent with `bars_1h: 0` beside it — "not measured", not zero. |
+
 ## 2026-09-07 · Auditing the roadmap against the code
 
 The status paragraph had said "**the P2 and P3 boxes are stale**" since

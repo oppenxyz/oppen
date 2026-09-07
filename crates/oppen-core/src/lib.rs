@@ -22,6 +22,7 @@ pub mod guardrail;
 pub mod journal;
 pub mod keys;
 pub mod ledger;
+pub mod market;
 pub mod reconcile;
 pub mod state;
 pub mod tca;

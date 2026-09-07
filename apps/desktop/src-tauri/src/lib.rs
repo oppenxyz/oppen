@@ -7,6 +7,7 @@
 //! the operator and the agent cannot be shown different accounts (A3).
 
 use oppen_core::keys::{KeyStore, KeychainKeyStore};
+use oppen_core::market::{MarketRow, MarketSnapshot, rows, snapshot};
 use oppen_core::state::{AccountState, VenueReadings, assemble};
 use oppen_hl::{Address, InfoClient, Network};
 
@@ -98,6 +99,61 @@ fn network_of(network: &str) -> Network {
     }
 }
 
+/// Every listed perp, busiest first (`docs/spec.md` item 30).
+///
+/// One read serves the rail *and* the strip above the chart, so selecting a
+/// symbol costs nothing extra for the numbers both already show.
+#[tauri::command]
+async fn markets(network: String) -> Result<Vec<MarketRow>, ConsoleError> {
+    let info =
+        InfoClient::new(network_of(&network)).map_err(|e| ConsoleError::Venue(e.to_string()))?;
+    let contexts = info
+        .meta_and_asset_ctxs()
+        .await
+        .map_err(|e| ConsoleError::Venue(format!("asset contexts: {e}")))?;
+    Ok(rows(&contexts))
+}
+
+/// One symbol in depth: book, and spec F's book, funding and vol packs.
+///
+/// Three reads, taken on selection rather than on the account tick. That is
+/// why [`MarketSnapshot::as_of_ms`] exists — this panel ages on its own clock
+/// and has to be able to say so.
+#[tauri::command]
+async fn market_snapshot(network: String, coin: String) -> Result<MarketSnapshot, ConsoleError> {
+    let network = network_of(&network);
+    let info = InfoClient::new(network).map_err(|e| ConsoleError::Venue(e.to_string()))?;
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or_default();
+
+    let contexts = info
+        .meta_and_asset_ctxs()
+        .await
+        .map_err(|e| ConsoleError::Venue(format!("asset contexts: {e}")))?;
+    let ctx = contexts
+        .iter()
+        .find(|(asset, _)| asset.name == coin)
+        .map(|(_, ctx)| ctx.clone())
+        .ok_or_else(|| ConsoleError::Venue(format!("{coin} is not a listed perp")))?;
+
+    let book = info
+        .l2_book(&coin, None)
+        .await
+        .map_err(|e| ConsoleError::Venue(format!("book: {e}")))?;
+    // A day of hourly bars, for the vol pack. Failing to get candles costs
+    // the panel its σ, not its book: the two answer different questions and
+    // one being unavailable is no reason to withhold the other.
+    let day_ms = 24 * 60 * 60 * 1_000;
+    let hours = info
+        .candles(&coin, "1h", now_ms.saturating_sub(day_ms), now_ms)
+        .await
+        .unwrap_or_default();
+
+    Ok(snapshot(&coin, &book, &ctx, None, &hours, now_ms))
+}
+
 /// The account as it stands now: equity, margin, positions, resting orders.
 ///
 /// Four venue reads rather than one, because Hyperliquid publishes no single
@@ -156,7 +212,12 @@ fn now_ms() -> u64 {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![account_state, keychain_status])
+        .invoke_handler(tauri::generate_handler![
+            account_state,
+            keychain_status,
+            markets,
+            market_snapshot
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
