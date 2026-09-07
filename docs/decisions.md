@@ -11,6 +11,21 @@ decisions" section until then.
 
 ---
 
+## 2026-09-07 · Execution audit repairs
+
+These repairs implement spec items 7, 15, 19, 24, 26 and D6; they do not
+complete the live execution gate.
+
+| # | Decision | Choice | Why |
+|---|---|---|---|
+| ES1 | Submission ownership | One queue per container address, shared by all gateway sessions, acquired before exposure reads | Serializing only signatures or HTTP posts leaves concurrent evaluations spending the same headroom. |
+| ES2 | Unknown outcomes | Keep the submitted cloid reserved until an authoritative order-status result; never release on `unknownOid` | A missing result is not proof that the exchange did not apply the order. The reservation survives a dropped request, but is currently in memory: durable restart reconciliation remains a release blocker. |
+| ES3 | Paused-account cancellation | Retry from current pause state on a five-second runtime tick, retaining revoked pairing bindings for cancellation | A drained effect queue alone cannot represent incomplete delivery. Attempts must be bounded so one stalled container cannot starve the rest. Pairing persistence and operator-facing incomplete-delivery reporting remain open. |
+| ES4 | Exposure arithmetic | Keep opening and reduce-only sizes by side; compare independently reachable fill outcomes | Opposite orders do not necessarily fill together. A clipped reduction can flatten before an opening order flips the position. Replace a symbol's resting contribution using the same valuation that was added to the account total. Cross-symbol limit-price valuation still needs mark-based reconciliation. |
+| ES5 | Policy changes | Invalidate outstanding order clearances when operator guardrails or account limits change | A fresh timestamp does not make a verdict under an obsolete policy valid. Cancels remain available. |
+| ES6 | Stalled requests and definite rejection | Enforce a ten-second deadline through each info/exchange response body, including injected HTTP clients; distinguish parsed top-level rejection from malformed responses | A stalled request must eventually release the account queue so cancellation can proceed. Only a definite rejection releases a submitted cloid; timeout, malformed response and HTTP failure retain it for reconciliation. |
+| ES7 | Shutdown and resumed accounts | Cancel and join active tool execution and HTTP connections before `serve` returns; recheck pause state under the account queue before cancellation | Closing an SSE stream alone does not stop rmcp's detached method task. A pause sweep must not cancel a newly resumed agent's orders from an old snapshot. |
+
 ## 2026-09-07 · The console's own socket
 
 Item 34 asks for per-feed status, last-tick timestamps and a stale overlay. The

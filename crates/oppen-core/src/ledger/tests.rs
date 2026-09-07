@@ -23,6 +23,277 @@ use tempfile::TempDir;
 
 use super::*;
 
+/// D6 / item 29: production audit writes survive reopening as one intact chain.
+#[test]
+fn production_audit_sink_persists_orders_decisions_and_typed_refusals() {
+    use crate::guardrail::{
+        AgentId, AuditEntry, AuditOutcome, AuditSink, ClearedKind, GuardrailEngine, Refusal,
+        SqliteGuardrailStore,
+    };
+    use rust_decimal::Decimal;
+
+    let dir = TempDir::new().expect("tempdir");
+    let path = dir.path().join("audit.db");
+    let agent = AgentId::new("agent-a");
+    let reason = "<b>agent claim</b>\nkeep verbatim";
+    let refusal = Refusal::OrderNotional {
+        symbol: "BTC".into(),
+        observed_usd: Decimal::from(100),
+        limit_usd: Decimal::from(25),
+    };
+    let head = {
+        let ledger = Arc::new(Ledger::open_at(&path, Network::Testnet).expect("open"));
+        let sink = Arc::new(LedgerAuditSink::new(ledger.clone()));
+        let engine = GuardrailEngine::new(
+            Arc::new(SqliteGuardrailStore::open(dir.path().join("guardrails.db")).expect("store")),
+            sink.clone(),
+            Arc::new(crate::keys::MemoryKeyStore::new(Network::Testnet)),
+            Network::Testnet,
+        )
+        .expect("engine");
+        engine
+            .register_agent(&agent, None, 1_000)
+            .expect("register");
+        let cancel = engine
+            .clear_cancel(
+                &agent,
+                vec![oppen_hl::wire::CancelWire { a: 0, o: 42 }],
+                reason,
+                1_001,
+            )
+            .expect("real sink must allow cancel clearance");
+        engine
+            .clear_schedule_cancel(&agent, None, 1_002)
+            .expect("real sink must allow dead-man clearance");
+
+        // Exercise the adapter's order branch without duplicating the engine's
+        // market/exposure fixtures. Clearance is audit data, not signing proof.
+        let mut order = cancel.clearance().clone();
+        order.evaluated_at_ms = 1_003;
+        order.kind = ClearedKind::Order {
+            symbol: "BTC".into(),
+            is_buy: true,
+            px: Decimal::from(100),
+            sz: Decimal::ONE,
+            notional_usd: Decimal::from(100),
+            reduce_only: false,
+            slippage_bps: Decimal::ZERO,
+            reference_px: Decimal::from(100),
+            slippage_reference_px: Decimal::from(100),
+            cloid: None,
+            snapshot_id: None,
+            snapshot_hash: None,
+        };
+        sink.record(&AuditEntry {
+            agent: Some(&agent),
+            at_ms: 1_003,
+            reason,
+            outcome: AuditOutcome::Cleared(&order),
+        })
+        .expect("order must use record_intent rather than append");
+        sink.record(&AuditEntry {
+            agent: Some(&agent),
+            at_ms: 1_004,
+            reason,
+            outcome: AuditOutcome::Refused(&refusal),
+        })
+        .expect("refusal");
+        assert!(ledger.verify().expect("verify").is_intact());
+        ledger.chain_head().expect("head")
+    };
+
+    let ledger = Ledger::open_at(&path, Network::Testnet).expect("reopen");
+    assert_eq!(ledger.chain_head().expect("head"), head);
+    assert!(ledger.verify().expect("verify persisted chain").is_intact());
+    let events = ledger.get_events(0, 10).expect("events").events;
+    assert_eq!(
+        events.iter().map(|event| event.kind).collect::<Vec<_>>(),
+        vec![
+            EventKind::OperatorAction,
+            EventKind::AgentDecision,
+            EventKind::AgentDecision,
+            EventKind::OrderIntent,
+            EventKind::Refusal,
+        ]
+    );
+    for (index, event) in events.iter().enumerate() {
+        assert_eq!(event.agent_id.as_deref(), Some(agent.as_str()));
+        assert_eq!(event.ts_ms, 1_000 + index as i64);
+    }
+    let cancel = events[1].payload.as_ref().expect("cancel payload");
+    assert_eq!(cancel["kind"]["cleared"], "cancel");
+    assert_eq!(cancel["kind"]["count"], 1);
+    assert_eq!(cancel["reason"], reason);
+    let deadman = events[2].payload.as_ref().expect("dead-man payload");
+    assert_eq!(deadman["kind"]["cleared"], "schedule_cancel");
+    assert_eq!(deadman["reason"], "dead-man's switch");
+    let order = events[3].payload.as_ref().expect("order payload");
+    assert_eq!(order["kind"]["cleared"], "order");
+    assert_eq!(order["kind"]["notional_usd"], "100");
+    assert_eq!(order["reason"], reason);
+    let rejected = events[4].payload.as_ref().expect("refusal payload");
+    assert_eq!(rejected["reason"], reason);
+    assert_eq!(rejected["refusal"], refusal.to_string());
+    assert_eq!(
+        rejected["refusal_detail"],
+        serde_json::to_value(&refusal).expect("typed refusal")
+    );
+}
+
+/// D6 / item 29: a policy-cleared order is durable before it can be signed.
+#[test]
+fn engine_evaluates_and_signs_an_order_through_the_production_audit_sink() {
+    use crate::guardrail::{
+        AccountSnapshot, AgentGuardrails, AgentId, Exposure, FeedQuality, GuardrailEngine,
+        MarketRef, OrderIntent, RestingExposure, SqliteGuardrailStore,
+    };
+    use crate::keys::{KeyStore, MemoryKeyStore, SecretText};
+    use oppen_hl::meta::Asset;
+    use oppen_hl::order::OrderKind;
+    use oppen_hl::types::AssetInfo;
+    use oppen_hl::wire::{Cloid, Grouping, Tif};
+    use rust_decimal::Decimal;
+
+    let dir = TempDir::new().expect("tempdir");
+    let path = dir.path().join("signed-audit.db");
+    let ledger = Arc::new(Ledger::open_at(&path, Network::Testnet).expect("ledger"));
+    let agent = AgentId::new("test-agent");
+    let now_ms = 1_788_998_400_000;
+    let keys = Arc::new(MemoryKeyStore::new(Network::Testnet));
+    // Public test scalar, held only in memory; never opens an OS keychain.
+    keys.create_agent_key(
+        &agent,
+        SecretText::new(format!("{:064x}", 1)),
+        now_ms + 86_400_000,
+        now_ms,
+    )
+    .expect("test wallet");
+    let engine = GuardrailEngine::new(
+        Arc::new(SqliteGuardrailStore::open(dir.path().join("policy.db")).expect("policy store")),
+        Arc::new(LedgerAuditSink::new(ledger.clone())),
+        keys,
+        Network::Testnet,
+    )
+    .expect("engine");
+    engine
+        .register_agent(&agent, None, now_ms)
+        .expect("register");
+    engine
+        .operator_set_guardrails(
+            &agent,
+            AgentGuardrails {
+                symbols: ["BTC".to_owned()].into(),
+                max_order_usd: Decimal::from(100),
+                max_position_usd: Decimal::from(100),
+                approval_required: false,
+                ..AgentGuardrails::default()
+            },
+            now_ms,
+        )
+        .expect("valid policy");
+    let cloid = Cloid::parse("0x00000000000000000000000000000001").expect("cloid");
+    let intent = OrderIntent {
+        symbol: "BTC".into(),
+        is_buy: true,
+        px: Decimal::from(100),
+        sz: Decimal::ONE,
+        kind: OrderKind::Limit { tif: Tif::Gtc },
+        reduce_only: false,
+        cloid: Some(cloid.clone()),
+        grouping: Grouping::Na,
+        builder: None,
+        max_slippage_bps: None,
+        reason: "<b>test agent claim</b>".into(),
+    };
+    let asset = Asset {
+        index: 7,
+        info: AssetInfo {
+            name: "BTC".into(),
+            sz_decimals: 2,
+            max_leverage: 40,
+            margin_table_id: 0,
+            is_delisted: false,
+            only_isolated: false,
+        },
+    };
+    let market = MarketRef {
+        symbol: "BTC".into(),
+        reference_px: Some(intent.px),
+        as_of_ms: now_ms,
+        quality: FeedQuality::Ok,
+        mark_divergence_bps: None,
+        mark_divergent_since_ms: None,
+        snapshot: None,
+        sigma_day: None,
+        vol_ratio: None,
+    };
+    let exposure = Exposure {
+        agent: AccountSnapshot {
+            as_of_ms: now_ms,
+            reconciled: true,
+            equity_usd: Decimal::from(1_000),
+            peak_equity_usd: Decimal::from(1_000),
+            realized_pnl_today_usd: Decimal::ZERO,
+            unrealized_pnl_usd: Decimal::ZERO,
+            day_start_ms: now_ms,
+            total_position_notional_usd: Decimal::ZERO,
+            positions: Default::default(),
+            resting: Some(RestingExposure::default()),
+        },
+        fleet: None,
+    };
+    let cleared = engine
+        .evaluate(&agent, &intent, &asset, &market, &exposure, now_ms)
+        .expect("policy-cleared order must reach the real ledger");
+    let events = ledger
+        .get_events(0, 10)
+        .expect("events before signing")
+        .events;
+    let intents: Vec<_> = events
+        .iter()
+        .filter(|e| e.kind == EventKind::OrderIntent)
+        .collect();
+    assert_eq!(intents.len(), 1);
+    let stored = intents[0];
+    assert_eq!(stored.agent_id.as_deref(), Some(agent.as_str()));
+    assert_eq!(stored.ts_ms, now_ms as i64);
+    let mut expected = serde_json::to_value(cleared.clearance()).expect("clearance");
+    expected["reason"] = json!(intent.reason);
+    assert_eq!(stored.payload.as_ref(), Some(&expected));
+    assert_eq!(expected["kind"]["cloid"], json!(cloid));
+    assert!(ledger.verify().expect("verify before signing").is_intact());
+    let head = ledger.chain_head().expect("head before signing");
+
+    let (request, clearance) = engine
+        .sign_cleared(cleared, now_ms, None, now_ms)
+        .expect("real engine signs with the in-memory test wallet");
+    let oppen_hl::Action::Order { orders, .. } = request.action() else {
+        panic!("expected a signed order");
+    };
+    assert_eq!(orders.len(), 1);
+    assert_eq!(orders[0].c, Some(cloid));
+    assert_eq!(request.nonce(), now_ms);
+    assert_eq!(clearance.network, Network::Testnet);
+    assert_eq!(clearance.agent, agent);
+    assert_eq!(clearance.vault_address, None);
+    assert_eq!(ledger.chain_head().expect("head after signing"), head);
+    drop(engine);
+    drop(ledger);
+
+    let reopened = Ledger::open_at(&path, Network::Testnet).expect("reopen");
+    assert_eq!(
+        reopened.event(stored.seq).expect("read intent").as_ref(),
+        Some(stored)
+    );
+    assert_eq!(reopened.chain_head().expect("persisted head"), head);
+    assert!(
+        reopened
+            .verify()
+            .expect("verify persisted chain")
+            .is_intact()
+    );
+}
+
 /// Deterministic splitmix64. A test that fails only sometimes is a test nobody
 /// trusts, so the generator is seeded from a constant and never from the clock.
 struct Rng(u64);

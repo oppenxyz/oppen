@@ -120,8 +120,14 @@ fn account(equity: Decimal) -> AccountSnapshot {
 /// An exposure whose working book holds `szi` of `symbol` at `px`.
 fn with_resting(mut exposure: Exposure, symbol: &str, szi: Decimal, px: Decimal) -> Exposure {
     let mut book = RestingExposure::none();
-    book.szi.insert(symbol.to_owned(), szi);
+    if szi >= Decimal::ZERO {
+        book.buys.insert(symbol.to_owned(), szi);
+    } else {
+        book.sells.insert(symbol.to_owned(), -szi);
+    }
     book.notional_usd = szi.abs() * px;
+    book.notional_by_symbol
+        .insert(symbol.to_owned(), book.notional_usd);
     exposure.agent.resting = Some(book);
     exposure
 }
@@ -1656,8 +1662,11 @@ fn the_leverage_cap_counts_working_orders_on_other_symbols() {
     // With $150 of ETH already working, the same order is 2.5x.
     let mut with_eth = exposure(d("100"));
     with_eth.agent.resting = Some(RestingExposure {
-        szi: BTreeMap::from([("ETH".to_owned(), d("1.5"))]),
+        buys: BTreeMap::from([("ETH".to_owned(), d("1.5"))]),
+        sells: BTreeMap::new(),
         notional_usd: d("150"),
+        notional_by_symbol: BTreeMap::from([("ETH".into(), d("150"))]),
+        ..RestingExposure::default()
     });
     assert!(matches!(
         f.evaluate(&order, &btc, &market, &with_eth),
@@ -1666,6 +1675,334 @@ fn the_leverage_cap_counts_working_orders_on_other_symbols() {
 }
 
 // ---- item 26: the kill switch -------------------------------------------
+
+#[test]
+fn leverage_replaces_the_exact_limit_notional_from_production_state() {
+    use crate::state::{AccountState, Balances, Freshness as StateFreshness, OrderView};
+    let order = |is_buy, limit_px| OrderView {
+        symbol: "BTC".into(),
+        oid: 1,
+        cloid: None,
+        is_buy,
+        limit_px,
+        size: Decimal::ONE,
+        original_size: Decimal::ONE,
+        reduce_only: false,
+        is_trigger: false,
+        trigger_px: None,
+        placed_ts_ms: NOW_MS,
+    };
+    let state = AccountState {
+        contract_version: 1,
+        network: "testnet",
+        address: vault(),
+        as_of_ms: NOW_MS,
+        feed_age_ms: Some(0),
+        feed: StateFreshness::Live,
+        balances: Balances {
+            equity_usd: d("110"),
+            perps_account_value_usd: d("110"),
+            spot_usdc_available: Decimal::ZERO,
+            total_margin_used_usd: Decimal::ZERO,
+            withdrawable_usd: d("110"),
+        },
+        margin_runway_h: None,
+        loss_budget: vec![],
+        positions: vec![],
+        orders: vec![order(true, d("50")), order(false, d("110"))],
+    };
+    let mut exposure = crate::state::exposure_from(&state, Decimal::ZERO, None, true, MIDNIGHT_MS);
+    let resting = exposure.agent.resting.as_ref().expect("working book");
+    assert_eq!(resting.notional_usd, d("160"));
+    assert_eq!(resting.notional_by_symbol["BTC"], d("160"));
+    let mut config = permissive(&["BTC"]);
+    config.risk.max_leverage = 1;
+    let f = Fixture::new(config);
+    let candidate = intent("BTC", true, d("100"), d("0.5"));
+    let btc = asset("BTC", 2, 40);
+    let market = MarketRef::fresh("BTC", d("100"), NOW_MS);
+    assert!(matches!(f.evaluate(&candidate, &btc, &market, &exposure),
+        Err(Refusal::Leverage { position_notional_usd, .. }) if position_notional_usd == d("150")));
+
+    // Missing attribution cannot earn subtraction credit via a mark fallback.
+    exposure
+        .agent
+        .resting
+        .as_mut()
+        .expect("book")
+        .notional_by_symbol
+        .clear();
+    assert!(matches!(f.evaluate(&candidate, &btc, &market, &exposure),
+        Err(Refusal::Leverage { position_notional_usd, .. }) if position_notional_usd == d("310")));
+}
+
+#[test]
+fn reductions_before_opening_fills_cannot_hide_a_position_flip() {
+    for long in [true, false] {
+        for candidate_is_reduction in [true, false] {
+            for leverage_only in [false, true] {
+                let mut config = permissive(&["BTC"]);
+                config.max_position_usd = if leverage_only { d("1000") } else { d("100") };
+                config.risk.max_leverage = 1;
+                let f = Fixture::new(config);
+                let sign = if long { Decimal::ONE } else { -Decimal::ONE };
+                let opening = if candidate_is_reduction {
+                    d("1.5")
+                } else {
+                    Decimal::ONE
+                };
+                let mut state = with_resting(exposure(d("100")), "BTC", -sign * opening, d("100"));
+                state
+                    .agent
+                    .positions
+                    .insert("BTC".into(), PositionSnapshot { szi: sign });
+                state.agent.total_position_notional_usd = d("100");
+                if !candidate_is_reduction {
+                    let book = state.agent.resting.as_mut().expect("book");
+                    let side = if long {
+                        &mut book.reduce_sells
+                    } else {
+                        &mut book.reduce_buys
+                    };
+                    side.insert("BTC".into(), Decimal::ONE);
+                }
+                let mut candidate = intent(
+                    "BTC",
+                    !long,
+                    d("100"),
+                    if candidate_is_reduction {
+                        Decimal::ONE
+                    } else {
+                        d("0.5")
+                    },
+                );
+                candidate.reduce_only = candidate_is_reduction;
+                let refusal = f
+                    .evaluate(
+                        &candidate,
+                        &asset("BTC", 2, 40),
+                        &MarketRef::fresh("BTC", d("100"), NOW_MS),
+                        &state,
+                    )
+                    .expect_err("flip exceeds cap");
+                if leverage_only {
+                    assert!(
+                        matches!(refusal, Refusal::Leverage { position_notional_usd, .. }
+                        if position_notional_usd == d("150"))
+                    );
+                } else {
+                    assert!(
+                        matches!(refusal, Refusal::PositionNotional { observed_usd, .. }
+                        if observed_usd == d("150"))
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn genuine_reduce_only_orders_can_unwind_above_fixed_and_leverage_caps() {
+    for long in [true, false] {
+        let mut config = permissive(&["BTC"]);
+        config.max_position_usd = d("50");
+        config.risk.max_leverage = 1;
+        let f = Fixture::new(config);
+        let mut state = exposure(d("50"));
+        state.agent.positions.insert(
+            "BTC".into(),
+            PositionSnapshot {
+                szi: if long { Decimal::ONE } else { -Decimal::ONE },
+            },
+        );
+        state.agent.total_position_notional_usd = d("100");
+        for size in [d("0.5"), Decimal::ONE] {
+            let mut candidate = intent("BTC", !long, d("100"), size);
+            candidate.reduce_only = true;
+            let cleared = f
+                .evaluate(
+                    &candidate,
+                    &asset("BTC", 2, 40),
+                    &MarketRef::fresh("BTC", d("100"), NOW_MS),
+                    &state,
+                )
+                .expect("safe unwind");
+            assert_eq!(cleared.clearance().utilization.leverage, d("2"));
+            candidate.reduce_only = false;
+            assert!(matches!(
+                f.evaluate(
+                    &candidate,
+                    &asset("BTC", 2, 40),
+                    &MarketRef::fresh("BTC", d("100"), NOW_MS),
+                    &state
+                ),
+                Err(Refusal::PositionNotional { .. })
+            ));
+            candidate.reduce_only = true;
+            candidate.is_buy = long;
+            assert!(matches!(
+                f.evaluate(
+                    &candidate,
+                    &asset("BTC", 2, 40),
+                    &MarketRef::fresh("BTC", d("100"), NOW_MS),
+                    &state
+                ),
+                Err(Refusal::PositionNotional { .. })
+            ));
+        }
+    }
+}
+
+#[test]
+fn position_extrema_match_clipped_fill_permutations() {
+    let mut config = permissive(&["BTC"]);
+    config.max_position_usd = d("1000");
+    let f = Fixture::new(config);
+    let btc = asset("BTC", 2, 40);
+    let market = MarketRef::fresh("BTC", d("100"), NOW_MS);
+    let mut cases = 0;
+    let mut growing_reductions = 0;
+    let mut safe_reductions = 0;
+    // Three initial positions and all four side aggregates at sizes 0, 1, 2.
+    for encoded in 0..243 {
+        let mut digits = encoded;
+        let mut values = [Decimal::ZERO; 5];
+        for value in &mut values {
+            *value = Decimal::from(digits % 3);
+            digits /= 3;
+        }
+        let [p, buys, sells, rb, rs] = values;
+        let p = p - Decimal::ONE;
+        let mut state = exposure(d("10000"));
+        state
+            .agent
+            .positions
+            .insert("BTC".into(), PositionSnapshot { szi: p });
+        state.agent.total_position_notional_usd = p.abs() * d("100");
+        state.agent.resting = Some(RestingExposure {
+            buys: BTreeMap::from([("BTC".into(), buys)]),
+            sells: BTreeMap::from([("BTC".into(), sells)]),
+            reduce_buys: BTreeMap::from([("BTC".into(), rb)]),
+            reduce_sells: BTreeMap::from([("BTC".into(), rs)]),
+            notional_usd: buys * d("50") + sells * d("110"),
+            notional_by_symbol: BTreeMap::from([("BTC".into(), buys * d("50") + sells * d("110"))]),
+        });
+        for is_buy in [true, false] {
+            for reduce_only in [true, false] {
+                for sz in [d("0.5"), d("1.5")] {
+                    let mut candidate = intent("BTC", is_buy, d("100"), sz);
+                    candidate.reduce_only = reduce_only;
+                    let signed = if is_buy { sz } else { -sz };
+                    let fills = [
+                        (buys, false),
+                        (-sells, false),
+                        (rb, true),
+                        (-rs, true),
+                        (signed, reduce_only),
+                    ];
+                    let before = reachable_worst(p, &fills[..4]);
+                    let after = reachable_worst(p, &fills);
+                    let verdict = f.preflight(&candidate, &btc, &market, &state);
+                    assert!(verdict.would_clear, "case {encoded}: {:?}", verdict.refusal);
+                    let used = verdict.utilization.expect("cleared utilization");
+                    assert_eq!(
+                        used.position_notional_pct,
+                        Some(after * d("10")),
+                        "case {encoded}: {fills:?}"
+                    );
+                    assert_eq!(used.leverage, after / d("100"));
+                    cases += 1;
+                    if reduce_only && p * signed < Decimal::ZERO {
+                        if after > before {
+                            growing_reductions += 1;
+                        } else {
+                            safe_reductions += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(cases, 1944);
+    assert!(growing_reductions > 0 && safe_reductions > 0);
+}
+
+#[test]
+fn opposite_resting_orders_never_create_position_headroom() {
+    for is_buy in [true, false] {
+        let mut config = permissive(&["BTC"]);
+        config.max_position_usd = d("100");
+        let f = Fixture::new(config);
+        let mut state = exposure(d("10000"));
+        state.agent.resting = Some(RestingExposure {
+            buys: BTreeMap::from([("BTC".into(), d("1"))]),
+            sells: BTreeMap::from([("BTC".into(), d("1"))]),
+            notional_usd: d("200"),
+            notional_by_symbol: BTreeMap::from([("BTC".into(), d("200"))]),
+            ..RestingExposure::default()
+        });
+        assert!(matches!(f.evaluate(
+            &intent("BTC", is_buy, d("100"), d("1")),
+            &asset("BTC", 2, 40),
+            &MarketRef::fresh("BTC", d("100"), NOW_MS),
+            &state,
+        ), Err(Refusal::PositionNotional { observed_usd, .. }) if observed_usd == d("200")));
+    }
+}
+
+#[test]
+fn a_failed_kill_release_keeps_the_live_engine_paused() {
+    let f = Fixture::with(
+        permissive(&["BTC"]),
+        Arc::new(FailingStore),
+        Arc::new(NullAuditSink),
+    );
+    assert!(
+        f.engine
+            .operator_engage_kill(KillScope::Global, KillReason::Operator, NOW_MS)
+            .is_err()
+    );
+    assert!(
+        f.engine
+            .operator_release_kill(&KillScope::Global, NOW_MS)
+            .is_err()
+    );
+    assert!(f.engine.kill_switch().is_engaged(&KillScope::Global));
+    assert!(matches!(
+        f.evaluate(
+            &intent("BTC", true, d("100"), d("1")),
+            &asset("BTC", 2, 40),
+            &MarketRef::fresh("BTC", d("100"), NOW_MS),
+            &exposure(d("10000")),
+        ),
+        Err(Refusal::TradingPaused { .. })
+    ));
+    let effects = f.engine.take_pending_kill_effects();
+    assert_eq!(effects.len(), 1);
+    assert!(effects[0].cancel_for.contains(&f.agent));
+}
+
+#[test]
+fn changing_policy_invalidates_an_order_already_cleared() {
+    let f = Fixture::new(permissive(&["BTC"]));
+    let cleared = f
+        .evaluate(
+            &intent("BTC", true, d("100"), d("1")),
+            &asset("BTC", 2, 40),
+            &MarketRef::fresh("BTC", d("100"), NOW_MS),
+            &exposure(d("10000")),
+        )
+        .expect("initial policy permits order");
+    f.engine
+        .operator_set_guardrails(&f.agent, permissive(&[]), NOW_MS)
+        .expect("tighten policy");
+    assert!(matches!(
+        f.engine.sign_cleared(cleared, 1, None, NOW_MS),
+        Err(SignClearedError::Refused(Refusal::Unevaluable(
+            Unevaluable::PolicyChanged
+        )))
+    ));
+}
 
 #[test]
 fn the_kill_switch_survives_a_restart() {
@@ -3272,8 +3609,26 @@ fn no_input_produces_a_signable_value_without_passing_every_predicate() {
                 let mut book = RestingExposure::none();
                 if rng.chance(2) {
                     let szi = d(rng.pick(&["-2", "-0.5", "0.5", "2"]));
-                    book.notional_usd = szi.abs() * base_px;
-                    book.szi.insert(symbol.to_owned(), szi);
+                    let limit_px = base_px * d(rng.pick(&price_factors));
+                    book.notional_usd = szi.abs() * limit_px;
+                    if szi >= Decimal::ZERO {
+                        book.buys.insert(symbol.to_owned(), szi);
+                    } else {
+                        book.sells.insert(symbol.to_owned(), -szi);
+                    }
+                    if rng.chance(2) {
+                        book.buys.insert(symbol.to_owned(), d("2"));
+                        book.sells.insert(symbol.to_owned(), d("2"));
+                        book.notional_usd = d("4") * limit_px;
+                    }
+                    book.notional_by_symbol
+                        .insert(symbol.to_owned(), book.notional_usd);
+                }
+                if rng.chance(2) {
+                    book.reduce_buys
+                        .insert(symbol.to_owned(), d(rng.pick(&sizes)));
+                    book.reduce_sells
+                        .insert(symbol.to_owned(), d(rng.pick(&sizes)));
                 }
                 Some(book)
             },
@@ -3332,6 +3687,32 @@ fn no_input_produces_a_signable_value_without_passing_every_predicate() {
         unevaluable_count > 100,
         "only {unevaluable_count} fail-closed refusals; the generator is not exercising them"
     );
+}
+
+/// Enumerate every subset and ordering of fills, clipping reduce-only at zero.
+/// Partial fills cannot improve an extreme: each transition is monotone in
+/// position, and monotone in its own size, so zero/full endpoints suffice.
+fn reachable_worst(position: Decimal, fills: &[(Decimal, bool)]) -> Decimal {
+    fn visit(position: Decimal, fills: &[(Decimal, bool)], used: usize) -> Decimal {
+        let mut worst = position.abs();
+        for (index, &(signed_size, reduce_only)) in fills.iter().enumerate() {
+            if used & (1 << index) != 0 {
+                continue;
+            }
+            let next = if !reduce_only {
+                position + signed_size
+            } else if position > Decimal::ZERO && signed_size < Decimal::ZERO {
+                (position + signed_size).max(Decimal::ZERO)
+            } else if position < Decimal::ZERO && signed_size > Decimal::ZERO {
+                (position + signed_size).min(Decimal::ZERO)
+            } else {
+                position
+            };
+            worst = worst.max(visit(next, fills, used | (1 << index)));
+        }
+        worst
+    }
+    visit(position, fills, 0)
 }
 
 /// Re-derives every guardrail from the action that would be signed and the
@@ -3423,11 +3804,36 @@ fn verify_every_predicate(
         .resting
         .as_ref()
         .expect("a cleared order has a resting book");
-    let resting_szi = resting.szi_of(&order.symbol);
+    let buys = resting.buys.get(&order.symbol).copied().unwrap_or_default();
+    let sells = resting
+        .sells
+        .get(&order.symbol)
+        .copied()
+        .unwrap_or_default();
     let signed_sz = if order.is_buy { sz } else { -sz };
-    let after = position_szi + resting_szi + signed_sz;
+    let reduce_buys = resting
+        .reduce_buys
+        .get(&order.symbol)
+        .copied()
+        .unwrap_or_default();
+    let reduce_sells = resting
+        .reduce_sells
+        .get(&order.symbol)
+        .copied()
+        .unwrap_or_default();
+    let fills = [
+        (buys, false),
+        (-sells, false),
+        (reduce_buys, true),
+        (-reduce_sells, true),
+        (signed_sz, order.reduce_only),
+    ];
+    let before = reachable_worst(position_szi, &fills[..4]);
+    let after = reachable_worst(position_szi, &fills);
+    let genuine_reduction =
+        order.reduce_only && position_szi * signed_sz < Decimal::ZERO && after <= before;
     assert!(
-        after.abs() * reference_px <= config.max_position_usd,
+        genuine_reduction || after * reference_px <= config.max_position_usd,
         "{ctx}: position notional past the cap"
     );
     // Spec F's vol-scaled cap, re-derived rather than re-read. Unlike every
@@ -3449,21 +3855,33 @@ fn verify_every_predicate(
             "{ctx}: cleared against a non-positive volatility"
         );
         let scale = market.vol_ratio.unwrap_or(Decimal::ONE).max(Decimal::ONE);
-        let before = position_szi + resting_szi;
-        if after.abs() >= before.abs() {
+        let reduces = genuine_reduction
+            || (!order.reduce_only
+                && after <= before
+                && (position_szi + signed_sz).abs() < position_szi.abs());
+        if !reduces {
             assert!(
                 after.abs() * reference_px <= budget / (Decimal::from(2) * sigma * scale),
                 "{ctx}: position past the vol-scaled cap"
             );
         }
     }
-    let symbol_before = position_szi.abs() * reference_px + resting_szi.abs() * reference_px;
-    let total_after = (account.total_position_notional_usd + resting.notional_usd - symbol_before
-        + after.abs() * reference_px)
+    // Sum the other symbols independently; do not repeat the engine's
+    // total-minus-contribution arithmetic in the oracle.
+    let other_working: Decimal = resting
+        .notional_by_symbol
+        .iter()
+        .filter(|(symbol, _)| *symbol != &order.symbol)
+        .map(|(_, usd)| *usd)
+        .sum();
+    let total_after = (account.total_position_notional_usd - position_szi.abs() * reference_px
+        + other_working
+        + after * reference_px)
         .max(Decimal::ZERO);
     assert!(
-        total_after / account.equity_usd
-            <= Decimal::from(config.risk.max_leverage.min(asset.info.max_leverage)),
+        genuine_reduction
+            || total_after / account.equity_usd
+                <= Decimal::from(config.risk.max_leverage.min(asset.info.max_leverage)),
         "{ctx}: leverage past the cap"
     );
     if config.reduce_only {

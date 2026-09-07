@@ -95,13 +95,22 @@ async fn every_channel_the_console_watches_delivers() {
     if !venue_errors.is_empty() {
         println!("venue said: {venue_errors:?}");
     }
-    assert!(ctx > 0, "activeAssetCtx delivered nothing: the strip is dead");
+    assert!(
+        ctx > 0,
+        "activeAssetCtx delivered nothing: the strip is dead"
+    );
     assert!(bbo > 0, "bbo delivered nothing: the spread is dead");
     assert!(book > 0, "l2Book delivered nothing: the ladder is dead");
-    assert!(candle > 0, "candle delivered nothing: the bar is never reconciled");
+    assert!(
+        candle > 0,
+        "candle delivered nothing: the bar is never reconciled"
+    );
     // The tape is what actually moves the forming bar, so a silent `trades` is
     // a frozen chart even while every other channel looks healthy.
-    assert!(trades > 0, "trades delivered nothing: the chart cannot move");
+    assert!(
+        trades > 0,
+        "trades delivered nothing: the chart cannot move"
+    );
 }
 
 /// How often each source of a moving price actually delivers.
@@ -156,6 +165,8 @@ async fn candle_and_trade_cadence() {
         }
     }
 
-    println!("over {window:?}: candle frames={candles} (first at {first_candle:?}, last at {last_candle:?})");
+    println!(
+        "over {window:?}: candle frames={candles} (first at {first_candle:?}, last at {last_candle:?})"
+    );
     println!("               trade frames={trade_frames} carrying {prints} prints");
 }

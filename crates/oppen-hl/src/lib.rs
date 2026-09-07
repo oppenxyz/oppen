@@ -22,6 +22,9 @@ pub mod types;
 pub mod wire;
 pub mod ws;
 
+// A stalled venue must not retain a container's execution lock indefinitely.
+const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 pub use action::Action;
 pub use address::Address;
 pub use exchange::{ExchangeClient, ExchangeRequest, ExchangeResponse, NonceAllocator, Status};
@@ -90,9 +93,15 @@ pub enum Error {
     Msgpack(#[from] rmp_serde::encode::Error),
     #[error("http transport: {0}")]
     Http(#[from] reqwest::Error),
-    /// Non-2xx from the venue, or a `status: "err"` exchange response.
+    /// Non-2xx or an invalid info response. Not proof of exchange rejection.
     #[error("venue rejected the request (http {status}): {message}")]
     Venue { status: u16, message: String },
+    /// A parsed top-level exchange rejection, safe to release from in-flight exposure.
+    #[error("exchange rejected the request: {message}")]
+    ExchangeRejected { message: String },
+    /// The response cannot establish whether a submitted action was applied.
+    #[error("invalid exchange response: {0}")]
+    InvalidExchangeResponse(String),
     #[error("websocket: {0}")]
     Ws(String),
 }

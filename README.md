@@ -224,7 +224,7 @@ Nothing is released yet. To run from source:
 platform.
 
 ```sh
-git clone https://github.com/gkssxf/oppen
+git clone https://github.com/oppenxyz/oppen
 cd oppen
 bun install --cwd apps/desktop
 cargo build
@@ -349,7 +349,7 @@ Pull requests are welcome. Contributions require signing the
 ## Security
 
 Report vulnerabilities through a
-[GitHub security advisory](https://github.com/gkssxf/oppen/security/advisories/new).
+[GitHub security advisory](https://github.com/oppenxyz/oppen/security/advisories/new).
 Do not open a public issue for an exploitable bug.
 
 Read [docs/threat-model.md](docs/threat-model.md) before trading real funds. In

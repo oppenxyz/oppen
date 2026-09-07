@@ -1125,6 +1125,9 @@ impl Ledger {
     /// is what makes erasing the end of the chain evident. See [`anchor`] for
     /// the limits of the default sidecar.
     pub fn verify(&self) -> Result<ChainReport> {
+        // Append holds this lock through anchor storage; read both under the
+        // same lock so concurrent writes cannot make the witness look stale.
+        let guard = self.lock()?;
         let anchor = match &self.anchor {
             Some(anchor) => {
                 match anchor.load()? {
@@ -1135,7 +1138,6 @@ impl Ledger {
                     // that into "unanchored" would be a fail-open on the one
                     // file an attacker deletes first.
                     None => {
-                        let guard = self.lock()?;
                         let (head_seq, head_hash) = verify::head_of(&guard)?;
                         return Ok(ChainReport {
                             rows_checked: 0,
@@ -1151,7 +1153,6 @@ impl Ledger {
             }
             None => None,
         };
-        let guard = self.lock()?;
         verify::walk(&guard, &self.genesis, anchor.as_ref())
     }
 
@@ -1976,7 +1977,10 @@ fn sub_account_from_row(row: &Row<'_>) -> Result<SubAccount> {
 /// The event kind is chosen from the outcome rather than passed in, so a
 /// caller cannot file a refusal as an approval:
 ///
-/// - a clearance is [`EventKind::OrderIntent`], written *before* signing;
+/// - an order clearance is [`EventKind::OrderIntent`], committed through
+///   [`Ledger::record_intent`] *before* signing;
+/// - a cancel or dead-man clearance is [`EventKind::AgentDecision`]; it
+///   records permission to act, not a venue-confirmed order state change;
 /// - a refusal is [`EventKind::Refusal`], which `docs/decisions.md` D-c
 ///   requires in the record because the refusal is the onboarding;
 /// - an operator mutation is [`EventKind::OperatorAction`].
@@ -2001,20 +2005,26 @@ impl crate::guardrail::AuditSink for LedgerAuditSink {
         &self,
         entry: &crate::guardrail::AuditEntry<'_>,
     ) -> std::result::Result<(), crate::guardrail::AuditError> {
-        use crate::guardrail::AuditOutcome;
+        use crate::guardrail::{AuditOutcome, ClearedKind};
 
         let (kind, mut payload) = match &entry.outcome {
             AuditOutcome::Cleared(clearance) => (
-                EventKind::OrderIntent,
+                match clearance.kind {
+                    ClearedKind::Order { .. } => EventKind::OrderIntent,
+                    ClearedKind::Cancel { .. } | ClearedKind::ScheduleCancel { .. } => {
+                        EventKind::AgentDecision
+                    }
+                },
                 serde_json::to_value(clearance).map_err(|e| crate::guardrail::AuditError {
                     detail: e.to_string(),
                 })?,
             ),
             AuditOutcome::Refused(refusal) => (
                 EventKind::Refusal,
-                // The Display impl is the contract: it names the predicate,
-                // the observed value and the limit.
-                serde_json::json!({ "refusal": refusal.to_string() }),
+                serde_json::json!({
+                    "refusal": refusal.to_string(),
+                    "refusal_detail": refusal,
+                }),
             ),
             AuditOutcome::Operator(action) => (
                 EventKind::OperatorAction,
@@ -2031,6 +2041,23 @@ impl crate::guardrail::AuditSink for LedgerAuditSink {
                 "reason".into(),
                 serde_json::Value::String(entry.reason.to_owned()),
             );
+        }
+
+        if let AuditOutcome::Cleared(clearance) = &entry.outcome
+            && matches!(clearance.kind, ClearedKind::Order { .. })
+        {
+            return self
+                .ledger
+                .record_intent(&NewIntent {
+                    agent_id: clearance.agent.as_str(),
+                    ts_ms: entry.at_ms as i64,
+                    payload: &payload,
+                    snapshot: None,
+                })
+                .map(|_| ())
+                .map_err(|e| crate::guardrail::AuditError {
+                    detail: e.to_string(),
+                });
         }
 
         self.ledger

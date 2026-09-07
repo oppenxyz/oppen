@@ -42,7 +42,13 @@ impl InfoClient {
     }
 
     async fn post<T: DeserializeOwned>(&self, body: serde_json::Value) -> Result<T, Error> {
-        let response = self.http.post(&self.url).json(&body).send().await?;
+        let response = self
+            .http
+            .post(&self.url)
+            .timeout(crate::REQUEST_TIMEOUT)
+            .json(&body)
+            .send()
+            .await?;
         let status = response.status();
         if !status.is_success() {
             let text = response.text().await.unwrap_or_default();
@@ -163,7 +169,13 @@ impl InfoClient {
         // Read the body before judging the status: the unlisted-coin answer
         // is a `null` payload delivered with an error status, and the
         // distinction it draws is worth more than the status code.
-        let response = self.http.post(&self.url).json(&body).send().await?;
+        let response = self
+            .http
+            .post(&self.url)
+            .timeout(crate::REQUEST_TIMEOUT)
+            .json(&body)
+            .send()
+            .await?;
         let status = response.status().as_u16();
         let text = response.text().await?;
         parse_funding_history(status, &text, universe.get(coin.as_str()).is_ok())
@@ -273,6 +285,36 @@ fn parse_funding_history(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn requests_cannot_hold_an_execution_lock_forever() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let peer = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            socket.writable().await.unwrap();
+            let partial = b"HTTP/1.1 200 OK\r\nContent-Length: 1024\r\n\r\n{";
+            assert_eq!(socket.try_write(partial).unwrap(), partial.len());
+            std::future::pending::<()>().await;
+            drop(socket);
+        });
+        let mut info = InfoClient::with_client(Network::Testnet, Client::new());
+        info.url = format!("http://{address}/info");
+        let result = tokio::time::timeout(
+            crate::REQUEST_TIMEOUT + std::time::Duration::from_secs(3),
+            info.meta(),
+        )
+        .await;
+        peer.abort();
+        let _ = peer.await;
+        let error = result
+            .expect("the client deadline must release the request")
+            .unwrap_err();
+        assert!(
+            matches!(error, Error::Http(ref error) if error.is_timeout()),
+            "{error:?}"
+        );
+    }
     use crate::types::{FUNDING_HISTORY_PAGE_LIMIT, ScopeError};
 
     /// Bodies captured verbatim from mainnet on 2026-09-03.

@@ -11,7 +11,9 @@
 //! on success, a typed code with its retryability on failure, never a
 //! formatted sentence (invariant 8).
 
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::future::Future;
+use std::sync::{Arc, Mutex};
 
 use oppen_core::alert::{AlertStore, Condition, Direction};
 use oppen_core::book;
@@ -61,6 +63,9 @@ pub struct Gateway {
 }
 
 struct GatewayInner {
+    // Shared by account across tokens and sessions. The pending cloid survives
+    // a dropped request, but this in-memory reservation does not survive restart.
+    execution: Mutex<HashMap<Address, Arc<tokio::sync::Mutex<Option<Cloid>>>>>,
     network: Network,
     info: InfoClient,
     /// The agent and account are **not** here. They come from the pairing
@@ -109,6 +114,11 @@ struct EvaluationContext {
     state: AccountState,
     exposure: oppen_core::guardrail::Exposure,
     market: MarketRef,
+}
+
+struct CancelAllResult {
+    reply: Reply,
+    complete: bool,
 }
 
 /// What `place` takes.
@@ -467,6 +477,7 @@ impl Gateway {
     ) -> Result<Self, oppen_hl::Error> {
         Ok(Self {
             inner: Arc::new(GatewayInner {
+                execution: Mutex::new(HashMap::new()),
                 network,
                 info: InfoClient::new(network)?,
                 engine,
@@ -504,6 +515,90 @@ impl Gateway {
 
     pub fn network(&self) -> Network {
         self.inner.network
+    }
+
+    fn execution_queue(&self, account: Address) -> Arc<tokio::sync::Mutex<Option<Cloid>>> {
+        self.inner
+            .execution
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(account)
+            .or_default()
+            .clone()
+    }
+
+    async fn reserve_submission(
+        &self,
+        bound: &Binding,
+    ) -> Result<tokio::sync::OwnedMutexGuard<Option<Cloid>>, ToolError> {
+        reserve_account(self.execution_queue(bound.account), |cloid| async move {
+            self.inner
+                .info
+                .order_status(bound.account, OrderRef::Cloid(cloid))
+                .await
+                .map_err(|e| ToolError::unavailable("submission reconciliation", e))
+        })
+        .await
+    }
+
+    /// Runtime-only: retry from the persisted pause state, never from the
+    /// drainable kill-effect queue. This is not an MCP tool or an unpause path.
+    pub(crate) async fn enforce_pauses(&self, bindings: &[Binding]) -> Result<(), ToolError> {
+        self.enforce_pauses_with(bindings, |bound| async move {
+            let result = self
+                .cancel_all_bound(
+                    &bound,
+                    &SymbolActionParams {
+                        symbol: None,
+                        reason: "cancel resting orders while trading is paused".to_owned(),
+                    },
+                    true,
+                )
+                .await?;
+            if result.complete {
+                Ok(())
+            } else {
+                Err(ToolError::unavailable(
+                    "pause cancellation",
+                    "resting orders were not all confirmed canceled",
+                ))
+            }
+        })
+        .await
+    }
+
+    async fn enforce_pauses_with<F, Fut>(
+        &self,
+        bindings: &[Binding],
+        mut cancel: F,
+    ) -> Result<(), ToolError>
+    where
+        F: FnMut(Binding) -> Fut,
+        Fut: Future<Output = Result<(), ToolError>>,
+    {
+        let paused = self.inner.engine.paused_agents();
+        let mut seen = HashSet::new();
+        let mut failure = None;
+        for bound in bindings {
+            if !paused.contains(&bound.agent) || !seen.insert((bound.agent.clone(), bound.account))
+            {
+                continue;
+            }
+            let result =
+                tokio::time::timeout(std::time::Duration::from_secs(10), cancel(bound.clone()))
+                    .await
+                    .unwrap_or_else(|error| {
+                        Err(ToolError::unavailable("pause cancellation timeout", error))
+                    });
+            if let Err(error) = result {
+                tracing::warn!(agent = %bound.agent, account = %bound.account, %error, "paused agent cancellation failed; will retry");
+                failure.get_or_insert(error);
+            }
+        }
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     /// `get_meta` — per-symbol trading rules (`docs/spec.md` item 17).
@@ -565,6 +660,7 @@ impl Gateway {
     ) -> Result<CallToolResult, ErrorData> {
         let inner = &self.inner;
         let bound = Self::bound(&ctx)?;
+        let mut pending = self.reserve_submission(&bound).await?;
         let now_ms = now_ms();
 
         let context = self
@@ -657,13 +753,15 @@ impl Gateway {
             asset,
             &context.market,
             &context.exposure,
-            now_ms,
+            self::now_ms(),
         ) {
             Ok(cleared) => cleared,
             Err(refusal) => return Ok(outcome::refused(refusal).into_result()),
         };
 
-        let response = self.submit(cleared, Some(&cloid), now_ms).await?;
+        let response = self
+            .submit(cleared, Some(&cloid), Some(&mut pending))
+            .await?;
         Ok(order_outcome(response, Some(cloid.as_str().to_owned()))?.into_result())
     }
 
@@ -680,6 +778,8 @@ impl Gateway {
     ) -> Result<CallToolResult, ErrorData> {
         let inner = &self.inner;
         let bound = Self::bound(&ctx)?;
+        let queue = self.execution_queue(bound.account);
+        let _execution = queue.lock().await;
         let now_ms = now_ms();
 
         // Which resting order this names, and on which asset. The asset id is
@@ -732,7 +832,7 @@ impl Gateway {
             Err(refusal) => return Ok(outcome::refused(refusal).into_result()),
         };
 
-        let response = self.submit(cleared, order.cloid.as_ref(), now_ms).await?;
+        let response = self.submit(cleared, order.cloid.as_ref(), None).await?;
         Ok(cancel_outcome(
             response,
             vec![(
@@ -755,16 +855,67 @@ impl Gateway {
         Parameters(params): Parameters<SymbolActionParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
-        let inner = &self.inner;
         let bound = Self::bound(&ctx)?;
-        let now_ms = now_ms();
+        Ok(self
+            .cancel_all_bound(&bound, &params, false)
+            .await?
+            .reply
+            .into_result())
+    }
 
-        let orders = inner
-            .info
-            .frontend_open_orders(bound.account)
-            .await
-            .map_err(|e| ToolError::unavailable("orders", e))?;
-        let universe = self.universe().await?;
+    async fn cancel_all_bound(
+        &self,
+        bound: &Binding,
+        params: &SymbolActionParams,
+        paused_only: bool,
+    ) -> Result<CancelAllResult, ToolError> {
+        self.cancel_all_with(
+            bound,
+            params,
+            paused_only,
+            async {
+                let orders = self
+                    .inner
+                    .info
+                    .frontend_open_orders(bound.account)
+                    .await
+                    .map_err(|e| ToolError::unavailable("orders", e))?;
+                Ok((orders, self.universe().await?))
+            },
+            |cleared| self.submit(cleared, None, None),
+        )
+        .await
+    }
+
+    async fn cancel_all_with<Read, Submit, Posted>(
+        &self,
+        bound: &Binding,
+        params: &SymbolActionParams,
+        paused_only: bool,
+        read: Read,
+        submit: Submit,
+    ) -> Result<CancelAllResult, ToolError>
+    where
+        Read: Future<Output = Result<(Vec<oppen_hl::types::OpenOrder>, Universe), ToolError>>,
+        Submit: FnOnce(Cleared) -> Posted,
+        Posted: Future<Output = Result<ExchangeResponse, ToolError>>,
+    {
+        let inner = &self.inner;
+        let queue = self.execution_queue(bound.account);
+        let _execution = queue.lock().await;
+        let cancellation_needed =
+            || !paused_only || inner.engine.paused_agents().contains(&bound.agent);
+        let skipped = || CancelAllResult {
+            reply: outcome::canceled(0, Vec::new()),
+            complete: true,
+        };
+        // The runtime's sweep snapshot may predate an operator resume while
+        // this account was waiting for an in-flight execution.
+        if !cancellation_needed() {
+            return Ok(skipped());
+        }
+        let now_ms = now_ms();
+        let (orders, universe) = read.await?;
 
         let targets: Vec<_> = orders
             .into_iter()
@@ -774,7 +925,10 @@ impl Gateway {
         // refuses an empty cancel as an input mismatch — so this answers
         // without asking it.
         if targets.is_empty() {
-            return Ok(outcome::canceled(0, Vec::new()).into_result());
+            return Ok(CancelAllResult {
+                reply: outcome::canceled(0, Vec::new()),
+                complete: true,
+            });
         }
 
         let mut wires = Vec::with_capacity(targets.len());
@@ -798,11 +952,29 @@ impl Gateway {
             .clear_cancel(&bound.agent, wires, &params.reason, now_ms)
         {
             Ok(cleared) => cleared,
-            Err(refusal) => return Ok(outcome::refused(refusal).into_result()),
+            Err(refusal) => {
+                return Ok(CancelAllResult {
+                    reply: outcome::refused(refusal),
+                    complete: false,
+                });
+            }
         };
 
-        let response = self.submit(cleared, None, now_ms).await?;
-        Ok(cancel_outcome(response, named).into_result())
+        // Reads above yield; a resume during them also withdraws the runtime's
+        // reason to cancel. Agent-requested cancels are independent of pause.
+        if !cancellation_needed() {
+            return Ok(skipped());
+        }
+        let response = submit(cleared).await?;
+        let complete = response.statuses.len() == named.len()
+            && response
+                .statuses
+                .iter()
+                .all(|status| matches!(status, Status::Success));
+        Ok(CancelAllResult {
+            reply: cancel_outcome(response, named),
+            complete,
+        })
     }
 
     /// `close_position` — flatten one symbol (`docs/spec.md` item 19).
@@ -820,6 +992,7 @@ impl Gateway {
     ) -> Result<CallToolResult, ErrorData> {
         let inner = &self.inner;
         let bound = Self::bound(&ctx)?;
+        let mut pending = self.reserve_submission(&bound).await?;
         let now_ms = now_ms();
 
         let context = self
@@ -878,14 +1051,16 @@ impl Gateway {
             asset,
             &context.market,
             &context.exposure,
-            now_ms,
+            self::now_ms(),
         ) {
             Ok(cleared) => cleared,
             Err(refusal) => return Ok(outcome::refused(refusal).into_result()),
         };
 
         let cloid = intent.cloid.clone();
-        let response = self.submit(cleared, cloid.as_ref(), now_ms).await?;
+        let response = self
+            .submit(cleared, cloid.as_ref(), Some(&mut pending))
+            .await?;
         Ok(order_outcome(response, cloid.map(|c| c.as_str().to_owned()))?.into_result())
     }
 
@@ -1360,9 +1535,8 @@ impl Gateway {
             .await
             .map_err(|e| ToolError::unavailable("order status", e))?;
 
-        // `unknown_oid` is a real answer and the important one after a
-        // timeout: the venue never saw the order, so it is safe to place
-        // again. Anything else means it did, and resending would double it.
+        // A not-yet-visible order is still ambiguous after a timeout. Never
+        // turn a single unknown lookup into permission to resend.
         let body = match status {
             OrderStatusResponse::UnknownOid => serde_json::json!({
                 "contract_version": 0,
@@ -1459,22 +1633,16 @@ impl Gateway {
         &self,
         cleared: Cleared,
         cloid: Option<&Cloid>,
-        now_ms: u64,
+        pending: Option<&mut Option<Cloid>>,
     ) -> Result<ExchangeResponse, ToolError> {
         let inner = &self.inner;
         let nonce = inner.nonces.next();
         let (request, _clearance) = inner
             .engine
-            .sign_cleared(cleared, nonce, None, now_ms)
+            .sign_cleared(cleared, nonce, None, self::now_ms())
             .map_err(|e| ToolError::unavailable("signer", e))?;
 
-        inner.exchange.post(&request).await.map_err(|e| match e {
-            oppen_hl::Error::Venue { status, message } => ToolError::venue(status, message),
-            transport => ToolError::TimeoutUnknownOutcome {
-                cloid: cloid.map(|c| c.as_str().to_owned()),
-                detail: transport.to_string(),
-            },
-        })
+        track_submission(cloid, pending, inner.exchange.post(&request)).await
     }
 
     /// Everything [`GuardrailEngine::evaluate`] needs, assembled once.
@@ -1837,6 +2005,61 @@ impl Gateway {
             },
         ))
     }
+}
+
+async fn track_submission(
+    cloid: Option<&Cloid>,
+    mut pending: Option<&mut Option<Cloid>>,
+    post: impl Future<Output = Result<ExchangeResponse, oppen_hl::Error>>,
+) -> Result<ExchangeResponse, ToolError> {
+    if let Some(slot) = pending.as_mut() {
+        **slot = cloid.cloned();
+    }
+    let response = post.await.map_err(|e| match e {
+        oppen_hl::Error::ExchangeRejected { message } => {
+            if let Some(slot) = pending.as_mut() {
+                **slot = None;
+            }
+            ToolError::venue(200, message)
+        }
+        oppen_hl::Error::Venue { status, message } => ToolError::venue(status, message),
+        transport => ToolError::TimeoutUnknownOutcome {
+            cloid: cloid.map(|c| c.as_str().to_owned()),
+            detail: transport.to_string(),
+        },
+    })?;
+    // Only a structured rejection proves that this request cannot fill.
+    // Successful submissions remain reserved until a later status read,
+    // followed by fresh account reads under the same container lock.
+    if matches!(response.statuses.as_slice(), [Status::Error(_)]) {
+        if let Some(slot) = pending {
+            *slot = None;
+        }
+    }
+    Ok(response)
+}
+
+// Return the account lock only after the previous submission is visible at the
+// venue. Callers then refresh exposure and keep this lock through submission.
+async fn reserve_account<F, Fut>(
+    queue: Arc<tokio::sync::Mutex<Option<Cloid>>>,
+    lookup: F,
+) -> Result<tokio::sync::OwnedMutexGuard<Option<Cloid>>, ToolError>
+where
+    F: FnOnce(Cloid) -> Fut,
+    Fut: Future<Output = Result<OrderStatusResponse, ToolError>>,
+{
+    let mut pending = queue.lock_owned().await;
+    if let Some(cloid) = pending.as_ref() {
+        match lookup(cloid.clone()).await? {
+            OrderStatusResponse::Order { .. } => *pending = None,
+            OrderStatusResponse::UnknownOid => return Err(ToolError::TimeoutUnknownOutcome {
+                cloid: Some(cloid.as_str().to_owned()),
+                detail: "previous submission is not confirmed by the venue; this container remains reserved".into(),
+            }),
+        }
+    }
+    Ok(pending)
 }
 
 /// Map an order response onto item 19's synchronous result.
@@ -2306,6 +2529,490 @@ mod tests {
                 .parse()
                 .expect("address"),
         }
+    }
+
+    #[tokio::test]
+    async fn different_agents_on_one_address_share_the_execution_queue() {
+        let gateway = gateway_over(&[]);
+        let alpha = binding_for("alpha");
+        let beta = binding_for("beta");
+        let other: Address = "0x1111111111111111111111111111111111111111"
+            .parse()
+            .expect("address");
+        let alpha_queue = gateway.execution_queue(alpha.account);
+        let beta_queue = gateway.clone().execution_queue(beta.account);
+        let held = alpha_queue.lock().await;
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), beta_queue.lock())
+                .await
+                .is_err()
+        );
+        let independent = gateway.execution_queue(other);
+        assert!(
+            independent.try_lock().is_ok(),
+            "one account blocked another"
+        );
+        drop(held);
+        assert!(
+            beta_queue.try_lock().is_ok(),
+            "account lock was not released"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dropped_submission_with_unknown_status_blocks_another_agent_order() {
+        let gateway = gateway_over(&[]);
+        let queue = gateway.execution_queue(binding_for("alpha").account);
+        let submitted_queue = queue.clone();
+        let (sent, received) = tokio::sync::oneshot::channel();
+        let request = tokio::spawn(async move {
+            let mut slot = reserve_account(submitted_queue, |_| async {
+                panic!("no pending submission")
+            })
+            .await
+            .expect("first reservation");
+            track_submission(Some(&a_cloid()), Some(&mut slot), async {
+                sent.send(()).expect("observer");
+                std::future::pending().await
+            })
+            .await
+            .expect("submission");
+        });
+        received.await.expect("submission started");
+        let next_queue = gateway.execution_queue(binding_for("beta").account);
+        let waiting_queue = next_queue.clone();
+        let mut next_request = tokio::spawn(async move {
+            reserve_account(waiting_queue, |cloid| async move {
+                assert_eq!(cloid, a_cloid());
+                Ok(OrderStatusResponse::UnknownOid)
+            })
+            .await
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut next_request)
+                .await
+                .is_err()
+        );
+        request.abort();
+        assert!(request.await.expect_err("request dropped").is_cancelled());
+
+        let error = tokio::time::timeout(std::time::Duration::from_secs(1), next_request)
+            .await
+            .expect("second request stayed blocked")
+            .expect("second request")
+            .expect_err("unknown outcome must block another order");
+        let data = ErrorData::from(error).data.expect("typed refusal");
+        assert_eq!(data["code"], "timeout_unknown_outcome");
+        assert_eq!(data["cloid"], a_cloid().as_str());
+        assert_eq!(data["retryable"], false);
+        assert_eq!(*queue.lock().await, Some(a_cloid()));
+
+        // Dropping a reconciliation lookup cannot release the reservation either.
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(20),
+                reserve_account(next_queue.clone(), |_| std::future::pending())
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(*queue.lock().await, Some(a_cloid()));
+        let known = serde_json::from_value(serde_json::json!({
+            "status": "order", "order": {
+                "status": "filled", "statusTimestamp": 1,
+                "order": { "coin": "BTC", "side": "B", "limitPx": "100", "sz": "0", "oid": 1,
+                    "timestamp": 1, "origSz": "1", "cloid": a_cloid().as_str() }
+            }
+        }))
+        .expect("known order");
+        let next = reserve_account(next_queue, |_| async { Ok(known) })
+            .await
+            .expect("confirmed submission releases next order");
+        assert!(next.is_none());
+    }
+
+    #[tokio::test]
+    async fn only_a_structured_order_rejection_clears_the_submission_reservation() {
+        for (statuses, retained) in [
+            (vec![Status::Error("rejected".into())], false),
+            (vec![Status::Resting { oid: 1 }], true),
+            (vec![Status::WaitingForTrigger], true),
+            (vec![], true),
+        ] {
+            let mut pending = None;
+            track_submission(Some(&a_cloid()), Some(&mut pending), async {
+                Ok(response(statuses))
+            })
+            .await
+            .expect("structured response");
+            assert_eq!(pending, retained.then(a_cloid));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_top_level_exchange_rejection_releases_the_next_submission() {
+        let queue = Arc::new(tokio::sync::Mutex::new(None));
+        let mut slot = queue.clone().lock_owned().await;
+        let error = track_submission(Some(&a_cloid()), Some(&mut slot), async {
+            Err(oppen_hl::Error::ExchangeRejected {
+                message: "invalid nonce".into(),
+            })
+        })
+        .await
+        .expect_err("authoritative rejection");
+        assert!(
+            matches!(error, ToolError::VenueError { http_status: 200, venue_message }
+            if venue_message == "invalid nonce")
+        );
+        assert!(slot.is_none());
+        drop(slot);
+        let next = reserve_account(queue, |_| async {
+            panic!("a rejected request must not need order-status reconciliation")
+        })
+        .await
+        .expect("next submission can proceed");
+        assert!(next.is_none());
+    }
+
+    #[tokio::test]
+    async fn http_and_unparseable_responses_keep_the_submission_reserved() {
+        for error in [
+            oppen_hl::Error::Venue {
+                status: 503,
+                message: "upstream unavailable".into(),
+            },
+            oppen_hl::Error::Venue {
+                status: 400,
+                message: "bad request".into(),
+            },
+            oppen_hl::Error::InvalidExchangeResponse("truncated JSON".into()),
+        ] {
+            let queue = Arc::new(tokio::sync::Mutex::new(None));
+            let mut slot = queue.clone().lock_owned().await;
+            assert!(
+                track_submission(Some(&a_cloid()), Some(&mut slot), async { Err(error) })
+                    .await
+                    .is_err()
+            );
+            assert_eq!(*slot, Some(a_cloid()));
+            drop(slot);
+            assert!(matches!(
+                reserve_account(queue, |_| async { Ok(OrderStatusResponse::UnknownOid) }).await,
+                Err(ToolError::TimeoutUnknownOutcome { .. })
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn parsed_exchange_bodies_release_only_authoritative_rejections() {
+        for (body, rejected) in [
+            (r#"{"status":"err","response":"invalid nonce"}"#, true),
+            ("{", false),
+            (
+                r#"{"status":"ok","response":{"type":"order","data":{}}}"#,
+                false,
+            ),
+        ] {
+            let mut pending = None;
+            let error = track_submission(Some(&a_cloid()), Some(&mut pending), async {
+                ExchangeResponse::parse(body)
+            })
+            .await
+            .expect_err("rejected or malformed response");
+            if rejected {
+                assert!(matches!(
+                    error,
+                    ToolError::VenueError {
+                        http_status: 200,
+                        ..
+                    }
+                ));
+                assert!(pending.is_none());
+            } else {
+                assert!(
+                    matches!(error, ToolError::TimeoutUnknownOutcome { cloid: Some(cloid), .. }
+                    if cloid == a_cloid().as_str())
+                );
+                assert_eq!(pending, Some(a_cloid()));
+            }
+        }
+    }
+
+    fn resume(gateway: &Gateway, bound: &Binding) {
+        gateway
+            .inner
+            .engine
+            .operator_release_kill(
+                &oppen_core::guardrail::KillScope::Agent {
+                    agent: bound.agent.clone(),
+                },
+                3,
+            )
+            .expect("resume");
+    }
+
+    fn cancel_fixture() -> (Vec<oppen_hl::types::OpenOrder>, Universe) {
+        let orders = serde_json::from_value(serde_json::json!([{
+            "coin": "BTC", "side": "B", "limitPx": "100", "sz": "1",
+            "origSz": "1", "oid": 42, "timestamp": 1, "orderType": "Limit",
+            "reduceOnly": false, "isTrigger": false, "isPositionTpsl": false
+        }]))
+        .expect("orders");
+        let meta = serde_json::from_value(serde_json::json!({
+            "universe": [{ "name": "BTC", "szDecimals": 2, "maxLeverage": 40 }]
+        }))
+        .expect("meta");
+        (orders, Universe::from_meta(&meta).expect("universe"))
+    }
+
+    #[tokio::test]
+    async fn a_resume_while_waiting_for_execution_skips_the_stale_pause_cancel() {
+        let gateway = gateway_over(&[]);
+        let bound = binding_for("alpha");
+        pause(&gateway, &bound);
+        let queue = gateway.execution_queue(bound.account);
+        let held = queue.lock().await;
+        let params = SymbolActionParams {
+            symbol: None,
+            reason: "pause sweep".into(),
+        };
+        let mut cancel = std::pin::pin!(gateway.cancel_all_with(
+            &bound,
+            &params,
+            true,
+            async { panic!("resumed account must not even read cancellation targets") },
+            |_| async { panic!("resumed account must not submit a cancel") },
+        ));
+        assert!(matches!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(cancel.as_mut().poll(cx))).await,
+            std::task::Poll::Pending
+        ));
+        resume(&gateway, &bound);
+        drop(held);
+        let result = cancel.await.expect("skip stale sweep");
+        assert!(result.complete);
+        assert!(queue.try_lock().is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_resume_during_target_reads_skips_submission_but_agent_cancel_still_works() {
+        let gateway = gateway_over(&[]);
+        let bound = binding_for("alpha");
+        pause(&gateway, &bound);
+        let params = SymbolActionParams {
+            symbol: None,
+            reason: "cancel".into(),
+        };
+        let result = gateway
+            .cancel_all_with(
+                &bound,
+                &params,
+                true,
+                async {
+                    resume(&gateway, &bound);
+                    Ok(cancel_fixture())
+                },
+                |_| async { panic!("resume during reads must prevent cancellation") },
+            )
+            .await
+            .expect("skip after resume");
+        assert!(result.complete);
+        let mut submitted = false;
+        let result = gateway
+            .cancel_all_with(
+                &bound,
+                &params,
+                false,
+                async { Ok(cancel_fixture()) },
+                |cleared| {
+                    submitted = true;
+                    assert!(matches!(
+                        cleared.clearance().kind,
+                        oppen_core::guardrail::ClearedKind::Cancel { count: 1 }
+                    ));
+                    async { Ok(response(vec![Status::Success])) }
+                },
+            )
+            .await
+            .expect("agent cancel while unpaused");
+        assert!(submitted && result.complete);
+        assert!(!gateway.inner.engine.paused_agents().contains(&bound.agent));
+    }
+
+    #[tokio::test]
+    async fn a_still_paused_account_submits_cancellation_without_releasing_its_reservation() {
+        let gateway = gateway_over(&[]);
+        let bound = binding_for("alpha");
+        pause(&gateway, &bound);
+        let queue = gateway.execution_queue(bound.account);
+        *queue.lock().await = Some(a_cloid());
+        let params = SymbolActionParams {
+            symbol: None,
+            reason: "pause sweep".into(),
+        };
+        let mut submitted = false;
+        let result = gateway
+            .cancel_all_with(
+                &bound,
+                &params,
+                true,
+                async { Ok(cancel_fixture()) },
+                |cleared| {
+                    assert!(
+                        queue.try_lock().is_err(),
+                        "cancel must keep the execution lock"
+                    );
+                    assert!(matches!(
+                        cleared.clearance().kind,
+                        oppen_core::guardrail::ClearedKind::Cancel { count: 1 }
+                    ));
+                    submitted = true;
+                    async { Ok(response(vec![Status::Success])) }
+                },
+            )
+            .await
+            .expect("paused cancel");
+        assert!(submitted && result.complete);
+        assert_eq!(*queue.lock().await, Some(a_cloid()));
+        assert!(gateway.inner.engine.paused_agents().contains(&bound.agent));
+    }
+
+    fn pause(gateway: &Gateway, bound: &Binding) {
+        use oppen_core::guardrail::{KillReason, KillScope};
+        gateway
+            .inner
+            .engine
+            .register_agent(&bound.agent, None, 1)
+            .expect("register");
+        gateway
+            .inner
+            .engine
+            .operator_engage_kill(
+                KillScope::Agent {
+                    agent: bound.agent.clone(),
+                },
+                KillReason::Operator,
+                2,
+            )
+            .expect("persist pause");
+    }
+
+    #[tokio::test]
+    async fn pause_enforcement_retries_revoked_bindings_and_continues_after_a_failure() {
+        let gateway = gateway_over(&[]);
+        let alpha = binding_for("alpha");
+        let mut beta = binding_for("beta");
+        beta.account = "0x1111111111111111111111111111111111111111"
+            .parse()
+            .expect("address");
+        pause(&gateway, &alpha);
+        pause(&gateway, &beta);
+        let mut store = crate::auth::TokenStore::new();
+        let issued = store.issue(alpha.clone()).expect("token");
+        store.revoke(issued.id);
+        store.issue(beta.clone()).expect("token");
+        store.issue(beta.clone()).expect("duplicate pairing");
+        store.issue(binding_for("unpaused")).expect("token");
+        let mut bindings = store.bindings();
+        bindings.sort_by(|a, b| a.agent.cmp(&b.agent));
+        gateway.inner.engine.take_pending_kill_effects();
+
+        let mut attempts = Vec::new();
+        let failed = gateway
+            .enforce_pauses_with(&bindings, |bound| {
+                attempts.push(bound.agent.clone());
+                let fail = bound.agent == alpha.agent;
+                async move {
+                    if fail {
+                        Err(ToolError::unavailable("cancel", "connection reset"))
+                    } else {
+                        Ok(())
+                    }
+                }
+            })
+            .await;
+        assert!(matches!(failed, Err(ToolError::Unavailable { .. })));
+        assert_eq!(attempts, [alpha.agent.clone(), beta.agent.clone()]);
+
+        attempts.clear();
+        gateway
+            .enforce_pauses_with(&bindings, |bound| {
+                attempts.push(bound.agent);
+                async { Ok(()) }
+            })
+            .await
+            .expect("next sweep retries");
+        assert_eq!(attempts, [alpha.agent.clone(), beta.agent.clone()]);
+        assert!(gateway.inner.engine.paused_agents().contains(&alpha.agent));
+    }
+
+    #[tokio::test]
+    async fn dropping_a_pause_sweep_keeps_the_persisted_pause_for_retry() {
+        let gateway = gateway_over(&[]);
+        let bound = binding_for("alpha");
+        pause(&gateway, &bound);
+        let bindings = [bound.clone()];
+        let mut started = false;
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(20),
+                gateway.enforce_pauses_with(&bindings, |_| {
+                    started = true;
+                    std::future::pending()
+                })
+            )
+            .await
+            .is_err()
+        );
+        assert!(started);
+        gateway.inner.engine.take_pending_kill_effects();
+        let mut retried = false;
+        gateway
+            .enforce_pauses_with(&bindings, |retry| {
+                assert_eq!(retry, bound);
+                retried = true;
+                async { Ok(()) }
+            })
+            .await
+            .expect("retry after dropped sweep");
+        assert!(retried);
+        assert!(gateway.inner.engine.paused_agents().contains(&bound.agent));
+    }
+
+    #[tokio::test]
+    async fn a_hung_pause_cancel_does_not_starve_another_account() {
+        let gateway = gateway_over(&[]);
+        let alpha = binding_for("alpha");
+        let mut beta = binding_for("beta");
+        beta.account = "0x1111111111111111111111111111111111111111"
+            .parse()
+            .expect("address");
+        pause(&gateway, &alpha);
+        pause(&gateway, &beta);
+        let mut attempts = Vec::new();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(12),
+            gateway.enforce_pauses_with(&[alpha.clone(), beta.clone()], |bound| {
+                attempts.push(bound.agent.clone());
+                let hangs = bound.agent == alpha.agent;
+                async move {
+                    if hangs {
+                        std::future::pending::<()>().await;
+                    }
+                    Ok(())
+                }
+            }),
+        )
+        .await
+        .expect("hung account starved the sweep");
+        assert!(matches!(
+            result,
+            Err(ToolError::Unavailable {
+                what: "pause cancellation timeout",
+                ..
+            })
+        ));
+        assert_eq!(attempts, [alpha.agent, beta.agent]);
     }
 
     fn events_of(gateway: &Gateway, agent: &str, params: GetEventsParams) -> serde_json::Value {
