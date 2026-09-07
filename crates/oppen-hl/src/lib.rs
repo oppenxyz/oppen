@@ -35,7 +35,9 @@ pub use signing::{AgentKey, Signature};
 
 /// Which Hyperliquid network a client talks to. Testnet is the default
 /// everywhere in oppen; mainnet is an explicit, persisted operator choice.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum Network {
     #[default]

@@ -578,7 +578,7 @@ fn v2_upgrade_preserves_existing_events_hashes_and_head() {
             .unwrap()
             .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0),)
             .unwrap(),
-        4
+        5
     );
     let index_count: i64 = upgraded.lock().unwrap().query_row(
         "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'index' AND name = 'events_submission_account'",

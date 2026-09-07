@@ -53,6 +53,7 @@
 mod anchor;
 mod export;
 mod hash;
+mod pairing;
 mod pilot;
 mod schema;
 mod submission;
@@ -74,6 +75,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub use anchor::{Anchor, FileAnchor, HeadAnchor};
+pub use pairing::{PairingBinding, PairingError, PairingId, PairingJournal, PairingRecord};
 pub use pilot::{PilotAccounting, PilotError, PilotJournal, PilotState, PilotStatus, PilotStop};
 pub use submission::{
     SubmissionError, SubmissionJournal, SubmissionReceipt, SubmissionResolution, SubmissionState,
@@ -206,6 +208,8 @@ pub enum LedgerError {
     UseSubmissionJournal,
     #[error("pilot authority events must use PilotJournal")]
     UsePilotJournal,
+    #[error("pairing authority events must use PairingJournal")]
+    UsePairingJournal,
     #[error("pilot accounting failed: {detail}")]
     PilotBudget { detail: String },
     /// A [`EventKind::PayloadRedacted`] row was itself passed to
@@ -306,6 +310,10 @@ pub enum EventKind {
     PilotAuthorized,
     /// Irreversible exhaustion of this pilot's cumulative authority.
     PilotHalted,
+    /// Authenticated operator-issued MCP credential identity, never its bearer.
+    PairingIssued,
+    /// Authenticated, durable revocation of an earlier pairing.
+    PairingRevoked,
     /// Something the human did: a manual ticket, a flatten, a setting change.
     OperatorAction,
     /// An approval-mode proposal was approved, rejected or expired
@@ -344,6 +352,8 @@ impl EventKind {
             EventKind::SubmissionResolved => "submission_resolved",
             EventKind::PilotAuthorized => "pilot_authorized",
             EventKind::PilotHalted => "pilot_halted",
+            EventKind::PairingIssued => "pairing_issued",
+            EventKind::PairingRevoked => "pairing_revoked",
             EventKind::OperatorAction => "operator_action",
             EventKind::ApprovalDecision => "approval_decision",
             EventKind::KillSwitchChanged => "kill_switch_changed",
@@ -371,6 +381,8 @@ impl std::str::FromStr for EventKind {
             "submission_resolved" => Ok(EventKind::SubmissionResolved),
             "pilot_authorized" => Ok(EventKind::PilotAuthorized),
             "pilot_halted" => Ok(EventKind::PilotHalted),
+            "pairing_issued" => Ok(EventKind::PairingIssued),
+            "pairing_revoked" => Ok(EventKind::PairingRevoked),
             "operator_action" => Ok(EventKind::OperatorAction),
             "approval_decision" => Ok(EventKind::ApprovalDecision),
             "kill_switch_changed" => Ok(EventKind::KillSwitchChanged),
@@ -891,6 +903,9 @@ impl Ledger {
             EventKind::PilotAuthorized | EventKind::PilotHalted => {
                 Err(LedgerError::UsePilotJournal)
             }
+            EventKind::PairingIssued | EventKind::PairingRevoked => {
+                Err(LedgerError::UsePairingJournal)
+            }
             _ => Ok(()),
         }
     }
@@ -1201,7 +1216,8 @@ impl Ledger {
     /// The agent's own rows, plus the account-wide ones no agent owns — a kill
     /// switch, a feed dropping, an alert. Item 18's taxonomy still arrives
     /// whole; what does not arrive is another agent's intents and reason
-    /// strings.
+    /// strings. Pairing authority records remain operator-only even though
+    /// they have no agent attribution.
     pub(crate) fn get_events_for_agent(
         &self,
         agent_id: &str,
@@ -1244,7 +1260,7 @@ impl Ledger {
         let mut statement = guard.prepare(&format!(
             "SELECT {SELECT_EVENT_COLUMNS} FROM events WHERE seq > ?1{} ORDER BY seq ASC LIMIT ?2",
             match scope {
-                Some(_) => " AND (agent_id = ?3 OR agent_id IS NULL)",
+                Some(_) => " AND (agent_id = ?3 OR agent_id IS NULL) AND kind NOT IN ('pairing_issued', 'pairing_revoked')",
                 None => "",
             }
         ))?;
@@ -1854,7 +1870,10 @@ impl AgentView {
     /// exists, and saying which would leak the thing the scope withholds.
     pub fn event(&self, seq: u64) -> Result<Option<Event>> {
         Ok(self.ledger.event(seq)?.filter(|event| {
-            event
+            !matches!(
+                event.kind,
+                EventKind::PairingIssued | EventKind::PairingRevoked
+            ) && event
                 .agent_id
                 .as_ref()
                 .is_none_or(|owner| *owner == self.agent_id)

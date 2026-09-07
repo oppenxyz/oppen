@@ -13,8 +13,8 @@ use oppen_core::feed::FeedSession;
 use oppen_core::feed::pump::FeedPump;
 use oppen_core::guardrail::{AgentId, GuardrailEngine, SqliteGuardrailStore};
 use oppen_core::journal::Journal;
-use oppen_core::keys::KeychainKeyStore;
-use oppen_core::ledger::{EventViews, Ledger, LedgerAuditSink};
+use oppen_core::keys::{KeyStore, KeychainKeyStore};
+use oppen_core::ledger::{EventViews, Ledger, LedgerAuditSink, PairingJournal};
 use oppen_core::reconcile::VenueSource;
 use oppen_hl::ws::{Subscription, WsPool, WsPoolConfig};
 use oppen_mcp::Network;
@@ -45,21 +45,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .parse()?;
     let agent = AgentId::new("agent-alpha");
 
-    // Item 15's approve dialog, as a one-liner: name the agent, bind it to its
-    // container, then mint the token. There is no unbound token to mint.
-    let mut store = TokenStore::new();
-    let issued = store.issue(Binding {
-        agent: agent.clone(),
-        account,
-    })?;
-    println!("pairing  {} -> {agent}", issued.id);
-    println!("token    {}", issued.reveal());
-    println!("url      http://127.0.0.1:{port}{MCP_PATH}");
-    println!();
-    println!("claude mcp add --transport http oppen http://127.0.0.1:{port}{MCP_PATH} \\");
-    println!("  --header \"Authorization: Bearer {}\"", issued.reveal());
-    println!();
-
     // Per-network database (R4): the ledger rowid is an agent's get_events
     // cursor, so a shared file would make two networks share cursor positions.
     let dir = std::path::PathBuf::from(
@@ -70,12 +55,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &dir.join(oppen_core::db_file_name(Network::Testnet)),
         Network::Testnet,
     )?);
+    // Pairing authority is durable and authenticated. This development example
+    // does not provision or replace the authentication key or authorize a pilot.
+    let keys = Arc::new(KeychainKeyStore::new(Network::Testnet));
+    let hmac = keys
+        .load_hmac_key()?
+        .ok_or("testnet authentication key is not configured; complete operator setup first")?;
+    let mut store = TokenStore::open(PairingJournal::open(ledger.clone(), Arc::new(hmac))?)?;
     let engine = Arc::new(GuardrailEngine::new(
         Arc::new(SqliteGuardrailStore::open(
             dir.join("guardrails-testnet.db"),
         )?),
         Arc::new(LedgerAuditSink::new(ledger.clone())),
-        Arc::new(KeychainKeyStore::new(Network::Testnet)),
+        keys,
         Network::Testnet,
     )?);
 
@@ -84,6 +76,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let guardrails = engine.register_agent(&agent, None, now_ms())?;
     println!("agent    {agent} registered");
     println!("limits   {guardrails:?}");
+    println!();
+
+    let issued = store.issue(Binding {
+        agent: agent.clone(),
+        account,
+    })?;
+    println!("pairing  {} -> {agent}", issued.id);
+    println!("token    {}", issued.reveal());
+    println!("url      http://127.0.0.1:{port}{MCP_PATH}");
+    println!();
+    println!("claude mcp add --transport http oppen http://127.0.0.1:{port}{MCP_PATH} \\");
+    println!("  --header \"Authorization: Bearer {}\"", issued.reveal());
     println!();
 
     // One gateway serves every paired agent; each request resolves its own

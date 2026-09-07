@@ -117,6 +117,8 @@ struct GatewayInner {
     /// the gap surface are not spellable from here, so `AGENTS.md` invariant 3
     /// is a compile error rather than a review note.
     events: EventViews,
+    #[cfg(test)]
+    _test_dir: Option<tempfile::TempDir>,
 }
 
 /// The inputs `GuardrailEngine::evaluate` needs, gathered once per call.
@@ -527,6 +529,8 @@ impl Gateway {
                 quotes,
                 sigmas: SigmaCache::new(),
                 events,
+                #[cfg(test)]
+                _test_dir: None,
             }),
         })
     }
@@ -534,24 +538,24 @@ impl Gateway {
     /// Who this request's token names (`docs/spec.md` item 15).
     ///
     /// `rmcp` republishes the request's `http::request::Parts` into the tool's
-    /// context, and the door put the [`Binding`] there after authenticating.
-    /// An absent binding is not a caller error to explain: the door refuses
+    /// context, and the door put its session authority there after authenticating.
+    /// An absent authority is not a caller error to explain: the door refuses
     /// every unauthenticated request, so reaching a tool without one means the
     /// gateway was mounted without its guard. Fail closed and say so.
     fn bound(ctx: &RequestContext<RoleServer>) -> Result<Binding, ToolError> {
         ctx.extensions
             .get::<http::request::Parts>()
-            .and_then(|parts| parts.extensions.get::<Binding>())
-            .cloned()
+            .and_then(|parts| parts.extensions.get::<crate::auth::SessionAuthority>())
+            .map(|authority| authority.binding().clone())
             .ok_or(ToolError::Unavailable {
                 what: "pairing",
-                detail: "this request carries no pairing binding; the gateway is \
+                detail: "this request carries no pairing authority; the gateway is \
                          mounted without its door"
                     .to_owned(),
             })
     }
 
-    pub fn network(&self) -> Network {
+    pub(crate) fn network(&self) -> Network {
         self.inner.network
     }
 
@@ -2704,10 +2708,7 @@ mod tests {
         let journal = std::sync::Arc::new(
             oppen_core::journal::Journal::open(dir.path().join("journal.db")).expect("journal"),
         );
-        // The tempdir must outlive the gateway; leaking the handle is fine in a
-        // test process that is about to exit.
-        std::mem::forget(dir);
-        Gateway::new(
+        let mut gateway = Gateway::new(
             Network::Testnet,
             engine,
             EventViews::new(ledger),
@@ -2716,7 +2717,49 @@ mod tests {
             std::sync::Arc::new(oppen_core::alert::AlertStore::open(":memory:").expect("alerts")),
             std::sync::Arc::new(oppen_core::features::quotes::QuoteCache::new()),
         )
-        .expect("gateway")
+        .expect("gateway");
+        Arc::get_mut(&mut gateway.inner).unwrap()._test_dir = Some(dir);
+        gateway
+    }
+
+    fn pairing_store(path: &std::path::Path) -> crate::auth::TokenStore {
+        let ledger = Arc::new(oppen_core::ledger::Ledger::open_at(path, Network::Testnet).unwrap());
+        crate::auth::TokenStore::open(
+            oppen_core::ledger::PairingJournal::open(
+                ledger,
+                Arc::new(oppen_core::keys::HmacKey::from_bytes([42; 32])),
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn request_binding_requires_authority_and_ignores_an_untrusted_binding() {
+        let gateway = gateway_over(&[]);
+        let (transport, _client) = tokio::io::duplex(4096);
+        let service = rmcp::service::serve_directly(gateway, transport, None);
+        let mut context = RequestContext::new(
+            rmcp::model::NumberOrString::Number(1),
+            service.peer().clone(),
+        );
+        let (mut parts, ()) = http::Request::new(()).into_parts();
+        parts.extensions.insert(binding_for("not-authorized"));
+        context.extensions.insert(parts.clone());
+        assert!(matches!(
+            Gateway::bound(&context),
+            Err(ToolError::Unavailable { .. })
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = pairing_store(&dir.path().join("pairings.db"));
+        let expected = binding_for("alpha");
+        let token = store.issue(expected.clone()).unwrap();
+        parts
+            .extensions
+            .insert(store.authenticate(token.reveal()).unwrap().authority());
+        context.extensions.insert(parts);
+        assert_eq!(Gateway::bound(&context).unwrap(), expected);
+        service.cancel().await.unwrap();
     }
 
     struct NoKeys;
@@ -2838,8 +2881,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_fresh_gateway_recovers_the_previous_gateways_pending_submission() {
-        let (gateway, bound, receipt) = pending_fixture();
-        let fresh = Gateway::new(
+        let (mut gateway, bound, receipt) = pending_fixture();
+        let mut fresh = Gateway::new(
             Network::Testnet,
             gateway.inner.engine.clone(),
             gateway.inner.events.clone(),
@@ -2849,6 +2892,8 @@ mod tests {
             gateway.inner.quotes.clone(),
         )
         .expect("fresh gateway");
+        Arc::get_mut(&mut fresh.inner).unwrap()._test_dir =
+            Arc::get_mut(&mut gateway.inner).unwrap()._test_dir.take();
         assert!(!Arc::ptr_eq(
             &gateway.execution_queue(bound.account),
             &fresh.execution_queue(bound.account)
@@ -3474,7 +3519,8 @@ mod tests {
                     drop(lock);
                 })
             };
-            let mut pairings = crate::auth::TokenStore::new();
+            // Separate authority journal: this test deliberately blocks the pilot ledger.
+            let mut pairings = pairing_store(&dir.path().join("pairings.db"));
             pairings.issue(alpha.clone()).unwrap();
             let shutdown = tokio_util::sync::CancellationToken::new();
             let server = tokio::spawn(crate::server::serve(
@@ -3744,9 +3790,10 @@ mod tests {
             .expect("address");
         pause(&gateway, &alpha);
         pause(&gateway, &beta);
-        let mut store = crate::auth::TokenStore::new();
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = pairing_store(&dir.path().join("pairings.db"));
         let issued = store.issue(alpha.clone()).expect("token");
-        store.revoke(issued.id);
+        store.revoke(issued.id).unwrap();
         store.issue(beta.clone()).expect("token");
         store.issue(beta.clone()).expect("duplicate pairing");
         store.issue(binding_for("unpaused")).expect("token");
