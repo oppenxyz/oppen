@@ -1,11 +1,21 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from "vue";
+import CandleChart from "../components/CandleChart.vue";
 import ColumnHeader from "../components/housing/ColumnHeader.vue";
 import EmptyState from "../components/housing/EmptyState.vue";
 import PanelHousing from "../components/housing/PanelHousing.vue";
 import ReadoutRows, { type ReadoutRow } from "../components/housing/ReadoutRows.vue";
 import StatBlock from "../components/housing/StatBlock.vue";
-import { market, refreshMarkets, refreshSnapshot, select, selectedRow } from "../stores/market";
+import {
+  INTERVALS,
+  market,
+  refreshMarkets,
+  refreshSnapshot,
+  select,
+  selectedRow,
+  setInterval,
+  type ChartInterval,
+} from "../stores/market";
 
 type Ledger = "positions" | "orders" | "fills";
 
@@ -15,13 +25,26 @@ const LEDGER_TABS: ReadonlyArray<{ key: Ledger; label: string; empty: string }> 
   { key: "fills", label: "Fills", empty: "No fills." },
 ];
 
-const TIMEFRAMES = ["1M", "5M", "15M", "1H", "4H", "1D"] as const;
-
 const POSITION_COLUMNS = ["Market", "Side", "Size", "Entry", "Mark", "Liq", "PnL", "Agent · sub-acct"] as const;
 const POSITION_TEMPLATE = "1.2fr 0.8fr 1fr 1fr 1fr 1fr 1fr 1.2fr";
 
 /** A missing number renders as an em dash. It never renders as zero. */
 const DASH = "—";
+
+/**
+ * How many bars the chart is drawing, and whether one of them is still open.
+ *
+ * The count is worth showing because the renderer draws the last `cols` of
+ * what it is given: a panel narrower than the window says less than the number
+ * beside it, and an operator reading a thin chart should be able to tell a
+ * short history from a narrow panel.
+ */
+const chartMeta = computed(() => {
+  const chart = market.chart;
+  if (chart === null) return "No bars.";
+  const forming = chart.forming === null ? "" : " · 1 forming";
+  return `${chart.closed.length} closed${forming}`;
+});
 
 function show(value: string | undefined, suffix = ""): string {
   return value === undefined ? DASH : `${value}${suffix}`;
@@ -144,10 +167,27 @@ onMounted(() => void refreshMarkets());
 
       <PanelHousing :brackets="['tl', 'br']" data-tour="chart">
         <template #label>
-          <span v-for="tf in TIMEFRAMES" :key="tf" class="chart__tf">{{ tf }}</span>
+          <button
+            v-for="tf in INTERVALS"
+            :key="tf"
+            type="button"
+            class="chart__tf"
+            :class="{ 'chart__tf--active': market.interval === tf }"
+            :aria-pressed="market.interval === tf"
+            @click="setInterval(tf as ChartInterval)"
+          >
+            {{ tf.toUpperCase() }}
+          </button>
         </template>
-        <template #meta>Agent fills marked +</template>
-        <EmptyState matrix mode="sweep" size="md" line="No market feed." />
+        <template #meta>{{ chartMeta }}</template>
+        <EmptyState
+          v-if="market.chartError !== null"
+          matrix
+          mode="sweep"
+          size="md"
+          :line="market.chartError"
+        />
+        <CandleChart v-else :data="market.chart" />
       </PanelHousing>
 
       <PanelHousing data-tour="positions">
@@ -362,12 +402,22 @@ onMounted(() => void refreshMarkets());
 
 .strip__stats {
   display: grid;
-  grid-template-columns: repeat(5, auto);
+  grid-template-columns: repeat(6, auto);
   gap: var(--s-6);
 }
 
 .chart__tf {
+  font-size: var(--fs-label);
+  letter-spacing: var(--ls-label);
   color: var(--bracket);
+}
+
+.chart__tf:hover {
+  color: var(--body);
+}
+
+.chart__tf--active {
+  color: var(--signal);
 }
 
 .ledger__tab {

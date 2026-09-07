@@ -178,6 +178,96 @@ pub fn snapshot(
     }
 }
 
+/// One bar as the chart draws it.
+///
+/// A projection of [`crate::candles::Bar`] and not that type re-exported: the
+/// chart wants a bucket's open time and its five numbers, and does not want
+/// the inclusive close, the trade count, or any of the invariants
+/// [`crate::candles`] enforces on the way in. Shipping the richer type would
+/// put fields on the wire that the renderer must then be trusted to ignore.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ChartBar {
+    /// Bucket start, epoch ms. Epoch-aligned to the interval, which
+    /// [`crate::candles::bars_from_candles`] has already checked.
+    pub time_ms: i64,
+    pub open: String,
+    pub high: String,
+    pub low: String,
+    pub close: String,
+    pub volume: String,
+}
+
+impl ChartBar {
+    fn of(bar: &crate::candles::Bar) -> Self {
+        ChartBar {
+            time_ms: bar.open_time_ms,
+            open: bar.open.to_string(),
+            high: bar.high.to_string(),
+            low: bar.low.to_string(),
+            close: bar.close.to_string(),
+            volume: bar.volume.to_string(),
+        }
+    }
+}
+
+/// A symbol's bars at one interval, split the way the renderer takes them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ChartSeries {
+    pub symbol: String,
+    /// The canonical interval, which is not always the one that was asked for
+    /// — [`crate::candles::Interval::parse`] canonicalises, so `120s` comes
+    /// back `2m`. The chart labels its axis from this, so it has to be what
+    /// was actually drawn.
+    pub interval: String,
+    pub interval_ms: i64,
+    /// `max_price_decimals` for the asset. Axis labels never carry more.
+    pub price_decimals: u32,
+    /// Closed buckets, oldest first.
+    pub closed: Vec<ChartBar>,
+    /// The bucket now in progress, if the venue's last row is still open.
+    /// Drawn with the forming glyph, so it must be told apart from a closed
+    /// bar rather than appended to them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub forming: Option<ChartBar>,
+}
+
+/// Project a `candleSnapshot` response into what the chart draws.
+///
+/// **The partition check is not skippable, and a failure costs the chart.**
+/// [`crate::candles::bars_from_candles`] refuses rows that are the wrong
+/// interval, misaligned to the epoch, or not exactly one width wide — a venue
+/// that does any of those has stopped partitioning the time axis, and bars
+/// drawn from them are a picture of something that did not happen. The error
+/// travels to the panel, which says the chart is unavailable and why. A chart
+/// that is quietly wrong is worse than one that is quietly absent, and both
+/// are worse than one that says which.
+pub fn chart(
+    symbol: &str,
+    interval: crate::candles::Interval,
+    candles: &[oppen_hl::types::Candle],
+    price_decimals: u32,
+    now_ms: u64,
+) -> Result<ChartSeries, crate::candles::BarError> {
+    let mut bars = crate::candles::bars_from_candles(candles, interval)?;
+    // The venue returns the in-progress bucket as the last row, so only the
+    // last one can be open — and it is open exactly while now falls inside it.
+    // Comparing against the inclusive close rather than the next open is what
+    // keeps the final millisecond of a bucket from reading as closed.
+    let forming = bars
+        .last()
+        .is_some_and(|bar| i64::try_from(now_ms).is_ok_and(|now| now <= bar.close_time_ms))
+        .then(|| bars.pop())
+        .flatten();
+    Ok(ChartSeries {
+        symbol: symbol.to_owned(),
+        interval: interval.to_string(),
+        interval_ms: interval.millis(),
+        price_decimals,
+        closed: bars.iter().map(ChartBar::of).collect(),
+        forming: forming.as_ref().map(ChartBar::of),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -251,5 +341,98 @@ mod tests {
             MarketRow::of("BTC", &ctx("100", "100", Some("100"), "1")).funding_1h_bps,
             "0.1250"
         );
+    }
+
+    const HOUR_MS: u64 = 60 * 60 * 1_000;
+
+    fn bar_at(t: u64, close: &str) -> oppen_hl::types::Candle {
+        oppen_hl::types::Candle {
+            t,
+            t_close: t + HOUR_MS - 1,
+            s: "BTC".to_owned(),
+            i: "1h".to_owned(),
+            o: d("100"),
+            c: d(close),
+            h: d("110"),
+            l: d("90"),
+            v: d("7.5"),
+            n: 42,
+        }
+    }
+
+    fn hourly() -> crate::candles::Interval {
+        crate::candles::Interval::parse("1h").expect("1h")
+    }
+
+    /// The venue hands back the in-progress bucket as an ordinary last row.
+    /// Appending it to the closed bars would draw a bucket that has not
+    /// finished as though it had, which is the one thing the renderer's
+    /// separate `forming` slot exists to prevent.
+    #[test]
+    fn the_bucket_now_in_progress_is_told_apart_from_the_ones_that_closed() {
+        let candles = [bar_at(0, "101"), bar_at(HOUR_MS, "102")];
+        // Halfway through the second bucket.
+        let series = chart("BTC", hourly(), &candles, 2, HOUR_MS + HOUR_MS / 2).expect("series");
+
+        assert_eq!(series.closed.len(), 1);
+        assert_eq!(series.closed[0].time_ms, 0);
+        assert_eq!(
+            series.forming.as_ref().map(|bar| bar.time_ms),
+            Some(HOUR_MS as i64)
+        );
+    }
+
+    /// The boundary, which is where an off-by-one hides. A bucket is open
+    /// through its **inclusive** close, so at that exact millisecond it is
+    /// still forming; one millisecond later every bar is closed.
+    #[test]
+    fn a_bucket_is_open_through_its_last_millisecond_and_closed_after() {
+        let candles = [bar_at(0, "101")];
+
+        let last_ms = HOUR_MS - 1;
+        assert!(
+            chart("BTC", hourly(), &candles, 2, last_ms)
+                .expect("series")
+                .forming
+                .is_some(),
+            "still forming on its final millisecond"
+        );
+        assert!(
+            chart("BTC", hourly(), &candles, 2, last_ms + 1)
+                .expect("series")
+                .forming
+                .is_none(),
+            "closed once the bucket has ended"
+        );
+    }
+
+    /// A venue that has stopped partitioning the time axis costs the panel its
+    /// chart and says so. Drawing the bars anyway would be a picture of
+    /// something that did not happen, and silently dropping them would leave
+    /// the operator staring at an empty panel that reads as downtime.
+    #[test]
+    fn a_broken_partition_refuses_rather_than_drawing_it() {
+        let mut misaligned = bar_at(0, "101");
+        misaligned.t = 90_000;
+        misaligned.t_close = 90_000 + HOUR_MS - 1;
+
+        assert!(matches!(
+            chart("BTC", hourly(), &[misaligned], 2, HOUR_MS),
+            Err(crate::candles::BarError::Misaligned { .. })
+        ));
+    }
+
+    /// Every price leaves as a string, like every other decimal this module
+    /// ships. The chart is the one consumer that will parse them back to
+    /// floats, and it does that at its own edge — the wire stays exact.
+    #[test]
+    fn the_chart_ships_prices_as_strings_like_everything_else_here() {
+        let series = chart("BTC", hourly(), &[bar_at(0, "101.5")], 2, HOUR_MS).expect("series");
+
+        let bar = &series.closed[0];
+        assert_eq!(bar.close, "101.5");
+        assert_eq!(bar.volume, "7.5");
+        assert_eq!(series.interval, "1h");
+        assert_eq!(series.interval_ms, HOUR_MS as i64);
     }
 }

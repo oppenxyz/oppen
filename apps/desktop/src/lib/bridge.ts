@@ -170,6 +170,41 @@ export async function fetchMarkets(network: "testnet" | "mainnet"): Promise<Mark
   return invoke<MarketRow[]>("markets", { network });
 }
 
+/**
+ * One bar as it crosses the boundary. Decimals arrive as strings like every
+ * other price here; the chart store parses them to numbers at its own edge,
+ * because a renderer that maps prices to pixels is the one consumer where an
+ * f64 loses nothing anybody can see.
+ */
+export interface ChartBar {
+  time_ms: number;
+  open: string;
+  high: string;
+  low: string;
+  close: string;
+  volume: string;
+}
+
+/** A symbol's bars at one interval. */
+export interface ChartSeries {
+  symbol: string;
+  /** Canonical, so `120s` comes back `2m`. The axis is labelled from this. */
+  interval: string;
+  interval_ms: number;
+  price_decimals: number;
+  closed: ChartBar[];
+  /** The bucket in progress, drawn with the forming glyph. Absent between buckets. */
+  forming?: ChartBar;
+}
+
+export async function fetchChartSeries(
+  network: "testnet" | "mainnet",
+  coin: string,
+  interval: string,
+): Promise<ChartSeries> {
+  return invoke<ChartSeries>("chart_series", { network, coin, interval });
+}
+
 export async function fetchMarketSnapshot(
   network: "testnet" | "mainnet",
   coin: string,

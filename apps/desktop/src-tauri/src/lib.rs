@@ -6,8 +6,9 @@
 //! The MCP `get_state` tool reads the same [`oppen_core::state::assemble`], so
 //! the operator and the agent cannot be shown different accounts (A3).
 
+use oppen_core::candles::Interval;
 use oppen_core::keys::{KeyStore, KeychainKeyStore};
-use oppen_core::market::{MarketRow, MarketSnapshot, rows, snapshot};
+use oppen_core::market::{ChartSeries, MarketRow, MarketSnapshot, chart, rows, snapshot};
 use oppen_core::state::{AccountState, VenueReadings, assemble};
 use oppen_hl::{Address, InfoClient, Network};
 
@@ -123,10 +124,7 @@ async fn markets(network: String) -> Result<Vec<MarketRow>, ConsoleError> {
 async fn market_snapshot(network: String, coin: String) -> Result<MarketSnapshot, ConsoleError> {
     let network = network_of(&network);
     let info = InfoClient::new(network).map_err(|e| ConsoleError::Venue(e.to_string()))?;
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or_default();
+    let now_ms = now_ms();
 
     let contexts = info
         .meta_and_asset_ctxs()
@@ -152,6 +150,56 @@ async fn market_snapshot(network: String, coin: String) -> Result<MarketSnapshot
         .unwrap_or_default();
 
     Ok(snapshot(&coin, &book, &ctx, None, &hours, now_ms))
+}
+
+/// How many buckets the chart asks the venue for.
+///
+/// The renderer draws the last `cols` of whatever it is handed and clamps its
+/// own grid at 500 columns, so this is that ceiling with room to spare rather
+/// than a number the layout can outrun. Asking for more would be paying for
+/// bars no grid can show.
+const CHART_BARS: u64 = 600;
+
+/// Bars for the chart panel, split into closed buckets and the forming one.
+///
+/// The interval is parsed rather than passed through, so `120s` reaches the
+/// venue as `2m` and the axis is labelled with what was actually drawn. A
+/// parse failure is the operator's typo and says so; a partition the venue
+/// broke costs the chart and says that instead.
+#[tauri::command]
+async fn chart_series(
+    network: String,
+    coin: String,
+    interval: String,
+) -> Result<ChartSeries, ConsoleError> {
+    let parsed = Interval::parse(&interval)
+        .map_err(|e| ConsoleError::Venue(format!("{interval} is not an interval: {e}")))?;
+    let info =
+        InfoClient::new(network_of(&network)).map_err(|e| ConsoleError::Venue(e.to_string()))?;
+
+    // The universe, for `max_price_decimals`. The axis is labelled to the
+    // asset's own precision rather than to whatever the prices happen to
+    // carry, so a quiet market does not relabel itself.
+    let meta = info
+        .meta()
+        .await
+        .map_err(|e| ConsoleError::Venue(format!("universe: {e}")))?;
+    let universe = oppen_hl::Universe::from_meta(&meta)
+        .map_err(|e| ConsoleError::Venue(format!("universe: {e}")))?;
+    let asset = universe
+        .get(&coin)
+        .map_err(|e| ConsoleError::Venue(e.to_string()))?;
+
+    let now_ms = now_ms();
+    let width_ms = parsed.millis().unsigned_abs();
+    let from_ms = now_ms.saturating_sub(CHART_BARS.saturating_mul(width_ms));
+    let candles = info
+        .candles(&coin, &parsed.to_string(), from_ms, now_ms)
+        .await
+        .map_err(|e| ConsoleError::Venue(format!("candles: {e}")))?;
+
+    chart(&coin, parsed, &candles, asset.max_price_decimals(), now_ms)
+        .map_err(|e| ConsoleError::Venue(format!("the venue's bars are not a partition: {e}")))
 }
 
 /// The account as it stands now: equity, margin, positions, resting orders.
@@ -216,7 +264,8 @@ pub fn run() {
             account_state,
             keychain_status,
             markets,
-            market_snapshot
+            market_snapshot,
+            chart_series
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
