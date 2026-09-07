@@ -6,6 +6,7 @@
 //! The MCP `get_state` tool reads the same [`oppen_core::state::assemble`], so
 //! the operator and the agent cannot be shown different accounts (A3).
 
+use oppen_core::keys::{KeyStore, KeychainKeyStore};
 use oppen_core::state::{AccountState, VenueReadings, assemble};
 use oppen_hl::{Address, InfoClient, Network};
 
@@ -48,16 +49,62 @@ fn configured_account() -> Result<Address, ConsoleError> {
     })
 }
 
+/// Whether this machine's keychain answers.
+///
+/// The setup tracker's first real check. On a fresh machine the store is
+/// usually reachable and empty, which is `reachable: true` — the question is
+/// not whether anything is stored but whether the store can be *asked*. A
+/// locked login keychain, a headless box with no keyring daemon, a denied
+/// prompt: each of those makes every later step fail for a reason that has
+/// nothing to do with what the operator was doing, and the console currently
+/// shows none of them.
+///
+/// **Read-only, and no secret crosses this boundary.** `KeyStore::reachable`
+/// probes one entry and discards what it read; this returns a boolean and, on
+/// failure, the store's own message. There is deliberately no command here
+/// that reads a key: the console never needs one, and a command that could is
+/// a command that can be called.
+#[tauri::command]
+async fn keychain_status(network: String) -> KeychainStatus {
+    let store = KeychainKeyStore::new(network_of(&network));
+    match store.reachable() {
+        Ok(()) => KeychainStatus {
+            reachable: true,
+            detail: None,
+        },
+        // The error is shown to the operator, so it is the store's own words:
+        // "the keychain is locked" is actionable where "unreachable" is not.
+        Err(error) => KeychainStatus {
+            reachable: false,
+            detail: Some(error.to_string()),
+        },
+    }
+}
+
+/// What [`keychain_status`] answers.
+#[derive(Debug, serde::Serialize)]
+struct KeychainStatus {
+    reachable: bool,
+    /// Absent when reachable. Present, and the store's own message, when not.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
+}
+
+/// Testnet unless the caller says otherwise (`AGENTS.md` invariant 5).
+fn network_of(network: &str) -> Network {
+    match network {
+        "mainnet" => Network::Mainnet,
+        _ => Network::Testnet,
+    }
+}
+
 /// The account as it stands now: equity, margin, positions, resting orders.
 ///
 /// Four venue reads rather than one, because Hyperliquid publishes no single
 /// endpoint that answers it and spot is load-bearing under unified margin.
 #[tauri::command]
 async fn account_state(network: String) -> Result<AccountState, ConsoleError> {
-    let network = match network.as_str() {
-        "mainnet" => Network::Mainnet,
-        _ => Network::Testnet,
-    };
+    let network = network_of(&network);
     let account = configured_account()?;
     let info = InfoClient::new(network).map_err(|e| ConsoleError::Venue(e.to_string()))?;
 
@@ -109,7 +156,7 @@ fn now_ms() -> u64 {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![account_state])
+        .invoke_handler(tauri::generate_handler![account_state, keychain_status])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

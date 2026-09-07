@@ -11,7 +11,7 @@
  * under `bun test` and keeps `vue-tsc --noEmit` green.
  */
 
-import { milestones, progress, TOUR } from "./tour";
+import { keychainDetail, keychainState, milestones, progress, TOUR } from "./tour";
 
 interface Assertions {
   toBe(expected: unknown): void;
@@ -153,6 +153,31 @@ describe("the setup tracker", () => {
       expect(milestone.detail.length).toBeGreaterThan(20);
       expect(milestone.label.length).toBeGreaterThan(0);
     }
+  });
+
+  /**
+   * **Three answers, not two.** A keychain nobody has asked about is not an
+   * unreachable one: outside the desktop app there is no store to ask, and
+   * collapsing that into `pending` would send an operator to fix something
+   * that is not broken. Only a store that answered "no" is pending.
+   */
+  it("tells an unasked keychain from an unreachable one", () => {
+    expect(keychainState(null)).toBe("unverifiable");
+    expect(keychainState({ reachable: true })).toBe("done");
+    expect(keychainState({ reachable: false, detail: "locked" })).toBe("pending");
+  });
+
+  /**
+   * A store that refused says why, in its own words — "the keychain is locked"
+   * is actionable where "unreachable" is not.
+   */
+  it("passes the store's own reason through", () => {
+    expect(keychainDetail({ reachable: false, detail: "the keychain is locked" })).toContain(
+      "the keychain is locked",
+    );
+    // And a refusal with no message still reads as a refusal rather than as
+    // an empty string appended to a sentence.
+    expect(keychainDetail({ reachable: false })).toContain("no reason given");
   });
 
   /**
