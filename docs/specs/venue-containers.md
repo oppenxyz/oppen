@@ -335,8 +335,10 @@ Each is checked against venue state, not against local belief.
    makes a missing fill indistinguishable from one that never happened.
 7. **Dead-man budget.** `scheduleCancel` needs a time at least 5 seconds ahead
    and allows a **maximum of 10 triggers per day, resetting at 00:00 UTC** (O1).
-   A migration that disarms and re-arms spends from a budget shared with every
-   other agent on the address, so it is spent deliberately or not at all.
+   Current documentation counts scheduled firings, not ordinary disarm/re-arm
+   operations. Migration must preserve each address's confirmed and uncertain
+   schedule outcomes: a missed deadline during migration may have fired, and
+   unknown disarm/re-arm results do not prove coverage on either account.
 
 ### 3.4 The migration
 

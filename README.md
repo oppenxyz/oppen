@@ -201,13 +201,16 @@ value and the configured limit, so the agent can adapt and you can read why.
 Refusals are the most informative telemetry the system produces.
 
 Above them sit a **kill switch** (halts entry, cancels resting orders, survives
-restart) and a **dead-man switch** (`scheduleCancel`, armed while agents are
-active).
+restart) and a **dead-man decision helper** (`scheduleCancel`). Runtime
+scheduling, confirmed coverage and durable daily accounting remain pending.
 
 The dead-man is a daily budget rather than a standing guarantee, and the README is
 where that is easiest to overclaim: Hyperliquid takes a time at least 5 seconds
 ahead and allows a **maximum of 10 triggers per day per address**, resetting at
-00:00 UTC, so re-arming on every reconnect would exhaust it inside one bad hour.
+00:00 UTC. Current documentation counts scheduled firings, not ordinary
+refreshes; repeated outages that let schedules fire can exhaust the allowance.
+See the [signing reference](docs/hl-signing.md#10-schedulecancel--the-dead-mans-switch-and-its-daily-budget)
+for the documented semantics and outstanding venue acceptance.
 Whether `scheduleCancel` is itself volume-gated is unconfirmed — if it is, a
 brand-new account has no dead-man at all, and oppen will say so rather than promise
 one.

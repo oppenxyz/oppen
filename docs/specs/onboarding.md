@@ -996,8 +996,11 @@ that a claim in the body was checked.
    string suggests it; official docs are silent. If it is, a brand-new account has
    no dead-man switch and onboarding must not promise one. Separately, the
    documented budget is a minimum of 5 seconds ahead and a **maximum of 10 triggers
-   per day, resetting 00:00 UTC** — whether a "trigger" is an arm or a firing is
-   not stated, and P3's design depends on the answer.
+   per day, resetting 00:00 UTC**. The 2026-09-08 official documentation reread
+   explicitly counts scheduled firings, not ordinary refreshes; see
+   [the signing reference](../hl-signing.md#10-schedulecancel--the-dead-mans-switch-and-its-daily-budget).
+   Accepted scheduling, actual firing and truthful coverage still need venue
+   acceptance; this documentation clarification does not prove protection.
 9. Whether the builder address falling below the required 100 USDC perps balance
    rejects the order or silently drops the fee. Invariant 10 forbids the order path
    being dropped silently, so this must be tested before mainnet.
