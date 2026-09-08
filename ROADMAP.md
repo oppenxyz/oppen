@@ -320,14 +320,28 @@ before expanding features:
    supervisor could retry cleanup. The startup regression failed before the
    narrow fix and passes afterward, preserving authenticated identity, known
    accounting, the original cumulative budget and order inhibition through
-   physical ledger reopen. Unavailable-accounting startup remains a separate
-   limitation. Three focused regressions cover reopen, assembled cancellation
+   physical ledger reopen. That PR left unavailable-accounting startup as a
+   separate limitation, addressed by ES36 below. Three focused regressions cover
+   reopen, assembled cancellation
    failure/retry with an actual MCP order refusal, and unavailable-accounting
    startup refusal. Full workspace: 1,178 Rust tests pass, 15 live/keychain
    tests ignored; all-target Clippy, formatting and offline dependency checks
    pass. Independent review corrected an overclaim about the cleanup trigger;
    startup inhibition remains active. Exact-head review and green CI remain
    required; no live recovery gate is claimed.
+   ES36 on `fix/unavailable-pilot-supervision` extends that recovery boundary to
+   an authenticated, identity-matching pilot whose accounting projection is
+   unavailable. The regression failed at the known-accounting startup check,
+   then passed after removing only that projection requirement. Cleanup failure
+   and retry, actual MCP order refusal, unavailable status and original consent
+   records are preserved. Missing or failed authority still refuses startup.
+   Actual startup reconciliation ingests a subsequent fill exactly once through
+   physical reopen without clearing unavailable accounting. The full workspace
+   passes 1,178 Rust tests (15 live/keychain tests ignored); 20 focused UI status
+   tests pass without fabricated totals. All-target Clippy, formatting and
+   offline dependency checks pass. Aggregate automated review found no
+   blockers. Exact-head review and green CI remain required; this does not
+   authorize live cleanup or establish a live recovery gate.
    No dedicated-account activity has been performed during this development.
 4. **Recovery:** PR #44 merged as `06fc0e3` after green CI and separate automated
    review. The durable submission journal has SQLite reopen, independent
