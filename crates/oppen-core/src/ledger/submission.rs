@@ -173,9 +173,17 @@ impl SubmissionJournal {
         // A write reservation also stabilizes the snapshot against independent
         // handles while the anchor and chain are checked.
         let tx = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut replay = self.replay(&tx)?;
+        self.state_in(&tx, account)
+    }
+
+    pub(super) fn state_in(
+        &self,
+        connection: &Connection,
+        account: Address,
+    ) -> Result<SubmissionState> {
+        let mut replay = self.replay(connection)?;
         if self.1.is_some() {
-            self.verify_evidence_in(&tx)?;
+            self.verify_evidence_in(connection)?;
         }
         Ok(replay.accounts.remove(&account).unwrap_or_default())
     }

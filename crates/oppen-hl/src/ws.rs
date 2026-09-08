@@ -1481,6 +1481,17 @@ impl WsPool {
         Ok((pool, events))
     }
 
+    /// The loopback pool's actual monitored ingress for cross-crate queue races.
+    /// Injected events exercise the consumer, not WebSocket wire decoding.
+    #[cfg(feature = "test-support")]
+    pub fn loopback_fixture_with_ingress(
+        port: u16,
+    ) -> Result<(Self, EventReceiver, EventSender), PoolError> {
+        let (pool, receiver) = Self::loopback_fixture(port)?;
+        let sender = pool.events.clone();
+        Ok((pool, receiver, sender))
+    }
+
     /// Add a subscription, opening a connection if every existing one is full.
     ///
     /// Synchronous and non-blocking: commands go to the owning connection task

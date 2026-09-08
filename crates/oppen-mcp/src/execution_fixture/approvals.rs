@@ -7,6 +7,8 @@ use oppen_hl::wire::{OrderWire, WireFloat};
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
+#[path = "approvals/activation_admission.rs"]
+mod activation_admission;
 #[path = "approvals/cancellations.rs"]
 mod cancellations;
 #[path = "approvals/ownership.rs"]

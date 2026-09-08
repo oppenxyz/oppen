@@ -104,8 +104,9 @@ pub use config::{
 };
 pub use deadman::DeadManIntent;
 pub use engine::{
-    ApprovalReview, ApprovalReviewDisplay, AuditEntry, AuditError, AuditOutcome, AuditSink,
-    CancelApprovalReviewDisplay, Clearance, Cleared, ClearedKind, GuardedSignature,
+    ActivationDisplay, ActivationEvidence, ActivationObservation, ActivationReceipt,
+    ActivationReview, ApprovalReview, ApprovalReviewDisplay, AuditEntry, AuditError, AuditOutcome,
+    AuditSink, CancelApprovalReviewDisplay, Clearance, Cleared, ClearedKind, GuardedSignature,
     GuardrailEngine, GuardrailError, OperatorAction, OrderApprovalReviewDisplay, OrderIntent,
     PolicyAcknowledgment, PolicyStatus, Proposal, ProposalIntent, SignClearedError,
     SignedCancellation, SignedSubmission, SigningPermit, SubmissionPostError, Utilization, Verdict,

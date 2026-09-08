@@ -4,6 +4,7 @@ export type * from "../src/lib/bridge";
 export { isConsoleError } from "../src/lib/bridge";
 export { fetchPolicySetupStatus, reviewPolicySetup, persistPolicySetup, discardPolicySetup } from "./policy-setup";
 export { fetchApprovalQueueStatus, refreshApprovalQueue, rejectApprovalProposal, prepareApprovalReview, confirmApprovalReview, discardApprovalReview } from "./approvals";
+export { fetchActivationStatus, reviewActivation, confirmActivation, discardActivation } from "./activation";
 export let failedRead = false;
 export function failNextReads(): void { failedRead = true; }
 const scenario = new URLSearchParams(location.search).get("state") ?? "positions";

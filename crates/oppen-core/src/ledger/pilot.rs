@@ -251,6 +251,32 @@ impl PilotJournal {
     }
 }
 
+pub(super) fn activation_state_in(
+    registry: &super::RegistryJournal,
+    connection: &Connection,
+    route: &super::AuthorizedRoute,
+) -> Result<PilotState> {
+    let history = history(registry.ledger(), connection, true)?;
+    authority::verify(registry, connection, &history)?;
+    authority::verify_authorized_route(registry, connection, &history, route)?;
+    let authority = history
+        .authorities
+        .iter()
+        .find(|authority| {
+            authority.data.agent == route.binding.agent
+                && authority.data.account == route.binding.container
+        })
+        .ok_or_else(|| unavailable("matching authenticated pilot consent required"))?;
+    let state = project(&history, authority)?;
+    permitted(&state, Decimal::ZERO, &authority.data)?;
+    if state.halt.is_some() {
+        return Err(unavailable(
+            "pilot reconciliation or stop blocks activation",
+        ));
+    }
+    Ok(state)
+}
+
 pub(super) fn status(ledger: &Ledger, account: Address) -> Result<Option<PilotStatus>> {
     let mut guard = ledger.lock()?;
     let tx = guard.transaction_with_behavior(TransactionBehavior::Deferred)?;

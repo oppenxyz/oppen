@@ -434,6 +434,69 @@ export function haltMcp(agent: string, account: string): Promise<McpStatus> {
   return invoke<McpStatus>("halt_mcp", { agent, account });
 }
 
+export type AuthorizedRoute = PolicySetupReview["route"];
+export interface ActivationPilotState {
+  agent: string;
+  account: string;
+  authorized_at_ms: number;
+  baseline: { seq: number; hash: string };
+  executed_usd: string;
+  reserved_usd: string;
+  net_realized_pnl_usd: string;
+  halt: PilotStop | null;
+}
+export interface ActivationDisplay {
+  route: AuthorizedRoute;
+  policy_revision: number;
+  stop_generation: number;
+  policy: ReviewedAgentPolicy;
+  pilot: ActivationPilotState;
+  account: AccountState;
+  wallet_approval: { name: string; address: string; validUntil: number };
+  observed_at_ms: number;
+  expires_at_ms: number;
+  gross_exposure_usd: string;
+  remaining_committed_usd: string;
+}
+export interface ActivationReceipt {
+  route: AuthorizedRoute;
+  policy_revision: number;
+  stop_generation: number;
+  acknowledged_at_ms: number;
+  audit_seq: number;
+  audit_hash: string;
+}
+export interface PolicyStatus {
+  cached_revision: number | null;
+  acknowledgment: { revision: number; stop_generation: number } | null;
+  stop_generation: number;
+  admission_inhibited: boolean;
+}
+export interface ActivationStatus {
+  operation_seq: number;
+  last_operation: { kind: "review" } | { kind: "confirm" | "discard"; review_id: string } | null;
+  owner_id: string;
+  agent: string;
+  account: string;
+  phase: "idle" | "reviewing" | "review_ready" | "confirming" | "acknowledged" | "refused" | "uncertain" | "closed";
+  review: { id: string; display: ActivationDisplay } | null;
+  receipt: ActivationReceipt | null;
+  error: { kind: "refusal" | "worker"; detail: string } | null;
+  policy_status: PolicyStatus;
+}
+export function fetchActivationStatus(agent: string, account: string): Promise<ActivationStatus> {
+  return invoke<ActivationStatus>("activation_status", { agent, account });
+}
+export function reviewActivation(agent: string, account: string): Promise<ActivationStatus> {
+  return invoke<ActivationStatus>("review_activation", { agent, account });
+}
+export function confirmActivation(agent: string, account: string, ownerId: string, reviewId: string): Promise<ActivationStatus> {
+  return invoke<ActivationStatus>("confirm_activation", { agent, account, ownerId, reviewId });
+}
+export function discardActivation(agent: string, account: string, ownerId: string, reviewId: string): Promise<ActivationStatus> {
+  return invoke<ActivationStatus>("discard_activation", { agent, account, ownerId, reviewId });
+}
+
 export type RequestedOrderKind =
   | { kind: "limit"; limit_px: string; tif: "Alo" | "Ioc" | "Gtc" }
   | { kind: "market"; slippage_bps: string }

@@ -1,7 +1,8 @@
 //! Info-endpoint response types. Field names are the venue's; decimals
 //! arrive as strings and are parsed into [`Decimal`] (`serde-with-str`).
 //! Unknown fields are ignored so a venue-side addition never breaks
-//! deserialization.
+//! deserialization, except authority-sensitive role responses which reject
+//! ambiguous or unknown structure.
 //!
 //! Nullability here is not defensive style, it is a load-bearing property.
 //! `serde` fails the **whole** response, not one row, when a field typed
@@ -18,6 +19,32 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::wire::{Cloid, Tif};
+
+/// Venue-reported extra agent, not proof of local signing authority.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtraAgent {
+    pub name: String,
+    pub address: crate::Address,
+    pub valid_until: u64,
+}
+
+/// Account role reported by `userRole`. Unknown roles and absent relationship
+/// data are errors, never an inferred top-level user.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(
+    tag = "role",
+    content = "data",
+    rename_all = "camelCase",
+    deny_unknown_fields
+)]
+pub enum UserRole {
+    User,
+    Agent { user: crate::Address },
+    SubAccount { master: crate::Address },
+    Vault,
+    Missing,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]

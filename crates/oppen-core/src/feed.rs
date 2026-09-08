@@ -160,6 +160,12 @@ pub(crate) struct AdmissionGuard<'a> {
     _held: MutexGuard<'a, Inner>,
 }
 
+impl AdmissionGuard<'_> {
+    pub(crate) fn last_tick_ms(&self) -> Option<u64> {
+        self._held.last_tick_ms
+    }
+}
+
 impl Inner {
     fn stamp(&self) -> FeedStamp {
         FeedStamp {

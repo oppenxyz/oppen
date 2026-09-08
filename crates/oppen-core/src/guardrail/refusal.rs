@@ -378,6 +378,8 @@ impl From<OrderError> for VenueRule {
 #[serde(tag = "unevaluable", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum Unevaluable {
+    #[error("activation review unavailable or stale: {detail}")]
+    ActivationAuthority { detail: String },
     #[error("approval review changed; prepare a new review: {detail}")]
     ApprovalReviewChanged { detail: String },
     #[error("operator approval expired at {expires_at_ms}; signing observed {now_ms}")]

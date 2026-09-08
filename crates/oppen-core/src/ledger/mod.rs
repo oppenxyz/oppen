@@ -50,6 +50,7 @@
 //!   hands out the read-only surface (`AGENTS.md` invariant 3); `&Ledger`
 //!   itself is operator-only.
 
+pub(crate) mod activation;
 mod anchor;
 pub(crate) mod approval;
 mod export;
