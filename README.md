@@ -7,13 +7,17 @@
 Agents trade through a built-in MCP gateway. You supervise from an operator
 console. Keys stay on your machine.
 
+**Open core, with separate desktop terms:** [Rust crates: Apache-2.0](LICENSE) ·
+[Desktop: Commercial Source](apps/desktop/LICENSE). See [license boundaries](LICENSES.md).
+
 [Specification](docs/spec.md) · [Threat model](docs/threat-model.md) ·
 [Roadmap](ROADMAP.md) · [Feature specs](docs/specs/) · [For agents](AGENTS.md)
 
 </div>
 
 > **Status: pre-alpha.** v1 targets Hyperliquid only. Testnet by default. There is
-> no release yet — the gates in [ROADMAP.md](ROADMAP.md) say exactly what works.
+> no stable release yet. Published macOS development builds are ad-hoc signed,
+> not Apple-notarized. The gates in [ROADMAP.md](ROADMAP.md) say exactly what works.
 > Do not point this at real funds.
 
 ---
@@ -400,7 +404,9 @@ were rejected, are decisions L1–L7 in [docs/decisions.md](docs/decisions.md).
 
 Contributions to either half are under the [CLA](CLA.md), which already licenses
 them "under any license" and so needs no amendment. Third-party attributions in
-[NOTICE](NOTICE). Source opens Q4 2026 for the Apache-2.0 crates (L6).
+[NOTICE](NOTICE). The repository became public on 8 September 2026 (PUB1);
+the existing license boundary is unchanged. The desktop license and CLA still
+require counsel review before a stable release; see [LICENSES.md](LICENSES.md).
 
 "oppen" is a trademark. The core may be forked and modified freely; forks may not
 ship under the oppen name. The safety claims here are claims about a particular
@@ -409,4 +415,7 @@ keeps the name would be a security problem for users, not merely a branding one.
 
 ### Private desktop updates
 
-Owner installations can follow main through the [signed private update channel](docs/runbooks/desktop-updates.md). This personal Apple Silicon channel does not change the roadmap gates or imply general release readiness.
+Owner installations can follow main through the [signed update channel](docs/runbooks/desktop-updates.md). Releases are public; this personal Apple Silicon channel does not change the roadmap gates or imply general release readiness.
+
+Report vulnerabilities through [private security reporting](SECURITY.md).
+For contributions and review expectations, see [CONTRIBUTING.md](CONTRIBUTING.md).

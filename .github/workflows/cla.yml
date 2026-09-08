@@ -4,17 +4,28 @@ on:
   issue_comment:
     types: [created]
   pull_request_target:
-    types: [opened, closed, synchronize]
+    types: [opened, reopened, closed, synchronize]
 
-permissions:
-  actions: write
-  contents: write
-  pull-requests: write
-  statuses: write
+permissions: {}
 
 jobs:
   cla:
+    # Run trusted, pinned action code only; never check out or execute PR code.
+    # Preserve merged-PR signature locking and explicit signature/recheck comments.
+    if: >-
+      (github.event_name == 'pull_request_target' &&
+       (github.event.action != 'closed' || github.event.pull_request.merged == true)) ||
+      (github.event_name == 'issue_comment' && github.event.issue.pull_request &&
+       github.event.issue.state == 'open' &&
+       (github.event.comment.body == 'I have read the CLA Document and I hereby sign the CLA' ||
+        (github.event.comment.body == 'recheck' &&
+         contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association))))
     runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: write # Rerun the failed CLA check after a signature is recorded.
+      contents: write # Write .github/cla-signatures.json on cla-signatures only.
+      pull-requests: write # Signature comments and merged-PR locking.
     steps:
       - uses: contributor-assistant/github-action@ca4a40a7d1004f18d9960b404b97e5f30a505a08 # v2.6.1
         env:
@@ -24,4 +35,6 @@ jobs:
           path-to-document: "https://github.com/oppenxyz/oppen/blob/main/CLA.md"
           branch: "cla-signatures"
           allowlist: gkssxf,dependabot[bot]
+          custom-pr-sign-comment: "I have read the CLA Document and I hereby sign the CLA"
+          suggest-recheck: "false"
           custom-notsigned-prcomment: "Thanks for the contribution. Before we can merge, please sign the CLA by commenting exactly: **I have read the CLA Document and I hereby sign the CLA**"
