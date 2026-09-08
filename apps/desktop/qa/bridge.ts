@@ -1,5 +1,5 @@
 // UI fixture transport only. Every read is local; no invoke, venue, key or signer call.
-import type { AccountState, ChartSeries, MarketSnapshot, OperatorRead } from "../src/lib/bridge";
+import type { AccountState, ChartSeries, FeedBinding, MarketSnapshot, OperatorRead, RuntimeStatus } from "../src/lib/bridge";
 export type * from "../src/lib/bridge";
 export { isConsoleError } from "../src/lib/bridge";
 export let failedRead = false;
@@ -36,8 +36,21 @@ export async function fetchOperatorState(): Promise<OperatorRead> {
 export async function fetchMarkets() { return []; }
 export async function fetchChartSeries(): Promise<ChartSeries> { throw new Error("UI fixture: chart not supplied."); }
 export async function fetchMarketSnapshot(): Promise<MarketSnapshot> { throw new Error("UI fixture: market snapshot not supplied."); }
-export async function watchMarket() {}
+export async function watchMarket(network: FeedBinding["network"]): Promise<FeedBinding> { return { network, generation: "1" }; }
 export async function onFeedUpdate() { return () => {}; }
+
+export async function fetchRuntimeStatus(): Promise<RuntimeStatus> {
+  const requested = new URLSearchParams(location.search).get("runtime");
+  const phase: RuntimeStatus["phase"] = requested === "stopping" || requested === "stopped_with_error" || requested === "replacing" || requested === "stopped" ? requested : "running";
+  const detail = phase === "stopped_with_error"
+    ? "UI fixture: all desktop tasks finished, but a feed consumer reported an error. Update installation was not started. Diagnostic="
+    : "UI fixture: waiting for retained desktop work to finish before shutdown or replacement. Update installation has not started. Diagnostic=";
+  return {
+    phase,
+    binding: phase === "running" ? { network: "testnet", generation: "1" } : null,
+    detail: phase === "running" || phase === "stopped" ? null : detail + "retained-task-context/".repeat(24),
+  };
+}
 
 export async function checkUpdate() { throw { kind: "unavailable", detail: "Updates are unavailable in the UI fixture." }; }
 export async function downloadUpdate() { throw new Error("UI fixture: no updates."); }

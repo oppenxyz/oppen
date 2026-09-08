@@ -68,10 +68,22 @@ before expanding features:
    with complete HMAC snapshots, reviewed paused migration, revision-bound final
    signing and explicit restart acknowledgment. Idle supervision refreshes policy
    on a tracked worker and retains registry-verified cleanup when policy fails.
-   Separate automated review found no remaining blockers; final workspace checks,
-   exact-head review and CI remain merge gates. See
+   PR #55 passed separate automated exact-head review and every CI check at
+   `39a60b8`; the integrated local suite passed 876 Rust tests (15 live-gated
+   ignored), 90 desktop tests, the build, formatting and all-target clippy.
+   Merge is held for owner
+   confirmation of the newly automatic private macOS update publication. See
    [policy-authority.md](docs/specs/policy-authority.md). Desktop ownership
-   remains subsequent work; this branch does not activate a trading account.
+   is in progress on `feat/desktop-runtime-ownership` (ES19): retained socket
+   and event tasks, bounded local reads, scoped feed generations and a drain
+   barrier before quit/update installation. The full local suite passes 905
+   Rust tests (15 live-gated ignored) and 104 desktop tests; build, formatting
+   and all-target clippy pass. Separate automated review cleared the native
+   startup and late-failure fixes. Exact-head review and CI remain PR gates.
+   The lifecycle banner wraps at 390px while the console remains desktop-only.
+   Real native installer/restart and MCP activation remain unverified. See
+   [desktop-runtime-ownership.md](docs/specs/desktop-runtime-ownership.md).
+   Neither branch activates a trading account.
 4. **Recovery:** PR #44 merged as `06fc0e3` after green CI and separate automated
    review. The durable submission journal has SQLite reopen, independent
    handle, stale-revision, corruption and dropped-request regressions. Starts and
@@ -137,7 +149,7 @@ Status as of 2026-09-07: P0 and the P1 code are on `main`; the P1 gate is waitin
 ### P3 · Guardrails, kill switch, dead-man
 
 - [x] Per-agent guardrails: symbol allowlist, max position, notional cap, order-rate cap, reduce-only mode, max slippage, leverage cap; leverage and margin mode operator-set [24, D3] — all eight on `AgentGuardrails`, with D-c's near-zero defaults, plus spec F's `max_risk_usd` vol-scaled cap (N1–N5), whose σ is corrected by the last hour's realised vol so a twenty-four-bar statistic cannot leave the cap wide through a regime change (B1–B4)
-- [ ] Guardrail config HMAC-checked with a keychain key [3] — complete authenticated snapshots, explicit reviewed migration, deleted-history refusal and final signing revision checks are implemented on `feat/authenticated-policy` (ES18), pending exact-head review and green CI. Key provisioning and desktop runtime activation are not automatic; see [policy-authority.md](docs/specs/policy-authority.md).
+- [x] Guardrail config HMAC-checked with a keychain key [3] — complete authenticated snapshots, explicit reviewed migration, deleted-history refusal and final signing revision checks are in PR #55 (ES18), with green exact-head CI and separate automated review. Merge awaits approval of automatic private-update publication. Key provisioning and desktop runtime activation are not automatic; see [policy-authority.md](docs/specs/policy-authority.md).
 - [x] Loss circuit breaker: max daily loss / drawdown per agent and account-wide trips the kill switch [25] — `guardrail::breaker`, exhausted **at** the limit rather than past it, plus spec F's continuous gauge over the same predicate (L1–L4)
 - [ ] Kill switch per agent and global: pauses new orders, cancels resting, persists across restart, typed `trading_paused` [26] — core pause predicates exist; runtime cancellation delivery/retry and restart behavior must pass the assembled gate before this is complete
 - [ ] Dead-man's switch: `scheduleCancel` armed while any agent is active; quit dialog with cancel-all when positions are open [27] — **it is a daily budget, not a standing net**: minimum 5 s ahead, maximum 10 triggers per day resetting 00:00 UTC, so the arming policy is deliberate and the remaining count is shown in the risk console [decisions.md O1] — **the lead-time half landed** in `guardrail::deadman` (`DEAD_MAN_MIN_LEAD_MS`, a 60 s arm refreshed at 20 s remaining) and `clear_schedule_cancel` clears it. **The daily budget has not**: nothing counts triggers or resets at 00:00 UTC, so O1's central claim — that this is a budget and not a standing net — is the part still to build

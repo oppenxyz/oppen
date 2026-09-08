@@ -59,7 +59,8 @@ use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use futures_util::{SinkExt, StreamExt};
+use futures_util::future::{BoxFuture, Shared};
+use futures_util::{FutureExt, SinkExt, StreamExt};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpStream;
@@ -135,6 +136,12 @@ pub enum PoolError {
     /// subscriptions are accepted.
     #[error("websocket pool is shut down")]
     Shutdown,
+    /// A connection task panicked. Drain still waits for every other task.
+    #[error("websocket connection task {connection} failed: {detail}")]
+    ConnectionTask {
+        connection: ConnectionId,
+        detail: String,
+    },
     /// A frame arrived on a known channel but did not deserialize. Surfaced
     /// rather than swallowed, because a silent drop on a data plane is
     /// indistinguishable from a quiet market.
@@ -1376,6 +1383,20 @@ struct PoolInner {
     registry: SubscriptionRegistry,
     conns: Vec<mpsc::UnboundedSender<ConnCommand>>,
     shutdown: bool,
+    tasks: Vec<ConnectionTask>,
+}
+
+struct ConnectionTask {
+    abort: tokio::task::AbortHandle,
+    completion: Shared<BoxFuture<'static, Result<(), PoolError>>>,
+}
+
+impl fmt::Debug for ConnectionTask {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ConnectionTask")
+            .field("abort", &self.abort)
+            .finish_non_exhaustive()
+    }
 }
 
 /// A pool of independently-reconnecting Hyperliquid websockets.
@@ -1385,8 +1406,8 @@ struct PoolInner {
 /// own reconnect loop, and a drop on one degrades exactly the feeds it carried
 /// while emitting the gap window the ledger needs to backfill.
 ///
-/// Dropping the pool closes every command channel, which stops every connection
-/// task; [`WsPool::shutdown`] does the same explicitly.
+/// Dropping the pool signals cancellation, as does [`WsPool::shutdown`]. Await
+/// [`WsPool::shutdown_and_drain`] to prove every connection task has stopped.
 #[derive(Debug)]
 pub struct WsPool {
     cfg: WsPoolConfig,
@@ -1429,6 +1450,7 @@ impl WsPool {
             registry: SubscriptionRegistry::new(cfg.max_connections, cfg.max_subs_per_connection),
             conns: Vec::new(),
             shutdown: false,
+            tasks: Vec::new(),
         };
         Ok((
             WsPool {
@@ -1451,6 +1473,11 @@ impl WsPool {
     /// coin closes the whole connection (measured), and the pool cannot tell
     /// that apart from a network drop.
     pub fn subscribe(&self, sub: Subscription) -> Result<(), PoolError> {
+        self.subscribe_to(sub, self.cfg.network.ws_url())
+    }
+
+    // The explicit URL is private so tests can exercise real loopback sockets.
+    fn subscribe_to(&self, sub: Subscription, url: &str) -> Result<(), PoolError> {
         let mut guard = lock(&self.inner);
         if guard.shutdown {
             return Err(PoolError::Shutdown);
@@ -1466,18 +1493,46 @@ impl WsPool {
             Placement::NewConnection(id) => {
                 let (tx, rx) = mpsc::unbounded_channel();
                 guard.conns.push(tx);
-                drop(guard);
-                self.handle.spawn(run_connection(
+                self.spawn_connection(
+                    &mut guard,
                     id,
-                    self.cfg.network.ws_url().to_owned(),
-                    self.cfg.clone(),
-                    Arc::clone(&self.inner),
-                    self.events.clone(),
-                    rx,
-                ));
+                    run_connection(
+                        id,
+                        url.to_owned(),
+                        self.cfg.clone(),
+                        Arc::clone(&self.inner),
+                        self.events.clone(),
+                        rx,
+                    ),
+                );
                 Ok(())
             }
         }
+    }
+
+    fn spawn_connection(
+        &self,
+        guard: &mut PoolInner,
+        id: ConnectionId,
+        run: impl std::future::Future<Output = ()> + Send + 'static,
+    ) {
+        let task = self.handle.spawn(run);
+        let abort = task.abort_handle();
+        let completion = async move {
+            match task.await {
+                Ok(()) => Ok(()),
+                Err(error) if error.is_cancelled() => Ok(()),
+                Err(error) => Err(PoolError::ConnectionTask {
+                    connection: id,
+                    detail: error.to_string(),
+                }),
+            }
+        }
+        .boxed()
+        .shared();
+        // Publication shares the admission lock with shutdown. The retained
+        // shared join is never taken by a caller that could abandon its wait.
+        guard.tasks.push(ConnectionTask { abort, completion });
     }
 
     /// Drop a subscription and tell its connection to unsubscribe.
@@ -1541,15 +1596,59 @@ impl WsPool {
         Ok(())
     }
 
-    /// Stop every connection. Idempotent; further subscribes return
-    /// [`PoolError::Shutdown`].
+    /// Signal cancellation of every connection. Idempotent; further subscribes
+    /// return [`PoolError::Shutdown`]. Use [`Self::shutdown_and_drain`] to wait
+    /// for actual completion rather than treating this signal as proof.
     pub fn shutdown(&self) {
         let mut guard = lock(&self.inner);
         guard.shutdown = true;
+        for task in &guard.tasks {
+            task.abort.abort();
+        }
         for tx in &guard.conns {
             let _ = tx.send(ConnCommand::Shutdown);
         }
         guard.conns.clear();
+        for index in 0..guard.tasks.len() {
+            guard
+                .registry
+                .set_connected(ConnectionId(index), false, now_ms());
+        }
+    }
+
+    /// Stop admission and await actual termination of every connection task.
+    /// Concurrent callers and retries after a dropped wait observe the same
+    /// retained completions, including task panic errors. All tasks are joined
+    /// before an error is returned. No pool lock is held across an await.
+    ///
+    /// Socket I/O and blocked event sends are canceled; this does not require
+    /// the event consumer to make progress. Already queued events remain
+    /// readable, but an in-flight frame may not be delivered. This is an
+    /// ownership boundary, not a lossless flush: reconcile on the next start.
+    /// The receiver reaches EOF only after the pool itself is also dropped.
+    pub async fn shutdown_and_drain(&self) -> Result<(), PoolError> {
+        self.shutdown();
+        let completions: Vec<_> = lock(&self.inner)
+            .tasks
+            .iter()
+            .map(|task| task.completion.clone())
+            .collect();
+        let mut failure = None;
+        for completion in completions {
+            if let Err(error) = completion.await {
+                failure.get_or_insert(error);
+            }
+        }
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+}
+
+impl Drop for WsPool {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }
 
@@ -1742,6 +1841,9 @@ async fn run_connection(
             Ok((mut stream, _response)) => {
                 let subs = {
                     let mut guard = lock(&inner);
+                    if guard.shutdown {
+                        return;
+                    }
                     let now = now_ms();
                     guard.registry.set_connected(id, true, now);
                     guard.registry.resubscribe_set(id, now)
@@ -3364,11 +3466,209 @@ mod tests {
 
     // -- connection task internals --------------------------------------------
 
+    #[tokio::test]
+    async fn drain_stops_a_backpressured_connection_without_consuming_queued_events() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            ws.send(Message::Text(fixtures::BBO.to_owned()))
+                .await
+                .unwrap();
+            while let Some(Ok(_)) = ws.next().await {}
+        });
+        let (pool, mut rx) = WsPool::new(WsPoolConfig::default()).unwrap();
+        for _ in 0..EVENT_BUFFER {
+            pool.events
+                .try_send(WsEvent::VenueError {
+                    connection: ConnectionId(0),
+                    message: "queued fixture".into(),
+                })
+                .unwrap();
+        }
+        pool.subscribe_to(
+            Subscription::Bbo { coin: "BTC".into() },
+            &format!("ws://{addr}"),
+        )
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while pool.health()[0].last_message_ms.is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("connection did not reach blocked event send");
+        tokio::time::timeout(Duration::from_secs(1), pool.shutdown_and_drain())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(pool.health().iter().all(|feed| !feed.connected));
+        for _ in 0..EVENT_BUFFER {
+            assert!(matches!(rx.try_recv(), Ok(WsEvent::VenueError { .. })));
+        }
+        assert!(rx.try_recv().is_err(), "a writer survived drain");
+        pool.shutdown_and_drain().await.unwrap();
+        drop(pool);
+        assert!(rx.recv().await.is_none());
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn dropping_pool_cancels_a_stalled_handshake_and_breaks_the_inner_cycle() {
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (accepted, ready) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut tcp, _) = listener.accept().await.unwrap();
+            accepted.send(()).unwrap();
+            let _ = tcp.read_to_end(&mut Vec::new()).await;
+        });
+        let (pool, mut rx) = WsPool::new(WsPoolConfig::default()).unwrap();
+        let inner = Arc::downgrade(&pool.inner);
+        pool.subscribe_to(
+            Subscription::Bbo { coin: "BTC".into() },
+            &format!("ws://{addr}"),
+        )
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), ready)
+            .await
+            .unwrap()
+            .unwrap();
+        drop(pool);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while inner.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+            assert!(rx.recv().await.is_none());
+        })
+        .await
+        .expect("connection retained its own shutdown sender");
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn subscribe_publication_and_shutdown_are_one_admission_boundary() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        for _ in 0..32 {
+            let (pool, _rx) = WsPool::new(WsPoolConfig::default()).unwrap();
+            let pool = Arc::new(pool);
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let subscribing = pool.clone();
+            let start = barrier.clone();
+            let thread_url = url.clone();
+            let thread = std::thread::spawn(move || {
+                start.wait();
+                subscribing.subscribe_to(Subscription::Bbo { coin: "BTC".into() }, &thread_url)
+            });
+            barrier.wait();
+            pool.shutdown_and_drain().await.unwrap();
+            let result = thread.join().unwrap();
+            assert!(result.is_ok() || result == Err(PoolError::Shutdown));
+            let guard = lock(&pool.inner);
+            assert!(guard.shutdown);
+            assert!(guard.tasks.iter().all(|task| task.abort.is_finished()));
+            drop(guard);
+            assert_eq!(
+                pool.subscribe_to(Subscription::Bbo { coin: "ETH".into() }, &url),
+                Err(PoolError::Shutdown)
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn dropped_and_concurrent_drain_waiters_retain_actual_completion_and_panic_result() {
+        struct HeldDrop {
+            entered: Arc<tokio::sync::Notify>,
+            release: std::sync::mpsc::Receiver<()>,
+            completed: Arc<std::sync::atomic::AtomicBool>,
+        }
+        impl Drop for HeldDrop {
+            fn drop(&mut self) {
+                self.entered.notify_one();
+                self.release.recv_timeout(Duration::from_secs(5)).unwrap();
+                self.completed
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let (pool, _rx) = WsPool::new(WsPoolConfig::default()).unwrap();
+        let pool = Arc::new(pool);
+        let started = Arc::new(tokio::sync::Notify::new());
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (release, wait) = std::sync::mpsc::channel();
+        let panicked = Arc::new(tokio::sync::Notify::new());
+        {
+            let mut guard = lock(&pool.inner);
+            let panicked = panicked.clone();
+            pool.spawn_connection(&mut guard, ConnectionId(0), async move {
+                panicked.notify_one();
+                panic!("synthetic connection failure");
+            });
+            let started = started.clone();
+            let held = HeldDrop {
+                entered: entered.clone(),
+                release: wait,
+                completed: completed.clone(),
+            };
+            pool.spawn_connection(&mut guard, ConnectionId(1), async move {
+                let _held = held;
+                started.notify_one();
+                std::future::pending::<()>().await;
+            });
+        }
+        started.notified().await;
+        panicked.notified().await;
+        let draining = pool.clone();
+        let first = tokio::spawn(async move { draining.shutdown_and_drain().await });
+        tokio::time::timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .unwrap();
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        let second_pool = pool.clone();
+        let mut second = tokio::spawn(async move { second_pool.shutdown_and_drain().await });
+        let third_pool = pool.clone();
+        let mut third = tokio::spawn(async move { third_pool.shutdown_and_drain().await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), &mut second)
+                .await
+                .is_err()
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), &mut third)
+                .await
+                .is_err()
+        );
+        assert!(!completed.load(std::sync::atomic::Ordering::SeqCst));
+        release.send(()).unwrap();
+        let error = second.await.unwrap().unwrap_err();
+        assert!(matches!(
+            error,
+            PoolError::ConnectionTask {
+                connection: ConnectionId(0),
+                ..
+            }
+        ));
+        assert_eq!(third.await.unwrap(), Err(error.clone()));
+        assert_eq!(pool.shutdown_and_drain().await, Err(error));
+        assert!(completed.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
     fn test_inner(registry: SubscriptionRegistry) -> Arc<Mutex<PoolInner>> {
         Arc::new(Mutex::new(PoolInner {
             registry,
             conns: Vec::new(),
             shutdown: false,
+            tasks: Vec::new(),
         }))
     }
 

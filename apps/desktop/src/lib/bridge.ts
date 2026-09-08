@@ -320,6 +320,27 @@ export type FeedUpdate =
     }
   | { kind: "status"; last_tick_ms?: number; connected: boolean; detail?: string };
 
+export interface FeedBinding {
+  network: "testnet" | "mainnet";
+  generation: string;
+}
+
+export interface FeedEnvelope extends FeedBinding {
+  update: FeedUpdate;
+  failure?: string;
+}
+
+/** Cached desktop task lifecycle only; not execution or reconciliation readiness. */
+export interface RuntimeStatus {
+  phase: "running" | "replacing" | "stopping" | "stopped" | "stopped_with_error";
+  binding: FeedBinding | null;
+  detail: string | null;
+}
+
+export function fetchRuntimeStatus(): Promise<RuntimeStatus> {
+  return invoke<RuntimeStatus>("runtime_status");
+}
+
 /**
  * Point the socket at one symbol and interval.
  *
@@ -331,8 +352,8 @@ export async function watchMarket(
   network: "testnet" | "mainnet",
   coin: string,
   interval: string,
-): Promise<void> {
-  return invoke<void>("watch_market", { network, coin, interval });
+): Promise<FeedBinding> {
+  return invoke<FeedBinding>("watch_market", { network, coin, interval });
 }
 
 /**
@@ -343,11 +364,11 @@ export async function watchMarket(
  * a venue to do it.
  */
 export async function onFeedUpdate(
-  handler: (update: FeedUpdate) => void,
+  handler: (envelope: FeedEnvelope) => void,
 ): Promise<() => void> {
   if (!inTauri()) return () => {};
   const { listen } = await import("@tauri-apps/api/event");
-  return listen<FeedUpdate>("feed://update", (event) => handler(event.payload));
+  return listen<FeedEnvelope>("feed://update", (event) => handler(event.payload));
 }
 
 /** UP2: only version/readiness cross IPC; private-release credentials stay in Rust. */

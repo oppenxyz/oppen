@@ -13,7 +13,7 @@
  * happens to be a REST read.
  */
 
-import { computed, reactive, readonly } from "vue";
+import { computed, reactive, readonly, watch } from "vue";
 
 import type { Bar } from "../lib/candles";
 import {
@@ -26,6 +26,7 @@ import {
   watchMarket,
   type BookLevel,
   type ChartBar,
+  type FeedBinding,
   type FeedUpdate,
   type MarketRow,
   type MarketSnapshot,
@@ -428,13 +429,139 @@ export interface TradeFrame {
  * down: losing the socket costs the panels their live updates, not the values
  * the REST reads already put there.
  */
-export async function watchSelected(): Promise<void> {
-  if (state.selected === null || !inTauri()) return;
-  try {
-    await watchMarket(shell.network, state.selected, state.interval);
-  } catch (error) {
-    state.error = reason(error);
+interface FeedScope {
+  network: FeedBinding["network"];
+  coin: string | null;
+  interval: string;
+}
+
+/** Retained IPC ownership and listener lifecycle; injectable for deferred transport proofs. */
+export function createMarketFeed(
+  scope: () => FeedScope,
+  transport: { watch: typeof watchMarket; listen: typeof onFeedUpdate },
+  callbacks: {
+    update: (update: FeedUpdate, failure?: string) => void;
+    invalidate: () => void;
+    failure: (detail: string) => void;
+    error: (detail: string | null) => void;
+  },
+) {
+  let active = false;
+  let lifecycle = 0;
+  let desired: FeedScope | null = null;
+  let accepted: { binding: FeedBinding; request: FeedScope } | null = null;
+  let failedOwner: (FeedBinding & { failure: string }) | null = null;
+  let running: Promise<void> | null = null;
+  let completed: FeedScope | null = null;
+  let unlisten: (() => void) | null = null;
+  let unwatch: (() => void) | null = null;
+
+  function invalidate(): void {
+    accepted = null;
+    callbacks.invalidate();
+    callbacks.error(null);
   }
+
+  async function drain(): Promise<void> {
+    while (active && desired !== null) {
+      const request = desired;
+      try {
+        const binding = await transport.watch(request.network, request.coin!, request.interval);
+        if (active && desired === request) {
+          if (binding?.network !== request.network || typeof binding.generation !== "string" || binding.generation.length === 0) {
+            throw new Error("Market feed acknowledgment does not match the requested scope.");
+          }
+          accepted = { binding, request };
+          if (failedOwner?.network !== binding.network || failedOwner.generation !== binding.generation) failedOwner = null;
+          callbacks.error(null);
+        }
+      } catch (error) {
+        if (active && desired === request) callbacks.error(reason(error));
+      }
+      completed = request;
+      if (desired === request) break;
+    }
+  }
+
+  function request(): Promise<void> {
+    if (!active) return Promise.resolve();
+    const next = scope();
+    if (desired?.network === next.network && desired.coin === next.coin && desired.interval === next.interval
+      && (running !== null || accepted !== null)) return running ?? Promise.resolve();
+    invalidate();
+    desired = next.coin === null ? null : next;
+    // Never clear this slot on stop: an IPC already sent still owns backend work.
+    if (running === null && desired !== null) {
+      running = drain().finally(() => {
+        running = null;
+        if (active && desired !== null && completed !== desired) void request();
+      });
+    }
+    return running ?? Promise.resolve();
+  }
+
+  async function start(): Promise<void> {
+    if (active) return;
+    active = true;
+    const owner = ++lifecycle;
+    unwatch = watch(scope, () => { void request(); }, { flush: "sync", immediate: true });
+    try {
+      const cleanup = await transport.listen((envelope) => {
+        if (!active || owner !== lifecycle || accepted === null || accepted.request !== desired) return;
+        if (envelope.network !== accepted.binding.network || envelope.generation !== accepted.binding.generation) return;
+        const update = envelope.update;
+        if (envelope.failure !== undefined && failedOwner === null) {
+          failedOwner = { ...accepted.binding, failure: envelope.failure };
+          callbacks.failure(failedOwner.failure);
+        }
+        if (update.kind === "ctx" && update.row.symbol !== desired?.coin) return;
+        if ("coin" in update && update.coin !== desired?.coin) return;
+        if (update.kind === "candle" && update.interval !== desired?.interval) return;
+        callbacks.update(update, failedOwner?.failure);
+      });
+      if (!active || owner !== lifecycle) cleanup();
+      else unlisten = cleanup;
+    } catch (error) {
+      if (active && owner === lifecycle) callbacks.error(reason(error));
+    }
+  }
+
+  function stop(): void {
+    active = false;
+    lifecycle += 1;
+    unwatch?.();
+    unwatch = null;
+    desired = null;
+    invalidate();
+    unlisten?.();
+    unlisten = null;
+  }
+
+  return { start, stop, request };
+}
+
+let watchError: string | null = null;
+const liveFeed = createMarketFeed(
+  () => ({ network: shell.network, coin: state.selected, interval: state.interval }),
+  { watch: watchMarket, listen: onFeedUpdate },
+  {
+    invalidate: () => { feedStatus(false, "Awaiting selected market feed."); },
+    failure: (detail) => { feedStatus(false, detail); },
+    error: (detail) => {
+      if (detail !== null || state.error === watchError) state.error = detail;
+      watchError = detail;
+    },
+    update: (update, failure) => {
+      applyFeed(update);
+      if (failure !== undefined) feedStatus(false, failure);
+      else if (update.kind === "status") feedStatus(update.connected, update.detail);
+      else feedTick("at_ms" in update ? update.at_ms : Date.now());
+    },
+  },
+);
+
+export async function watchSelected(): Promise<void> {
+  if (inTauri()) await liveFeed.request();
 }
 
 /**
@@ -453,7 +580,6 @@ const AGE_TICK_MS = 1_000;
 
 let rail: ReturnType<typeof globalThis.setInterval> | null = null;
 let age: ReturnType<typeof globalThis.setInterval> | null = null;
-let unlisten: (() => void) | null = null;
 
 /**
  * Start the console's live data (`docs/spec.md` items 31, 34).
@@ -468,25 +594,14 @@ export async function startMarketFeed(): Promise<void> {
   void refreshMarkets();
   rail = globalThis.setInterval(() => void refreshMarkets(), RAIL_REFRESH_MS);
   age = globalThis.setInterval(() => ageFeeds(Date.now()), AGE_TICK_MS);
-  unlisten = await onFeedUpdate((update) => {
-    applyFeed(update);
-    if (update.kind === "status") {
-      feedStatus(update.connected, update.detail);
-      return;
-    }
-    // Every payload frame is evidence the socket is alive, and it carries the
-    // venue's own instant where it has one — which is what item 34 wants the
-    // overlay to age against rather than the moment the renderer woke up.
-    feedTick("at_ms" in update ? update.at_ms : Date.now());
-  });
+  if (inTauri()) await liveFeed.start();
 }
 
 /** Stop everything `startMarketFeed` started. */
 export function stopMarketFeed(): void {
   if (rail !== null) globalThis.clearInterval(rail);
   if (age !== null) globalThis.clearInterval(age);
-  unlisten?.();
+  liveFeed.stop();
   rail = null;
   age = null;
-  unlisten = null;
 }

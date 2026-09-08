@@ -292,6 +292,19 @@ The complete migration, provenance, admission and regression contract is
 [policy-authority.md](specs/policy-authority.md). This records the implementation
 decision, not completed code or supervised-testnet acceptance.
 
+### Desktop task ownership before activation (ES19)
+
+Spec items 9, 14, 27, 31 and 34 require actual ownership through shutdown,
+not detached feed tasks or a cancellation flag reported as completion. The
+desktop owner retains socket/event tasks and admitted local reads through
+context replacement, quit and explicit update installation. Incomplete drain
+remains stopping; no replacement runtime or installer runs ahead of it.
+Reuse the existing WebSocket pool and blocking-read ownership pattern, without
+introducing a second runtime framework or trading activation. Network-scoped
+generation tags prevent queued old feed events from changing the new context.
+See [desktop-runtime-ownership.md](specs/desktop-runtime-ownership.md) for the
+implementation and evidence contract. This is not a completed lifecycle gate.
+
 ## 2026-09-07 · The console's own socket
 
 Item 34 asks for per-feed status, last-tick timestamps and a stale overlay. The
