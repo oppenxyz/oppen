@@ -1,10 +1,12 @@
-//! ES28: retained operator queue reads and rejection, never approval or signing.
+//! Runtime-owned queue decisions and opaque guarded pricing reviews.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use oppen_core::guardrail::{GuardrailEngine, OriginalRequest, Proposal};
+use oppen_core::guardrail::{ApprovalReviewDisplay, GuardrailEngine, OriginalRequest, Proposal};
+use oppen_core::ledger::PairingId;
 use oppen_mcp::auth::Binding;
+use oppen_mcp::server::{OperatorControl, OperatorReview};
 use serde::Serialize;
 
 static NEXT_OWNER: AtomicU64 = AtomicU64::new(1);
@@ -15,6 +17,9 @@ pub(crate) enum QueuePhase {
     Idle,
     Refreshing,
     Rejecting,
+    Reviewing,
+    ReviewReady,
+    Confirming,
     Ready,
     Unavailable,
     RecoveryRequired,
@@ -62,16 +67,39 @@ pub(crate) struct ApprovalQueueStatus {
     pub pending: Vec<PendingApprovalView>,
     pub decision: Option<ApprovalDecision>,
     pub error: Option<String>,
+    pub review: Option<PricingReviewView>,
+    pub confirmation: Option<ApprovalConfirmation>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct PricingReviewView {
+    pub id: String,
+    pub owner_id: String,
+    pub pairing_id: PairingId,
+    pub reason: String,
+    pub display: ApprovalReviewDisplay,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ApprovalConfirmation {
+    pub review_id: String,
+    pub proposal_id: String,
+    pub at_ms: u64,
+    pub result: Option<serde_json::Value>,
+    pub error: Option<serde_json::Value>,
 }
 
 struct Admission {
     closed: bool,
     busy: bool,
     status: ApprovalQueueStatus,
+    review: Option<OperatorReview>,
+    next_review: u64,
 }
 
 pub(crate) struct ApprovalQueueControl {
     engine: Arc<GuardrailEngine>,
+    operator: Option<OperatorControl>,
     binding: Binding,
     admission: Mutex<Admission>,
     task: tokio::sync::Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
@@ -179,7 +207,24 @@ fn perform(
 }
 
 impl ApprovalQueueControl {
+    #[cfg(test)]
     pub(crate) fn new(engine: Arc<GuardrailEngine>, binding: Binding) -> Result<Arc<Self>, String> {
+        Self::construct(engine, binding, None)
+    }
+
+    pub(crate) fn with_operator(
+        engine: Arc<GuardrailEngine>,
+        binding: Binding,
+        operator: OperatorControl,
+    ) -> Result<Arc<Self>, String> {
+        Self::construct(engine, binding, Some(operator))
+    }
+
+    fn construct(
+        engine: Arc<GuardrailEngine>,
+        binding: Binding,
+        operator: Option<OperatorControl>,
+    ) -> Result<Arc<Self>, String> {
         let owner_id = NEXT_OWNER
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
                 value.checked_add(1)
@@ -195,14 +240,19 @@ impl ApprovalQueueControl {
             pending: Vec::new(),
             decision: None,
             error: None,
+            review: None,
+            confirmation: None,
         };
         Ok(Arc::new(Self {
             engine,
+            operator,
             binding,
             admission: Mutex::new(Admission {
                 closed: false,
                 busy: false,
                 status,
+                review: None,
+                next_review: 1,
             }),
             task: tokio::sync::Mutex::new(None),
         }))
@@ -279,6 +329,9 @@ impl ApprovalQueueControl {
         }
         if admission.busy {
             return Err("approval queue work is still running".into());
+        }
+        if admission.review.is_some() {
+            return Err("discard or confirm the retained pricing review first".into());
         }
         let mut task = self
             .task
@@ -367,17 +420,277 @@ impl ApprovalQueueControl {
                 admission.status.phase = QueuePhase::Closed;
             }
             admission.busy = false;
+            let close_operator = admission.closed;
+            drop(admission);
+            if close_operator && let Some(operator) = &owner.operator {
+                operator.close();
+            }
         }));
         Ok(initial)
     }
 
     pub(crate) fn close(&self) -> Result<(), String> {
+        if let Some(operator) = &self.operator {
+            operator.close();
+        }
         let mut admission = self.admission()?;
         admission.closed = true;
+        admission.review = None;
         if admission.status.phase != QueuePhase::RecoveryRequired {
             admission.status.phase = QueuePhase::Closed;
         }
         Ok(())
+    }
+
+    pub(crate) fn prepare(
+        self: &Arc<Self>,
+        binding: &Binding,
+        owner_id: &str,
+        proposal_id: String,
+    ) -> Result<ApprovalQueueStatus, String> {
+        self.review_operation(binding, owner_id, proposal_id, false)
+    }
+
+    pub(crate) fn confirm(
+        self: &Arc<Self>,
+        binding: &Binding,
+        owner_id: &str,
+        review_id: String,
+    ) -> Result<ApprovalQueueStatus, String> {
+        self.review_operation(binding, owner_id, review_id, true)
+    }
+
+    pub(crate) fn discard(
+        &self,
+        binding: &Binding,
+        owner_id: &str,
+        review_id: &str,
+    ) -> Result<ApprovalQueueStatus, String> {
+        self.check_binding(binding)?;
+        let mut admission = self.admission()?;
+        if admission.closed || admission.busy || admission.status.owner_id != owner_id {
+            return Err("pricing review owner is closed, busy or changed".into());
+        }
+        if admission.review.is_none()
+            || admission
+                .status
+                .review
+                .as_ref()
+                .is_none_or(|view| view.id != review_id)
+        {
+            return Err("pricing review is no longer retained".into());
+        }
+        admission.review = None;
+        admission.status.review = None;
+        admission.status.phase = QueuePhase::Ready;
+        admission.status.error = None;
+        Ok(admission.status.clone())
+    }
+
+    fn review_operation(
+        self: &Arc<Self>,
+        binding: &Binding,
+        owner_id: &str,
+        id: String,
+        confirming: bool,
+    ) -> Result<ApprovalQueueStatus, String> {
+        self.check_binding(binding)?;
+        let operator = self
+            .operator
+            .clone()
+            .ok_or("guarded operator submission is unavailable")?;
+        let mut admission = self.admission()?;
+        if admission.closed || admission.busy || admission.status.owner_id != owner_id {
+            return Err("pricing review owner is closed, busy or changed".into());
+        }
+        let mut task = self
+            .task
+            .try_lock()
+            .map_err(|_| "approval queue is draining")?;
+        if task
+            .as_ref()
+            .is_some_and(|task| !task.inner().is_finished())
+        {
+            return Err("approval queue task has not finished".into());
+        }
+        let at_ms =
+            u64::try_from(oppen_core::ledger::now_ms()).map_err(|error| error.to_string())?;
+        let (review_id, proposal_id, reason, retained) = if confirming {
+            let view = admission
+                .status
+                .review
+                .as_ref()
+                .ok_or("pricing review is missing")?;
+            if view.id != id || view.owner_id != owner_id || view.display.expires_at_ms <= at_ms {
+                return Err("pricing review changed or expired".into());
+            }
+            let ids = (
+                view.id.clone(),
+                view.display.proposal_id.clone(),
+                view.reason.clone(),
+            );
+            let retained = admission
+                .review
+                .take()
+                .ok_or("pricing review was already consumed")?;
+            (ids.0, ids.1, ids.2, Some(retained))
+        } else {
+            if admission.review.is_some() {
+                return Err("discard the retained pricing review first".into());
+            }
+            let proposal = admission
+                .status
+                .pending
+                .iter()
+                .find(|proposal| proposal.id == id)
+                .ok_or("refresh the queue before reviewing this proposal")?;
+            if proposal.expires_at_ms <= at_ms {
+                return Err("proposal expired".into());
+            }
+            let reason = proposal.reason.clone();
+            let review_id = admission.next_review.to_string();
+            admission.next_review = admission
+                .next_review
+                .checked_add(1)
+                .ok_or("pricing review IDs exhausted")?;
+            admission.status.review = None;
+            (review_id, id, reason, None)
+        };
+        admission.busy = true;
+        admission.status.phase = if confirming {
+            QueuePhase::Confirming
+        } else {
+            QueuePhase::Reviewing
+        };
+        admission.status.error = None;
+        if confirming {
+            // Claiming can consume the proposal even when execution later fails.
+            // Retain old rows as evidence, not as a current queue observation.
+            admission.status.observed_at_ms = None;
+            admission.status.confirmation = Some(ApprovalConfirmation {
+                review_id: review_id.clone(),
+                proposal_id: proposal_id.clone(),
+                at_ms,
+                result: None,
+                error: None,
+            });
+        }
+        let initial = admission.status.clone();
+        let owner = self.clone();
+        // The outer retained task owns the actual async operation even if IPC or
+        // a drain waiter disappears. A consumed review is never restored on error.
+        *task = Some(tauri::async_runtime::spawn(async move {
+            let binding = owner.binding.clone();
+            let requested = proposal_id.clone();
+            let result = tauri::async_runtime::spawn(async move {
+                if let Some(review) = retained {
+                    operator
+                        .confirm(review)
+                        .await
+                        .map(|result| (None, Some(result)))
+                } else {
+                    operator
+                        .prepare(&binding, &requested)
+                        .await
+                        .map(|review| (Some(review), None))
+                }
+            })
+            .await;
+            let Ok(mut admission) = owner.admission() else {
+                return;
+            };
+            let completed_at = u64::try_from(oppen_core::ledger::now_ms()).unwrap_or(at_ms);
+            match result {
+                Ok(Ok((Some(review), None))) if !confirming => {
+                    let display = review.display();
+                    if display.agent != owner.binding.agent
+                        || display.account != owner.binding.account
+                        || display.proposal_id != proposal_id
+                        || display.expires_at_ms <= completed_at
+                    {
+                        admission.status.phase = QueuePhase::Unavailable;
+                        admission.status.error =
+                            Some("prepared review identity changed or expired".into());
+                    } else if !admission.closed {
+                        admission.status.review = Some(PricingReviewView {
+                            id: review_id,
+                            owner_id: admission.status.owner_id.clone(),
+                            pairing_id: review.pairing_id(),
+                            reason,
+                            display: display.clone(),
+                        });
+                        admission.review = Some(review);
+                        admission.status.phase = QueuePhase::ReviewReady;
+                    }
+                }
+                Ok(Ok((None, Some(result)))) if confirming => {
+                    admission.status.confirmation = Some(ApprovalConfirmation {
+                        review_id,
+                        proposal_id,
+                        at_ms: completed_at,
+                        result: Some(result),
+                        error: None,
+                    });
+                    admission.status.phase = QueuePhase::Idle;
+                }
+                other => {
+                    let (message, error, panic) = match other {
+                        Ok(Err(error)) => {
+                            let recovery = error
+                                .data
+                                .as_ref()
+                                .and_then(|data| data.get("code"))
+                                .and_then(serde_json::Value::as_str)
+                                == Some("worker_failed");
+                            (
+                                error.message.to_string(),
+                                serde_json::to_value(error).unwrap_or(serde_json::Value::Null),
+                                recovery,
+                            )
+                        }
+                        Err(error) => {
+                            let message = format!("pricing review worker: {error}");
+                            (
+                                message.clone(),
+                                serde_json::json!({"message": message}),
+                                true,
+                            )
+                        }
+                        _ => (
+                            "pricing review worker returned an invalid result".into(),
+                            serde_json::Value::Null,
+                            true,
+                        ),
+                    };
+                    if confirming {
+                        admission.status.confirmation = Some(ApprovalConfirmation {
+                            review_id,
+                            proposal_id,
+                            at_ms: completed_at,
+                            result: None,
+                            error: Some(error),
+                        });
+                    }
+                    admission.status.error = Some(message);
+                    admission.status.phase = if panic {
+                        QueuePhase::RecoveryRequired
+                    } else {
+                        QueuePhase::Unavailable
+                    };
+                    admission.closed |= panic;
+                }
+            }
+            if admission.closed && admission.status.phase != QueuePhase::RecoveryRequired {
+                admission.status.phase = QueuePhase::Closed;
+            }
+            admission.busy = false;
+            let close_operator = admission.closed;
+            drop(admission);
+            if close_operator && let Some(operator) = &owner.operator {
+                operator.close();
+            }
+        }));
+        Ok(initial)
     }
 
     #[cfg(test)]
@@ -660,6 +973,33 @@ mod tests {
         fn queue(&self) -> Arc<ApprovalQueueControl> {
             ApprovalQueueControl::new(self.engine.clone(), self.alpha.clone()).unwrap()
         }
+    }
+
+    #[test]
+    fn queue_without_actual_listener_cannot_prepare_or_confirm() {
+        let fixture = Fixture::new();
+        let queue = fixture.queue();
+        let before = queue.status(&fixture.alpha).unwrap();
+        assert!(
+            queue
+                .prepare(&fixture.alpha, &before.owner_id, "proposal".into())
+                .is_err()
+        );
+        assert!(
+            queue
+                .confirm(&fixture.alpha, &before.owner_id, "review".into())
+                .is_err()
+        );
+        assert!(
+            queue
+                .discard(&fixture.alpha, &before.owner_id, "review")
+                .is_err()
+        );
+        let after = queue.status(&fixture.alpha).unwrap();
+        assert_eq!(after.phase, before.phase);
+        assert!(after.review.is_none());
+        assert!(after.confirmation.is_none());
+        assert!(!queue.admission().unwrap().busy);
     }
 
     async fn settled(queue: &ApprovalQueueControl) -> ApprovalQueueStatus {

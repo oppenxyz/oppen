@@ -193,6 +193,15 @@ before expanding features:
    frozen install, QA typecheck, production build, 168 frontend tests and three
    release-script unit tests pass. Independent automated diff review found no
    blocking issues; exact-head review/CI remain separate from live gates.
+   ES29 is in progress on `feat/native-approval-review`: retained full-action
+   pricing review, one-shot native confirmation through the existing gateway,
+   authenticated review/receipt commitments, pinned pairing authority at final
+   signing, and retained shutdown work. Workspace tests (1,062 passed, 15
+   live-gated ignored), frontend tests (172), build and QA typecheck pass.
+   Separate automated working-diff review found no blocking findings; exact-head
+   review and CI remain gates. Healthy live WebSocket acceptance and dedicated
+   native route-read timeout regression coverage remain open. This is not a
+   live-activation or release-readiness claim.
    No dedicated-account activity has been performed during this development.
 4. **Recovery:** PR #44 merged as `06fc0e3` after green CI and separate automated
    review. The durable submission journal has SQLite reopen, independent

@@ -101,9 +101,10 @@ pub use config::{
 };
 pub use deadman::DeadManIntent;
 pub use engine::{
-    AuditEntry, AuditError, AuditOutcome, AuditSink, Clearance, Cleared, ClearedKind,
-    GuardrailEngine, GuardrailError, OperatorAction, OrderIntent, PolicyAcknowledgment,
-    PolicyStatus, Proposal, SignClearedError, SigningPermit, Utilization, Verdict,
+    ApprovalReview, ApprovalReviewDisplay, AuditEntry, AuditError, AuditOutcome, AuditSink,
+    Clearance, Cleared, ClearedKind, GuardrailEngine, GuardrailError, OperatorAction, OrderIntent,
+    PolicyAcknowledgment, PolicyStatus, Proposal, SignClearedError, SigningPermit, Utilization,
+    Verdict,
 };
 pub use kill::{Engagement, KillEffect, KillReason, KillScope, KillSwitch};
 pub use refusal::{PilotMetric, ReduceOnlyBreach, Refusal, Unevaluable, VenueRule};

@@ -38,6 +38,10 @@ use crate::auth::{SessionAuthority, TokenStore};
 use crate::guard::{Refusal, bearer_token, check_host, check_origin};
 use crate::tools::Gateway;
 
+mod operator;
+pub(crate) use operator::OperatorWork;
+pub use operator::{OperatorControl, OperatorReview};
+
 /// The path agents connect to. `claude mcp add --transport http oppen
 /// http://127.0.0.1:<port>/mcp`.
 pub const MCP_PATH: &str = "/mcp";
@@ -224,6 +228,7 @@ pub struct BoundServer {
     network: oppen_hl::Network,
     supervision: watch::Sender<SupervisionStatus>,
     supervision_wake: Arc<Notify>,
+    operator: OperatorControl,
 }
 
 /// Cached pause-sweep observation, not proof that the venue is flat or ready.
@@ -269,6 +274,7 @@ impl BoundServer {
             network: gateway.network(),
             supervision: watch::channel(SupervisionStatus::default()).0,
             supervision_wake: Arc::new(Notify::new()),
+            operator: OperatorControl::new(gateway.clone(), pairings.clone()),
         })
     }
 
@@ -287,6 +293,10 @@ impl BoundServer {
         }
     }
 
+    pub fn operator_control(&self) -> OperatorControl {
+        self.operator.clone()
+    }
+
     pub async fn serve(
         self,
         gateway: impl GatewayHandler,
@@ -300,15 +310,36 @@ impl BoundServer {
             ));
         }
         validate_pairing_network(self.network, &pairings)?;
-        serve_bound(
+        self.operator.start(gateway.gateway(), &pairings)?;
+        let lifecycle = self.operator.owner.lifecycle.clone();
+        drop(self.operator);
+        struct CloseOperator(Arc<operator::OperatorLifecycle>);
+        impl Drop for CloseOperator {
+            fn drop(&mut self) {
+                self.0.close();
+                self.0.shutdown.cancel();
+            }
+        }
+        let _close = CloseOperator(lifecycle.clone());
+        let serving = serve_bound(
             self.listener,
             gateway,
             pairings,
-            shutdown,
+            lifecycle.shutdown.clone(),
             self.supervision,
             self.supervision_wake,
-        )
-        .await
+            lifecycle.execution.clone(),
+        );
+        tokio::pin!(serving);
+        tokio::select! {
+            biased;
+            () = shutdown.cancelled() => {
+                lifecycle.close();
+                lifecycle.shutdown.cancel();
+                serving.await
+            }
+            result = &mut serving => result,
+        }
     }
 }
 
@@ -342,15 +373,14 @@ async fn serve_bound(
     shutdown: CancellationToken,
     supervision: watch::Sender<SupervisionStatus>,
     supervision_wake: Arc<Notify>,
+    execution: watch::Sender<()>,
 ) -> std::io::Result<()> {
     let addr = listener.local_addr()?;
     tracing::info!(%addr, path = MCP_PATH, "MCP gateway listening on loopback");
 
-    let shutdown = shutdown.child_token();
     // Dropping serve also cancels its connections and execution. Only awaiting
     // serve can guarantee that their teardown has finished.
     let _shutdown_guard = shutdown.clone().drop_guard();
-    let (execution, _) = watch::channel(());
 
     let enforcement_gateway = gateway.gateway().clone();
     let enforcement_pairings = pairings.clone();

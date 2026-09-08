@@ -82,7 +82,8 @@ The native pricing implementation must preserve these ownership boundaries:
   identity; do not claim otherwise. Revocation must prevent new execution and
   preserve uncertain/submitted outcomes for reconciliation, not assert not-sent.
 
-These are implementation requirements, not an implemented native approval flow.
+These requirements remain acceptance criteria; the ES29 implementation status
+below does not establish supervised live acceptance.
 
 Implementation trace after ES28:
 
@@ -107,8 +108,30 @@ Implementation trace after ES28:
   grant execution. No originating pairing-token identity is currently stored
   in proposals, so a live same-binding lease is not proof of originating token.
 
-These traced gaps are still implementation work. They do not authorize native
-approval execution, key reads or live activation.
+### ES29 Implementation In Progress
+
+`feat/native-approval-review` implements opaque retained core/native reviews,
+full rounded-action commitments linked to the actual clearance receipt, and
+confirmation through the existing gateway reservation and submission path.
+Native commands accept retained IDs rather than editable actions. The actual
+server owns admission and draining; a live same-binding pairing is selected,
+displayed and pinned without fallback after revocation. Its authority is checked
+again after key loading and held through guarded signing.
+
+Worker failure is nonretryable and places the native controller in recovery
+required. Losing an IPC observer does not cancel accepted work or prove an order
+was not sent. Resting acknowledgments remain subject to durable reconciliation.
+New integration fixtures cover one-shot confirmation, shutdown ownership and
+post-claim panic/reopen. Local workspace tests pass (1,062; 15 live-gated ignored)
+and separate automated working-diff review found no blocking issues. Exact-head
+review, CI and live acceptance remain gates; dedicated native route-read timeout
+coverage and healthy live WebSocket proof are still open.
+
+Ledger V11 is a reader barrier for reviewed commitments and receipt links; old
+event bytes are preserved. Stop all older writers before upgrading. Rollback
+requires V11-capable code preserving the complete history, not lowering the
+schema version, restoring old budgets or deleting claims. No dedicated-account
+ledger migration, key read or live activation is authorized by this work.
 
 - Approve/approve and approve/reject races produce one disposition, never two
   executable clearances; restart and same-time ID generation cannot revive one.

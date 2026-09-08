@@ -67,6 +67,41 @@ test("queue and row-local confirmation render identity, money and untrusted text
     expect(confirmation).toContain("Buy");
     expect(confirmation).toContain("&lt;img");
     expect(html).not.toContain(">Approve<");
+    queue.status.review = { id: "retained-1", owner_id: "owner-observed", reason: first.reason,
+      pairing_id: { network: "testnet", issued_seq: 8 }, display: {
+        ...first, proposal_id: first.id, original_px: "101", reference_px: "100.25", reference_at_ms: 1002,
+        drift_bps: "25.1234", asset_index: 0, notional_usd: "12.469135690336", order_type: { limit: { tif: "Ioc" } },
+        cloid: "0x012345", grouping: "na", builder: null, policy_revision: 14, policy_hash: "verified-policy-hash",
+        reviewed_at_ms: 1003, route: { network: "testnet", binding_seq: 9, binding: {
+          agent: binding.agent, container: binding.account, vault_address: null,
+          wallet: { generation: 1, address: `0x${"2".repeat(40)}`, approved_at_ms: 1, valid_until_ms: 200000 } } },
+      } };
+    queue.execution = { review_id: "retained-1", proposal_id: first.id, at_ms: 1004, result: null,
+      error: { code: -32000, message: "<script>bad()</script>", data: { cloid: "0x012345", retryable: false } } };
+    const reviewed = await renderToString(createSSRApp(Panel));
+    for (const exact of ["100.25", "25.1234", "12.469135690336", "verified-policy-hash", "0x012345", "Ioc", "Confirm and submit", "execution unconfirmed"]) expect(reviewed).toContain(exact);
+    expect(reviewed).not.toContain("<script");
+    expect(reviewed).toContain("&lt;script&gt;");
+    const candidate = reviewed.slice(reviewed.indexOf('aria-label="Candidate to submit"'), reviewed.indexOf("Confirm and submit"));
+    for (const exact of ["BTC", "Buy", first.px, first.sz, "12.469135690336", "Not reduce only", "Ioc", "immediate or cancel"]) expect(candidate).toContain(exact);
+    expect(candidate).not.toContain("<details");
+    expect(candidate).not.toContain("<pre");
+    const technicalEnd = reviewed.indexOf("</details>", reviewed.indexOf("Technical evidence"));
+    const visibleIdentity = reviewed.slice(technicalEnd, reviewed.indexOf('aria-label="Candidate to submit"'));
+    for (const exact of [binding.account, "Pairing", "testnet", "Review expires", "Builder", "None"]) expect(visibleIdentity).toContain(exact);
+    queue.status.review.display.order_type = { trigger: { isMarket: true, triggerPx: "99.123456", tpsl: "sl" } };
+    queue.status.review.display.reduce_only = true;
+    queue.status.review.display.builder = { b: `0x${"3".repeat(40)}`, f: 10 };
+    const triggered = await renderToString(createSSRApp(Panel));
+    const triggerCandidate = triggered.slice(triggered.indexOf('aria-label="Candidate to submit"'), triggered.indexOf("Confirm and submit"));
+    expect(triggerCandidate).toContain("Stop loss · Market trigger 99.123456 USD");
+    expect(triggerCandidate).toContain("Reduce only");
+    expect(triggered).toContain("10 tenths of a basis point");
+    expect(triggered).toContain(queue.status.review.display.builder.b);
+    queue.execution = { ...queue.execution, error: null, result: { status: "rejected", cloid: "0x012345" } };
+    const refused = await renderToString(createSSRApp(Panel));
+    expect(refused).toContain("Refused");
+    expect(refused).not.toContain("Venue status: filled");
   } finally {
     Object.assign(queue, before.queue); Object.assign(supervisor, before.supervisor);
     Object.assign(tasks, before.tasks); context.network = before.network;

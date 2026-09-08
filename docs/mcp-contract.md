@@ -184,7 +184,14 @@ Protocol errors, carrying the taxonomy in the JSON-RPC error's `data` — `{cont
 | `venue_error` | `429` and `5xx` only | The venue saw the request and refused it. A nonce was spent. `detail` is the venue's own words, **display-only** — never branch on it |
 | `timeout_unknown_outcome` | never | The request left the process and no answer came back. The order may be live |
 | `unavailable` | `true` | oppen could not read what it needed. Nothing was signed |
+| `worker_failed` | never | A retained worker failed; stop and require controlled recovery before further execution |
 | `invalid_params` | `false` | The caller's own input, refused as sent |
+
+Native approval confirmation uses the same execution envelope, but a consumed
+review is never retryable. Its errors retain the reviewed `cloid`, and generic
+unavailability does not establish a not-sent outcome after a claim or submission
+attempt. The native controller closes confirmation admission on `worker_failed`;
+unknown outcomes retain their durable reconciliation obligation.
 
 `timeout_unknown_outcome` is never retryable, and that is the whole content of the rule. The only safe move is `get_order_status` by the `cloid` the failed call returned — never a resend, which is how an agent doubles a position. `place` mints a cloid when the caller supplies none precisely so this move always exists.
 

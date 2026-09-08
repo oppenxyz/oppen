@@ -6,7 +6,7 @@ const account = "0x0000000000000000000000000000000000000001";
 const observed = Date.now();
 let status: ApprovalQueueStatus = {
   owner_id: "fixture-queue-1", agent: "fixture-agent", account, phase: "ready",
-  observed_at_ms: observed, error: null, decision: null,
+  observed_at_ms: observed, error: null, decision: null, review: null, confirmation: null,
   pending: [
     { id: "proposal-1", agent: "fixture-agent", account, symbol: "BTC", is_buy: true,
       px: "60250.123456", sz: "0.0002", reduce_only: false,
@@ -58,5 +58,40 @@ export async function rejectApprovalProposal(agent: string, requestedAccount: st
     status.phase = "ready";
     status.observed_at_ms = Date.now();
   }
+  return structuredClone(status);
+}
+
+export async function prepareApprovalReview(agent: string, requestedAccount: string, ownerId: string, proposalId: string): Promise<ApprovalQueueStatus> {
+  scoped(agent, requestedAccount);
+  if (ownerId !== status.owner_id || status.review) throw new Error("Fixture review unavailable.");
+  const proposal = status.pending.find(row => row.id === proposalId);
+  if (!proposal) throw new Error("Fixture proposal absent.");
+  status.review = {
+    id: "fixture-review-1", owner_id: ownerId, pairing_id: { network: "testnet", issued_seq: 3 }, reason: proposal.reason,
+    display: { ...proposal, proposal_id: proposal.id, original_px: proposal.px,
+      reference_px: "60200", reference_at_ms: Date.now(), drift_bps: "1.661",
+      asset_index: 0, notional_usd: "12.05", order_type: { limit: { tif: "Ioc" } },
+      cloid: "0x00000000000000000000000000000001", grouping: "na", builder: null,
+      route: { network: "testnet", binding_seq: 2, binding: { agent, container: account, vault_address: null,
+        wallet: { generation: 1, address: "0x0000000000000000000000000000000000000002", approved_at_ms: observed, valid_until_ms: observed + 300_000 } } },
+      policy_revision: 4, policy_hash: "a".repeat(64), reviewed_at_ms: Date.now(), expires_at_ms: observed + 120_000 },
+  };
+  status.phase = "review_ready";
+  return structuredClone(status);
+}
+export async function confirmApprovalReview(agent: string, requestedAccount: string, ownerId: string, reviewId: string): Promise<ApprovalQueueStatus> {
+  scoped(agent, requestedAccount);
+  if (ownerId !== status.owner_id || status.review?.id !== reviewId || status.phase !== "review_ready") throw new Error("Fixture review unavailable.");
+  status.confirmation = { review_id: reviewId, proposal_id: status.review.display.proposal_id, at_ms: Date.now(),
+    result: { status: "rejected", cloid: status.review.display.cloid, detail: "Synthetic fixture refusal; no submission." }, error: null };
+  status.phase = "idle";
+  status.observed_at_ms = null;
+  return structuredClone(status);
+}
+export async function discardApprovalReview(agent: string, requestedAccount: string, ownerId: string, reviewId: string): Promise<ApprovalQueueStatus> {
+  scoped(agent, requestedAccount);
+  if (ownerId !== status.owner_id || status.review?.id !== reviewId || status.phase !== "review_ready") throw new Error("Fixture review unavailable.");
+  status.review = null;
+  status.phase = "ready";
   return structuredClone(status);
 }

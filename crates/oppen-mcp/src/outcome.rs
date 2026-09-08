@@ -271,6 +271,10 @@ pub(crate) enum ToolError {
     #[error("{what} is unavailable: {detail}")]
     Unavailable { what: &'static str, detail: String },
 
+    /// A retained worker failed; its authority state requires controlled recovery.
+    #[error("{what} failed: {detail}")]
+    WorkerFailed { what: &'static str, detail: String },
+
     /// The agent's own input. Not retryable as sent.
     #[error("{field}: {detail}")]
     InvalidParams { field: &'static str, detail: String },
@@ -283,6 +287,7 @@ impl ToolError {
             ToolError::VenueError { .. } => "venue_error",
             ToolError::TimeoutUnknownOutcome { .. } => "timeout_unknown_outcome",
             ToolError::Unavailable { .. } => "unavailable",
+            ToolError::WorkerFailed { .. } => "worker_failed",
             ToolError::InvalidParams { .. } => "invalid_params",
         }
     }
@@ -299,6 +304,7 @@ impl ToolError {
             ToolError::TimeoutUnknownOutcome { .. }
             | ToolError::InvalidParams { .. }
             | ToolError::GuardrailRefused { .. } => false,
+            ToolError::WorkerFailed { .. } => false,
         }
     }
 
@@ -315,6 +321,13 @@ impl ToolError {
         ToolError::Unavailable {
             what,
             detail: e.to_string(),
+        }
+    }
+
+    pub(crate) fn worker_failed(what: &'static str, error: tokio::task::JoinError) -> Self {
+        Self::WorkerFailed {
+            what,
+            detail: error.to_string(),
         }
     }
 
@@ -337,6 +350,7 @@ impl From<ToolError> for ErrorData {
                 ToolError::VenueError { venue_message, .. } => venue_message.clone(),
                 ToolError::TimeoutUnknownOutcome { detail, .. }
                 | ToolError::Unavailable { detail, .. }
+                | ToolError::WorkerFailed { detail, .. }
                 | ToolError::InvalidParams { detail, .. } => detail.clone(),
             },
             "cloid": match &e {
@@ -373,6 +387,23 @@ mod tests {
 
     fn json(reply: Reply) -> String {
         serde_json::to_string(&reply).expect("Reply serializes")
+    }
+
+    #[tokio::test]
+    async fn a_failed_worker_has_a_nonretryable_recovery_code() {
+        let error = tokio::task::spawn_blocking(|| panic!("synthetic worker failure"))
+            .await
+            .unwrap_err();
+        let data: ErrorData = ToolError::worker_failed("operator decision worker", error).into();
+        let payload = data.data.unwrap();
+        assert_eq!(payload["code"], "worker_failed");
+        assert_eq!(payload["retryable"], false);
+        assert!(
+            payload["detail"]
+                .as_str()
+                .unwrap()
+                .contains("synthetic worker failure")
+        );
     }
 
     /// Invariant 6 is a claim about bytes, so it is asserted on bytes. A

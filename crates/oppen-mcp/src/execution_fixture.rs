@@ -19,6 +19,8 @@ use std::sync::{RwLock, Weak};
 use std::time::Duration;
 use tower::ServiceExt;
 
+#[path = "execution_fixture/approvals.rs"]
+mod approvals;
 #[path = "execution_fixture/decision.rs"]
 mod decision;
 #[path = "execution_fixture/pilot.rs"]
@@ -38,6 +40,13 @@ struct FixtureKeys {
     values: Mutex<HashMap<EntryName, String>>,
     ledger: Mutex<Weak<Ledger>>,
     read_heads: Mutex<Vec<EventKind>>,
+    read_gate: Mutex<Option<KeyReadGate>>,
+}
+
+#[derive(Debug)]
+struct KeyReadGate {
+    entered: Arc<tokio::sync::Notify>,
+    release: std::sync::mpsc::Receiver<()>,
 }
 
 impl KeyStore for FixtureKeys {
@@ -52,6 +61,11 @@ impl KeyStore for FixtureKeys {
         Ok(())
     }
     fn read(&self, entry: &EntryName) -> Result<Option<SecretText>, KeyStoreError> {
+        let gate = self.read_gate.lock().unwrap().take();
+        if let Some(gate) = gate {
+            gate.entered.notify_one();
+            let _ = gate.release.recv_timeout(Duration::from_secs(15));
+        }
         if let Some(ledger) = self.ledger.lock().unwrap().upgrade() {
             let head = ledger.chain_head().unwrap().seq;
             if head > 0 {

@@ -44,6 +44,8 @@ use oppen_hl::{ExchangeClient, ExchangeResponse, NonceAllocator, OrderKind, Stat
 use crate::auth::Binding;
 use crate::server::ExecutionTracker;
 
+mod operator;
+
 /// Basis points per unit. A bound 1% wide is 100 bps.
 /// The execution report's default window. A day: long enough that a few
 /// fills accumulate into a sample worth reading, short enough that it
@@ -593,6 +595,10 @@ impl Gateway {
         self.inner.network
     }
 
+    pub(crate) fn same_owner(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
     fn execution_queue(&self, account: Address) -> Arc<tokio::sync::Mutex<()>> {
         self.inner
             .execution
@@ -604,13 +610,21 @@ impl Gateway {
     }
 
     async fn reserve_submission(&self, bound: &Binding) -> Result<ExecutionPermit, ToolError> {
-        self.require_route(bound).await?;
+        self.reserve_submission_tracked(bound, None).await
+    }
+
+    async fn reserve_submission_tracked(
+        &self,
+        bound: &Binding,
+        tracker: Option<ExecutionTracker>,
+    ) -> Result<ExecutionPermit, ToolError> {
+        self.require_route_tracked(bound, tracker.clone()).await?;
         reserve_account(
             self.execution_queue(bound.account),
             &self.inner.submissions,
             bound.account,
             |cloid| async move {
-                self.require_route(bound).await?;
+                self.require_route_tracked(bound, tracker).await?;
                 self.inner
                     .info
                     .order_status(bound.account, OrderRef::Cloid(cloid))
@@ -622,6 +636,14 @@ impl Gateway {
     }
 
     async fn require_route(&self, bound: &Binding) -> Result<(), ToolError> {
+        self.require_route_tracked(bound, None).await
+    }
+
+    async fn require_route_tracked(
+        &self,
+        bound: &Binding,
+        tracker: Option<ExecutionTracker>,
+    ) -> Result<(), ToolError> {
         let permit = self
             .inner
             .route_reader
@@ -634,12 +656,13 @@ impl Gateway {
             std::time::Duration::from_secs(5),
             tokio::task::spawn_blocking(move || {
                 let _permit = permit;
+                let _tracker = tracker;
                 engine.route_for_agent(&agent)
             }),
         )
         .await
         .map_err(|error| ToolError::unavailable("registry read timeout", error))?
-        .map_err(|error| ToolError::unavailable("registry reader", error))?
+        .map_err(|error| ToolError::worker_failed("registry reader", error))?
         .map_err(|refusal| ToolError::GuardrailRefused { refusal })?;
         if route.binding.container != bound.account {
             return Err(ToolError::unavailable(
@@ -730,7 +753,7 @@ impl Gateway {
         )
         .await
         .map_err(|error| ToolError::unavailable("decision timeout", error))?
-        .map_err(|error| ToolError::unavailable("decision worker", error))
+        .map_err(|error| ToolError::worker_failed("decision worker", error))
     }
 
     async fn runtime_cancellation_needed(&self, bound: &Binding) -> Result<bool, ToolError> {
@@ -754,7 +777,7 @@ impl Gateway {
         )
         .await
         .map_err(|error| ToolError::unavailable("pilot cancellation status timeout", error))?
-        .map_err(|error| ToolError::unavailable("pilot cancellation reader", error))?
+        .map_err(|error| ToolError::worker_failed("pilot cancellation reader", error))?
         .map_err(|error| ToolError::unavailable("pilot cancellation status", error))?;
         pilot_cancellation_needed(bound, status)
     }
@@ -1873,6 +1896,18 @@ impl Gateway {
         bound: &Binding,
         submission: Option<&ExecutionPermit>,
     ) -> Result<ExchangeResponse, ToolError> {
+        self.submit_authorized(cleared, cloid, bound, submission, None)
+            .await
+    }
+
+    async fn submit_authorized(
+        &self,
+        cleared: Cleared,
+        cloid: Option<&Cloid>,
+        bound: &Binding,
+        submission: Option<&ExecutionPermit>,
+        operator: Option<&crate::server::OperatorWork>,
+    ) -> Result<ExchangeResponse, ToolError> {
         let inner = &self.inner;
         if cleared.clearance().agent != bound.agent
             || cleared.clearance().route.binding.container != bound.account
@@ -1910,9 +1945,21 @@ impl Gateway {
             None
         };
         let nonce = inner.nonces.next();
-        let signed = inner
-            .engine
-            .sign_cleared(cleared, nonce, None, self::now_ms);
+        let signed =
+            inner
+                .engine
+                .sign_cleared_authorized(cleared, nonce, None, self::now_ms, || {
+                    operator
+                        .map(|work| work.signing_admission())
+                        .transpose()
+                        .map_err(|error| {
+                            oppen_core::guardrail::Refusal::from(
+                                oppen_core::guardrail::Unevaluable::RouteAuthority {
+                                    detail: error.to_string(),
+                                },
+                            )
+                        })
+                });
         let (request, _clearance) = match signed {
             Ok(signed) => signed,
             Err(error) => {
@@ -1956,7 +2003,18 @@ impl Gateway {
         symbol: &str,
         now_ms: u64,
     ) -> Result<EvaluationContext, ToolError> {
-        self.require_route(bound).await?;
+        self.evaluation_context_tracked(bound, symbol, now_ms, None)
+            .await
+    }
+
+    async fn evaluation_context_tracked(
+        &self,
+        bound: &Binding,
+        symbol: &str,
+        now_ms: u64,
+        tracker: Option<ExecutionTracker>,
+    ) -> Result<EvaluationContext, ToolError> {
+        self.require_route_tracked(bound, tracker).await?;
         let inner = &self.inner;
         let account = bound.account;
         let universe = self.universe().await?;

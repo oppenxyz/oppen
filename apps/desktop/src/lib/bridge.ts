@@ -471,11 +471,32 @@ export interface ApprovalQueueStatus {
   owner_id: string;
   agent: string;
   account: string;
-  phase: "idle" | "refreshing" | "rejecting" | "ready" | "unavailable" | "recovery_required" | "closed";
+  phase: "idle" | "refreshing" | "rejecting" | "reviewing" | "review_ready" | "confirming" | "ready" | "unavailable" | "recovery_required" | "closed";
   observed_at_ms: number | null;
   pending: PendingApprovalView[];
   decision: ApprovalDecision | null;
   error: string | null;
+  review: ApprovalPricingReview | null;
+  confirmation: ApprovalConfirmation | null;
+}
+
+export interface ApprovalReviewDisplay {
+  proposal_id: string; agent: string; account: string; symbol: string;
+  original: OriginalRequest | null; original_px: string; reference_px: string;
+  reference_at_ms: number; drift_bps: string | null; asset_index: number;
+  is_buy: boolean; px: string; sz: string; notional_usd: string; reduce_only: boolean;
+  order_type: { limit: { tif: "Alo" | "Ioc" | "Gtc" } } | { trigger: { isMarket: boolean; triggerPx: string; tpsl: "tp" | "sl" } };
+  cloid: string; grouping: "na" | "normalTpsl" | "positionTpsl";
+  builder: { b: string; f: number } | null; route: PolicySetupReview["route"];
+  policy_revision: number; policy_hash: string; reviewed_at_ms: number; expires_at_ms: number;
+}
+export interface ApprovalPricingReview {
+  id: string; owner_id: string; pairing_id: { network: "testnet" | "mainnet"; issued_seq: number };
+  reason: string; display: ApprovalReviewDisplay;
+}
+export interface ApprovalConfirmation {
+  review_id: string; proposal_id: string; at_ms: number;
+  result: unknown | null; error: unknown | null;
 }
 
 export function fetchApprovalQueueStatus(agent: string, account: string): Promise<ApprovalQueueStatus> {
@@ -486,6 +507,15 @@ export function refreshApprovalQueue(agent: string, account: string): Promise<Ap
 }
 export function rejectApprovalProposal(agent: string, account: string, ownerId: string, proposalId: string): Promise<ApprovalQueueStatus> {
   return invoke<ApprovalQueueStatus>("reject_approval_proposal", { agent, account, ownerId, proposalId });
+}
+export function prepareApprovalReview(agent: string, account: string, ownerId: string, proposalId: string): Promise<ApprovalQueueStatus> {
+  return invoke<ApprovalQueueStatus>("prepare_approval_review", { agent, account, ownerId, proposalId });
+}
+export function confirmApprovalReview(agent: string, account: string, ownerId: string, reviewId: string): Promise<ApprovalQueueStatus> {
+  return invoke<ApprovalQueueStatus>("confirm_approval_review", { agent, account, ownerId, reviewId });
+}
+export function discardApprovalReview(agent: string, account: string, ownerId: string, reviewId: string): Promise<ApprovalQueueStatus> {
+  return invoke<ApprovalQueueStatus>("discard_approval_review", { agent, account, ownerId, reviewId });
 }
 
 /**

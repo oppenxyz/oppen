@@ -2752,7 +2752,7 @@ fn generic_writers_cannot_forge_submission_lifecycle_events() {
 
 #[test]
 fn authority_reader_barriers_preserve_the_existing_chain_on_upgrade() {
-    for prior_version in [3, 4, 5, 6, 7, 8, 9] {
+    for prior_version in [3, 4, 5, 6, 7, 8, 9, 10] {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("testnet.db");
         let (head, original) = {
@@ -2787,7 +2787,7 @@ fn authority_reader_barriers_preserve_the_existing_chain_on_upgrade() {
             .unwrap()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 10);
+        assert_eq!(version, 11);
     }
 }
 
@@ -2864,14 +2864,14 @@ fn a_reader_refuses_a_newer_authority_schema_without_rewriting_history() {
         .connection
         .lock()
         .unwrap()
-        .pragma_update(None, "user_version", 11)
+        .pragma_update(None, "user_version", 12)
         .unwrap();
     drop(ledger);
     assert!(matches!(
         Ledger::open_at(&path, Network::Testnet),
         Err(LedgerError::SchemaTooNew {
-            found: 11,
-            supported: 10
+            found: 12,
+            supported: 11
         })
     ));
     let connection = rusqlite::Connection::open(&path).unwrap();
@@ -2879,7 +2879,7 @@ fn a_reader_refuses_a_newer_authority_schema_without_rewriting_history() {
         connection
             .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
             .unwrap(),
-        11
+        12
     );
     let (seq, hash) = super::head(&connection).unwrap();
     assert_eq!(Anchor { seq, hash }, head);

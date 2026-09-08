@@ -524,6 +524,45 @@ fn reject_approval_proposal(
         .reject_approval_proposal(agent, account, owner_id, proposal_id)
         .map_err(ConsoleError::from)
 }
+
+#[tauri::command]
+fn prepare_approval_review(
+    runtime: State<'_, Runtime>,
+    agent: String,
+    account: String,
+    owner_id: String,
+    proposal_id: String,
+) -> Result<operator_approvals::ApprovalQueueStatus, ConsoleError> {
+    runtime
+        .prepare_approval_review(agent, account, owner_id, proposal_id)
+        .map_err(ConsoleError::from)
+}
+
+#[tauri::command]
+fn confirm_approval_review(
+    runtime: State<'_, Runtime>,
+    agent: String,
+    account: String,
+    owner_id: String,
+    review_id: String,
+) -> Result<operator_approvals::ApprovalQueueStatus, ConsoleError> {
+    runtime
+        .confirm_approval_review(agent, account, owner_id, review_id)
+        .map_err(ConsoleError::from)
+}
+
+#[tauri::command]
+fn discard_approval_review(
+    runtime: State<'_, Runtime>,
+    agent: String,
+    account: String,
+    owner_id: String,
+    review_id: String,
+) -> Result<operator_approvals::ApprovalQueueStatus, ConsoleError> {
+    runtime
+        .discard_approval_review(agent, account, owner_id, review_id)
+        .map_err(ConsoleError::from)
+}
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -563,6 +602,9 @@ pub fn run() {
             approval_queue_status,
             refresh_approval_queue,
             reject_approval_proposal,
+            prepare_approval_review,
+            confirm_approval_review,
+            discard_approval_review,
             updates::check_update,
             updates::download_update,
             updates::install_update

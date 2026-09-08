@@ -6,7 +6,76 @@ use oppen_hl::wire::{Tif, Tpsl};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
-use super::OrderIntent;
+use super::{Exposure, MarketRef, OrderIntent, Refusal, Unevaluable};
+
+pub(super) fn review_candidate(
+    intent: &OrderIntent,
+    asset: &Asset,
+    market: &MarketRef,
+    exposure: &Exposure,
+) -> Result<OrderIntent, Refusal> {
+    let mut candidate = intent.clone();
+    let Some(original) = &intent.original else {
+        return Ok(candidate);
+    };
+    if !original.matches_normalization(intent, asset) {
+        return Err(Unevaluable::OriginalRequestMismatch.into());
+    }
+    let slippage_bps = match original.kind {
+        RequestedOrderKind::Market { slippage_bps } => slippage_bps,
+        RequestedOrderKind::ClosePosition {
+            position_size,
+            slippage_bps,
+        } => {
+            if exposure.agent.position_szi(&intent.symbol) != position_size {
+                return Err(Unevaluable::ApprovalReviewChanged {
+                    detail: "position close size or direction changed".into(),
+                }
+                .into());
+            }
+            slippage_bps
+        }
+        RequestedOrderKind::Limit { .. } | RequestedOrderKind::StopMarket { .. } => {
+            return Ok(candidate);
+        }
+    };
+    let reference_px = market
+        .reference_px
+        .filter(|px| *px > Decimal::ZERO)
+        .ok_or_else(|| {
+            Refusal::from(Unevaluable::ApprovalReviewChanged {
+                detail: "review requires a positive current reference price".into(),
+            })
+        })?;
+    let overflow = || Unevaluable::ArithmeticOverflow {
+        field: "review price".into(),
+    };
+    let slippage = slippage_bps
+        .checked_div(Decimal::from(10_000))
+        .ok_or_else(overflow)?;
+    let factor = if intent.is_buy {
+        Decimal::ONE.checked_add(slippage)
+    } else {
+        Decimal::ONE.checked_sub(slippage)
+    }
+    .ok_or_else(overflow)?;
+    let raw = reference_px.checked_mul(factor).ok_or_else(overflow)?;
+    if raw <= Decimal::ZERO {
+        return Err(Unevaluable::ApprovalReviewChanged {
+            detail: "review price bound is not positive".into(),
+        }
+        .into());
+    }
+    // The existing venue rounding helper uses these same operations unchecked;
+    // establishing their range first preserves its exact rounding semantics.
+    candidate.px = asset.slippage_price_bounded(reference_px, intent.is_buy, slippage);
+    candidate.original = Some(OriginalRequest {
+        kind: original.kind.clone(),
+        reference_px: Some(reference_px),
+        reference_at_ms: market.as_of_ms,
+    });
+    Ok(candidate)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

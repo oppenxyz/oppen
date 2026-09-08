@@ -162,6 +162,46 @@ impl TokenStore {
                 .all(|record| record.binding == *binding)
     }
 
+    // The earliest live same-binding pairing is selected once for a native
+    // review. Confirmation pins that ID and never falls back after revocation.
+    pub(crate) fn operator_authority(
+        &self,
+        binding: &Binding,
+    ) -> Result<SessionAuthority, AuthError> {
+        if self.closed {
+            return Err(AuthError::Unauthenticated);
+        }
+        let (id, record) = self
+            .records
+            .iter()
+            .filter(|(_, record)| record.binding == *binding && !*record.revoked_tx.borrow())
+            .min_by_key(|(id, _)| id.issued_seq)
+            .ok_or(AuthError::Unauthenticated)?;
+        Ok(SessionAuthority {
+            id: *id,
+            binding: record.binding.clone(),
+            revoked: record.revoked_tx.subscribe(),
+            _journal: self.journal.clone(),
+        })
+    }
+
+    pub(crate) fn check_authority(&self, authority: &SessionAuthority) -> Result<(), AuthError> {
+        if self.closed || !Arc::ptr_eq(&self.journal, &authority._journal) {
+            return Err(AuthError::Unauthenticated);
+        }
+        let record = self
+            .records
+            .get(&authority.id)
+            .ok_or(AuthError::Unauthenticated)?;
+        if record.binding != authority.binding {
+            return Err(AuthError::Unauthenticated);
+        }
+        if *record.revoked_tx.borrow() {
+            return Err(AuthError::Revoked);
+        }
+        Ok(())
+    }
+
     /// Owned bindings for pause enforcement, including revoked pairings whose
     /// resting orders still need cancellation. No credentials leave the store.
     pub(crate) fn bindings(&self) -> Vec<Binding> {
@@ -415,6 +455,61 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = reopen(dir.path(), Network::Testnet);
         (dir, store)
+    }
+
+    #[test]
+    fn native_review_selects_one_live_pairing_and_never_retargets_its_lease() {
+        let (_dir, mut store) = fixture();
+        let first = store.issue(binding("alpha")).unwrap();
+        let second = store.issue(binding("alpha")).unwrap();
+        let pinned = store.operator_authority(&binding("alpha")).unwrap();
+        assert_eq!(pinned.id, first.id);
+        assert!(store.operator_authority(&binding("beta")).is_err());
+        store.revoke(first.id).unwrap();
+        assert_eq!(store.check_authority(&pinned), Err(AuthError::Revoked));
+        assert_eq!(
+            store.operator_authority(&binding("alpha")).unwrap().id,
+            second.id
+        );
+        let (_other_dir, mut other) = fixture();
+        other.issue(binding("alpha")).unwrap();
+        assert_eq!(
+            other.check_authority(&pinned),
+            Err(AuthError::Unauthenticated)
+        );
+        store.revoke(second.id).unwrap();
+        assert!(store.supports_binding(&binding("alpha")));
+        assert!(store.operator_authority(&binding("alpha")).is_err());
+    }
+
+    #[test]
+    fn native_pairing_read_guard_serializes_revocation_and_closed_store_refuses() {
+        let (_dir, mut store) = fixture();
+        let issued = store.issue(binding("alpha")).unwrap();
+        let pinned = store.operator_authority(&binding("alpha")).unwrap();
+        let store = std::sync::RwLock::new(store);
+        {
+            let guard = store.try_read().unwrap();
+            guard.check_authority(&pinned).unwrap();
+            assert!(store.try_write().is_err());
+        }
+        store.write().unwrap().revoke(issued.id).unwrap();
+        assert_eq!(
+            store.read().unwrap().check_authority(&pinned),
+            Err(AuthError::Revoked)
+        );
+        store.write().unwrap().closed = true;
+        assert_eq!(
+            store.read().unwrap().check_authority(&pinned),
+            Err(AuthError::Unauthenticated)
+        );
+        assert!(
+            store
+                .read()
+                .unwrap()
+                .operator_authority(&binding("alpha"))
+                .is_err()
+        );
     }
 
     #[test]
