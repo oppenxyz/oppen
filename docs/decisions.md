@@ -11,6 +11,32 @@ decisions" section until then.
 
 ---
 
+## 2026-09-08 · Cleanup with authenticated unavailable accounting
+
+ES36 addresses spec items 25, 26 and 34 and the explicit ES35 recovery
+limitation. Successful authenticated pilot-status inspection and successful
+accounting projection are different gates. `PilotJournal::status` verifies
+authority before reporting a projection failure as unavailable accounting.
+That unavailable result is not authority to trade, but it must not by itself
+prevent the already-authorized account's cleanup supervisor from restarting.
+
+Retain the authenticated status call and exact identity checks. Missing, legacy,
+tampered or unreadable authority still refuses startup; never fall back to a
+keyless inspection, accept a failed status read or create replacement consent.
+Keep order admission inhibited, the original authorization and baseline intact,
+and unknown totals explicitly unavailable. Neither restart nor cancellation
+resets budgets, repairs accounting or clears the original stop. Existing final
+registry/signing checks and the existing cancellation worker remain mandatory.
+
+An accounting projection failure is not automatically a feed application
+failure. Continue recording valid later evidence, but preserve the existing
+fatal behavior for genuine persistence, application or integrity failures.
+Feed reconciliation and a listening endpoint do not prove usable accounting,
+trading readiness or completed cleanup. Verify actual pump ingestion, failed
+cancellation followed by retry, MCP order refusal, physical ownership drain and
+unchanged authority using synthetic/loopback fixtures. No live account action,
+credential access, publication or new service is authorized by this change.
+
 ## 2026-09-08 · Halted pilot supervision after restart
 
 ES35 addresses spec items 25, 26 and 34. A durable pilot halt inhibits trading;

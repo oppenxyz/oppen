@@ -139,17 +139,11 @@ impl Prepared {
             .status(binding.account)
             .map_err(|error| error.to_string())?
             .ok_or("existing pilot authorization required")?;
-        if pilot.agent != binding.agent
-            || pilot.account != binding.account
-            || !matches!(
-                pilot.accounting,
-                oppen_core::ledger::PilotAccounting::Known { .. }
-            )
-        {
-            return Err("pilot must match the requested identity and have known accounting".into());
+        if pilot.agent != binding.agent || pilot.account != binding.account {
+            return Err("pilot must match the requested identity".into());
         }
-        // A durable trading stop still needs its cancellation supervisor after
-        // restart. The new engine remains inhibited; opening never clears it.
+        // Verified authority can still need cleanup when accounting is unknown.
+        // The new engine stays inhibited; opening repairs neither budgets nor stops.
         let pairings = TokenStore::open(
             PairingJournal::open(ledger.clone(), hmac).map_err(|error| error.to_string())?,
         )
@@ -594,6 +588,47 @@ mod tests {
     }
 
     struct FixtureSource;
+
+    struct FollowupFillSource {
+        account: Address,
+        fill: Option<oppen_hl::types::Fill>,
+    }
+
+    impl ReconcileSource for FollowupFillSource {
+        fn network(&self) -> Network {
+            Network::Testnet
+        }
+
+        async fn user_fills_by_time(
+            &self,
+            account: Address,
+            start: u64,
+            end: Option<u64>,
+        ) -> Result<Vec<oppen_hl::types::Fill>, oppen_hl::Error> {
+            assert_eq!(account, self.account);
+            Ok(self
+                .fill
+                .iter()
+                .filter(|fill| fill.time >= start && end.is_none_or(|end| fill.time <= end))
+                .cloned()
+                .collect())
+        }
+
+        async fn frontend_open_orders(
+            &self,
+            account: Address,
+        ) -> Result<Vec<oppen_hl::types::OpenOrder>, oppen_hl::Error> {
+            FixtureSource.frontend_open_orders(account).await
+        }
+
+        async fn order_status(
+            &self,
+            account: Address,
+            order: oppen_hl::OrderRef,
+        ) -> Result<oppen_hl::types::OrderStatusResponse, oppen_hl::Error> {
+            FixtureSource.order_status(account, order).await
+        }
+    }
 
     struct BlockedSource {
         entered: Mutex<Option<oneshot::Sender<()>>>,
@@ -1928,8 +1963,8 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn halted_pilot_unavailable_accounting_still_refuses_startup() {
-        halted_pilot_restart(false, true).await;
+    async fn halted_pilot_unavailable_accounting_restarts_cleanup_and_refuses_orders() {
+        halted_pilot_restart(true, true).await;
     }
 
     async fn halted_pilot_restart(supervise: bool, unavailable: bool) {
@@ -1974,6 +2009,21 @@ mod tests {
             .unwrap(),
         ));
         let before = pilot.status(fixture.binding.account).unwrap().unwrap();
+        let authority_before = prepared
+            .ledger
+            .get_events(0, 1000)
+            .unwrap()
+            .events
+            .into_iter()
+            .filter(|row| {
+                matches!(
+                    row.kind,
+                    oppen_core::ledger::EventKind::PilotAuthorized
+                        | oppen_core::ledger::EventKind::PilotAdopted
+                )
+            })
+            .map(|row| serde_json::to_value(row).unwrap())
+            .collect::<Vec<_>>();
         if unavailable {
             assert_eq!(
                 before.authentication,
@@ -1984,30 +2034,27 @@ mod tests {
                 PilotAccounting::Unavailable { .. }
             ));
             assert!(prepared.ledger.verify().unwrap().is_intact());
-            let weak = Arc::downgrade(&prepared.ledger);
-            drop(pilot);
-            drop(seed_feed);
-            drop(prepared);
-            assert_eq!(weak.strong_count(), 0);
-            let refused = Prepared::open(fixture.dir.path(), fixture.binding.clone(), keys);
-            venue.shutdown().await;
-            assert!(matches!(refused, Err(error) if error.contains("known accounting")));
-            fixture.assert_pairing_owner_released();
-            return;
+            assert!(matches!(before.halt, Some(PilotStop::Unavailable { .. })));
         }
-        let budget_before = pilot.state(fixture.binding.account).unwrap().unwrap();
-        assert_eq!(budget_before.executed_usd, 3.into());
-        assert_eq!(budget_before.reserved_usd, 12.into());
-        assert_eq!(budget_before.net_realized_pnl_usd, (-5).into());
-        assert!(matches!(before.accounting, PilotAccounting::Known { .. }));
-        assert_eq!(
-            before.halt,
-            Some(PilotStop::Exhausted {
-                metric: PilotMetric::RealizedLoss,
-                observed_usd: 5.into(),
-                limit_usd: 5.into(),
-            })
-        );
+        let budget_before = if unavailable {
+            None
+        } else {
+            Some(pilot.state(fixture.binding.account).unwrap().unwrap())
+        };
+        if let Some(budget_before) = &budget_before {
+            assert_eq!(budget_before.executed_usd, 3.into());
+            assert_eq!(budget_before.reserved_usd, 12.into());
+            assert_eq!(budget_before.net_realized_pnl_usd, (-5).into());
+            assert!(matches!(before.accounting, PilotAccounting::Known { .. }));
+            assert_eq!(
+                before.halt,
+                Some(PilotStop::Exhausted {
+                    metric: PilotMetric::RealizedLoss,
+                    observed_usd: 5.into(),
+                    limit_usd: 5.into(),
+                })
+            );
+        }
         let policy_before = prepared.engine.policy_status().cached_revision;
         assert_eq!(
             serde_json::to_value(prepared.engine.kill_switch()).unwrap(),
@@ -2053,37 +2100,68 @@ mod tests {
             serde_json::to_value(&reopened).unwrap(),
             serde_json::to_value(&before).unwrap()
         );
-        let budget_after = PilotJournal::new(Arc::new(
-            RegistryJournal::open(
-                restarted.ledger.clone(),
-                Arc::new(HmacKey::from_bytes([11; 32])),
-            )
-            .unwrap(),
-        ))
-        .state(fixture.binding.account)
-        .unwrap()
-        .unwrap();
-        assert_eq!(
-            budget_after, budget_before,
-            "restart must preserve baseline, authorization and accounting"
-        );
+        if let Some(budget_before) = &budget_before {
+            let budget_after = PilotJournal::new(Arc::new(
+                RegistryJournal::open(
+                    restarted.ledger.clone(),
+                    Arc::new(HmacKey::from_bytes([11; 32])),
+                )
+                .unwrap(),
+            ))
+            .state(fixture.binding.account)
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                &budget_after, budget_before,
+                "restart must preserve baseline, authorization and accounting"
+            );
+        }
         if supervise {
-            supervise_halted_pilot(&fixture, restarted, &venue, &target).await;
+            supervise_halted_pilot(&fixture, restarted, &venue, &target, unavailable).await;
         } else {
             drop(restarted);
         }
         fixture.assert_pairing_owner_released();
         let final_open = Prepared::open(fixture.dir.path(), fixture.binding.clone(), keys).unwrap();
-        let final_budget = PilotJournal::new(Arc::new(
+        let final_pilot = PilotJournal::new(Arc::new(
             RegistryJournal::open(
                 final_open.ledger.clone(),
                 Arc::new(HmacKey::from_bytes([11; 32])),
             )
             .unwrap(),
-        ))
-        .state(fixture.binding.account)
-        .unwrap()
-        .unwrap();
+        ));
+        let final_status = final_pilot
+            .status(fixture.binding.account)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(final_status).unwrap(),
+            serde_json::to_value(&before).unwrap()
+        );
+        if let Some(budget_before) = &budget_before {
+            assert_eq!(
+                &final_pilot.state(fixture.binding.account).unwrap().unwrap(),
+                budget_before
+            );
+        }
+        drop(final_pilot);
+        if unavailable {
+            let fills = final_open.ledger.get_events(0, 1000).unwrap().events;
+            assert_eq!(
+                fills
+                    .iter()
+                    .filter(|row| {
+                        row.kind == oppen_core::ledger::EventKind::Fill
+                            && row
+                                .payload
+                                .as_ref()
+                                .is_some_and(|payload| payload["tid"] == 36002)
+                    })
+                    .count(),
+                1,
+                "startup pump must durably ingest the unrelated follow-up fill exactly once"
+            );
+        }
         let authority_rows = final_open
             .ledger
             .get_events(0, 1000)
@@ -2098,7 +2176,14 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
-        assert_eq!(final_budget, budget_before);
+        assert_eq!(
+            authority_rows
+                .iter()
+                .map(|row| serde_json::to_value(row).unwrap())
+                .collect::<Vec<_>>(),
+            authority_before,
+            "restart must preserve original consent and baseline bytes"
+        );
         assert_eq!(
             authority_rows.len(),
             1,
@@ -2130,6 +2215,7 @@ mod tests {
         mut prepared: Prepared,
         venue: &LocalVenue,
         target: &oppen_core::guardrail::CancelTarget,
+        unavailable: bool,
     ) {
         use serde_json::json;
         *venue.orders.lock().unwrap() = vec![json!({
@@ -2152,10 +2238,24 @@ mod tests {
         let port = venue.port;
         prepared.gateway = prepared.gateway.with_loopback_fixture(port).unwrap();
         let status = Arc::new(Mutex::new(McpStatus::starting(&fixture.binding)));
+        // Synthetic REST catch-up, not a hand-written WebSocket or direct ledger apply.
+        // This unrelated external fill cannot change the seeded cancellation target.
+        let source = FollowupFillSource {
+            account: fixture.binding.account,
+            fill: unavailable.then(|| {
+                serde_json::from_value(json!({
+                    "coin":"TEST","px":"100","sz":"0.01","side":"B","time":now_ms(),
+                    "startPosition":"0","dir":"Open Long","closedPnl":"0",
+                    "hash":"synthetic-follow-up-fill","oid":36002,"crossed":true,
+                    "fee":"0","feeToken":"USDC","tid":36002
+                }))
+                .unwrap()
+            }),
+        };
         let mut owned = OwnedMcp::launch(
             prepared,
             0,
-            FixtureSource,
+            source,
             move || WsPool::loopback_fixture(port),
             status.clone(),
             CancellationToken::new(),
@@ -2209,8 +2309,24 @@ mod tests {
         }).await;
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
+                let followup_ingested = !unavailable
+                    || weak
+                        .upgrade()
+                        .unwrap()
+                        .get_events(0, 1000)
+                        .unwrap()
+                        .events
+                        .iter()
+                        .any(|row| {
+                            row.kind == oppen_core::ledger::EventKind::Fill
+                                && row
+                                    .payload
+                                    .as_ref()
+                                    .is_some_and(|payload| payload["tid"] == 36002)
+                        });
                 if venue.orders.lock().unwrap().is_empty()
                     && status_lock(&status).supervision_error.is_none()
+                    && followup_ingested
                 {
                     break;
                 }
@@ -2218,7 +2334,7 @@ mod tests {
             }
         })
         .await
-        .expect("same supervisor must retry cleanup successfully");
+        .expect("same runtime must ingest follow-up evidence and retry cleanup successfully");
         let inhibited = engine.policy_status();
         owned.shutdown_and_drain().await.unwrap();
         drop(owned);

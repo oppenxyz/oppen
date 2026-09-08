@@ -7,17 +7,17 @@ Execution-owner integration after ES19. Traces to spec items 9, 14, 15, 26,
 
 An explicit operator command starts one testnet agent/account supervisor. It
 requires existing authenticated registry and policy authority, the matching
-durable pilot authorization and account identity, usable pilot accounting, and
+durable pilot authorization and account identity, and
 pairing bindings covered by that single account pump. Revoked pairings still
 count because they retain cleanup obligations. At least one matching retained
 binding is required: an empty store gives pause enforcement no account target.
 ES35 permits an authenticated, identity-matching halted pilot with known
-accounting to restart supervision. A durable trading stop must not suppress the
+accounting to restart supervision; ES36 extends this to unavailable accounting
+as described below. A durable trading stop must not suppress the
 existing cleanup/retry worker. Startup preserves the original pilot budget,
 baseline and stop and leaves order admission inhibited. It is not a resume,
-policy acknowledgment, new consent or position-close operation. Authenticated
-but unavailable accounting still refuses startup; that recovery limitation is
-not resolved here. A running listener does not prove completed cancellation.
+policy acknowledgment, new consent or position-close operation. A running
+listener does not prove completed cancellation or usable accounting.
 
 Missing or conflicting authority
 blocks startup; startup never initializes, replaces, issues or acknowledges it.
@@ -37,6 +37,22 @@ owns retained startup work independently of the IPC observer. Local socket
 ownership is established before venue work so an occupied port cannot leave an
 orphan pump. Wallet material remains in Rust; status observation never opens
 keys or databases.
+
+### Authenticated Unavailable Accounting
+
+ES36 extends the ES35 startup boundary: an authenticated, identity-matching
+`PilotStatus` may report unavailable accounting without preventing cleanup
+supervision. This supersedes ES35's known-accounting restriction, not its
+authority checks. A failed/missing status result still refuses startup, as do
+legacy or tampered authority. Never substitute a keyless status read.
+
+Startup remains order-inhibited. Preserve the original consent, baseline and
+stop; report unknown budgets as unavailable, never zero or usable remaining
+capacity. Valid later evidence must still reach the ledger through the pump.
+Genuine feed application/persistence failures retain their existing failure
+latch and shutdown behavior. Existing UI accounting/stop warnings remain
+independent of listener and feed status. Local verification of this extension
+does not authorize actual account cleanup.
 
 ## Lifecycle
 
@@ -95,18 +111,31 @@ establish live venue acceptance or authorize real-account cleanup.
 
 ## Local Verification
 
-ES35 focused verification passes three synthetic/loopback tests. The startup
-regression failed before the fix with the explicit halted-pilot rejection,
-then passed after it. A second case runs the retained desktop supervisor with
-no ordinary policy kill and startup inhibition still active, observes a scripted
-cancellation failure, releases a
-gated successful retry and verifies an actual MCP order refusal. Task drain,
-physical ledger reopen and original pilot-state preservation are checked.
-The third case confirms unavailable accounting still refuses startup. The full
-workspace passes 1,178 Rust tests with 15 live/keychain tests ignored; all-target
-Clippy, formatting and offline dependency checks pass. No frontend change or
-frontend test rerun is included. Exact-head review and green CI remain required;
-these results do not establish a live recovery gate.
+The ES36 unavailable-accounting restart regression
+failed at ES35's known-accounting check despite verified authority and an intact
+ledger, then passed after removing only that projection requirement. It covers
+cleanup failure/retry, actual MCP order refusal, retained unavailable status and
+unchanged original consent records. Actual startup reconciliation ingests a new,
+unrelated fill and verifies its durable `tid` exactly once after physical reopen,
+while unavailable accounting and the original halt persist. The full workspace
+passes 1,178 Rust tests, with 15 live/keychain tests ignored; all-target Clippy,
+formatting and offline dependency checks pass. Existing UI
+pilot-status tests pass 20 cases, including
+unavailable accounting without fabricated totals and retained stop/authentication
+warnings.
+Aggregate automated source review found no blockers. Exact-head review and
+green CI remain separate requirements; no live account activity is included.
+
+At [ES35 / PR #81](https://github.com/oppenxyz/oppen/pull/81), three focused
+synthetic/loopback tests passed: halted-pilot reopen, retained supervisor
+cancellation failure/retry with an actual MCP order refusal, and the then-current
+unavailable-accounting startup refusal. Startup inhibition stayed active; this
+did not isolate the pilot halt as the sole cleanup trigger. Physical ownership
+drain and original pilot-state preservation were verified. The workspace passed
+1,178 Rust tests with 15 live/keychain tests ignored; all-target Clippy,
+formatting and offline dependency checks passed. ES36 supersedes that third
+case's restriction, not its authority requirements. None of these results
+establishes a live recovery gate.
 
 Earlier ES20 verification:
 
