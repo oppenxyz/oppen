@@ -637,12 +637,14 @@ impl Fixture {
         engine
     }
 
-    fn evaluate(
+    fn context(
         &self,
-        engine: &crate::guardrail::GuardrailEngine,
-        intent: &OrderIntent,
         at_ms: u64,
-    ) -> Cleared {
+    ) -> (
+        oppen_hl::meta::Asset,
+        crate::guardrail::MarketRef,
+        crate::guardrail::Exposure,
+    ) {
         use crate::guardrail::{
             AccountSnapshot, Exposure, FeedQuality, MarketRef, RestingExposure,
         };
@@ -684,6 +686,16 @@ impl Fixture {
             },
             fleet: None,
         };
+        (asset, market, exposure)
+    }
+
+    fn evaluate(
+        &self,
+        engine: &crate::guardrail::GuardrailEngine,
+        intent: &OrderIntent,
+        at_ms: u64,
+    ) -> Cleared {
+        let (asset, market, exposure) = self.context(at_ms);
         engine
             .evaluate(
                 &self.route.binding.agent,
@@ -730,6 +742,201 @@ fn approved_finish_links_actual_engine_intent_and_replay_survives_reopen() {
         .unwrap();
     assert!(f.ledger.verify().unwrap().is_intact());
     assert!(f.journal.pending(NOW + 5).is_err());
+}
+
+#[test]
+fn reviewed_finish_rejects_a_different_action_even_with_identical_clearance_economics() {
+    let f = Fixture::new();
+    let engine = f.evaluation_engine();
+    let proposal = f.journal.mint(f.candidate(1, NOW)).unwrap();
+    let evidence = f.journal.prepare(proposal.id(), NOW).unwrap().unwrap();
+    let evaluated = f.evaluate(&engine, proposal.intent(), NOW);
+    let review = ReviewCommitment::new(
+        &evidence,
+        proposal.intent(),
+        evaluated.action().clone(),
+        evaluated.clearance(),
+        NOW,
+        NOW,
+    )
+    .unwrap();
+    let claim = f
+        .journal
+        .claim_review(evidence, review, NOW + 1)
+        .unwrap()
+        .unwrap();
+    let mut different = proposal.intent().clone();
+    different.kind = OrderKind::Limit { tif: Tif::Ioc };
+    let cleared = f.evaluate(&engine, &different, NOW + 2);
+    assert_eq!(evaluated.clearance().kind, cleared.clearance().kind);
+    assert_ne!(evaluated.action(), cleared.action());
+    let head = f.ledger.chain_head().unwrap();
+    let receipt = Appended {
+        seq: head.seq,
+        hash: head.hash.clone(),
+    };
+    assert!(matches!(
+        f.journal
+            .finish(claim, &Ok(cleared), Some(&receipt), NOW + 2),
+        Err(ApprovalError::Conflict { .. })
+    ));
+    assert_eq!(f.ledger.chain_head().unwrap(), head);
+    assert!(f.reopened().pending(NOW + 3).unwrap().is_empty());
+}
+
+#[test]
+fn reviewed_disposition_digest_binds_entire_commitment_to_actual_receipt() {
+    let f = Fixture::new();
+    let engine = f.evaluation_engine();
+    let proposal = f.journal.mint(f.candidate(1, NOW)).unwrap();
+    let (asset, market, exposure) = f.context(NOW);
+    let retained = engine
+        .operator_prepare_proposal(proposal.id(), &asset, &market, &exposure, NOW)
+        .unwrap();
+    let cleared = engine
+        .operator_confirm_review(retained, &asset, &market, &exposure, NOW + 2)
+        .unwrap();
+    let events = f.ledger.get_events(0, 100).unwrap().events;
+    let claim = events
+        .iter()
+        .find(|event| event.kind == EventKind::ApprovalClaimed)
+        .unwrap();
+    let review: ReviewCommitment = serde_json::from_value(
+        claim.payload.as_ref().unwrap()["envelope"]["operation"]["review"].clone(),
+    )
+    .unwrap();
+    let intent = events
+        .iter()
+        .find(|event| event.kind == EventKind::OrderIntent)
+        .unwrap();
+    let receipt = Appended {
+        seq: intent.seq,
+        hash: intent.hash.clone(),
+    };
+    assert_eq!(
+        cleared.clearance().approval_review_digest.as_ref(),
+        Some(&review.digest().unwrap())
+    );
+    assert_eq!(
+        intent.payload.as_ref().unwrap()["approval_review_digest"],
+        review.digest().unwrap()
+    );
+    let raw = events.last().unwrap().payload.as_ref().unwrap();
+    let actual_digest = raw["envelope"]["operation"]["outcome"]["review_receipt"]
+        .as_str()
+        .unwrap();
+    assert_eq!(
+        actual_digest,
+        review.receipt_digest(&Link::appended(&receipt)).unwrap()
+    );
+    for field in ["action", "reference", "policy", "deadline", "receipt"] {
+        let mut changed = review.clone();
+        let mut link = Link::appended(&receipt);
+        match field {
+            "action" => {
+                if let Action::Order { orders, .. } = &mut changed.action {
+                    orders[0].t = oppen_hl::wire::OrderType::Limit { tif: Tif::Ioc };
+                }
+            }
+            "reference" => changed.reference_px += Decimal::ONE,
+            "policy" => changed.policy.hash = "0".repeat(64),
+            "deadline" => changed.expires_at_ms += 1,
+            _ => link.hash = "0".repeat(64),
+        }
+        assert_ne!(
+            actual_digest,
+            changed.receipt_digest(&link).unwrap(),
+            "{field}"
+        );
+    }
+    assert!(f.reopened().pending(NOW + 3).unwrap().is_empty());
+}
+
+#[test]
+fn reviewed_finish_refuses_missing_or_wrong_commitment_in_actual_intent_receipt() {
+    for wrong_digest in [false, true] {
+        let f = Fixture::new();
+        let engine = f.evaluation_engine();
+        let proposal = f.journal.mint(f.candidate(1, NOW)).unwrap();
+        let evidence = f.journal.prepare(proposal.id(), NOW).unwrap().unwrap();
+        let evaluated = f.evaluate(&engine, proposal.intent(), NOW);
+        let review = ReviewCommitment::new(
+            &evidence,
+            proposal.intent(),
+            evaluated.action().clone(),
+            evaluated.clearance(),
+            NOW,
+            NOW,
+        )
+        .unwrap();
+        let claim = f
+            .journal
+            .claim_review(evidence, review, NOW + 1)
+            .unwrap()
+            .unwrap();
+        let cleared = f.evaluate(&engine, proposal.intent(), NOW + 2);
+        let mut payload = serde_json::to_value(cleared.clearance()).unwrap();
+        payload["reason"] = json!(proposal.intent().reason);
+        assert!(payload.get("approval_review_digest").is_none());
+        if wrong_digest {
+            payload["approval_review_digest"] = json!("0".repeat(64));
+        }
+        let receipt = f
+            .ledger
+            .record_intent(&crate::ledger::NewIntent {
+                agent_id: proposal.agent().as_str(),
+                ts_ms: (NOW + 2) as i64,
+                payload: &payload,
+                snapshot: None,
+            })
+            .unwrap();
+        let receipt = Appended {
+            seq: receipt.seq(),
+            hash: receipt.hash().to_owned(),
+        };
+        let head = f.ledger.chain_head().unwrap();
+        assert!(
+            matches!(f.journal.finish(claim, &Ok(cleared), Some(&receipt), NOW + 2),
+            Err(ApprovalError::Unavailable { detail }) if detail.contains("reviewed commitment"))
+        );
+        assert_eq!(f.ledger.chain_head().unwrap(), head);
+        assert!(f.reopened().pending(NOW + 3).unwrap().is_empty());
+    }
+}
+
+#[test]
+fn legacy_claim_and_disposition_omit_review_fields_and_preserve_canonical_bytes() {
+    let f = Fixture::new();
+    let proposal = f.journal.mint(f.candidate(1, NOW)).unwrap();
+    let claim = f.journal.claim(proposal.id(), NOW + 1).unwrap().unwrap();
+    let receipt = f.refusal_receipt(&proposal, NOW + 2);
+    f.journal
+        .finish(claim, &Err(Refusal::MissingReason), Some(&receipt), NOW + 2)
+        .unwrap();
+    let before = f.ledger.get_events(0, 100).unwrap().events;
+    for event in before.iter().filter(|event| {
+        matches!(
+            event.kind,
+            EventKind::ApprovalClaimed | EventKind::ApprovalDisposed
+        )
+    }) {
+        let payload = event.payload.as_ref().unwrap();
+        let operation = &payload["envelope"]["operation"];
+        assert!(operation.get("review").is_none());
+        assert!(
+            operation
+                .get("outcome")
+                .is_none_or(|outcome| outcome.get("review_receipt").is_none())
+        );
+        let raw = super::super::hash::canonical_json(payload).unwrap();
+        let decoded = f.journal.decode(event, &raw).unwrap();
+        assert_eq!(
+            super::super::hash::canonical_json(&serde_json::to_value(decoded).unwrap()).unwrap(),
+            raw
+        );
+    }
+    assert!(f.reopened().pending(NOW + 3).unwrap().is_empty());
+    assert_eq!(f.ledger.get_events(0, 100).unwrap().events, before);
 }
 
 #[test]

@@ -35,11 +35,11 @@ use serde::Serialize;
 use oppen_hl::exchange::{PreSign, PreSignCheck, SignError};
 use oppen_hl::meta::Asset;
 use oppen_hl::order::{OrderKind, OrderSpec};
-use oppen_hl::wire::{BuilderInfo, CancelByCloidWire, CancelWire, Cloid, Grouping};
+use oppen_hl::wire::{BuilderInfo, CancelByCloidWire, CancelWire, Cloid, Grouping, OrderType};
 use oppen_hl::{Action, Address, AgentKey, ExchangeRequest, Network};
 
 use crate::keys::{AgentWallet, KeyStore, KeyStoreError};
-use crate::ledger::approval::{ApprovalJournal, Candidate};
+use crate::ledger::approval::{ApprovalJournal, Candidate, ReviewCommitment, ReviewEvidence};
 use crate::ledger::{AuthorizedRoute, LedgerAuditSink, PolicyJournal};
 
 use super::AgentId;
@@ -147,6 +147,86 @@ impl Proposal {
     fn is_expired(&self, now_ms: u64) -> bool {
         now_ms >= self.expires_at_ms
     }
+}
+
+/// An operator's retained review, not a clearance. Only this engine can build
+/// one, and confirmation consumes it. Display data cannot reconstruct authority.
+///
+/// ```compile_fail
+/// use oppen_core::guardrail::ApprovalReview;
+/// fn duplicate(review: &ApprovalReview) -> ApprovalReview { review.clone() }
+/// ```
+///
+/// ```compile_fail
+/// use oppen_core::guardrail::ApprovalReview;
+/// let _: ApprovalReview = serde_json::from_str("{}").unwrap();
+/// ```
+pub struct ApprovalReview {
+    evidence: ReviewEvidence,
+    candidate: OrderIntent,
+    action: Action,
+    commitment: ReviewCommitment,
+    display: ApprovalReviewDisplay,
+}
+
+impl std::fmt::Debug for ApprovalReview {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ApprovalReview")
+            .field("display", &self.display)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ApprovalReview {
+    pub fn proposal_id(&self) -> &str {
+        &self.display.proposal_id
+    }
+    pub fn agent(&self) -> &AgentId {
+        &self.display.agent
+    }
+    pub fn account(&self) -> Address {
+        self.display.account
+    }
+    pub fn symbol(&self) -> &str {
+        &self.display.symbol
+    }
+    pub fn display(&self) -> &ApprovalReviewDisplay {
+        &self.display
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ApprovalReviewDisplay {
+    pub proposal_id: String,
+    pub agent: AgentId,
+    pub account: Address,
+    pub symbol: String,
+    pub original: Option<super::OriginalRequest>,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub original_px: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub reference_px: Decimal,
+    pub reference_at_ms: u64,
+    #[serde(with = "rust_decimal::serde::str_option")]
+    pub drift_bps: Option<Decimal>,
+    pub asset_index: u32,
+    pub is_buy: bool,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub px: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub sz: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub notional_usd: Decimal,
+    pub reduce_only: bool,
+    pub order_type: OrderType,
+    pub cloid: Cloid,
+    pub grouping: Grouping,
+    pub builder: Option<BuilderInfo>,
+    pub route: AuthorizedRoute,
+    pub policy_revision: u64,
+    pub policy_hash: String,
+    pub reviewed_at_ms: u64,
+    pub expires_at_ms: u64,
 }
 
 /// How much of each guardrail this order consumes, for the utilization block
@@ -258,6 +338,10 @@ pub enum ClearedKind {
 /// evaluation (D6).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Clearance {
+    /// Set only by retained-review confirmation after exact action comparison.
+    /// Omitted for legacy/direct evaluations and policy-exempt cleanup.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approval_review_digest: Option<String>,
     /// Whose container this was evaluated against. **Every** clearance names
     /// one, including the dead-man's switch: spec item 27 arms
     /// `scheduleCancel` *per container*, "N times, not once", and an
@@ -330,6 +414,10 @@ impl Cleared {
 
     pub fn clearance(&self) -> &Clearance {
         &self.clearance
+    }
+
+    pub(crate) fn matches_reviewed_action(&self, action: &Action) -> bool {
+        &self.action == action
     }
 
     fn into_parts(self) -> (Action, Clearance, Option<u64>) {
@@ -1234,18 +1322,210 @@ impl GuardrailEngine {
         Ok(state.proposals.values().cloned().collect())
     }
 
-    /// Approves a proposal and re-evaluates it in full against fresh market
-    /// and account state (spec item 28 re-prices at approval time).
-    ///
-    /// Operator-only, like everything else in this section (`AGENTS.md`
-    /// invariant 3). The intent comes from the engine's own store, never from
-    /// the caller, so approving proposal *A* cannot sign order *B*; and the
-    /// proposal is consumed on success, so one approval authorises one
-    /// evaluation. Every hard predicate runs again — an order that has since
-    /// become a breach is refused rather than waved through because a human
-    /// looked at it a minute ago. Only two things are skipped: the order-rate
-    /// token, which was spent when the proposal was minted, and the approval
-    /// requirement itself.
+    /// Builds a non-signable review from authenticated pending evidence. No
+    /// proposal is claimed and no rate token is spent by preparing a review.
+    pub fn operator_prepare_proposal(
+        &self,
+        id: &str,
+        asset: &Asset,
+        market: &MarketRef,
+        exposure: &Exposure,
+        now_ms: u64,
+    ) -> Result<ApprovalReview, Refusal> {
+        let journal = self
+            .approvals
+            .as_ref()
+            .ok_or_else(|| approval_refusal("durable approval authority required for review"))?;
+        let evidence = journal
+            .prepare(id, now_ms)
+            .map_err(approval_refusal)?
+            .ok_or_else(|| Unevaluable::UnknownProposal {
+                approval_id: id.to_owned(),
+            })?;
+        let proposal = &evidence.proposal;
+        let candidate =
+            super::request::review_candidate(&proposal.intent, asset, market, exposure)?;
+        let evaluated = self.decide(
+            &proposal.agent,
+            &candidate,
+            asset,
+            market,
+            exposure,
+            now_ms,
+            Mode::Approved(&proposal.route),
+        )?;
+        let commitment = ReviewCommitment::new(
+            &evidence,
+            &candidate,
+            evaluated.action.clone(),
+            &evaluated.clearance,
+            now_ms,
+            market.as_of_ms,
+        )
+        .map_err(approval_refusal)?;
+        let ClearedKind::Order {
+            px,
+            sz,
+            notional_usd,
+            reference_px,
+            ..
+        } = evaluated.clearance.kind
+        else {
+            return Err(approval_refusal(
+                "review evaluation did not produce an order",
+            ));
+        };
+        let Action::Order { orders, .. } = &evaluated.action else {
+            return Err(approval_refusal(
+                "review evaluation did not produce an order action",
+            ));
+        };
+        let [wire] = orders.as_slice() else {
+            return Err(approval_refusal("review requires one order"));
+        };
+        let drift_bps = proposal
+            .intent
+            .original
+            .as_ref()
+            .and_then(|original| original.reference_px)
+            .map(|original| {
+                checked(
+                    reference_px
+                        .checked_sub(original)
+                        .and_then(|delta| delta.checked_div(original))
+                        .and_then(|ratio| ratio.checked_mul(BPS)),
+                    "review drift",
+                )
+            })
+            .transpose()?;
+        let display = ApprovalReviewDisplay {
+            proposal_id: proposal.id.clone(),
+            agent: proposal.agent.clone(),
+            account: proposal.account(),
+            symbol: proposal.intent.symbol.clone(),
+            original: proposal.intent.original.clone(),
+            original_px: proposal.intent.px,
+            reference_px,
+            reference_at_ms: market.as_of_ms,
+            drift_bps,
+            asset_index: wire.a,
+            is_buy: wire.b,
+            px,
+            sz,
+            notional_usd,
+            reduce_only: wire.r,
+            order_type: wire.t.clone(),
+            cloid: candidate
+                .cloid
+                .clone()
+                .ok_or_else(|| approval_refusal("review requires a cloid"))?,
+            grouping: candidate.grouping,
+            builder: candidate.builder.clone(),
+            route: proposal.route.clone(),
+            policy_revision: evidence.policy_revision,
+            policy_hash: evidence.policy_hash.clone(),
+            reviewed_at_ms: now_ms,
+            expires_at_ms: proposal.expires_at_ms,
+        };
+        Ok(ApprovalReview {
+            evidence,
+            candidate,
+            action: evaluated.action,
+            commitment,
+            display,
+        })
+    }
+
+    /// Consumes only the retained candidate; callers cannot supply edited fields.
+    /// Guard refusals after claiming are terminal and carry actual audit receipts.
+    pub fn operator_confirm_review(
+        &self,
+        review: ApprovalReview,
+        asset: &Asset,
+        market: &MarketRef,
+        exposure: &Exposure,
+        now_ms: u64,
+    ) -> Result<Cleared, Refusal> {
+        let journal = self.approvals.as_ref().ok_or_else(|| {
+            approval_refusal("durable approval authority required for confirmation")
+        })?;
+        if now_ms >= review.display.expires_at_ms {
+            return Err(Unevaluable::ApprovalExpired {
+                expires_at_ms: review.display.expires_at_ms,
+                now_ms,
+            }
+            .into());
+        }
+        if now_ms < review.display.reviewed_at_ms {
+            return Err(Unevaluable::ApprovalReviewChanged {
+                detail: "review clock moved backwards".into(),
+            }
+            .into());
+        }
+        // A close never silently changes size or side. Check against the original
+        // proposal, retaining the reviewed quote timestamp in the actual candidate.
+        let refreshed = super::request::review_candidate(
+            &review.evidence.proposal.intent,
+            asset,
+            market,
+            exposure,
+        )?;
+        let mut comparable = refreshed;
+        comparable.original = review.candidate.original.clone();
+        if comparable != review.candidate {
+            return Err(Unevaluable::ApprovalReviewChanged {
+                detail: "rounded candidate changed".into(),
+            }
+            .into());
+        }
+        let ApprovalReview {
+            evidence,
+            candidate,
+            action,
+            commitment,
+            display,
+        } = review;
+        let review_digest = commitment.digest().map_err(approval_refusal)?;
+        let claim = journal
+            .claim_review(evidence, commitment, now_ms)
+            .map_err(approval_refusal)?
+            .ok_or_else(|| Unevaluable::UnknownProposal {
+                approval_id: display.proposal_id.clone(),
+            })?;
+        let outcome = self
+            .decide(
+                &display.agent,
+                &candidate,
+                asset,
+                market,
+                exposure,
+                now_ms,
+                Mode::Approved(&display.route),
+            )
+            .and_then(|mut cleared| {
+                if cleared.action != action
+                    || cleared.clearance.policy_revision != display.policy_revision
+                {
+                    return Err(Unevaluable::ApprovalReviewChanged {
+                        detail: "rounded action or policy changed".into(),
+                    }
+                    .into());
+                }
+                cleared.approval_deadline_ms = Some(display.expires_at_ms);
+                cleared.clearance.approval_review_digest = Some(review_digest);
+                Ok(cleared)
+            });
+        let receipt = self.record(Some(&display.agent), now_ms, &candidate.reason, &outcome)?;
+        journal
+            .finish(claim, &outcome, receipt.as_ref(), now_ms)
+            .map_err(approval_refusal)?;
+        outcome
+    }
+
+    /// Legacy direct approval of the retained normalized intent, without repricing
+    /// or a reviewed-candidate commitment. Re-evaluates every hard guard and
+    /// consumes the proposal once; its rate token was already spent at minting.
+    /// Native review/confirmation uses the separate retained-review APIs above.
     pub fn operator_approve_proposal(
         &self,
         approval_id: &str,
@@ -2035,6 +2315,7 @@ impl GuardrailEngine {
             None => (None, None),
         };
         let clearance = Clearance {
+            approval_review_digest: None,
             agent: agent.clone(),
             policy_revision: state.policy_revision,
             vault_address: route.binding.vault_address,
@@ -2158,6 +2439,7 @@ impl GuardrailEngine {
         Ok(Cleared::new(
             action,
             Clearance {
+                approval_review_digest: None,
                 agent: agent.clone(),
                 policy_revision: 0,
                 vault_address: route.binding.vault_address,
@@ -2226,6 +2508,7 @@ impl GuardrailEngine {
         Ok(Cleared::new(
             Action::ScheduleCancel { time: cancel_at_ms },
             Clearance {
+                approval_review_digest: None,
                 agent: agent.clone(),
                 policy_revision: 0,
                 vault_address: route.binding.vault_address,
@@ -2241,8 +2524,8 @@ impl GuardrailEngine {
     // ---- the signer ------------------------------------------------------
 
     /// Signs a cleared action, with this engine as the gate that runs inside
-    /// the signer. **This is the only signing entry point `oppen-core`
-    /// offers** (`AGENTS.md` invariant 1).
+    /// the signer. This delegates to the same signing boundary as
+    /// [`Self::sign_cleared_authorized`] (`AGENTS.md` invariant 1).
     ///
     /// It takes [`Cleared`] **by value** on purpose: a clearance is spent by
     /// the signature it authorises, so the same evaluation cannot be replayed
@@ -2284,9 +2567,26 @@ impl GuardrailEngine {
         expires_after: Option<u64>,
         clock: impl Fn() -> u64,
     ) -> Result<(ExchangeRequest, Clearance), SignClearedError> {
+        self.sign_cleared_authorized(cleared, nonce, expires_after, clock, || Ok(()))
+    }
+
+    /// Adds live caller authority after key loading without replacing any core
+    /// checks. The returned guard remains held through crypto, not through audit.
+    pub fn sign_cleared_authorized<G>(
+        &self,
+        cleared: Cleared,
+        nonce: u64,
+        expires_after: Option<u64>,
+        clock: impl Fn() -> u64,
+        authorize: impl FnOnce() -> Result<G, Refusal>,
+    ) -> Result<(ExchangeRequest, Clearance), SignClearedError> {
         let (action, clearance, approval_deadline_ms) = cleared.into_parts();
         let (key, wallet): (AgentKey, AgentWallet) =
             self.keys.load_agent_key_with_wallet(&clearance.agent)?;
+        let caller_authority = authorize().map_err(|refusal| {
+            self.record_pre_sign_refusal(&clearance.agent, clock(), &refusal);
+            SignClearedError::Refused(refusal)
+        })?;
         let actual_signer = key.address();
         let gate = PreSignGate {
             engine: self,
@@ -2312,6 +2612,7 @@ impl GuardrailEngine {
         // auditing (which needs the same ledger lock).
         let observed_at_ms = gate.observed_at_ms.get();
         drop(gate);
+        drop(caller_authority);
         let request = signed.map_err(|e| match e {
             SignError::Refused(refusal) => {
                 if matches!(
@@ -2364,7 +2665,7 @@ impl GuardrailEngine {
 
 /// The pre-sign gate: one engine bound to the one clearance it is signing.
 ///
-/// **Private, and constructed only by [`GuardrailEngine::sign_cleared`].**
+/// **Private, and constructed only by the shared guarded signing boundary.**
 /// That is the compile-time half of `AGENTS.md` invariant 1, and it is the
 /// reason `GuardrailEngine` itself deliberately does *not* implement
 /// [`PreSignCheck`]. While it did, the engine was public, `sign_checked` is

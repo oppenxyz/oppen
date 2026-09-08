@@ -21,6 +21,7 @@ fn account(n: u8) -> Address {
 
 fn clearance(n: u8) -> Clearance {
     Clearance {
+        approval_review_digest: None,
         policy_revision: crate::ledger::tests::AUDIT_POLICY_REVISION,
         route: audit_route(AgentId::new("agent-a"), account(1), 100),
         agent: AgentId::new("agent-a"),
@@ -520,7 +521,7 @@ fn prior_pending_survives_upgrade_without(missing: &str) {
             .unwrap()
             .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
             .unwrap(),
-        10
+        11
     );
     let journal = SubmissionJournal::new(ledger.clone());
     // A stricter typed reader may refuse this legacy intent. Neither reader
@@ -716,7 +717,7 @@ fn v2_upgrade_preserves_existing_events_hashes_and_head() {
             .unwrap()
             .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0),)
             .unwrap(),
-        10
+        11
     );
     let index_count: i64 = upgraded.lock().unwrap().query_row(
         "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'index' AND name = 'events_submission_account'",

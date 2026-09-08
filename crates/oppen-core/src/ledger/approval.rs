@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use oppen_hl::order::OrderKind;
 use oppen_hl::wire::{BuilderInfo, Cloid, Grouping, Tif, Tpsl};
-use oppen_hl::{Address, Network};
+use oppen_hl::{Action, Address, Network};
 use rusqlite::{Connection, Transaction, TransactionBehavior, params};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -62,6 +62,110 @@ pub(crate) struct Candidate {
 }
 
 pub(crate) struct ApprovalJournal(Arc<PolicyJournal>);
+
+pub(crate) struct ReviewEvidence {
+    pub proposal: Proposal,
+    pub policy_revision: u64,
+    pub policy_hash: String,
+    root: Link,
+    authority: Arc<PolicyJournal>,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ReviewCommitment {
+    proposal_root: Link,
+    route: AuthorizedRoute,
+    candidate: NormalizedIntent,
+    action: Action,
+    policy: Link,
+    reviewed_at_ms: u64,
+    reference_at_ms: u64,
+    expires_at_ms: u64,
+    #[serde(with = "rust_decimal::serde::str")]
+    reference_px: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    px: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    sz: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    notional_usd: Decimal,
+}
+
+impl ReviewCommitment {
+    pub(crate) fn new(
+        evidence: &ReviewEvidence,
+        candidate: &OrderIntent,
+        action: Action,
+        clearance: &crate::guardrail::Clearance,
+        reviewed_at_ms: u64,
+        reference_at_ms: u64,
+    ) -> Result<Self> {
+        let ClearedKind::Order {
+            px,
+            sz,
+            notional_usd,
+            reference_px,
+            ..
+        } = &clearance.kind
+        else {
+            return Err(unavailable("approval review requires an order"));
+        };
+        if clearance.policy_revision != evidence.policy_revision
+            || clearance.route != evidence.proposal.route
+        {
+            return Err(conflict("review authority changed during evaluation"));
+        }
+        Ok(Self {
+            proposal_root: evidence.root.clone(),
+            route: evidence.proposal.route.clone(),
+            candidate: NormalizedIntent::from_intent(candidate)?,
+            action,
+            policy: Link {
+                seq: evidence.policy_revision,
+                hash: evidence.policy_hash.clone(),
+            },
+            reviewed_at_ms,
+            reference_at_ms,
+            expires_at_ms: evidence.proposal.expires_at_ms,
+            reference_px: *reference_px,
+            px: *px,
+            sz: *sz,
+            notional_usd: *notional_usd,
+        })
+    }
+
+    fn receipt_digest(&self, receipt: &Link) -> Result<String> {
+        let canonical = super::hash::canonical_json(&serde_json::json!({
+            "domain": "oppen.approval-review-receipt.v1", "review": self, "receipt": receipt,
+        }))?;
+        Ok(super::hash::payload_hash(canonical.as_bytes()))
+    }
+
+    pub(crate) fn digest(&self) -> Result<String> {
+        let canonical = super::hash::canonical_json(&serde_json::json!({
+            "domain": "oppen.approval-review-commitment.v1", "review": self,
+        }))?;
+        Ok(super::hash::payload_hash(canonical.as_bytes()))
+    }
+
+    fn matches_payload(&self, payload: &serde_json::Value) -> Result<bool> {
+        let expected = serde_json::json!({
+            "px": self.px, "sz": self.sz, "notional_usd": self.notional_usd,
+        });
+        Ok(
+            payload.get("policy_revision") == Some(&self.policy.seq.into())
+                && payload.get("approval_review_digest") == Some(&self.digest()?.into())
+                && expected
+                    .as_object()
+                    .ok_or_else(|| unavailable("review economics missing"))?
+                    .iter()
+                    .all(|(key, value)| {
+                        payload.get("kind").and_then(|kind| kind.get(key)) == Some(value)
+                    }),
+        )
+    }
+}
 
 pub(crate) struct ClaimPermit {
     authority: Arc<PolicyJournal>,
@@ -253,8 +357,17 @@ struct Proposed {
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "disposition", rename_all = "snake_case", deny_unknown_fields)]
 enum Disposition {
-    Approved { intent: Link },
-    Refused { detail: String, audit: Link },
+    Approved {
+        intent: Link,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        review_receipt: Option<String>,
+    },
+    Refused {
+        detail: String,
+        audit: Link,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        review_receipt: Option<String>,
+    },
     Rejected,
     Expired,
 }
@@ -262,15 +375,22 @@ enum Disposition {
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum Operation {
-    Proposed { proposal: Box<Proposed> },
-    Claimed,
-    Disposed { outcome: Disposition },
+    Proposed {
+        proposal: Box<Proposed>,
+    },
+    Claimed {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        review: Option<Box<ReviewCommitment>>,
+    },
+    Disposed {
+        outcome: Disposition,
+    },
 }
 impl Operation {
     fn kind(&self) -> EventKind {
         match self {
             Self::Proposed { .. } => EventKind::ApprovalProposed,
-            Self::Claimed => EventKind::ApprovalClaimed,
+            Self::Claimed { .. } => EventKind::ApprovalClaimed,
             Self::Disposed { .. } => EventKind::ApprovalDisposed,
         }
     }
@@ -307,6 +427,7 @@ struct Entry {
     minted_at_ms: u64,
     last_at_ms: u64,
     state: State,
+    review: Option<Box<ReviewCommitment>>,
 }
 impl Entry {
     fn proposal(&self, network: Network) -> Proposal {
@@ -346,6 +467,144 @@ impl ApprovalJournal {
         self.0.registry().ledger()
     }
 
+    pub(crate) fn prepare(&self, id: &str, at_ms: u64) -> Result<Option<ReviewEvidence>> {
+        timestamp(at_ms)?;
+        let mut guard = self.ledger().lock()?;
+        let tx = guard.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let entries = self.replay(&tx)?;
+        let current = self.0.current_in(&tx).map_err(unavailable)?;
+        let evidence = entries
+            .values()
+            .find(|entry| entry.proposal(self.ledger().network).id() == id)
+            .map(|entry| {
+                if at_ms < entry.last_at_ms {
+                    return Err(unavailable("approval clock moved backwards"));
+                }
+                if !matches!(entry.state, State::Pending) || at_ms >= entry.data.expires_at_ms {
+                    return Ok(None);
+                }
+                Ok(Some(ReviewEvidence {
+                    proposal: entry.proposal(self.ledger().network),
+                    root: entry.root.clone(),
+                    policy_revision: current.revision,
+                    policy_hash: row(&tx, current.revision)?.hash,
+                    authority: self.0.clone(),
+                }))
+            })
+            .transpose()?
+            .flatten();
+        tx.commit()?;
+        Ok(evidence)
+    }
+
+    fn validate_review(
+        &self,
+        connection: &Connection,
+        entry: &Entry,
+        review: &ReviewCommitment,
+        at_ms: u64,
+        claim_seq: u64,
+    ) -> Result<()> {
+        review.candidate.validate()?;
+        if review.proposal_root != entry.root
+            || review.route != entry.data.route
+            || review.reviewed_at_ms < entry.minted_at_ms
+            || review.reviewed_at_ms > at_ms
+            || review.reference_at_ms > review.reviewed_at_ms
+            || review.expires_at_ms != entry.data.expires_at_ms
+            || at_ms >= review.expires_at_ms
+            || review.reference_px <= Decimal::ZERO
+            || review.px <= Decimal::ZERO
+            || review.sz <= Decimal::ZERO
+            || review.notional_usd <= Decimal::ZERO
+            || review.policy.seq >= claim_seq
+        {
+            return Err(unavailable(
+                "invalid reviewed lifetime, economics or policy ordering",
+            ));
+        }
+        let policy = row(connection, review.policy.seq)?;
+        if policy.hash != review.policy.hash
+            || !matches!(
+                policy.kind,
+                EventKind::PolicyInitialized | EventKind::PolicyReplaced
+            )
+        {
+            return Err(unavailable("review policy linkage mismatch"));
+        }
+        let mut expected = entry.data.intent.clone();
+        if let Some(original) = &mut expected.original
+            && matches!(
+                original.kind,
+                crate::guardrail::RequestedOrderKind::Market { .. }
+                    | crate::guardrail::RequestedOrderKind::ClosePosition { .. }
+            )
+        {
+            expected.px = review.candidate.px;
+            original.reference_px = Some(review.reference_px);
+            original.reference_at_ms = review.reference_at_ms;
+        }
+        if expected != review.candidate {
+            return Err(conflict("review changed fixed proposal fields"));
+        }
+        let Action::Order {
+            orders,
+            grouping,
+            builder,
+        } = &review.action
+        else {
+            return Err(unavailable("review action is not an order"));
+        };
+        let [order] = orders.as_slice() else {
+            return Err(unavailable("review requires one order"));
+        };
+        let same_kind = match (&order.t, &review.candidate.kind) {
+            (oppen_hl::wire::OrderType::Limit { tif }, NormalizedKind::Limit { tif: expected }) => {
+                tif == expected
+            }
+            (
+                oppen_hl::wire::OrderType::Trigger {
+                    is_market, tpsl, ..
+                },
+                NormalizedKind::Trigger {
+                    is_market: expected_market,
+                    tpsl: expected_tpsl,
+                    ..
+                },
+            ) => is_market == expected_market && tpsl == expected_tpsl,
+            _ => false,
+        };
+        if *grouping != review.candidate.grouping
+            || !same_kind
+            || review.px.checked_mul(review.sz) != Some(review.notional_usd)
+            || *builder != review.candidate.builder
+            || order.b != review.candidate.is_buy
+            || order.r != review.candidate.reduce_only
+            || order.c.as_ref() != Some(&review.candidate.cloid)
+            || order.p.as_str().parse::<Decimal>().map_err(unavailable)? != review.px
+            || order.s.as_str().parse::<Decimal>().map_err(unavailable)? != review.sz
+        {
+            return Err(unavailable("review action does not match candidate"));
+        }
+        Ok(())
+    }
+
+    fn validate_review_receipt(
+        entry: &Entry,
+        receipt: &Link,
+        digest: &Option<String>,
+    ) -> Result<()> {
+        let expected = entry
+            .review
+            .as_ref()
+            .map(|review| review.receipt_digest(receipt))
+            .transpose()?;
+        if &expected != digest {
+            return Err(unavailable("review commitment/receipt digest mismatch"));
+        }
+        Ok(())
+    }
+
     fn replay(&self, connection: &Connection) -> Result<BTreeMap<u64, Entry>> {
         // This verifies the anchored chain and all policy MACs even when the queue is empty.
         self.0.current_in(connection).map_err(unavailable)?;
@@ -383,6 +642,7 @@ impl ApprovalJournal {
                             minted_at_ms: e.at_ms,
                             last_at_ms: e.at_ms,
                             state: State::Pending,
+                            review: None,
                         },
                     );
                 }
@@ -404,10 +664,16 @@ impl ApprovalJournal {
                         return Err(unavailable("approval transition key mismatch"));
                     }
                     match operation {
-                        Operation::Claimed
+                        Operation::Claimed { review }
                             if matches!(entry.state, State::Pending)
                                 && e.at_ms < entry.data.expires_at_ms =>
                         {
+                            if let Some(review) = &review {
+                                self.validate_review(
+                                    connection, entry, review, e.at_ms, event.seq,
+                                )?;
+                            }
+                            entry.review = review;
                             entry.state = State::Claimed
                         }
                         Operation::Disposed { outcome } => {
@@ -416,15 +682,28 @@ impl ApprovalJournal {
                                     if e.at_ms < entry.data.expires_at_ms => {}
                                 (State::Pending, Disposition::Expired)
                                     if e.at_ms >= entry.data.expires_at_ms => {}
-                                (State::Claimed, Disposition::Refused { detail, audit })
-                                    if !detail.is_empty() =>
-                                {
+                                (
+                                    State::Claimed,
+                                    Disposition::Refused {
+                                        detail,
+                                        audit,
+                                        review_receipt,
+                                    },
+                                ) if !detail.is_empty() => {
                                     self.validate_refusal_row(
                                         connection, entry, audit, detail, event.seq,
                                     )?;
+                                    Self::validate_review_receipt(entry, audit, review_receipt)?;
                                 }
-                                (State::Claimed, Disposition::Approved { intent }) => {
+                                (
+                                    State::Claimed,
+                                    Disposition::Approved {
+                                        intent,
+                                        review_receipt,
+                                    },
+                                ) => {
                                     self.validate_intent_row(connection, entry, intent, event.seq)?;
+                                    Self::validate_review_receipt(entry, intent, review_receipt)?;
                                 }
                                 _ => {
                                     return Err(unavailable(
@@ -585,6 +864,13 @@ impl ApprovalJournal {
                 != Some(entry.data.intent.reduce_only)
         {
             return Err(unavailable("approved intent does not match proposal"));
+        }
+        if let Some(review) = &entry.review
+            && !review.matches_payload(payload)?
+        {
+            return Err(unavailable(
+                "approved receipt differs from reviewed commitment, economics or policy",
+            ));
         }
         Ok(event)
     }
@@ -771,6 +1057,7 @@ impl ApprovalJournal {
             minted_at_ms: candidate.at_ms,
             last_at_ms: candidate.at_ms,
             state: State::Pending,
+            review: None,
         }
         .proposal(self.ledger().network))
     }
@@ -808,6 +1095,27 @@ impl ApprovalJournal {
     }
 
     pub(crate) fn claim(&self, id: &str, at_ms: u64) -> Result<Option<ClaimPermit>> {
+        self.claim_inner(id, at_ms, None)
+    }
+
+    pub(crate) fn claim_review(
+        &self,
+        evidence: ReviewEvidence,
+        review: ReviewCommitment,
+        at_ms: u64,
+    ) -> Result<Option<ClaimPermit>> {
+        if !Arc::ptr_eq(&evidence.authority, &self.0) {
+            return Err(conflict("review belongs to another authority owner"));
+        }
+        self.claim_inner(evidence.proposal.id(), at_ms, Some((&evidence, review)))
+    }
+
+    fn claim_inner(
+        &self,
+        id: &str,
+        at_ms: u64,
+        reviewed: Option<(&ReviewEvidence, ReviewCommitment)>,
+    ) -> Result<Option<ClaimPermit>> {
         timestamp(at_ms)?;
         let mut guard = self.ledger().lock()?;
         let tx = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -837,7 +1145,28 @@ impl ApprovalJournal {
             )?;
             return Ok(None);
         }
-        let appended = self.append(tx, Some(entry), Operation::Claimed, at_ms)?;
+        let review = if let Some((evidence, review)) = reviewed {
+            let current = self.0.current_in(&tx).map_err(unavailable)?;
+            if entry.root != evidence.root
+                || entry.proposal(self.ledger().network) != evidence.proposal
+                || current.revision != evidence.policy_revision
+                || row(&tx, current.revision)?.hash != evidence.policy_hash
+            {
+                return Err(conflict("review proposal or policy changed"));
+            }
+            let (head, _) = super::head(&tx)?;
+            self.validate_review(
+                &tx,
+                entry,
+                &review,
+                at_ms,
+                head.checked_add(1).ok_or(LedgerError::SeqOutOfRange)?,
+            )?;
+            Some(Box::new(review))
+        } else {
+            None
+        };
+        let appended = self.append(tx, Some(entry), Operation::Claimed { review }, at_ms)?;
         Ok(Some(ClaimPermit {
             authority: self.0.clone(),
             proposal: entry.proposal(self.ledger().network),
@@ -914,6 +1243,11 @@ impl ApprovalJournal {
                 {
                     return Err(conflict("approval clearance route or action differs"));
                 }
+                if let Some(review) = &entry.review
+                    && !cleared.matches_reviewed_action(&review.action)
+                {
+                    return Err(conflict("clearance action differs from reviewed action"));
+                }
                 let receipt = receipt.ok_or_else(|| {
                     unavailable("approved outcome requires durable intent receipt")
                 })?;
@@ -935,7 +1269,15 @@ impl ApprovalJournal {
                         "intent receipt payload differs from approved clearance",
                     ));
                 }
-                Disposition::Approved { intent: link }
+                let review_receipt = entry
+                    .review
+                    .as_ref()
+                    .map(|review| review.receipt_digest(&link))
+                    .transpose()?;
+                Disposition::Approved {
+                    intent: link,
+                    review_receipt,
+                }
             }
             Err(refusal) => {
                 let receipt = receipt
@@ -954,7 +1296,16 @@ impl ApprovalJournal {
                 if event.payload.as_ref() != Some(&expected) {
                     return Err(conflict("refusal receipt differs from actual outcome"));
                 }
-                Disposition::Refused { detail, audit }
+                let review_receipt = entry
+                    .review
+                    .as_ref()
+                    .map(|review| review.receipt_digest(&audit))
+                    .transpose()?;
+                Disposition::Refused {
+                    detail,
+                    audit,
+                    review_receipt,
+                }
             }
         };
         self.append(

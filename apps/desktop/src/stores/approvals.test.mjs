@@ -11,13 +11,94 @@ const proposal = (binding = A) => ({
 });
 const status = (binding = A, overrides = {}) => ({
   ...binding, owner_id: "owner-1", phase: "ready", observed_at_ms: NOW,
-  pending: [proposal(binding)], decision: null, error: null, ...overrides,
+  pending: [proposal(binding)], decision: null, error: null, review: null, confirmation: null, ...overrides,
 });
 function deferred() {
   let resolve, reject;
   const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
   return { promise, resolve, reject };
 }
+const review = () => ({ id: "review-1", owner_id: "owner-1", pairing_id: { network: "testnet", issued_seq: 3 }, reason: proposal().reason,
+  display: { ...proposal(), proposal_id: proposal().id, original_px: "101", reference_px: "100", reference_at_ms: NOW,
+    drift_bps: "0", asset_index: 0, notional_usd: "10.1", order_type: { limit: { tif: "Ioc" } }, cloid: "0x01", grouping: "na", builder: null,
+    route: { network: "testnet", binding_seq: 2, binding: { agent: A.agent, container: A.account, vault_address: null,
+      wallet: { generation: 1, address: B.account, approved_at_ms: 1, valid_until_ms: 200000 } } },
+    policy_revision: 4, policy_hash: "abc", reviewed_at_ms: NOW, expires_at_ms: 100000 } });
+
+test("pricing preparation retains exact evidence and confirmation sends only owner and review ID once", async () => {
+  const held = review();
+  const f = fixture({ prepare: async () => status(A, { phase: "review_ready", review: held }),
+    confirm: async () => { throw new Error("unavailable after submission"); }, discard: async () => status() });
+  await settle();
+  await f.store.prepare(proposal().id);
+  expect(f.store.state.status.review).toEqual(held);
+  expect(f.store.canRefresh()).toBe(false);
+  expect(f.store.canConfirm()).toBe(true);
+  await f.store.confirm();
+  expect(f.calls.at(-1)).toEqual(["confirm", A.agent, A.account, "owner-1", held.id]);
+  expect(f.store.state.execution.result).toBeNull();
+  expect(f.store.state.execution.error).not.toBeNull();
+  f.handlers.status = async () => status(A, { phase: "review_ready", review: held });
+  await f.store.readStatus(); await f.store.confirm();
+  f.store.stop(); f.store.setBinding(A); f.store.start(); await settle(); await f.store.confirm();
+  expect(f.calls.filter(call => call[0] === "confirm")).toHaveLength(1);
+  f.store.stop();
+});
+
+test("expired pricing review can be discarded but never confirmed; mismatched identity is rejected", async () => {
+  const held = review(); held.display.expires_at_ms = NOW;
+  const f = fixture({ status: async () => status(A, { phase: "review_ready", review: held }),
+    confirm: async () => status(), discard: async () => status() });
+  await settle();
+  expect(f.store.canConfirm()).toBe(false);
+  expect(f.store.canDiscard()).toBe(true);
+  await f.store.discard();
+  expect(f.calls.at(-1)).toEqual(["discard", A.agent, A.account, "owner-1", held.id]);
+  f.handlers.status = async () => status(A, { phase: "review_ready", review: { ...review(), owner_id: "other" } });
+  await f.store.readStatus();
+  expect(f.store.state.error).toContain("identity");
+  expect(f.store.canConfirm()).toBe(false);
+  f.store.stop();
+});
+
+test("preparing and discarding another review preserve unresolved confirmation; consumed queue needs refresh", async () => {
+  const earlier = { review_id: "older", proposal_id: "older-proposal", at_ms: NOW, result: null, error: { message: "submission unknown", data: { cloid: "0x02" } } };
+  const f = fixture({ status: async () => status(A, { confirmation: earlier }),
+    prepare: async () => status(A, { phase: "review_ready", review: review(), confirmation: earlier }),
+    discard: async () => status(A, { confirmation: earlier }),
+    confirm: async () => status(A, { phase: "idle", observed_at_ms: null, review: review(), confirmation: {
+      review_id: review().id, proposal_id: proposal().id, at_ms: NOW, result: { status: "resting", cloid: "0x01" }, error: null } }) });
+  await settle(); await f.store.prepare(proposal().id);
+  expect(f.store.state.execution).toEqual(earlier);
+  await f.store.discard();
+  expect(f.store.state.execution).toEqual(earlier);
+  await f.store.prepare(proposal().id); await f.store.confirm();
+  expect(f.store.state.status.observed_at_ms).toBeNull();
+  expect(f.store.canPrepare(proposal().id)).toBe(false);
+  expect(f.store.canReject(proposal().id)).toBe(false);
+  expect(f.store.canConfirm()).toBe(false);
+  expect(f.store.canRefresh()).toBe(true);
+  f.store.stop();
+});
+
+test("timed out confirmation retains slot and unrelated cached result cannot erase its uncertainty", async () => {
+  const hung = deferred(); const held = review();
+  const f = fixture({ status: async () => status(A, { phase: "review_ready", review: held }), confirm: () => hung.promise });
+  await settle(); const confirming = f.store.confirm(); f.fire(5000);
+  expect(f.store.state.execution.error).not.toBeNull();
+  await f.store.readStatus(); await f.store.confirm();
+  expect(f.calls).toHaveLength(2);
+  hung.resolve(status()); await confirming;
+  f.handlers.status = async () => status(A, { confirmation: { review_id: "older", proposal_id: "older", at_ms: NOW, result: { status: "filled" }, error: null } });
+  await f.store.readStatus();
+  expect(f.store.state.execution.review_id).toBe(held.id);
+  expect(f.store.state.execution.result).toBeNull();
+  f.handlers.status = async () => status(A, { confirmation: { review_id: held.id, proposal_id: proposal().id, at_ms: NOW, result: null, error: { code: -32000, data: { cloid: "0x01" } } } });
+  await f.store.readStatus();
+  expect(f.store.state.execution.error.data.cloid).toBe("0x01");
+  expect(f.calls.filter(call => call[0] === "confirm")).toHaveLength(1);
+  f.store.stop();
+});
 async function settle() { for (let i = 0; i < 6; i++) await Promise.resolve(); }
 function fixture(overrides = {}) {
   const calls = [];

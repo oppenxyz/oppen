@@ -1756,6 +1756,42 @@ impl Runtime {
         })
     }
 
+    pub(crate) fn prepare_approval_review(
+        &self,
+        agent: String,
+        account: String,
+        owner_id: String,
+        proposal_id: String,
+    ) -> Result<ApprovalQueueStatus, RuntimeError> {
+        self.with_approval_queue(agent, account, |queue, binding| {
+            queue.prepare(binding, &owner_id, proposal_id)
+        })
+    }
+
+    pub(crate) fn confirm_approval_review(
+        &self,
+        agent: String,
+        account: String,
+        owner_id: String,
+        review_id: String,
+    ) -> Result<ApprovalQueueStatus, RuntimeError> {
+        self.with_approval_queue(agent, account, |queue, binding| {
+            queue.confirm(binding, &owner_id, review_id)
+        })
+    }
+
+    pub(crate) fn discard_approval_review(
+        &self,
+        agent: String,
+        account: String,
+        owner_id: String,
+        review_id: String,
+    ) -> Result<ApprovalQueueStatus, RuntimeError> {
+        self.with_approval_queue(agent, account, |queue, binding| {
+            queue.discard(binding, &owner_id, &review_id)
+        })
+    }
+
     pub(super) fn launch_mcp<F, Fut>(
         &self,
         agent: String,

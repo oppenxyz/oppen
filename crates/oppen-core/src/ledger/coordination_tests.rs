@@ -79,6 +79,7 @@ fn alternate_path(path: &Path) -> PathBuf {
 
 fn order(ledger: &Arc<Ledger>, id: u8, account: Address) -> Clearance {
     let clearance = Clearance {
+        approval_review_digest: None,
         policy_revision: crate::ledger::tests::AUDIT_POLICY_REVISION,
         route: audit_route(AgentId::new("coordination-agent"), account, 100),
         agent: AgentId::new("coordination-agent"),

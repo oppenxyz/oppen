@@ -11,6 +11,30 @@ decisions" section until then.
 
 ---
 
+## 2026-09-08 · Retained native approval review
+
+ES29 implements spec items 18, 19, 28 and 32 using the existing gateway and
+desktop owner. Core prepares an opaque, non-cloneable review from authenticated
+proposal evidence and fresh context without consuming the proposal or returning
+signing authority. Market repricing preserves original semantics; explicit
+limit/TIF and trigger/TPSL constraints remain fixed. Unknown historical origins
+are never inferred as market orders. Confirmation pins the full rounded action,
+original route, displayed current policy and original expiry, not caller-edited
+fields or a stale clearance alone. New claim evidence must authenticate this
+commitment and match the actual audit receipt, preserving historical bytes.
+
+Native work must use actual server admission/drain and a live exact-binding
+pairing lease. Preparation selects the earliest-issued live pairing for the
+exact agent/account, displays its ID and pins that specific lease; confirmation
+never substitutes another pairing. This is same-binding authorization, not
+originating-token provenance (proposals do not retain a token ID).
+Retained account reservation and worker ownership outlive a lost
+IPC waiter. Revocation and shutdown are rechecked before signing; uncertainty
+retains reconciliation evidence. No second signer/submission path or MCP approval
+tool is introduced. Queue/review/confirm UI must distinguish recorded approval
+from submission, venue acceptance and fills. This decision authorizes code and
+synthetic verification only; all dedicated-account and publication gates remain.
+
 ## 2026-09-08 · Desktop QA type boundary
 
 | # | Decision | Choice | Why, and what was rejected |

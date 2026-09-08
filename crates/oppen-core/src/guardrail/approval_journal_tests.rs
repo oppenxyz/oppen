@@ -1,5 +1,8 @@
 use super::*;
 
+#[path = "approval_review_tests.rs"]
+mod approval_review_tests;
+
 use std::path::Path;
 use std::sync::atomic::AtomicU64;
 

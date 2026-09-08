@@ -168,7 +168,8 @@ CREATE INDEX events_submission_account
 // V8 requires authenticated pilot consent; legacy history is never auto-adopted.
 // V9 requires authenticated, one-shot approval lifecycle authority.
 // V10: older writers cannot preserve original request evidence in approvals.
-const MIGRATIONS: &[&str] = &[V1, V2, V3, "", "", "", "", "", "", ""];
+// V11: reviewed candidate commitments and their actual receipt binding.
+const MIGRATIONS: &[&str] = &[V1, V2, V3, "", "", "", "", "", "", "", ""];
 
 pub(super) const CURRENT_VERSION: usize = MIGRATIONS.len();
 

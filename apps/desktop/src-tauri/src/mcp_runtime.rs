@@ -395,7 +395,11 @@ where
         bound.supervision_control(),
         status.clone(),
     );
-    let approvals = ApprovalQueueControl::new(prepared.engine.clone(), prepared.binding.clone())?;
+    let approvals = ApprovalQueueControl::with_operator(
+        prepared.engine.clone(),
+        prepared.binding.clone(),
+        bound.operator_control(),
+    )?;
     let (pool, mut events) = pool().map_err(|error| error.to_string())?;
     let pool = Arc::new(pool);
     let (pump_stop, stopping) = oneshot::channel();
@@ -667,6 +671,13 @@ mod tests {
         requests: Arc<Mutex<Vec<LocalRequest>>>,
         stop: CancellationToken,
         task: Option<tokio::task::JoinHandle<()>>,
+        info_gate: Arc<Mutex<Option<InfoGate>>>,
+    }
+
+    struct InfoGate {
+        kind: &'static str,
+        entered: oneshot::Sender<()>,
+        released: oneshot::Receiver<()>,
     }
 
     struct LocalRequest {
@@ -676,12 +687,20 @@ mod tests {
 
     impl LocalVenue {
         async fn start() -> Self {
+            Self::start_with_pending_handshake(false).await
+        }
+
+        // Controller tests exercise REST-reconciled state without injecting a
+        // socket outage. This does not pretend that account subscriptions are live.
+        async fn start_with_pending_handshake(pending_handshake: bool) -> Self {
             let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
             let port = listener.local_addr().unwrap().port();
             let stop = CancellationToken::new();
             let stopping = stop.clone();
             let requests = Arc::new(Mutex::new(Vec::new()));
             let recorded = requests.clone();
+            let info_gate = Arc::new(Mutex::new(None::<InfoGate>));
+            let gates = info_gate.clone();
             let task = tokio::spawn(async move {
                 let mut clients = tokio::task::JoinSet::new();
                 loop {
@@ -691,6 +710,8 @@ mod tests {
                         client = listener.accept() => {
                             let (socket, _) = client.unwrap();
                             let recorded = recorded.clone();
+                            let gates = gates.clone();
+                            let stopped = stopping.clone();
                             clients.spawn(async move {
                                 let mut socket = BufReader::new(socket);
                                 let mut line = String::new();
@@ -712,12 +733,24 @@ mod tests {
                                 let mut body = vec![0; length];
                                 socket.read_exact(&mut body).await.unwrap();
                                 recorded.lock().unwrap().push(LocalRequest { path: path.clone(), body: body.clone() });
+                                if websocket && pending_handshake {
+                                    stopped.cancelled().await;
+                                    return;
+                                }
                                 let (code, response) = if websocket {
                                     // No public venue, and no fictional healthy account socket.
                                     ("503 Service Unavailable", String::new())
                                 } else {
                                     assert_eq!(path, "/info", "unexpected venue operation");
                                     let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                                    let gate = {
+                                        let mut gates = gates.lock().unwrap();
+                                        if gates.as_ref().is_some_and(|gate| request["type"] == gate.kind) { gates.take() } else { None }
+                                    };
+                                    if let Some(gate) = gate {
+                                        let _ = gate.entered.send(());
+                                        let _ = gate.released.await;
+                                    }
                                     ("200 OK", Self::info(request).to_string())
                                 };
                                 let response = format!("HTTP/1.1 {code}\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{response}", response.len());
@@ -738,6 +771,7 @@ mod tests {
                 requests,
                 stop,
                 task: Some(task),
+                info_gate,
             }
         }
 
@@ -1236,6 +1270,517 @@ mod tests {
         assert!(status_lock(&status).listener.is_none());
         // The failed startup released the exclusive pairing owner.
         fixture.prepare().unwrap();
+    }
+
+    fn controller_proposal(prepared: &Prepared) -> String {
+        use oppen_core::guardrail::{
+            AccountSnapshot, Exposure, FeedQuality, KillScope, MarketRef, OrderIntent, Refusal,
+            RestingExposure,
+        };
+        use oppen_hl::wire::{Cloid, Grouping, Tif};
+        let at = u64::try_from(now_ms()).unwrap();
+        let engine = &prepared.engine;
+        let agent = &prepared.binding.agent;
+        let mut config = engine.guardrails(agent).unwrap();
+        config.symbols.insert("TEST".into());
+        config.approval_required = true;
+        engine.operator_set_guardrails(agent, config, at).unwrap();
+        engine
+            .operator_release_kill(&KillScope::Global, at)
+            .unwrap();
+        engine
+            .operator_acknowledge_policy(engine.policy_observation().unwrap(), at)
+            .unwrap();
+        let intent = OrderIntent {
+            symbol: "TEST".into(),
+            is_buy: true,
+            px: 100.into(),
+            sz: "0.12".parse().unwrap(),
+            kind: oppen_hl::order::OrderKind::Limit { tif: Tif::Gtc },
+            reduce_only: false,
+            cloid: Some(Cloid::from_bytes([121; 16])),
+            grouping: Grouping::Na,
+            builder: None,
+            max_slippage_bps: None,
+            reason: "native retained review fixture".into(),
+            original: None,
+        };
+        let asset = oppen_hl::meta::Asset {
+            index: 0,
+            info: oppen_hl::types::AssetInfo {
+                name: "TEST".into(),
+                sz_decimals: 2,
+                max_leverage: 10,
+                margin_table_id: 0,
+                is_delisted: false,
+                only_isolated: false,
+            },
+        };
+        let market = MarketRef {
+            symbol: "TEST".into(),
+            reference_px: Some(100.into()),
+            as_of_ms: at,
+            quality: FeedQuality::Ok,
+            mark_divergence_bps: None,
+            mark_divergent_since_ms: None,
+            snapshot: None,
+            sigma_day: None,
+            vol_ratio: None,
+        };
+        let exposure = Exposure {
+            account: prepared.binding.account,
+            fleet: None,
+            agent: AccountSnapshot {
+                as_of_ms: at,
+                reconciled: true,
+                equity_usd: 100.into(),
+                peak_equity_usd: 100.into(),
+                realized_pnl_today_usd: 0.into(),
+                unrealized_pnl_usd: 0.into(),
+                day_start_ms: at / 86_400_000 * 86_400_000,
+                total_position_notional_usd: 0.into(),
+                positions: Default::default(),
+                resting: Some(RestingExposure {
+                    buys: Default::default(),
+                    sells: Default::default(),
+                    reduce_buys: Default::default(),
+                    reduce_sells: Default::default(),
+                    notional_by_symbol: Default::default(),
+                    notional_usd: 0.into(),
+                }),
+            },
+        };
+        match engine.evaluate(agent, &intent, &asset, &market, &exposure, at) {
+            Err(Refusal::ApprovalRequired { approval_id, .. }) => approval_id,
+            other => panic!("expected durable pending proposal: {other:?}"),
+        }
+    }
+
+    async fn controller_settled(
+        queue: &ApprovalQueueControl,
+        binding: &Binding,
+    ) -> crate::operator_approvals::ApprovalQueueStatus {
+        use crate::operator_approvals::QueuePhase;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let status = queue.status(binding).unwrap();
+                if !matches!(
+                    status.phase,
+                    QueuePhase::Refreshing
+                        | QueuePhase::Reviewing
+                        | QueuePhase::Confirming
+                        | QueuePhase::Rejecting
+                ) {
+                    // The supervisor publishes status immediately before returning.
+                    tokio::task::yield_now().await;
+                    return status;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("native controller work must finish")
+    }
+
+    async fn controller_reconciled(feed: &FeedSession) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let state = feed.state();
+                assert!(state.failure.is_none(), "{state:?}");
+                if state.reconciled {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("actual startup reconcile must complete");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn native_controller_retains_review_wrong_id_and_one_shot_refused_confirmation() {
+        use crate::operator_approvals::QueuePhase;
+        let fixture = Fixture::authorized();
+        let venue = LocalVenue::start_with_pending_handshake(true).await;
+        let mut prepared = fixture.prepare().unwrap();
+        let id = controller_proposal(&prepared);
+        let engine = prepared.engine.clone();
+        let ledger = prepared.ledger.clone();
+        let feed = prepared.feed.clone();
+        prepared.gateway = prepared.gateway.with_loopback_fixture(venue.port).unwrap();
+        let port = venue.port;
+        let mut owned = OwnedMcp::launch(
+            prepared,
+            0,
+            FixtureSource,
+            move || WsPool::loopback_fixture(port),
+            Arc::new(Mutex::new(McpStatus::starting(&fixture.binding))),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        controller_reconciled(&feed).await;
+        let queue = owned.approvals().unwrap().clone();
+        drop(queue.refresh(&fixture.binding).unwrap());
+        let refreshed = controller_settled(&queue, &fixture.binding).await;
+        assert_eq!(refreshed.phase, QueuePhase::Ready);
+        assert_eq!(refreshed.pending.len(), 1);
+        drop(
+            queue
+                .prepare(&fixture.binding, &refreshed.owner_id, id.clone())
+                .unwrap(),
+        );
+        let reviewed = controller_settled(&queue, &fixture.binding).await;
+        assert_eq!(reviewed.phase, QueuePhase::ReviewReady, "{reviewed:?}");
+        let review = reviewed.review.unwrap();
+        assert_eq!(review.display.proposal_id, id);
+        assert!(
+            queue
+                .confirm(&fixture.binding, &review.owner_id, "wrong-review".into())
+                .is_err()
+        );
+        assert_eq!(
+            queue.status(&fixture.binding).unwrap().review.unwrap().id,
+            review.id
+        );
+        engine
+            .operator_engage_kill(
+                oppen_core::guardrail::KillScope::Agent {
+                    agent: fixture.binding.agent.clone(),
+                },
+                oppen_core::guardrail::KillReason::Operator,
+                u64::try_from(now_ms()).unwrap(),
+            )
+            .unwrap();
+        // Discard the IPC observation, not the controller-owned operation.
+        drop(
+            queue
+                .confirm(&fixture.binding, &review.owner_id, review.id.clone())
+                .unwrap(),
+        );
+        let confirmed = controller_settled(&queue, &fixture.binding).await;
+        assert_eq!(confirmed.phase, QueuePhase::Idle, "{confirmed:?}");
+        assert!(confirmed.observed_at_ms.is_none());
+        let outcome = confirmed.confirmation.unwrap();
+        assert_eq!(outcome.review_id, review.id);
+        assert_eq!(outcome.result.unwrap()["status"], "rejected");
+        assert!(
+            queue
+                .confirm(&fixture.binding, &review.owner_id, review.id.clone())
+                .is_err()
+        );
+        let rows = ledger.get_events(0, 1000).unwrap().events;
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.kind == oppen_core::ledger::EventKind::ApprovalClaimed)
+                .count(),
+            0
+        );
+        assert!(
+            !rows
+                .iter()
+                .any(|row| row.kind == oppen_core::ledger::EventKind::SubmissionStarted)
+        );
+        // A policy change refuses before claim; the native review alone is consumed.
+        assert_eq!(
+            engine
+                .pending_proposals(u64::try_from(now_ms()).unwrap())
+                .unwrap()
+                .len(),
+            1
+        );
+        tokio::time::timeout(Duration::from_secs(5), owned.shutdown_and_drain())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            venue
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|request| request.path != "/exchange")
+        );
+        venue.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn native_controller_close_during_prepare_or_confirm_drains_without_restoring_capability()
+    {
+        use crate::operator_approvals::QueuePhase;
+        for confirming in [false, true] {
+            let fixture = Fixture::authorized();
+            let venue = LocalVenue::start_with_pending_handshake(true).await;
+            let mut prepared = fixture.prepare().unwrap();
+            let id = controller_proposal(&prepared);
+            let feed = prepared.feed.clone();
+            prepared.gateway = prepared.gateway.with_loopback_fixture(venue.port).unwrap();
+            let port = venue.port;
+            let mut owned = OwnedMcp::launch(
+                prepared,
+                0,
+                FixtureSource,
+                move || WsPool::loopback_fixture(port),
+                Arc::new(Mutex::new(McpStatus::starting(&fixture.binding))),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            controller_reconciled(&feed).await;
+            let queue = owned.approvals().unwrap().clone();
+            queue.refresh(&fixture.binding).unwrap();
+            let refreshed = controller_settled(&queue, &fixture.binding).await;
+            let retained = if confirming {
+                queue
+                    .prepare(&fixture.binding, &refreshed.owner_id, id.clone())
+                    .unwrap();
+                let reviewed = controller_settled(&queue, &fixture.binding).await;
+                assert_eq!(reviewed.phase, QueuePhase::ReviewReady, "{reviewed:?}");
+                Some(reviewed.review.unwrap())
+            } else {
+                None
+            };
+            let (entered, entering) = oneshot::channel();
+            let (release, released) = oneshot::channel();
+            *venue.info_gate.lock().unwrap() = Some(InfoGate {
+                kind: if confirming {
+                    "clearinghouseState"
+                } else {
+                    "metaAndAssetCtxs"
+                },
+                entered,
+                released,
+            });
+            if let Some(review) = &retained {
+                drop(
+                    queue
+                        .confirm(&fixture.binding, &review.owner_id, review.id.clone())
+                        .unwrap(),
+                );
+            } else {
+                drop(
+                    queue
+                        .prepare(&fixture.binding, &refreshed.owner_id, id)
+                        .unwrap(),
+                );
+            }
+            tokio::time::timeout(Duration::from_secs(5), entering)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(30), owned.shutdown_and_drain())
+                    .await
+                    .is_err()
+            );
+            if !confirming {
+                assert!(queue.status(&fixture.binding).unwrap().review.is_none());
+            }
+            release.send(()).unwrap();
+            tokio::time::timeout(Duration::from_secs(5), owned.shutdown_and_drain())
+                .await
+                .unwrap()
+                .unwrap();
+            let closed = queue.status(&fixture.binding).unwrap();
+            assert_eq!(closed.phase, QueuePhase::Closed);
+            if let Some(review) = retained {
+                assert!(
+                    queue
+                        .confirm(&fixture.binding, &review.owner_id, review.id.clone())
+                        .is_err()
+                );
+                assert!(
+                    queue
+                        .discard(&fixture.binding, &review.owner_id, &review.id)
+                        .is_err()
+                );
+                assert!(closed.confirmation.unwrap().error.is_some());
+            } else {
+                assert!(closed.review.is_none());
+                assert!(closed.confirmation.is_none());
+            }
+            assert!(
+                queue
+                    .prepare(&fixture.binding, &refreshed.owner_id, "again".into())
+                    .is_err()
+            );
+            venue.shutdown().await;
+        }
+    }
+
+    #[derive(Debug)]
+    struct PanicClaimAnchor {
+        inner: oppen_core::ledger::FileAnchor,
+        panic_seq: Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    impl oppen_core::ledger::HeadAnchor for PanicClaimAnchor {
+        fn load(
+            &self,
+        ) -> Result<Option<oppen_core::ledger::Anchor>, oppen_core::ledger::LedgerError> {
+            oppen_core::ledger::HeadAnchor::load(&self.inner)
+        }
+        fn store(
+            &self,
+            anchor: &oppen_core::ledger::Anchor,
+        ) -> Result<(), oppen_core::ledger::LedgerError> {
+            oppen_core::ledger::HeadAnchor::store(&self.inner, anchor)?;
+            assert_ne!(
+                anchor.seq,
+                self.panic_seq.load(std::sync::atomic::Ordering::SeqCst),
+                "synthetic post-claim publication panic"
+            );
+            Ok(())
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn native_controller_post_claim_worker_panic_is_terminal_and_consumed_on_reopen() {
+        use crate::operator_approvals::QueuePhase;
+        let fixture = Fixture::authorized();
+        let venue = LocalVenue::start_with_pending_handshake(true).await;
+        let mut prepared = fixture.prepare().unwrap();
+        let path = fixture
+            .dir
+            .path()
+            .join(oppen_core::db_file_name(Network::Testnet));
+        let panic_seq = Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
+        let ledger = Arc::new(
+            Ledger::open_anchored(
+                &path,
+                Network::Testnet,
+                Some(Box::new(PanicClaimAnchor {
+                    inner: oppen_core::ledger::FileAnchor::beside(&path),
+                    panic_seq: panic_seq.clone(),
+                })),
+            )
+            .unwrap(),
+        );
+        let registry = Arc::new(
+            RegistryJournal::open(ledger.clone(), Arc::new(HmacKey::from_bytes([11; 32]))).unwrap(),
+        );
+        prepared.engine = Arc::new(
+            GuardrailEngine::new_supervised_alpha(
+                Arc::new(PolicyJournal::new(registry)),
+                Arc::new(FixtureKeys),
+            )
+            .unwrap(),
+        );
+        prepared.ledger = ledger.clone();
+        prepared.gateway = Gateway::new(
+            Network::Testnet,
+            prepared.engine.clone(),
+            EventViews::new(ledger),
+            Arc::new(Journal::open(fixture.dir.path().join("journal-testnet.db")).unwrap()),
+            prepared.feed.clone(),
+            prepared.alerts.clone(),
+            prepared.quotes.clone(),
+        )
+        .unwrap()
+        .with_loopback_fixture(venue.port)
+        .unwrap();
+        let id = controller_proposal(&prepared);
+        let feed = prepared.feed.clone();
+        let port = venue.port;
+        let mut owned = OwnedMcp::launch(
+            prepared,
+            0,
+            FixtureSource,
+            move || WsPool::loopback_fixture(port),
+            Arc::new(Mutex::new(McpStatus::starting(&fixture.binding))),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        controller_reconciled(&feed).await;
+        let queue = owned.approvals().unwrap().clone();
+        queue.refresh(&fixture.binding).unwrap();
+        let refreshed = controller_settled(&queue, &fixture.binding).await;
+        queue
+            .prepare(&fixture.binding, &refreshed.owner_id, id.clone())
+            .unwrap();
+        let reviewed = controller_settled(&queue, &fixture.binding).await;
+        assert_eq!(reviewed.phase, QueuePhase::ReviewReady, "{reviewed:?}");
+        let review = reviewed.review.unwrap();
+        let observer = Ledger::open_at(&path, Network::Testnet).unwrap();
+        panic_seq.store(
+            observer.chain_head().unwrap().seq + 1,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        drop(
+            queue
+                .confirm(&fixture.binding, &review.owner_id, review.id.clone())
+                .unwrap(),
+        );
+        let failed = controller_settled(&queue, &fixture.binding).await;
+        assert_eq!(failed.phase, QueuePhase::RecoveryRequired, "{failed:?}");
+        assert_eq!(
+            failed
+                .confirmation
+                .as_ref()
+                .unwrap()
+                .error
+                .as_ref()
+                .unwrap()["data"]["code"],
+            "worker_failed"
+        );
+        assert!(
+            queue
+                .prepare(&fixture.binding, &review.owner_id, id)
+                .is_err()
+        );
+        assert!(
+            queue
+                .confirm(&fixture.binding, &review.owner_id, review.id.clone())
+                .is_err()
+        );
+        assert!(
+            queue
+                .discard(&fixture.binding, &review.owner_id, &review.id)
+                .is_err()
+        );
+        let rows = observer.get_events(0, 1000).unwrap().events;
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.kind == oppen_core::ledger::EventKind::ApprovalClaimed)
+                .count(),
+            1
+        );
+        assert!(
+            !rows
+                .iter()
+                .any(|row| row.kind == oppen_core::ledger::EventKind::SubmissionStarted)
+        );
+        // Drain may report the poisoned authority, but must finish all owned work.
+        let _ = tokio::time::timeout(Duration::from_secs(5), owned.shutdown_and_drain())
+            .await
+            .unwrap();
+        drop(queue);
+        drop(owned);
+        let reopened = Arc::new(Ledger::open_at(&path, Network::Testnet).unwrap());
+        let registry = Arc::new(
+            RegistryJournal::open(reopened, Arc::new(HmacKey::from_bytes([11; 32]))).unwrap(),
+        );
+        let engine = GuardrailEngine::new_supervised_alpha(
+            Arc::new(PolicyJournal::new(registry)),
+            Arc::new(FixtureKeys),
+        )
+        .unwrap();
+        assert!(
+            engine
+                .pending_proposals(u64::try_from(now_ms()).unwrap())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            venue
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|request| request.path != "/exchange")
+        );
+        venue.shutdown().await;
     }
 
     #[tokio::test]
