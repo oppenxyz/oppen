@@ -14,7 +14,7 @@ mock.module('../lib/bridge', () => ({
   fetchMarketSnapshot: (_network, symbol) => new Promise(resolve => pendingSnapshots.set(symbol, resolve)),
   fetchChartSeries: async (_network, symbol, interval) => ({ symbol, interval, interval_ms: 3600000, price_decimals: 2, closed: [] }),
 }));
-const { operator, refreshOperator, recordedAgents } = await import('./operator');
+const { operator, refreshOperator, recordedAgents, storedPolicy, policySourceLabel } = await import('./operator');
 const { shell, refreshAccount, setNetwork } = await import('./shell');
 const { market, select, refreshSnapshot, applyFeed } = await import('./market');
 const snapshot = (symbol, at) => ({ symbol, as_of_ms: at, bids: [], asks: [], book: { depth: [] }, funding: {}, vol: {} });
@@ -99,16 +99,19 @@ describe('operator source reads', () => {
     expect(operator.ledger).toBe(null);
     expect(operator.policy).toBe(null);
     const ledger = { events: [{ seq: 1, ts_ms: 1000, kind: 'refusal', agent_id: 'alpha', payload: { reason: '<b>claim</b>' } }], head_seq: 1, next_cursor: 1, resync_required: false };
-    const policy = { guardrails: { alpha: {} }, account_limits: {}, kill: { global: null, agents: {} } };
+    const policy = { provenance: 'unverified_legacy', revision: null, observed_at_ms: 1234, state: { guardrails: { alpha: {} }, account_limits: {}, kill: { global: null, agents: {} } } };
     operatorRead = async () => ({ network: 'testnet', ledger: { status: 'ready', value: ledger }, policy: { status: 'ready', value: policy } });
     await refreshOperator();
     expect(recordedAgents.value).toEqual(['alpha']);
+    expect(policySourceLabel.value).toBe('Unverified legacy policy');
+    expect(operator.policyReadMs).toBe(1234);
     expect(operator.ledger.events[0].payload.reason).toBe('<b>claim</b>');
     const policyRead = operator.policyReadMs;
     operatorRead = async () => ({ network: 'testnet', ledger: { status: 'ready', value: { ...ledger, head_seq: 2 } }, policy: { status: 'unavailable', detail: 'Policy file unavailable.' } });
     await refreshOperator();
     expect(operator.ledger.head_seq).toBe(2);
-    expect(operator.policy.guardrails).toEqual({ alpha: {} });
+    expect(storedPolicy.value.guardrails).toEqual({ alpha: {} });
+    expect(operator.policy.provenance).toBe('unverified_legacy');
     expect(operator.policyReadMs).toBe(policyRead);
     expect(operator.policyError).toBe('Policy file unavailable.');
     operatorRead = async () => { throw { kind: 'local_status', detail: 'Reader failed.' }; };

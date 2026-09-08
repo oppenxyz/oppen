@@ -115,7 +115,13 @@ export interface StoredPolicy {
 export interface OperatorRead {
   network: "testnet" | "mainnet";
   ledger: SourceRead<EventPage>;
-  policy: SourceRead<StoredPolicy>;
+  policy: SourceRead<PolicyInspection>;
+}
+export interface PolicyInspection {
+  provenance: "unverified_legacy" | "unverified_ledger";
+  revision: number | null;
+  observed_at_ms: number;
+  state: StoredPolicy;
 }
 export async function fetchOperatorState(network: "testnet" | "mainnet"): Promise<OperatorRead> {
   return invoke<OperatorRead>("operator_state", { network });

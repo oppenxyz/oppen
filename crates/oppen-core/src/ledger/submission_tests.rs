@@ -21,6 +21,7 @@ fn account(n: u8) -> Address {
 
 fn clearance(n: u8) -> Clearance {
     Clearance {
+        policy_revision: crate::ledger::tests::AUDIT_POLICY_REVISION,
         route: audit_route(AgentId::new("agent-a"), account(1), 100),
         agent: AgentId::new("agent-a"),
         vault_address: None,
@@ -464,10 +465,19 @@ fn raw(ledger: &Ledger, kind: EventKind, payload: Value, key: &str) {
 
 #[test]
 fn a_prior_pending_intent_without_route_is_never_released_on_reopen() {
+    prior_pending_survives_upgrade_without("route");
+}
+
+#[test]
+fn v6_pending_without_policy_revision_is_preserved_and_never_auto_released() {
+    prior_pending_survives_upgrade_without("policy_revision");
+}
+
+fn prior_pending_survives_upgrade_without(missing: &str) {
     let (dir, ledger, journal) = fixture();
     let order = clearance(1);
     let mut legacy = serde_json::to_value(&order).unwrap();
-    legacy.as_object_mut().unwrap().remove("route");
+    legacy.as_object_mut().unwrap().remove(missing);
     let intent = ledger
         .record_intent(&super::super::NewIntent {
             agent_id: "agent-a",
@@ -495,10 +505,23 @@ fn a_prior_pending_intent_without_route_is_never_released_on_reopen() {
     persist(&ledger, &next);
     let before = ledger.get_events(0, 100).unwrap().events;
     let head = ledger.chain_head().unwrap();
+    ledger
+        .lock()
+        .unwrap()
+        .pragma_update(None, "user_version", 6)
+        .unwrap();
     drop(journal);
     drop(ledger);
 
     let ledger = Arc::new(Ledger::open(dir.path(), Network::Testnet).unwrap());
+    assert_eq!(
+        ledger
+            .lock()
+            .unwrap()
+            .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+            .unwrap(),
+        7
+    );
     let journal = SubmissionJournal::new(ledger.clone());
     // A stricter typed reader may refuse this legacy intent. Neither reader
     // may reinterpret missing authority as evidence that the order was not sent.
@@ -514,6 +537,35 @@ fn a_prior_pending_intent_without_route_is_never_released_on_reopen() {
     assert_eq!(ledger.get_events(0, 100).unwrap().events, before);
     assert_eq!(ledger.chain_head().unwrap(), head);
     assert!(ledger.verify().unwrap().is_intact());
+}
+
+#[test]
+fn policy_revision_is_payload_not_the_account_submission_revision() {
+    let (dir, ledger, journal) = fixture();
+    let mut order = clearance(1);
+    order.policy_revision = 901;
+    persist(&ledger, &order);
+    // No submissions exist for this account: its revision is zero regardless
+    // of the independently supplied audit-only policy revision.
+    let receipt = journal.begin(account(1), &order, 0, 101).unwrap();
+    assert_ne!(receipt.seq, order.policy_revision);
+    let intent = ledger.event(receipt.start.intent_seq).unwrap().unwrap();
+    assert_eq!(
+        intent.payload.as_ref().unwrap()["policy_revision"],
+        json!(901)
+    );
+    let before = ledger.get_events(0, 100).unwrap().events;
+    let head = ledger.chain_head().unwrap();
+    drop(journal);
+    drop(ledger);
+    let ledger = Arc::new(Ledger::open(dir.path(), Network::Testnet).unwrap());
+    let state = SubmissionJournal::new(ledger.clone())
+        .state(account(1))
+        .unwrap();
+    assert_eq!(state.revision, receipt.seq);
+    assert_eq!(state.pending.unwrap().cloid(), &receipt.start.cloid);
+    assert_eq!(ledger.get_events(0, 100).unwrap().events, before);
+    assert_eq!(ledger.chain_head().unwrap(), head);
 }
 
 #[test]
@@ -664,7 +716,7 @@ fn v2_upgrade_preserves_existing_events_hashes_and_head() {
             .unwrap()
             .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0),)
             .unwrap(),
-        6
+        7
     );
     let index_count: i64 = upgraded.lock().unwrap().query_row(
         "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'index' AND name = 'events_submission_account'",

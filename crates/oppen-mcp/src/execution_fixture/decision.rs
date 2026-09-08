@@ -53,6 +53,139 @@ fn request(
     request.body(Body::from(value.to_string())).unwrap()
 }
 
+#[tokio::test]
+async fn timed_out_policy_refresh_reports_retry_without_releasing_singleflight() {
+    let dir = tempfile::tempdir().unwrap();
+    let venue = Venue::start().await;
+    let keys = Arc::new(FixtureKeys::default());
+    let anchor = Arc::new(HeldAnchor::default());
+    let runtime = Runtime::open_with_anchor(
+        dir.path(),
+        venue.port(),
+        keys.clone(),
+        Some(Box::new(AnchorHandle(anchor.clone()))),
+    )
+    .await;
+    runtime.activate_orders().await;
+    let (release, wait) = std::sync::mpsc::channel();
+    *anchor.wait.lock().unwrap() = Some(wait);
+    let gateway = runtime.gateway.clone();
+    let tracker = runtime.tracker();
+    let sweep = tokio::spawn(async move { gateway.enforce_pauses(&[], tracker).await });
+    timeout(Duration::from_secs(2), anchor.entered.notified())
+        .await
+        .unwrap();
+    assert!(matches!(
+        timeout(Duration::from_secs(6), sweep)
+            .await
+            .unwrap()
+            .unwrap(),
+        Err(ToolError::Unavailable {
+            what: "decision timeout",
+            ..
+        })
+    ));
+    assert_eq!(runtime.gateway.inner.decision_worker.available_permits(), 0);
+    assert!(matches!(
+        runtime.gateway.enforce_pauses(&[], runtime.tracker()).await,
+        Err(ToolError::Unavailable {
+            what: "decision worker busy",
+            ..
+        })
+    ));
+    release.send(()).unwrap();
+    timeout(Duration::from_secs(2), async {
+        while runtime.gateway.inner.decision_worker.available_permits() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(venue.submissions().is_empty());
+    assert!(keys.read_heads.lock().unwrap().is_empty());
+    runtime.shutdown().await;
+    venue.shutdown().await;
+}
+
+#[tokio::test]
+async fn blocked_supervisor_policy_refresh_retains_owner_until_shutdown_drain() {
+    let dir = tempfile::tempdir().unwrap();
+    let venue = Venue::start().await;
+    let keys = Arc::new(FixtureKeys::default());
+    let anchor = Arc::new(HeldAnchor::default());
+    let runtime = Runtime::open_with_anchor(
+        dir.path(),
+        venue.port(),
+        keys.clone(),
+        Some(Box::new(AnchorHandle(anchor.clone()))),
+    )
+    .await;
+    runtime.activate_orders().await;
+    assert!(runtime.request("DELETE", None).await.status().is_success());
+    let gateway = runtime.gateway.clone();
+    let ledger = runtime.ledger.clone();
+    let pairings = runtime.pairings.clone();
+    drop(runtime);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    let (release, wait) = std::sync::mpsc::channel();
+    *anchor.wait.lock().unwrap() = Some(wait);
+    let shutdown = CancellationToken::new();
+    let mut server = tokio::spawn(crate::server::serve(
+        addr.port(),
+        gateway.clone(),
+        pairings,
+        shutdown.clone(),
+    ));
+    timeout(Duration::from_secs(2), anchor.entered.notified())
+        .await
+        .expect("supervisor did not replay policy");
+    assert_eq!(gateway.inner.decision_worker.available_permits(), 0);
+    // The five-second refresh deadline must not release the worker or owner.
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    assert_eq!(gateway.inner.decision_worker.available_permits(), 0);
+    assert!(!server.is_finished());
+    let heartbeat = Request::builder()
+        .uri(crate::server::MCP_PATH)
+        .header("host", addr.to_string())
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        timeout(
+            Duration::from_millis(500),
+            transport::http_request(addr, heartbeat)
+        )
+        .await
+        .expect("refresh blocked async worker")
+        .0,
+        401
+    );
+    shutdown.cancel();
+    assert!(
+        timeout(Duration::from_millis(100), &mut server)
+            .await
+            .is_err(),
+        "serve returned before refresh drained"
+    );
+    let hmac = Arc::new(oppen_core::keys::HmacKey::from_bytes([77; 32]));
+    assert!(matches!(
+        PairingJournal::open(ledger.clone(), hmac.clone()),
+        Err(PairingError::AlreadyOwned)
+    ));
+    release.send(()).unwrap();
+    timeout(Duration::from_secs(2), server)
+        .await
+        .expect("refresh did not drain")
+        .unwrap()
+        .unwrap();
+    assert_eq!(gateway.inner.decision_worker.available_permits(), 1);
+    assert!(PairingJournal::open(ledger, hmac).is_ok());
+    assert!(venue.submissions().is_empty());
+    assert!(keys.read_heads.lock().unwrap().is_empty());
+    venue.shutdown().await;
+}
+
 async fn initialize(addr: std::net::SocketAddr, token: &str) -> String {
     let (status, headers, mut body) = transport::http_request(addr, request(addr, token, None, json!({
         "jsonrpc":"2.0", "id":1, "method":"initialize",
@@ -94,7 +227,7 @@ async fn post_lookup_decisions_keep_runtime_ownership_until_drain_without_backgr
             Some(Box::new(AnchorHandle(anchor.clone()))),
         )
         .await;
-        runtime.reconcile().await;
+        runtime.activate_orders().await;
         let bound = Binding {
             agent: AgentId::new("fixture-agent"),
             account: runtime.account,

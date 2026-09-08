@@ -39,6 +39,41 @@ use crate::ledger::{AuthorizedRoute, RegistryBinding};
 
 // ---- fixtures -----------------------------------------------------------
 
+fn test_store() -> MemoryStore {
+    let store = MemoryStore::new();
+    let revision = store.load().unwrap().revision;
+    store
+        .compare_exchange(revision, &PersistedState::default(), NOW_MS)
+        .unwrap();
+    store
+}
+
+fn initialize_policy(
+    registry: crate::ledger::RegistryJournal,
+    legacy: &std::path::Path,
+) -> Arc<crate::ledger::PolicyJournal> {
+    let policy = Arc::new(crate::ledger::PolicyJournal::new(Arc::new(registry)));
+    let review = LegacyPolicyReview::open(legacy, Network::Testnet, NOW_MS).unwrap();
+    policy
+        .initialize(&review, PersistedState::paused(NOW_MS), NOW_MS)
+        .unwrap();
+    policy
+}
+
+fn open_test_policy(path: &std::path::Path, initialize: bool) -> Arc<crate::ledger::PolicyJournal> {
+    let ledger = Arc::new(crate::ledger::Ledger::open_at(path, Network::Testnet).unwrap());
+    let registry = crate::ledger::RegistryJournal::open(
+        ledger,
+        Arc::new(crate::keys::HmacKey::from_bytes([31; 32])),
+    )
+    .unwrap();
+    if initialize {
+        initialize_policy(registry, &path.with_extension("legacy.db"))
+    } else {
+        Arc::new(crate::ledger::PolicyJournal::new(Arc::new(registry)))
+    }
+}
+
 #[derive(Debug)]
 struct TestRoutes(Mutex<std::collections::BTreeMap<AgentId, AuthorizedRoute>>);
 impl TestRoutes {
@@ -124,8 +159,8 @@ fn expiring_wallet_fixture(config: AgentGuardrails) -> Fixture {
     )
     .unwrap();
     let route = route_for(keys.as_ref(), "alpha", vault(), Some(vault()));
-    let engine = GuardrailEngine::new(
-        Arc::new(MemoryStore::new()),
+    let engine = GuardrailEngine::from_parts(
+        Arc::new(test_store()),
         Arc::new(NullAuditSink::new([route])),
         keys,
         Network::Testnet,
@@ -135,6 +170,7 @@ fn expiring_wallet_fixture(config: AgentGuardrails) -> Fixture {
     engine
         .operator_set_guardrails(&agent, config, NOW_MS)
         .unwrap();
+    acknowledge(&engine);
     Fixture { engine, agent }
 }
 
@@ -340,13 +376,14 @@ fn expiry_during_signing_wait(key_wait: bool) {
             inner: inner_keys,
             wait: key_wait.then(|| (entered_tx.clone(), Mutex::new(release_rx))),
         });
+        let policy = initialize_policy(registry, &dir.path().join("legacy.db"));
         let sink = Arc::new(TimedLedgerSink {
-            inner: crate::ledger::LedgerAuditSink::new(registry),
+            inner: crate::ledger::LedgerAuditSink::new(policy.clone()),
             entering_permit: (!key_wait).then_some(entered_tx),
             refused_at: Mutex::new(Vec::new()),
         });
-        let engine = GuardrailEngine::new(
-            Arc::new(MemoryStore::new()),
+        let engine = GuardrailEngine::from_parts(
+            Arc::new(SqliteGuardrailStore::new(policy)),
             sink.clone(),
             keys,
             Network::Testnet,
@@ -354,8 +391,12 @@ fn expiry_during_signing_wait(key_wait: bool) {
         .unwrap();
         engine.register_agent(&agent, NOW_MS).unwrap();
         engine
+            .operator_release_kill(&KillScope::Global, NOW_MS)
+            .unwrap();
+        engine
             .operator_set_guardrails(&agent, permissive(&["BTC"]), NOW_MS)
             .unwrap();
+        acknowledge(&engine);
         let mut order = intent("BTC", !reduce_only, d("100"), Decimal::ONE);
         order.reduce_only = reduce_only;
         let mut state = exposure(d("100000"));
@@ -490,11 +531,7 @@ fn route_retirement_and_revision_changes_refuse_every_signed_action() {
     for kind in 0..5 {
         for retire in [false, true] {
             let sink = Arc::new(CountingSink::new([alpha_route()]));
-            let f = Fixture::with(
-                permissive(&["BTC"]),
-                Arc::new(MemoryStore::new()),
-                sink.clone(),
-            );
+            let f = Fixture::with(permissive(&["BTC"]), Arc::new(test_store()), sink.clone());
             let cleared = route_clearance(&f, kind);
             assert_eq!(cleared.clearance().route.binding.container, vault());
             if retire {
@@ -557,7 +594,7 @@ fn exposure_account_and_route_identity_must_agree_before_clearance() {
             .lock()
             .unwrap()
             .insert(AgentId::new("alpha"), route);
-        let f = Fixture::with(permissive(&["BTC"]), Arc::new(MemoryStore::new()), sink);
+        let f = Fixture::with(permissive(&["BTC"]), Arc::new(test_store()), sink);
         assert!(matches!(
             f.evaluate(&order, &instrument, &market, &exposure(d("100000"))),
             Err(Refusal::Unevaluable(Unevaluable::RouteAuthority { .. }))
@@ -567,9 +604,9 @@ fn exposure_account_and_route_identity_must_agree_before_clearance() {
 
 #[test]
 fn policy_registration_and_restart_never_grant_route_authority() {
-    let store = Arc::new(MemoryStore::new());
+    let store = Arc::new(test_store());
     for _ in 0..2 {
-        let engine = GuardrailEngine::new(
+        let engine = GuardrailEngine::from_parts(
             store.clone(),
             Arc::new(NullAuditSink::new([])),
             key_store(&["alpha"]),
@@ -604,7 +641,7 @@ fn every_wallet_field_in_the_grant_must_match_the_loaded_wallet_for_all_actions(
             }
             let f = Fixture::with(
                 permissive(&["BTC"]),
-                Arc::new(MemoryStore::new()),
+                Arc::new(test_store()),
                 Arc::new(NullAuditSink::new([route])),
             );
             let cleared = route_clearance(&f, kind);
@@ -870,7 +907,14 @@ impl AuditSink for FailingSink {
         .into())
     }
 
-    fn record(&self, _entry: &AuditEntry<'_>) -> Result<(), AuditError> {
+    fn record(&self, entry: &AuditEntry<'_>) -> Result<(), AuditError> {
+        // This seam fails decision writes after explicit fixture activation.
+        if matches!(
+            entry.outcome,
+            AuditOutcome::Operator(OperatorAction::PolicyAcknowledgmentRequested { .. })
+        ) {
+            return Ok(());
+        }
         Err(AuditError {
             detail: "the ledger disk is full".to_owned(),
         })
@@ -880,21 +924,521 @@ impl AuditSink for FailingSink {
 /// A store whose writes fail, for the fail-closed path where a kill-switch
 /// engagement cannot be persisted.
 #[derive(Debug)]
-struct FailingStore;
+struct FailingStore {
+    inner: MemoryStore,
+    failed: std::sync::atomic::AtomicBool,
+}
+
+impl Default for FailingStore {
+    fn default() -> Self {
+        Self {
+            inner: test_store(),
+            failed: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+}
 
 impl GuardrailStore for FailingStore {
-    fn load(&self) -> Result<PersistedState, StoreError> {
-        Ok(PersistedState::default())
+    fn load(&self) -> Result<PolicyVersion, StoreError> {
+        self.inner.load()
     }
-    fn save_guardrails(&self, _a: &AgentId, _c: &AgentGuardrails) -> Result<(), StoreError> {
+    fn compare_exchange(
+        &self,
+        expected: u64,
+        next: &PersistedState,
+        at_ms: u64,
+    ) -> Result<PolicyVersion, StoreError> {
+        if next.kill != KillSwitch::new() || self.failed.load(Ordering::SeqCst) {
+            self.failed.store(true, Ordering::SeqCst);
+            return Err(StoreError::Poisoned);
+        }
+        self.inner.compare_exchange(expected, next, at_ms)
+    }
+}
+
+fn acknowledge(engine: &GuardrailEngine) {
+    let observed = engine
+        .policy_observation()
+        .expect("synthetic operator policy review");
+    engine
+        .operator_acknowledge_policy(observed, NOW_MS)
+        .expect("explicit synthetic acknowledgment");
+}
+
+struct ControlledPolicyStore {
+    inner: MemoryStore,
+    fail_load: std::sync::atomic::AtomicBool,
+    uncertain_write: std::sync::atomic::AtomicBool,
+    wait: Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
+}
+
+impl ControlledPolicyStore {
+    fn new() -> Self {
+        Self {
+            inner: test_store(),
+            fail_load: false.into(),
+            uncertain_write: false.into(),
+            wait: Mutex::new(None),
+        }
+    }
+}
+
+impl GuardrailStore for ControlledPolicyStore {
+    fn load(&self) -> Result<PolicyVersion, StoreError> {
+        if self.fail_load.load(Ordering::SeqCst) {
+            return Err(StoreError::Poisoned);
+        }
+        self.inner.load()
+    }
+    fn compare_exchange(
+        &self,
+        expected: u64,
+        next: &PersistedState,
+        at_ms: u64,
+    ) -> Result<PolicyVersion, StoreError> {
+        let wait = self.wait.lock().unwrap().take();
+        if let Some((entered, release)) = wait {
+            entered.send(()).unwrap();
+            release
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+        }
+        let committed = self.inner.compare_exchange(expected, next, at_ms)?;
+        if self.uncertain_write.load(Ordering::SeqCst) {
+            return Err(StoreError::Poisoned);
+        }
+        Ok(committed)
+    }
+}
+
+#[test]
+fn startup_and_independent_policy_changes_require_explicit_acknowledgment() {
+    let store = Arc::new(test_store());
+    let f = Fixture::with(
+        permissive(&["BTC"]),
+        store.clone(),
+        Arc::new(NullAuditSink::new([alpha_route()])),
+    );
+    let reopened = GuardrailEngine::from_parts(
+        store.clone(),
+        Arc::new(NullAuditSink::new([alpha_route()])),
+        key_store(&["alpha"]),
+        Network::Testnet,
+    )
+    .unwrap();
+    let rejected = || {
+        reopened.evaluate(
+            &f.agent,
+            &intent("BTC", true, d("100"), Decimal::ONE),
+            &asset("BTC", 2, 40),
+            &MarketRef::fresh("BTC", d("100"), NOW_MS),
+            &exposure(d("100000")),
+            NOW_MS,
+        )
+    };
+    assert!(matches!(
+        rejected(),
+        Err(Refusal::Unevaluable(Unevaluable::PolicyAuthority { .. }))
+    ));
+    assert!(reopened.cancellation_needed(&AgentId::new("not-in-policy")));
+    let observed = reopened.policy_observation().unwrap();
+    assert!(
+        reopened.cancellation_needed(&f.agent),
+        "refresh never acknowledges"
+    );
+    reopened
+        .operator_acknowledge_policy(observed, NOW_MS)
+        .unwrap();
+    assert!(rejected().is_ok());
+    let version = store.load().unwrap();
+    let mut next = version.state;
+    next.account_limits.max_drawdown_usd = Some(d("9999"));
+    store
+        .compare_exchange(version.revision, &next, NOW_MS)
+        .unwrap();
+    assert!(matches!(
+        rejected(),
+        Err(Refusal::Unevaluable(Unevaluable::PolicyAuthority { .. }))
+    ));
+    assert!(
+        reopened
+            .operator_acknowledge_policy(observed, NOW_MS)
+            .is_err()
+    );
+}
+
+#[test]
+fn cached_policy_status_neither_reads_authority_nor_acknowledges_a_refresh() {
+    let store = Arc::new(ControlledPolicyStore::new());
+    let f = Fixture::with(
+        permissive(&["BTC"]),
+        store.clone(),
+        Arc::new(NullAuditSink::new([alpha_route()])),
+    );
+    let admitted = f.engine.policy_status();
+    assert!(!admitted.admission_inhibited);
+    assert_eq!(
+        admitted.cached_revision,
+        admitted.acknowledgment.map(|a| a.revision)
+    );
+    store.fail_load.store(true, Ordering::SeqCst);
+    assert_eq!(
+        f.engine.policy_status(),
+        admitted,
+        "cached status performs no authority read"
+    );
+    assert!(f.engine.policy_observation().is_err());
+    let inhibited = f.engine.policy_status();
+    assert!(inhibited.admission_inhibited);
+    assert_eq!(inhibited.cached_revision, admitted.cached_revision);
+    assert!(inhibited.acknowledgment.is_none());
+    assert!(inhibited.stop_generation > admitted.stop_generation);
+    store.fail_load.store(false, Ordering::SeqCst);
+    f.engine.policy_observation().unwrap();
+    assert_eq!(
+        f.engine.policy_status(),
+        inhibited,
+        "verification cannot acknowledge"
+    );
+}
+
+#[test]
+fn unavailable_policy_preserves_registry_cleanup_and_local_stop_visibility() {
+    let store = Arc::new(ControlledPolicyStore::new());
+    store.fail_load.store(true, Ordering::SeqCst);
+    let engine = GuardrailEngine::from_parts(
+        store,
+        Arc::new(NullAuditSink::new([alpha_route()])),
+        key_store(&["alpha"]),
+        Network::Testnet,
+    )
+    .unwrap();
+    let f = Fixture {
+        engine,
+        agent: AgentId::new("alpha"),
+    };
+    assert!(f.engine.guardrails(&f.agent).is_none());
+    assert!(f.engine.route_for_agent(&f.agent).is_ok());
+    assert!(f.engine.cancellation_needed(&f.agent));
+    assert!(matches!(
+        f.evaluate(
+            &intent("BTC", true, d("100"), Decimal::ONE),
+            &asset("BTC", 2, 40),
+            &MarketRef::fresh("BTC", d("100"), NOW_MS),
+            &exposure(d("100000"))
+        ),
+        Err(Refusal::Unevaluable(Unevaluable::PolicyAuthority { .. }))
+    ));
+    for kind in 1u8..5 {
+        let cleared = route_clearance(&f, kind);
+        assert_eq!(cleared.clearance().policy_revision, 0);
+        f.engine
+            .sign_cleared(cleared, u64::from(kind), None, || NOW_MS)
+            .expect("registry-only cleanup signs");
+    }
+}
+
+#[test]
+fn production_constructor_without_policy_still_signs_registry_verified_cleanup() {
+    let dir = tempfile::tempdir().unwrap();
+    let ledger = Arc::new(
+        crate::ledger::Ledger::open_at(&dir.path().join("cleanup.db"), Network::Testnet).unwrap(),
+    );
+    let keys = key_store(&["alpha"]);
+    let registry = crate::ledger::RegistryJournal::open(
+        ledger,
+        Arc::new(crate::keys::HmacKey::from_bytes([31; 32])),
+    )
+    .unwrap();
+    registry
+        .grant(
+            route_for(keys.as_ref(), "alpha", vault(), Some(vault())).binding,
+            NOW_MS,
+        )
+        .unwrap();
+    let policy = Arc::new(crate::ledger::PolicyJournal::new(Arc::new(registry)));
+    assert!(policy.current().is_err());
+    let engine = GuardrailEngine::new(policy, keys).unwrap();
+    let f = Fixture {
+        engine,
+        agent: AgentId::new("alpha"),
+    };
+    assert!(f.engine.policy_observation().is_err());
+    assert!(f.engine.cancellation_needed(&f.agent));
+    assert!(f.engine.route_for_agent(&f.agent).is_ok());
+    for kind in 1u8..5 {
+        let cleared = route_clearance(&f, kind);
+        f.engine
+            .sign_cleared(cleared, u64::from(kind), None, || NOW_MS)
+            .expect("no policy fallback needed for cleanup");
+    }
+}
+
+#[test]
+fn stale_engine_cas_cannot_overwrite_another_policy_or_acknowledge_it() {
+    let store = Arc::new(test_store());
+    let f = Fixture::with(
+        permissive(&["BTC"]),
+        store.clone(),
+        Arc::new(NullAuditSink::new([alpha_route()])),
+    );
+    let current = store.load().unwrap();
+    let mut changed = current.state;
+    changed.kill.engage(
+        KillScope::Global,
+        Engagement {
+            engaged_at_ms: NOW_MS,
+            reason: KillReason::Operator,
+        },
+    );
+    let committed = store
+        .compare_exchange(current.revision, &changed, NOW_MS)
+        .unwrap();
+    assert!(
+        f.engine
+            .operator_set_guardrails(&f.agent, permissive(&["ETH"]), NOW_MS)
+            .is_err()
+    );
+    assert_eq!(store.load().unwrap(), committed);
+    assert!(f.engine.cancellation_needed(&f.agent));
+    f.engine.policy_observation().unwrap();
+    assert!(f.engine.cancellation_needed(&f.agent));
+    assert!(f.engine.kill_switch().is_engaged(&KillScope::Global));
+}
+
+#[test]
+fn uncertain_cas_and_reload_cannot_clear_emergency_stop_or_enable_restart() {
+    let store = Arc::new(ControlledPolicyStore::new());
+    let f = Fixture::with(
+        permissive(&["BTC"]),
+        store.clone(),
+        Arc::new(NullAuditSink::new([alpha_route()])),
+    );
+    let old = f.engine.policy_observation().unwrap();
+    store.uncertain_write.store(true, Ordering::SeqCst);
+    assert!(
+        f.engine
+            .operator_engage_kill(KillScope::Global, KillReason::Operator, NOW_MS)
+            .is_err()
+    );
+    assert!(
+        store
+            .load()
+            .unwrap()
+            .state
+            .kill
+            .is_engaged(&KillScope::Global),
+        "error does not mean uncommitted"
+    );
+    assert_eq!(f.engine.take_pending_kill_effects().len(), 1);
+    f.engine.policy_observation().unwrap();
+    assert!(f.engine.operator_acknowledge_policy(old, NOW_MS).is_err());
+    assert!(f.engine.cancellation_needed(&f.agent));
+    store.fail_load.store(true, Ordering::SeqCst);
+    assert!(f.engine.policy_observation().is_err());
+    assert!(f.engine.kill_switch().is_engaged(&KillScope::Global));
+    let reopened = GuardrailEngine::from_parts(
+        store,
+        Arc::new(NullAuditSink::new([alpha_route()])),
+        key_store(&["alpha"]),
+        Network::Testnet,
+    )
+    .unwrap();
+    assert!(reopened.cancellation_needed(&f.agent));
+}
+
+#[test]
+fn an_older_release_cannot_clear_a_new_stop_while_cas_is_waiting() {
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+    let store = Arc::new(ControlledPolicyStore::new());
+    let f = Fixture::with(
+        permissive(&["BTC"]),
+        store.clone(),
+        Arc::new(NullAuditSink::new([alpha_route()])),
+    );
+    f.engine
+        .operator_engage_kill(KillScope::Global, KillReason::Operator, NOW_MS)
+        .unwrap();
+    let observed = f.engine.policy_observation().unwrap();
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    *store.wait.lock().unwrap() = Some((entered_tx, release_rx));
+    std::thread::scope(|scope| {
+        let release = scope.spawn(|| f.engine.operator_release_kill(&KillScope::Global, NOW_MS));
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let trip = scope.spawn(|| {
+            f.engine.operator_engage_kill(
+                KillScope::agent(f.agent.clone()),
+                KillReason::FeedFailure,
+                NOW_MS,
+            )
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let newer = loop {
+            // This read can complete while CAS waits: no engine-state lock is held.
+            let next = f.engine.policy_observation().unwrap();
+            if next.stop_generation != observed.stop_generation {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::yield_now();
+        };
+        release_tx.send(()).unwrap();
+        assert!(
+            newer,
+            "the newer stop must be installed before persistence waits"
+        );
+        assert!(release.join().unwrap().is_err());
+        trip.join().unwrap().unwrap();
+    });
+    assert!(
+        f.engine.kill_switch().is_engaged(&KillScope::Global),
+        "old release must not clear local evidence"
+    );
+    assert!(
+        f.engine
+            .kill_switch()
+            .is_engaged(&KillScope::agent(f.agent.clone()))
+    );
+    assert!(
+        f.engine
+            .operator_acknowledge_policy(observed, NOW_MS)
+            .is_err()
+    );
+    assert!(f.engine.cancellation_needed(&f.agent));
+}
+
+struct AcknowledgmentAuditSink {
+    routes: TestRoutes,
+    fail: std::sync::atomic::AtomicBool,
+    requests: Mutex<Vec<(u64, u64, u64)>>,
+    wait: Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
+}
+
+impl AuditSink for AcknowledgmentAuditSink {
+    fn route_for_agent(&self, agent: &AgentId) -> Result<AuthorizedRoute, Refusal> {
+        self.routes.get(agent)
+    }
+    fn before_sign(
+        &self,
+        clearance: &Clearance,
+        wallet: &crate::keys::AgentWallet,
+        signer: oppen_hl::Address,
+    ) -> Result<Box<dyn SigningPermit + '_>, Refusal> {
+        self.routes.permit(clearance, wallet, signer)
+    }
+    fn record(&self, entry: &AuditEntry<'_>) -> Result<(), AuditError> {
+        if let AuditOutcome::Operator(OperatorAction::PolicyAcknowledgmentRequested {
+            revision,
+            stop_generation,
+        }) = entry.outcome
+        {
+            let wait = self.wait.lock().unwrap().take();
+            if let Some((entered, release)) = wait {
+                entered.send(()).unwrap();
+                release
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+            }
+            if self.fail.load(Ordering::SeqCst) {
+                return Err(AuditError {
+                    detail: "ack audit unavailable".into(),
+                });
+            }
+            self.requests
+                .lock()
+                .unwrap()
+                .push((entry.at_ms, *revision, *stop_generation));
+        }
         Ok(())
     }
-    fn save_kill_switch(&self, _k: &KillSwitch) -> Result<(), StoreError> {
-        Err(StoreError::Poisoned)
-    }
-    fn save_account_limits(&self, _l: &LossLimits) -> Result<(), StoreError> {
-        Ok(())
-    }
+}
+
+#[test]
+fn acknowledgment_requires_audit_success_with_exact_reviewed_identity_and_time() {
+    let sink = Arc::new(AcknowledgmentAuditSink {
+        routes: TestRoutes::new([alpha_route()]),
+        fail: false.into(),
+        requests: Mutex::new(Vec::new()),
+        wait: Mutex::new(None),
+    });
+    let f = Fixture::with(permissive(&["BTC"]), Arc::new(test_store()), sink.clone());
+    let observed = f.engine.policy_observation().unwrap();
+    sink.fail.store(true, Ordering::SeqCst);
+    assert!(
+        f.engine
+            .operator_acknowledge_policy(observed, NOW_MS + 1)
+            .is_err()
+    );
+    assert!(f.engine.cancellation_needed(&f.agent));
+    sink.fail.store(false, Ordering::SeqCst);
+    assert!(
+        f.engine
+            .operator_acknowledge_policy(observed, NOW_MS + 2)
+            .is_err(),
+        "failed audit advanced inhibition generation"
+    );
+    let current = f.engine.policy_observation().unwrap();
+    f.engine
+        .operator_acknowledge_policy(current, NOW_MS + 3)
+        .unwrap();
+    assert_eq!(
+        sink.requests.lock().unwrap().last(),
+        Some(&(NOW_MS + 3, current.revision, current.stop_generation))
+    );
+    assert!(!f.engine.cancellation_needed(&f.agent));
+}
+
+#[test]
+fn acknowledgment_recorded_before_a_new_stop_does_not_enable_admission() {
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+    let sink = Arc::new(AcknowledgmentAuditSink {
+        routes: TestRoutes::new([alpha_route()]),
+        fail: false.into(),
+        requests: Mutex::new(Vec::new()),
+        wait: Mutex::new(None),
+    });
+    let f = Fixture::with(permissive(&["BTC"]), Arc::new(test_store()), sink.clone());
+    let observed = f.engine.policy_observation().unwrap();
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    *sink.wait.lock().unwrap() = Some((entered_tx, release_rx));
+    std::thread::scope(|scope| {
+        let ack = scope.spawn(|| f.engine.operator_acknowledge_policy(observed, NOW_MS));
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(
+            f.engine.cancellation_needed(&f.agent),
+            "audit completion precedes enabling"
+        );
+        let trip = scope.spawn(|| {
+            f.engine
+                .operator_engage_kill(KillScope::Global, KillReason::Operator, NOW_MS)
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let newer = loop {
+            if f.engine.policy_observation().unwrap().stop_generation != observed.stop_generation {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::yield_now();
+        };
+        release_tx.send(()).unwrap();
+        assert!(newer, "audit wait must not hold engine state");
+        assert!(ack.join().unwrap().is_err());
+        trip.join().unwrap().unwrap();
+    });
+    assert!(sink.requests.lock().unwrap().contains(&(
+        NOW_MS,
+        observed.revision,
+        observed.stop_generation
+    )));
+    assert!(f.engine.cancellation_needed(&f.agent));
 }
 
 struct Fixture {
@@ -904,8 +1448,8 @@ struct Fixture {
 
 impl Fixture {
     fn without_keys(config: AgentGuardrails) -> Self {
-        let engine = GuardrailEngine::new(
-            Arc::new(MemoryStore::new()),
+        let engine = GuardrailEngine::from_parts(
+            Arc::new(test_store()),
             Arc::new(NullAuditSink::new([alpha_route()])),
             Arc::new(crate::keys::MemoryKeyStore::new(Network::Testnet)),
             Network::Testnet,
@@ -916,13 +1460,14 @@ impl Fixture {
         engine
             .operator_set_guardrails(&agent, config, NOW_MS)
             .unwrap();
+        acknowledge(&engine);
         Self { engine, agent }
     }
 
     fn new(config: AgentGuardrails) -> Self {
         Self::with(
             config,
-            Arc::new(MemoryStore::new()),
+            Arc::new(test_store()),
             Arc::new(NullAuditSink::new([alpha_route()])),
         )
     }
@@ -932,7 +1477,7 @@ impl Fixture {
         store: Arc<dyn GuardrailStore>,
         sink: Arc<dyn AuditSink>,
     ) -> Self {
-        let engine = GuardrailEngine::new(
+        let engine = GuardrailEngine::from_parts(
             store,
             sink,
             key_store(&["alpha"]) as Arc<dyn KeyStore>,
@@ -944,6 +1489,7 @@ impl Fixture {
         engine
             .operator_set_guardrails(&agent, config, NOW_MS)
             .expect("set guardrails");
+        acknowledge(&engine);
         Fixture { engine, agent }
     }
 
@@ -953,8 +1499,8 @@ impl Fixture {
     fn in_container(config: AgentGuardrails, vault_address: Option<oppen_hl::Address>) -> Self {
         let mut route = alpha_route();
         route.binding.vault_address = vault_address;
-        let engine = GuardrailEngine::new(
-            Arc::new(MemoryStore::new()),
+        let engine = GuardrailEngine::from_parts(
+            Arc::new(test_store()),
             Arc::new(NullAuditSink::new([route])),
             key_store(&["alpha"]) as Arc<dyn KeyStore>,
             Network::Testnet,
@@ -965,6 +1511,7 @@ impl Fixture {
         engine
             .operator_set_guardrails(&agent, config, NOW_MS)
             .expect("set guardrails");
+        acknowledge(&engine);
         Fixture { engine, agent }
     }
 
@@ -1014,8 +1561,8 @@ fn wire_sz(wire: &OrderWire) -> Decimal {
 
 #[test]
 fn a_freshly_paired_agent_is_refused_and_told_which_limit_to_raise() {
-    let store: Arc<dyn GuardrailStore> = Arc::new(MemoryStore::new());
-    let engine = GuardrailEngine::new(
+    let store: Arc<dyn GuardrailStore> = Arc::new(test_store());
+    let engine = GuardrailEngine::from_parts(
         store,
         Arc::new(NullAuditSink::new([alpha_route()])),
         key_store(&["alpha"]) as Arc<dyn KeyStore>,
@@ -1024,6 +1571,7 @@ fn a_freshly_paired_agent_is_refused_and_told_which_limit_to_raise() {
     .expect("engine");
     let agent = AgentId::new("alpha");
     let config = engine.register_agent(&agent, NOW_MS).expect("register");
+    acknowledge(&engine);
 
     // D-c verbatim.
     assert!(config.symbols.is_empty());
@@ -1726,6 +2274,7 @@ fn the_gauge_shows_the_shared_budget_an_agent_would_otherwise_never_see() {
             NOW_MS,
         )
         .expect("set account limits");
+    acknowledge(&f.engine);
 
     let mut agent_account = account(d("980"));
     agent_account.realized_pnl_today_usd = d("-20");
@@ -2237,6 +2786,7 @@ fn an_account_wide_breach_stops_every_agent() {
             NOW_MS,
         )
         .expect("set account limits");
+    acknowledge(&f.engine);
     let btc = asset("BTC", 2, 40);
     let market = MarketRef::fresh("BTC", d("100"), NOW_MS);
 
@@ -2751,27 +3301,22 @@ fn open_exposure_config_defaults_validation_and_sqlite_round_trip() {
 
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("config.db");
-    {
-        let store = SqliteGuardrailStore::open(&path).unwrap();
-        store
-            .save_guardrails(&AgentId::new("zero"), &config)
-            .unwrap();
-        config.risk.max_open_exposure_usd = Some(d("125.50"));
-        store
-            .save_guardrails(&AgentId::new("bounded"), &config)
-            .unwrap();
-    }
-    {
-        let connection = rusqlite::Connection::open(&path).unwrap();
-        connection
-            .execute(
-                "INSERT INTO guardrail_config (agent, config_json) VALUES (?1, ?2)",
-                rusqlite::params!["legacy", serde_json::to_string(&legacy).unwrap()],
-            )
-            .unwrap();
-    }
-    let store = SqliteGuardrailStore::open(&path).unwrap();
-    let loaded = store.load().unwrap();
+    let policy = open_test_policy(&path, true);
+    let current = policy.current().unwrap();
+    let mut next = current.state;
+    next.guardrails.insert(AgentId::new("zero"), config.clone());
+    config.risk.max_open_exposure_usd = Some(d("125.50"));
+    next.guardrails
+        .insert(AgentId::new("bounded"), config.clone());
+    // Missing legacy fields are decoded above for explicit operator review,
+    // never read as execution authority. The replacement is complete.
+    next.guardrails
+        .insert(AgentId::new("legacy"), decoded.clone());
+    next.kill.release(&KillScope::Global);
+    policy.replace(current.revision, next, NOW_MS).unwrap();
+    drop(policy);
+    let store = SqliteGuardrailStore::new(open_test_policy(&path, false));
+    let loaded = store.load().unwrap().state;
     assert_eq!(loaded.guardrails[&AgentId::new("bounded")], config);
     assert_eq!(
         loaded.guardrails[&AgentId::new("zero")]
@@ -2780,7 +3325,7 @@ fn open_exposure_config_defaults_validation_and_sqlite_round_trip() {
         Some(Decimal::ZERO)
     );
     assert_eq!(loaded.guardrails[&AgentId::new("legacy")], decoded);
-    let engine = GuardrailEngine::new(
+    let engine = GuardrailEngine::from_parts(
         Arc::new(store),
         Arc::new(NullAuditSink::new(["bounded", "zero", "legacy"].map(
             |agent| route_for(key_store(&[agent]).as_ref(), agent, vault(), None),
@@ -2789,6 +3334,7 @@ fn open_exposure_config_defaults_validation_and_sqlite_round_trip() {
         Network::Testnet,
     )
     .unwrap();
+    acknowledge(&engine);
     let candidate = intent("BTC", true, d("100"), d("2"));
     let btc = asset("BTC", 2, 40);
     let market = MarketRef::fresh("BTC", d("100"), NOW_MS);
@@ -2912,7 +3458,7 @@ fn opposite_resting_orders_never_create_position_headroom() {
 fn a_failed_kill_release_keeps_the_live_engine_paused() {
     let f = Fixture::with(
         permissive(&["BTC"]),
-        Arc::new(FailingStore),
+        Arc::new(FailingStore::default()),
         Arc::new(NullAuditSink::new([alpha_route()])),
     );
     assert!(
@@ -2954,6 +3500,7 @@ fn changing_policy_invalidates_an_order_already_cleared() {
     f.engine
         .operator_set_guardrails(&f.agent, permissive(&[]), NOW_MS)
         .expect("tighten policy");
+    acknowledge(&f.engine);
     assert!(matches!(
         f.engine.sign_cleared(cleared, 1, None, || NOW_MS),
         Err(SignClearedError::Refused(Refusal::Unevaluable(
@@ -2970,8 +3517,8 @@ fn the_kill_switch_survives_a_restart() {
 
     {
         let store: Arc<dyn GuardrailStore> =
-            Arc::new(SqliteGuardrailStore::open(&path).expect("open"));
-        let engine = GuardrailEngine::new(
+            Arc::new(SqliteGuardrailStore::new(open_test_policy(&path, true)));
+        let engine = GuardrailEngine::from_parts(
             store,
             Arc::new(NullAuditSink::new([alpha_route()])),
             key_store(&["alpha"]) as Arc<dyn KeyStore>,
@@ -2980,10 +3527,18 @@ fn the_kill_switch_survives_a_restart() {
         .expect("engine");
         engine.register_agent(&agent, NOW_MS).expect("register");
         engine
+            .operator_release_kill(&KillScope::Global, NOW_MS)
+            .unwrap();
+        engine
             .operator_set_guardrails(&agent, permissive(&["BTC"]), NOW_MS)
             .expect("set guardrails");
+        acknowledge(&engine);
         let effect = engine
-            .operator_engage_kill(KillScope::agent(agent.clone()), KillReason::Operator, 7)
+            .operator_engage_kill(
+                KillScope::agent(agent.clone()),
+                KillReason::Operator,
+                NOW_MS + 7,
+            )
             .expect("engage");
         assert!(effect.newly_engaged);
         assert!(effect.cancel_for.contains(&agent));
@@ -2991,8 +3546,8 @@ fn the_kill_switch_survives_a_restart() {
 
     // A whole new process would see exactly this.
     let store: Arc<dyn GuardrailStore> =
-        Arc::new(SqliteGuardrailStore::open(&path).expect("reopen"));
-    let engine = GuardrailEngine::new(
+        Arc::new(SqliteGuardrailStore::new(open_test_policy(&path, false)));
+    let engine = GuardrailEngine::from_parts(
         store,
         Arc::new(NullAuditSink::new([alpha_route()])),
         key_store(&["alpha"]) as Arc<dyn KeyStore>,
@@ -3018,9 +3573,9 @@ fn the_kill_switch_survives_a_restart() {
         refusal,
         Refusal::TradingPaused {
             reason: KillReason::Operator,
-            since_ms: 7,
+            since_ms,
             ..
-        }
+        } if since_ms == NOW_MS + 7
     ));
 
     // And the guardrails came back too, not D-c defaults.
@@ -3051,6 +3606,7 @@ fn a_global_engagement_pauses_an_agent_with_no_engagement_of_its_own() {
     f.engine
         .operator_release_kill(&KillScope::Global, NOW_MS)
         .expect("release");
+    acknowledge(&f.engine);
     assert!(
         f.evaluate(
             &intent("BTC", true, d("100"), d("1")),
@@ -3146,6 +3702,7 @@ fn a_global_breaker_trip_names_every_agent() {
             NOW_MS,
         )
         .expect("set account limits");
+    acknowledge(&f.engine);
 
     let mut fleet = account(d("4600"));
     fleet.realized_pnl_today_usd = d("-400");
@@ -3188,7 +3745,7 @@ fn a_trip_whose_state_write_fails_still_queues_the_cancels() {
     };
     let f = Fixture::with(
         config,
-        Arc::new(FailingStore),
+        Arc::new(FailingStore::default()),
         Arc::new(NullAuditSink::new([alpha_route()])),
     );
     let mut losing = exposure(d("975"));
@@ -3444,6 +4001,7 @@ fn account_wide_limits_with_no_fleet_snapshot_refuse() {
             NOW_MS,
         )
         .expect("set");
+    acknowledge(&f.engine);
     assert!(matches!(
         f.evaluate(
             &intent("BTC", true, d("100"), d("1")),
@@ -3494,7 +4052,7 @@ fn an_order_whose_arithmetic_overflows_is_refused_not_fatal() {
 fn a_ledger_write_failure_refuses_the_order() {
     let f = Fixture::with(
         permissive(&["BTC"]),
-        Arc::new(MemoryStore::new()),
+        Arc::new(test_store()),
         Arc::new(FailingSink {
             routes: TestRoutes::new([alpha_route()]),
         }),
@@ -3524,7 +4082,7 @@ fn a_ledger_write_failure_refuses_the_order() {
 fn a_ledger_write_failure_never_blocks_a_cancel_or_the_dead_man_switch() {
     let f = Fixture::with(
         permissive(&["BTC"]),
-        Arc::new(MemoryStore::new()),
+        Arc::new(test_store()),
         Arc::new(FailingSink {
             routes: TestRoutes::new([alpha_route()]),
         }),
@@ -3583,12 +4141,13 @@ fn operator_actions_reach_the_ledger() {
     let sink = Arc::new(CountingSink::new([alpha_route()]));
     let f = Fixture::with(
         permissive(&["BTC"]),
-        Arc::new(MemoryStore::new()),
+        Arc::new(test_store()),
         sink.clone() as Arc<dyn AuditSink>,
     );
     f.engine
         .operator_set_account_limits(LossLimits::UNSET, NOW_MS)
         .expect("set");
+    acknowledge(&f.engine);
     f.engine
         .operator_engage_kill(KillScope::Global, KillReason::Operator, NOW_MS)
         .expect("engage");
@@ -3651,7 +4210,7 @@ fn operator_actions_reach_the_ledger() {
 fn an_operator_action_still_happens_when_its_ledger_row_fails() {
     let f = Fixture::with(
         permissive(&["BTC"]),
-        Arc::new(MemoryStore::new()),
+        Arc::new(test_store()),
         Arc::new(FailingSink {
             routes: TestRoutes::new([alpha_route()]),
         }),
@@ -3817,7 +4376,7 @@ fn a_kill_switch_write_failure_refuses_rather_than_forgetting_the_trip() {
     };
     let f = Fixture::with(
         config,
-        Arc::new(FailingStore),
+        Arc::new(FailingStore::default()),
         Arc::new(NullAuditSink::new([alpha_route()])),
     );
     let mut losing = exposure(d("975"));
@@ -3845,7 +4404,7 @@ fn refusals_are_recorded_too() {
     let sink = Arc::new(CountingSink::new([alpha_route()]));
     let f = Fixture::with(
         permissive(&[]),
-        Arc::new(MemoryStore::new()),
+        Arc::new(test_store()),
         sink.clone() as Arc<dyn AuditSink>,
     );
     let _ = f.evaluate(
@@ -4472,8 +5031,8 @@ fn a_clearance_is_signed_for_the_network_and_sub_account_it_was_evaluated_for() 
         other_vault,
         Some(other_vault),
     );
-    let mainnet = GuardrailEngine::new(
-        Arc::new(MemoryStore::new()),
+    let mainnet = GuardrailEngine::from_parts(
+        Arc::new(test_store()),
         Arc::new(NullAuditSink::new([route])),
         mainnet_keys as Arc<dyn KeyStore>,
         Network::Mainnet,
@@ -4484,6 +5043,7 @@ fn a_clearance_is_signed_for_the_network_and_sub_account_it_was_evaluated_for() 
     mainnet
         .operator_set_guardrails(&other, permissive(&["BTC"]), NOW_MS)
         .expect("set guardrails");
+    acknowledge(&mainnet);
     let cleared = mainnet
         .evaluate(
             &other,
@@ -5247,6 +5807,7 @@ fn a_sequence_against_one_engine_never_outruns_the_rate_cap_or_the_pause() {
                     .expect("release"),
                 "step {step}: the switch should still have been engaged"
             );
+            acknowledge(&f.engine);
             stopped_at_step = None;
             releases += 1;
         }
@@ -5379,14 +5940,12 @@ fn a_kill_switch_engaged_after_the_clearance_still_stops_the_signature() {
         .expect("engage");
 
     match f.engine.sign_cleared(cleared, 1, None, || NOW_MS + 2) {
-        Err(SignClearedError::Refused(Refusal::TradingPaused {
-            scope,
-            since_ms,
-            reason,
-        })) => {
-            assert_eq!(scope, KillScope::agent(f.agent.clone()));
-            assert_eq!(since_ms, NOW_MS + 1);
-            assert_eq!(reason, KillReason::Operator);
+        Err(SignClearedError::Refused(Refusal::Unevaluable(Unevaluable::PolicyChanged))) => {
+            assert!(
+                f.engine
+                    .kill_switch()
+                    .is_engaged(&KillScope::agent(f.agent.clone()))
+            );
         }
         other => panic!("a paused agent must not get a signature, got {other:?}"),
     }
@@ -5401,7 +5960,7 @@ fn a_refusal_at_the_signer_reaches_the_ledger() {
     let sink = Arc::new(CountingSink::new([alpha_route()]));
     let f = Fixture::with(
         permissive(&["BTC"]),
-        Arc::new(MemoryStore::new()),
+        Arc::new(test_store()),
         sink.clone() as Arc<dyn AuditSink>,
     );
     let cleared = f
@@ -5424,7 +5983,7 @@ fn a_refusal_at_the_signer_reaches_the_ledger() {
         .expect_err("the signer refuses");
     assert!(matches!(
         err,
-        SignClearedError::Refused(Refusal::TradingPaused { .. })
+        SignClearedError::Refused(Refusal::Unevaluable(Unevaluable::PolicyChanged))
     ));
 
     // The clearance row still stands — it was true when it was written — and
@@ -5440,7 +5999,7 @@ fn a_refusal_at_the_signer_reaches_the_ledger() {
 fn a_failed_ledger_write_never_turns_a_signer_refusal_into_a_signature() {
     let f = Fixture::with(
         permissive(&["BTC"]),
-        Arc::new(MemoryStore::new()),
+        Arc::new(test_store()),
         Arc::new(NullAuditSink::new([alpha_route()])),
     );
     let cleared = f
@@ -5454,8 +6013,8 @@ fn a_failed_ledger_write_never_turns_a_signer_refusal_into_a_signature() {
 
     // A second engine over the same store, whose sink fails every write, and
     // which has never paired this agent.
-    let broken = GuardrailEngine::new(
-        Arc::new(MemoryStore::new()),
+    let broken = GuardrailEngine::from_parts(
+        Arc::new(test_store()),
         Arc::new(FailingSink {
             routes: TestRoutes::new([alpha_route()]),
         }),
@@ -5468,7 +6027,7 @@ fn a_failed_ledger_write_never_turns_a_signer_refusal_into_a_signature() {
         .expect_err("still refuses with the ledger down");
     assert!(matches!(
         err,
-        SignClearedError::Refused(Refusal::Unevaluable(Unevaluable::UnknownAgent { .. }))
+        SignClearedError::Refused(Refusal::Unevaluable(Unevaluable::AuditWriteFailed { .. }))
     ));
 }
 
@@ -5539,8 +6098,8 @@ fn a_clearance_cannot_be_signed_through_another_networks_engine() {
             NOW_MS,
         )
         .expect("wallet");
-    let mainnet = GuardrailEngine::new(
-        Arc::new(MemoryStore::new()),
+    let mainnet = GuardrailEngine::from_parts(
+        Arc::new(test_store()),
         Arc::new(NullAuditSink::new([route_for(
             mainnet_keys.as_ref(),
             "alpha",
@@ -5578,10 +6137,12 @@ fn a_clearance_cannot_be_signed_through_another_networks_engine() {
 /// and the address-derived version of this check saw nothing to reject.
 #[test]
 fn a_clearance_cannot_be_signed_through_an_engine_that_does_not_know_its_agent() {
-    let stranger = || {
-        GuardrailEngine::new(
-            Arc::new(MemoryStore::new()),
-            Arc::new(NullAuditSink::new([alpha_route()])),
+    let stranger = |container| {
+        let mut route = alpha_route();
+        route.binding.vault_address = container;
+        GuardrailEngine::from_parts(
+            Arc::new(test_store()),
+            Arc::new(NullAuditSink::new([route])),
             key_store(&["alpha"]) as Arc<dyn KeyStore>,
             Network::Testnet,
         )
@@ -5600,10 +6161,8 @@ fn a_clearance_cannot_be_signed_through_an_engine_that_does_not_know_its_agent()
             .expect("clears");
         assert_eq!(cleared.clearance().vault_address, container);
 
-        match stranger().sign_cleared(cleared, 1, None, || NOW_MS) {
-            Err(SignClearedError::Refused(Refusal::Unevaluable(Unevaluable::UnknownAgent {
-                agent,
-            }))) => assert_eq!(agent, f.agent),
+        match stranger(container).sign_cleared(cleared, 1, None, || NOW_MS) {
+            Err(SignClearedError::Refused(Refusal::Unevaluable(Unevaluable::PolicyChanged))) => {}
             other => panic!("an unknown agent must not be signed for, got {other:?}"),
         }
     }
@@ -5712,11 +6271,12 @@ fn an_agent_scoped_kill_stops_a_top_level_containers_signature() {
         .expect("engage");
 
     match f.engine.sign_cleared(cleared, 1, None, || NOW_MS + 2) {
-        Err(SignClearedError::Refused(Refusal::TradingPaused {
-            scope, since_ms, ..
-        })) => {
-            assert_eq!(scope, KillScope::agent(f.agent.clone()));
-            assert_eq!(since_ms, NOW_MS + 1);
+        Err(SignClearedError::Refused(Refusal::Unevaluable(Unevaluable::PolicyChanged))) => {
+            assert!(
+                f.engine
+                    .kill_switch()
+                    .is_engaged(&KillScope::agent(f.agent.clone()))
+            );
         }
         other => panic!("a paused agent's top-level container must not sign, got {other:?}"),
     }
@@ -5833,8 +6393,8 @@ fn an_order_clearance_expires_between_the_evaluation_and_the_signature() {
 #[test]
 fn a_clearance_is_signed_by_the_wallet_of_the_agent_it_names() {
     let sign_for = |keys: Arc<crate::keys::MemoryKeyStore>, agent: &str| -> String {
-        let engine = GuardrailEngine::new(
-            Arc::new(MemoryStore::new()),
+        let engine = GuardrailEngine::from_parts(
+            Arc::new(test_store()),
             Arc::new(NullAuditSink::new([route_for(
                 keys.as_ref(),
                 agent,
@@ -5852,6 +6412,7 @@ fn a_clearance_is_signed_by_the_wallet_of_the_agent_it_names() {
         engine
             .operator_set_guardrails(&agent, permissive(&["BTC"]), NOW_MS)
             .expect("rails");
+        acknowledge(&engine);
         let cleared = engine
             .evaluate(
                 &agent,
@@ -5962,8 +6523,8 @@ fn one_proposal_authorises_exactly_one_approval() {
         per_ms: 3_600_000,
     };
     let engine = Arc::new(
-        GuardrailEngine::new(
-            Arc::new(MemoryStore::new()),
+        GuardrailEngine::from_parts(
+            Arc::new(test_store()),
             sink.clone() as Arc<dyn AuditSink>,
             key_store(&["alpha"]) as Arc<dyn KeyStore>,
             Network::Testnet,
@@ -5975,6 +6536,7 @@ fn one_proposal_authorises_exactly_one_approval() {
     engine
         .operator_set_guardrails(&alpha, config, NOW_MS)
         .expect("rails");
+    acknowledge(&engine);
 
     let Err(Refusal::ApprovalRequired { approval_id, .. }) = engine.evaluate(
         &alpha,
@@ -6038,8 +6600,8 @@ fn one_proposal_authorises_exactly_one_approval() {
 /// orders were left unwatched while the console reported them covered.
 #[test]
 fn the_dead_man_switch_is_armed_per_container() {
-    let engine = GuardrailEngine::new(
-        Arc::new(MemoryStore::new()),
+    let engine = GuardrailEngine::from_parts(
+        Arc::new(test_store()),
         Arc::new(NullAuditSink::new([alpha_route()])),
         key_store(&["alpha", "beta"]) as Arc<dyn KeyStore>,
         Network::Testnet,
@@ -6072,7 +6634,7 @@ fn the_dead_man_switch_is_armed_per_container() {
     // And an agent the engine has never paired cannot arm anything.
     assert!(matches!(
         engine.clear_schedule_cancel(&AgentId::new("ghost"), Some(NOW_MS + 60_000), NOW_MS),
-        Err(Refusal::Unevaluable(Unevaluable::UnknownAgent { .. }))
+        Err(Refusal::Unevaluable(Unevaluable::RouteAuthority { .. }))
     ));
 }
 
@@ -6228,7 +6790,7 @@ fn no_generated_intent_reaches_the_signer_without_an_evaluation() {
     };
     let f = Fixture::with(
         config,
-        Arc::new(MemoryStore::new()),
+        Arc::new(test_store()),
         sink.clone() as Arc<dyn AuditSink>,
     );
 
@@ -6246,6 +6808,7 @@ fn no_generated_intent_reaches_the_signer_without_an_evaluation() {
             f.engine
                 .operator_release_kill(&KillScope::Global, now_ms)
                 .expect("release");
+            acknowledge(&f.engine);
         }
 
         // "DOGE" is off the allowlist and the wide sizes and prices push
@@ -6300,7 +6863,7 @@ fn no_generated_intent_reaches_the_signer_without_an_evaluation() {
                 );
                 signed += 1;
             }
-            Err(SignClearedError::Refused(Refusal::TradingPaused { .. })) => {
+            Err(SignClearedError::Refused(Refusal::Unevaluable(Unevaluable::PolicyChanged))) => {
                 assert!(
                     paused,
                     "case {case}: refused at the signer with the switch open"

@@ -9,10 +9,10 @@
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use oppen_core::feed::FeedSession;
-use oppen_core::guardrail::{AgentId, GuardrailEngine, SqliteGuardrailStore};
+use oppen_core::guardrail::{AgentId, GuardrailEngine};
 use oppen_core::journal::Journal;
 use oppen_core::keys::{EntryName, HmacKey, KeyStore, KeyStoreError, SecretText};
-use oppen_core::ledger::{EventViews, Ledger, LedgerAuditSink, PairingJournal, RegistryJournal};
+use oppen_core::ledger::{EventViews, Ledger, PairingJournal, PolicyJournal, RegistryJournal};
 use oppen_mcp::Network;
 use oppen_mcp::auth::{Binding, TokenStore};
 use oppen_mcp::server::{GatewayHandler, MCP_PATH, router, serve};
@@ -98,15 +98,11 @@ impl Fixture {
         );
         let engine = Arc::new(
             GuardrailEngine::new(
-                Arc::new(
-                    SqliteGuardrailStore::open(dir.path().join("guardrails.db")).expect("store"),
-                ),
-                Arc::new(LedgerAuditSink::new(
+                Arc::new(PolicyJournal::new(Arc::new(
                     RegistryJournal::open(ledger.clone(), Arc::new(HmacKey::from_bytes([42; 32])))
                         .expect("registry"),
-                )),
+                ))),
                 Arc::new(NoKeys(network)),
-                network,
             )
             .expect("engine"),
         );
@@ -317,6 +313,11 @@ async fn durable_writer_contention_refuses_http_and_startup_without_holding_shut
         Network::Testnet,
         Some(Box::new(MutationAnchorHandle(anchor.clone()))),
     );
+    // Isolate the transport's pairing lock from tracked policy work. A sweep
+    // already holding a binding snapshot may legitimately wait on a shared
+    // ledger and must drain before shutdown; the blocked-supervisor policy
+    // refresh regression in execution_fixture::decision covers that case.
+    let gateway_fixture = Fixture::new(Network::Testnet);
     let mut store = fixture.store();
     let token = store.issue(binding("agent-alpha")).unwrap();
     let pairings = Arc::new(RwLock::new(store));
@@ -326,7 +327,7 @@ async fn durable_writer_contention_refuses_http_and_startup_without_holding_shut
     let shutdown = tokio_util::sync::CancellationToken::new();
     let server = tokio::spawn(serve(
         addr.port(),
-        fixture.gateway.clone(),
+        gateway_fixture.gateway.clone(),
         pairings.clone(),
         shutdown.clone(),
     ));
@@ -359,7 +360,7 @@ async fn durable_writer_contention_refuses_http_and_startup_without_holding_shut
         Duration::from_millis(500),
         serve(
             0,
-            fixture.gateway.clone(),
+            gateway_fixture.gateway.clone(),
             pairings.clone(),
             tokio_util::sync::CancellationToken::new(),
         ),

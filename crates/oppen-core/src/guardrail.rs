@@ -100,8 +100,8 @@ pub use config::{
 pub use deadman::DeadManIntent;
 pub use engine::{
     AuditEntry, AuditError, AuditOutcome, AuditSink, Clearance, Cleared, ClearedKind,
-    GuardrailEngine, GuardrailError, OperatorAction, OrderIntent, Proposal, SignClearedError,
-    SigningPermit, Utilization, Verdict,
+    GuardrailEngine, GuardrailError, OperatorAction, OrderIntent, PolicyAcknowledgment,
+    PolicyStatus, Proposal, SignClearedError, SigningPermit, Utilization, Verdict,
 };
 pub use kill::{Engagement, KillEffect, KillReason, KillScope, KillSwitch};
 pub use refusal::{PilotMetric, ReduceOnlyBreach, Refusal, Unevaluable, VenueRule};
@@ -109,7 +109,8 @@ pub use snapshot::{
     AccountSnapshot, Exposure, FeedQuality, MarketRef, MarketSnapshotRef, PositionSnapshot,
     RestingExposure,
 };
-pub use store::{GuardrailStore, PersistedState, SqliteGuardrailStore, StoreError};
+pub use store::{GuardrailStore, PersistedState, PolicyVersion, SqliteGuardrailStore, StoreError};
+pub use store::{LegacyPolicyEvidence, LegacyPolicyReview};
 
 /// Stable identity of one paired agent. D1 maps the roster 1:1 onto
 /// **containers**, so an `AgentId` is also the identity of the venue account

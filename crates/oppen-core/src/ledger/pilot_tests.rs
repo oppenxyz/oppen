@@ -40,6 +40,7 @@ fn before_sign<'a>(
 
 fn order(id: u8, size: &str) -> Clearance {
     Clearance {
+        policy_revision: crate::ledger::tests::AUDIT_POLICY_REVISION,
         route: audit_route(agent(), account(), BASE + 1),
         agent: agent(),
         vault_address: None,

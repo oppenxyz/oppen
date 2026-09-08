@@ -6,7 +6,7 @@ import ReadoutRows from "../components/housing/ReadoutRows.vue";
 import UiButton from "../components/ui/UiButton.vue";
 import { setNetwork, shell, refreshKeychain, type Network } from "../stores/shell";
 import { decimal } from "../lib/display";
-import { operator, storedPolicy, refreshOperator } from "../stores/operator";
+import { operator, storedPolicy, policySourceLabel, refreshOperator } from "../stores/operator";
 import { motionPaused, motionReduced, setMotionPaused } from "../lib/clock";
 
 const SECTIONS = ["Permissions & limits", "Keys & venues", "Models & API keys", "Local data", "MCP server", "Display"] as const;
@@ -50,8 +50,9 @@ const local = computed(() => [
     <div class="settings__content">
       <PanelHousing inset :label="section" :brackets="['tl']" data-tour="settings">
         <template v-if="section === 'Permissions & limits'">
-          <p class="copy">Risk limits and approval settings are enforced by Rust. These are persisted policy readings; editing requires a live operator connection. Inspect per-agent caps in Agents.</p>
+          <p class="copy" role="status">{{ policySourceLabel }}. Runtime policy not read.</p>
           <ReadoutRows size="md" :rows="[
+            { k: 'Snapshot revision', v: operator.policy?.revision != null ? String(operator.policy.revision) : 'Unavailable' },
             { k: 'Account daily loss halt · USD', v: storedPolicy ? (storedPolicy.account_limits.max_daily_loss_usd === null ? 'Unset' : decimal(storedPolicy.account_limits.max_daily_loss_usd)) : 'Not read' },
             { k: 'Account drawdown halt · USD', v: storedPolicy ? (storedPolicy.account_limits.max_drawdown_usd === null ? 'Unset' : decimal(storedPolicy.account_limits.max_drawdown_usd)) : 'Not read' },
             { k: 'Stored agent policies', v: storedPolicy ? String(Object.keys(storedPolicy.guardrails).length) : 'Not read' },

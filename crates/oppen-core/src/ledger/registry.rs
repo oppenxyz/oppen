@@ -361,6 +361,10 @@ impl RegistryJournal {
         &self.ledger
     }
 
+    pub(super) fn authority_key(&self) -> &HmacKey {
+        &self.key
+    }
+
     /// Caller retains the ledger coordination guard and a stable SQL snapshot.
     pub(super) fn route_in(
         &self,

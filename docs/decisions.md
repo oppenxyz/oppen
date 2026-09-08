@@ -257,6 +257,41 @@ rollback requires a compatible reader, never a lowered schema version or erased
 authority history. Authenticated policy storage and supervised desktop activation
 remain separate required work, not consequences of a successful route lookup.
 
+### Authenticated policy and restart admission (ES18)
+
+Spec items 3, 24, 26 and 29 require complete authenticated policy snapshots in
+the existing ledger, not independently tagged rows with permissive deletion
+defaults. Use a separate policy MAC domain and the policy event sequence as its
+durable revision; registry, policy and final signing share one authority source.
+Preserve legacy policy as explicitly unverified inspection, never auto-adopt it.
+An operator-reviewed complete replacement initializes globally paused, with
+review provenance bound into its authenticated event and a V7 reader barrier.
+
+Orders require a verified policy revision matching both clearance and explicit
+runtime acknowledgment through the final signing permit. Every engine open is
+order-inhibited until operator reconciliation; refreshing a cache cannot resume
+it or acknowledge an independent writer's newer revision. Unavailable policy
+must not prevent registry-verified cancellation and dead-man cleanup.
+
+Writes use complete-snapshot compare-and-swap without holding engine state
+across ledger I/O. Final signing keeps ledger-before-engine lock ordering.
+Loss trips retain local emergency stops and cancellation effects on failed
+persistence. Refresh cannot clear them; release targets the exact stop
+generation. Commit-before-anchor errors report uncertain durable outcomes,
+never unchanged policy; continued inhibition and explicit reconciliation are
+required before orders can resume. No key provisioning, automatic activation,
+new production dependency or second event journal is introduced.
+
+MCP's corruption regressions use `rusqlite` as a dev dependency, sharing the
+existing core version and bundled SQLite resolution. Direct writes to synthetic
+fixture databases prove the HTTP cleanup boundary without exposing production
+corruption hooks or substituting a mock policy failure. No new resolved package
+is added by this test-only dependency edge.
+
+The complete migration, provenance, admission and regression contract is
+[policy-authority.md](specs/policy-authority.md). This records the implementation
+decision, not completed code or supervised-testnet acceptance.
+
 ## 2026-09-07 · The console's own socket
 
 Item 34 asks for per-feed status, last-tick timestamps and a stale overlay. The

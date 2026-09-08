@@ -639,10 +639,10 @@ mod tests {
     #[test]
     fn cross_symbol_marks_reach_the_engine_and_missing_marks_fail_closed() {
         use crate::guardrail::{
-            AgentGuardrails, AgentId, FeedQuality, GuardrailEngine, MarketRef, OrderIntent,
-            Refusal, SqliteGuardrailStore, Unevaluable,
+            AgentGuardrails, AgentId, FeedQuality, GuardrailEngine, KillScope, LegacyPolicyReview,
+            MarketRef, OrderIntent, PersistedState, Refusal, Unevaluable,
         };
-        use crate::ledger::{Ledger, LedgerAuditSink, RegistryBinding, RegistryJournal};
+        use crate::ledger::{Ledger, PolicyJournal, RegistryBinding, RegistryJournal};
         use oppen_hl::wire::{Grouping, Tif};
         use std::sync::Arc;
 
@@ -671,11 +671,15 @@ mod tests {
                 now,
             )
             .unwrap();
+        let policy = Arc::new(PolicyJournal::new(Arc::new(registry)));
+        let review =
+            LegacyPolicyReview::open(dir.path().join("policy.db"), Network::Testnet, now).unwrap();
+        policy
+            .initialize(&review, PersistedState::paused(now), now)
+            .unwrap();
         let engine = GuardrailEngine::new(
-            Arc::new(SqliteGuardrailStore::open(dir.path().join("policy.db")).expect("policy")),
-            Arc::new(LedgerAuditSink::new(registry)),
+            policy,
             Arc::new(crate::keys::MemoryKeyStore::new(Network::Testnet)),
-            Network::Testnet,
         )
         .expect("engine");
         engine.register_agent(&agent, now).expect("register");
@@ -691,6 +695,12 @@ mod tests {
         engine
             .operator_set_guardrails(&agent, config, now)
             .expect("policy");
+        engine
+            .operator_release_kill(&KillScope::Global, now)
+            .unwrap();
+        engine
+            .operator_acknowledge_policy(engine.policy_observation().unwrap(), now)
+            .unwrap();
         let meta = serde_json::from_value(serde_json::json!({
             "universe": [{"name": "BTC", "szDecimals": 2, "maxLeverage": 40}]
         }))
@@ -811,9 +821,10 @@ mod tests {
     #[test]
     fn the_reconciled_flag_decides_which_refusal_the_agent_sees() {
         use crate::guardrail::{
-            AgentId, FeedQuality, GuardrailEngine, MarketRef, OrderIntent, SqliteGuardrailStore,
+            AgentId, FeedQuality, GuardrailEngine, KillScope, LegacyPolicyReview, MarketRef,
+            OrderIntent, PersistedState,
         };
-        use crate::ledger::{Ledger, LedgerAuditSink, RegistryBinding, RegistryJournal};
+        use crate::ledger::{Ledger, PolicyJournal, RegistryBinding, RegistryJournal};
         use oppen_hl::OrderKind;
         use oppen_hl::wire::{Grouping, Tif};
         use std::sync::Arc;
@@ -841,15 +852,25 @@ mod tests {
                 1_000,
             )
             .unwrap();
+        let policy = Arc::new(PolicyJournal::new(Arc::new(registry)));
+        let review =
+            LegacyPolicyReview::open(dir.path().join("g.db"), Network::Testnet, 1_000).unwrap();
+        policy
+            .initialize(&review, PersistedState::paused(1_000), 1_000)
+            .unwrap();
         let engine = GuardrailEngine::new(
-            Arc::new(SqliteGuardrailStore::open(dir.path().join("g.db")).expect("store")),
-            Arc::new(LedgerAuditSink::new(registry)),
+            policy,
             Arc::new(crate::keys::MemoryKeyStore::new(Network::Testnet)),
-            Network::Testnet,
         )
         .expect("engine");
 
         engine.register_agent(&agent, 1_000).expect("register");
+        engine
+            .operator_release_kill(&KillScope::Global, 1_000)
+            .unwrap();
+        engine
+            .operator_acknowledge_policy(engine.policy_observation().unwrap(), 1_000)
+            .unwrap();
 
         let meta: oppen_hl::types::Meta = serde_json::from_str(
             r#"{"universe":[{"name":"BTC","szDecimals":5,"maxLeverage":40}]}"#,

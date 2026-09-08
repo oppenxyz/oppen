@@ -79,6 +79,7 @@ fn alternate_path(path: &Path) -> PathBuf {
 
 fn order(ledger: &Arc<Ledger>, id: u8, account: Address) -> Clearance {
     let clearance = Clearance {
+        policy_revision: crate::ledger::tests::AUDIT_POLICY_REVISION,
         route: audit_route(AgentId::new("coordination-agent"), account, 100),
         agent: AgentId::new("coordination-agent"),
         vault_address: None,
@@ -120,7 +121,7 @@ fn order(ledger: &Arc<Ledger>, id: u8, account: Address) -> Clearance {
     clearance
 }
 
-fn signing_fixture() -> (TempDir, Arc<Ledger>, RegistryJournal, Clearance) {
+fn signing_fixture() -> (TempDir, Arc<Ledger>, Arc<PolicyJournal>, Clearance) {
     let dir = TempDir::new().unwrap();
     let ledger = Arc::new(Ledger::open(dir.path(), crate::Network::Testnet).unwrap());
     let registry = RegistryJournal::open(
@@ -135,14 +136,30 @@ fn signing_fixture() -> (TempDir, Arc<Ledger>, RegistryJournal, Clearance) {
             100,
         )
         .unwrap();
-    let clearance = order(&ledger, 1, account);
+    let policy = crate::ledger::tests::initialize_policy(
+        Arc::new(registry),
+        &dir.path().join("guardrails-testnet.db"),
+        AgentId::new("coordination-agent"),
+        100,
+    );
+    let engine = crate::guardrail::GuardrailEngine::new(
+        policy.clone(),
+        Arc::new(crate::keys::MemoryKeyStore::new(Network::Testnet)),
+    )
+    .unwrap();
+    engine
+        .operator_release_kill(&crate::guardrail::KillScope::Global, 100)
+        .unwrap();
+    let mut clearance = order(&ledger, 1, account);
+    clearance.policy_revision = policy.current().unwrap().revision;
     assert_eq!(clearance.route, route);
-    (dir, ledger, registry, clearance)
+    (dir, ledger, policy, clearance)
 }
 
 #[test]
 fn signing_snapshot_stays_stable_while_an_independent_raw_wal_writer_commits() {
-    let (dir, ledger, registry, clearance) = signing_fixture();
+    let (dir, ledger, policy, clearance) = signing_fixture();
+    let registry = policy.registry();
     let raw = Connection::open(
         dir.path()
             .join(crate::db_file_name(crate::Network::Testnet)),
@@ -212,14 +229,19 @@ fn signing_snapshot_stays_stable_while_an_independent_raw_wal_writer_commits() {
 }
 
 #[test]
-fn combined_signing_permit_rolls_back_on_identity_registry_and_pilot_errors() {
-    for failure in ["identity", "registry", "pilot"] {
-        let (_dir, ledger, registry, clearance) = signing_fixture();
+fn combined_signing_permit_rolls_back_on_identity_registry_policy_and_pilot_errors() {
+    for failure in ["identity", "registry", "policy", "pilot"] {
+        let (_dir, ledger, policy, clearance) = signing_fixture();
         let mut actual_wallet = clearance.route.binding.wallet.clone();
         match failure {
             "identity" => actual_wallet.generation += 1,
             "registry" => {
-                registry.retire(&clearance.route, 101).unwrap();
+                policy.registry().retire(&clearance.route, 101).unwrap();
+            }
+            "policy" => {
+                ledger
+                    .redact(clearance.policy_revision, "unavailable policy", 101)
+                    .unwrap();
             }
             "pilot" => {
                 pilot::PilotJournal::new(ledger.clone())
@@ -232,7 +254,7 @@ fn combined_signing_permit_rolls_back_on_identity_registry_and_pilot_errors() {
             }
             _ => unreachable!(),
         }
-        let sink = LedgerAuditSink::new(registry);
+        let sink = LedgerAuditSink::new(policy);
         let before = ledger.chain_head().unwrap();
         let refusal = sink
             .before_sign(&clearance, &actual_wallet, actual_wallet.address)
@@ -262,10 +284,106 @@ fn combined_signing_permit_rolls_back_on_identity_registry_and_pilot_errors() {
 }
 
 #[test]
+fn signing_held_permit_blocks_independent_policy_cas_until_drop_without_deadlock() {
+    let (dir, ledger, policy, clearance) = signing_fixture();
+    let independent = Arc::new(Ledger::open(dir.path(), Network::Testnet).unwrap());
+    let other = PolicyJournal::new(Arc::new(
+        RegistryJournal::open(
+            independent,
+            Arc::new(crate::keys::HmacKey::from_bytes([31; 32])),
+        )
+        .unwrap(),
+    ));
+    let mut next = other.current().unwrap();
+    next.state
+        .guardrails
+        .get_mut(&clearance.agent)
+        .unwrap()
+        .approval_required = false;
+    let old_revision = next.revision;
+    let sink = LedgerAuditSink::new(policy.clone());
+    let wallet = &clearance.route.binding.wallet;
+    let permit = sink
+        .before_sign(&clearance, wallet, wallet.address)
+        .unwrap();
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (done_tx, done_rx) = mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        ready_tx.send(()).unwrap();
+        let result = other.replace(old_revision, next.state, 101);
+        done_tx.send(result).unwrap();
+    });
+    ready_rx.recv_timeout(COMPLETION_TIMEOUT).unwrap();
+    let blocked = done_rx.recv_timeout(BLOCKED_WINDOW);
+    drop(permit);
+    assert!(matches!(blocked, Err(mpsc::RecvTimeoutError::Timeout)));
+    let changed = done_rx
+        .recv_timeout(COMPLETION_TIMEOUT)
+        .expect("CAS must finish after permit drop")
+        .unwrap();
+    worker.join().unwrap();
+    assert!(changed.revision > old_revision);
+    assert_eq!(policy.current().unwrap(), changed);
+    assert!(matches!(
+        sink.before_sign(&clearance, wallet, wallet.address),
+        Err(crate::guardrail::Refusal::Unevaluable(
+            crate::guardrail::Unevaluable::PolicyChanged
+        ))
+    ));
+    assert!(ledger.connection.lock().unwrap().is_autocommit());
+    assert!(ledger.verify().unwrap().is_intact());
+}
+
+#[test]
+fn invalid_policy_blocks_orders_but_cleanup_still_requires_current_registry_and_signer() {
+    use crate::guardrail::{Refusal, Unevaluable};
+    let (_dir, ledger, policy, mut clearance) = signing_fixture();
+    let sink = LedgerAuditSink::new(policy.clone());
+    let wallet = clearance.route.binding.wallet.clone();
+    drop(
+        sink.before_sign(&clearance, &wallet, wallet.address)
+            .unwrap(),
+    );
+    ledger
+        .redact(
+            clearance.policy_revision,
+            "unavailable policy evidence",
+            101,
+        )
+        .unwrap();
+    assert!(matches!(
+        sink.before_sign(&clearance, &wallet, wallet.address),
+        Err(Refusal::Unevaluable(Unevaluable::PolicyAuthority { .. }))
+    ));
+    for kind in [
+        ClearedKind::Cancel { count: 1 },
+        ClearedKind::ScheduleCancel { cancel_at_ms: None },
+    ] {
+        clearance.kind = kind;
+        clearance.policy_revision = 0;
+        drop(
+            sink.before_sign(&clearance, &wallet, wallet.address)
+                .unwrap(),
+        );
+        assert!(matches!(
+            sink.before_sign(&clearance, &wallet, Address::from_bytes([9; 20])),
+            Err(Refusal::Unevaluable(Unevaluable::RouteAuthority { .. }))
+        ));
+    }
+    policy.registry().retire(&clearance.route, 102).unwrap();
+    assert!(matches!(
+        sink.before_sign(&clearance, &wallet, wallet.address),
+        Err(Refusal::Unevaluable(Unevaluable::RouteAuthority { .. }))
+    ));
+    assert!(ledger.connection.lock().unwrap().is_autocommit());
+    assert!(ledger.verify().unwrap().is_intact());
+}
+
+#[test]
 fn valid_route_cleanup_survives_redacted_pilot_evidence_but_still_checks_signer_and_registry() {
     use crate::guardrail::{Refusal, Unevaluable};
     for target in ["authorization", "submission"] {
-        let (_dir, ledger, registry, mut clearance) = signing_fixture();
+        let (_dir, ledger, policy, mut clearance) = signing_fixture();
         let account = clearance.route.binding.container;
         pilot::PilotJournal::new(ledger.clone())
             .authorize(clearance.agent.clone(), account, 100)
@@ -278,7 +396,7 @@ fn valid_route_cleanup_survives_redacted_pilot_evidence_but_still_checks_signer_
             *sz = Decimal::new(1, 1);
             *notional_usd = Decimal::from(10);
         }
-        let sink = LedgerAuditSink::new(registry);
+        let sink = LedgerAuditSink::new(policy.clone());
         sink.record(&AuditEntry {
             agent: Some(&clearance.agent),
             at_ms: 100,
@@ -333,7 +451,7 @@ fn valid_route_cleanup_survives_redacted_pilot_evidence_but_still_checks_signer_
             ));
             assert!(ledger.connection.lock().unwrap().is_autocommit());
         }
-        sink.registry.retire(&clearance.route, 103).unwrap();
+        policy.registry().retire(&clearance.route, 103).unwrap();
         assert!(matches!(
             sink.before_sign(&clearance, &wallet, wallet.address),
             Err(Refusal::Unevaluable(Unevaluable::RouteAuthority { .. }))
