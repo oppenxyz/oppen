@@ -14,6 +14,16 @@ binding is required: an empty store gives pause enforcement no account target.
 Missing or conflicting authority
 blocks startup; startup never initializes, replaces, issues or acknowledges it.
 
+Startup uses `Ledger::open_existing`: the ledger must have a valid existing
+anchor and current schema. Missing authority cannot be adopted, and schema
+upgrades require a separate explicit path. The follow-up on
+`fix/mcp-existing-authority` replaces the previous create/adopt-capable opener.
+A synthetic missing-anchor regression failed before the fix and passes after
+it; missing-database startup also leaves the directory empty. The desktop suite
+passes 74 native tests and the updater regression, with two live tests ignored;
+all-target desktop clippy passes. This is startup-refusal evidence, not a live
+supervision gate.
+
 The console's configured account and requested account must agree. The runtime
 owns retained startup work independently of the IPC observer. Local socket
 ownership is established before venue work so an occupied port cannot leave an

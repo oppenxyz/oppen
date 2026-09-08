@@ -107,12 +107,9 @@ impl Prepared {
         if keys.network() != Network::Testnet {
             return Err("MCP requires testnet keys".into());
         }
-        let path = dir.join(oppen_core::db_file_name(Network::Testnet));
-        if !path.is_file() {
-            return Err("existing testnet ledger required".into());
-        }
-        let ledger =
-            Arc::new(Ledger::open_at(&path, Network::Testnet).map_err(|error| error.to_string())?);
+        let ledger = Arc::new(
+            Ledger::open_existing(dir, Network::Testnet).map_err(|error| error.to_string())?,
+        );
         let hmac = Arc::new(
             keys.load_hmac_key()
                 .map_err(|error| error.to_string())?
@@ -1025,6 +1022,29 @@ mod tests {
             .unwrap();
             assert!(store.supports_binding(&self.binding));
         }
+    }
+
+    #[test]
+    fn startup_refuses_missing_anchor_without_adopting_existing_authority() {
+        let fixture = Fixture::authorized();
+        let path = fixture
+            .dir
+            .path()
+            .join(oppen_core::db_file_name(Network::Testnet));
+        let anchor = oppen_core::ledger::FileAnchor::beside(&path);
+        std::fs::remove_file(anchor.path()).unwrap();
+        assert!(fixture.prepare().is_err());
+        assert!(
+            !anchor.path().exists(),
+            "startup must not adopt an unanchored ledger"
+        );
+    }
+
+    #[test]
+    fn startup_refuses_missing_database_without_creating_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(Prepared::open(dir.path(), Fixture::binding(), Arc::new(FixtureKeys)).is_err());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 
     #[test]
