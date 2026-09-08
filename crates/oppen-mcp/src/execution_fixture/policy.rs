@@ -130,7 +130,12 @@ async fn idle_server_refreshes_independent_kill_and_redacted_policy_before_clean
                     )
                     .unwrap();
             } else {
-                let operator = GuardrailEngine::new(Arc::new(journal), operator_keys).unwrap();
+                let operator = GuardrailEngine::new(
+                    Arc::new(journal),
+                    operator_keys,
+                    Arc::new(FeedSession::new()),
+                )
+                .unwrap();
                 operator
                     .operator_engage_kill(KillScope::Global, KillReason::Operator, now_ms())
                     .unwrap();

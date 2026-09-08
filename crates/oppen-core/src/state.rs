@@ -681,6 +681,7 @@ mod tests {
         let engine = GuardrailEngine::new(
             policy,
             Arc::new(crate::keys::MemoryKeyStore::new(Network::Testnet)),
+            crate::feed::test_session(addr()),
         )
         .expect("engine");
         engine.register_agent(&agent, now).expect("register");
@@ -746,7 +747,9 @@ mod tests {
                     last_tick_ms: Some(now),
                 },
             );
-            let exposure = exposure_from(&state, Decimal::ZERO, None, true, utc_day_start_ms(now));
+            let mut exposure =
+                exposure_from(&state, Decimal::ZERO, None, true, utc_day_start_ms(now));
+            exposure.feed_stamp = Some(engine.feed().stamp());
             let result = engine.evaluate(&agent, &intent, asset, &market, &exposure, now);
             (exposure, result)
         };
@@ -863,6 +866,7 @@ mod tests {
         let engine = GuardrailEngine::new(
             policy,
             Arc::new(crate::keys::MemoryKeyStore::new(Network::Testnet)),
+            crate::feed::test_session(addr()),
         )
         .expect("engine");
 
@@ -909,13 +913,14 @@ mod tests {
         };
 
         let refuse = |reconciled: bool| {
-            let exposure = exposure_from(
+            let mut exposure = exposure_from(
                 &state,
                 Decimal::ZERO,
                 None,
                 reconciled,
                 utc_day_start_ms(1_788_544_667_000),
             );
+            exposure.feed_stamp = Some(engine.feed().stamp());
             engine
                 .evaluate(
                     &agent,
@@ -1114,6 +1119,7 @@ pub fn exposure_from(
     // One container per agent (D1 as revised), so the fleet aggregate is the
     // same account. A second container would make these differ.
     Exposure {
+        feed_stamp: None,
         account: state.address,
         agent: agent.clone(),
         fleet: Some(agent),

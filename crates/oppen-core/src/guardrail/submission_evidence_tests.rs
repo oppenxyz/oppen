@@ -6,6 +6,9 @@ use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
+#[path = "feed_admission_tests.rs"]
+mod feed_admission_tests;
+
 fn reserved(f: &DurableFixture) -> (Cleared, SubmissionJournal, SubmissionReceipt) {
     let proposal = f.propose();
     let cleared = f.approve(proposal.id()).unwrap();
@@ -269,7 +272,12 @@ async fn submission_evidence_dispatch_rechecks_owner_deadline_and_authorization(
     for scenario in ["owner", "deadline", "authorization"] {
         let f = DurableFixture::new();
         let capability = signed(&f);
-        let other = GuardrailEngine::new(f.policy.clone(), f.keys.clone()).unwrap();
+        let other = GuardrailEngine::new(
+            f.policy.clone(),
+            f.keys.clone(),
+            crate::feed::test_session(vault()),
+        )
+        .unwrap();
         acknowledge(&other);
         let engine = if scenario == "owner" {
             &other
@@ -592,6 +600,7 @@ fn submission_evidence_cancellation_during_ledger_wait_refuses_before_crypto() {
             inner: f.keys.clone(),
             wait: Some((loading, Mutex::new(keys_released))),
         }),
+        crate::feed::test_session(vault()),
     )
     .unwrap();
     acknowledge(&f.engine);

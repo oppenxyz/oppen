@@ -160,11 +160,11 @@ impl Prepared {
             );
         }
         // The private engine starts inhibited. No caller receives an activation capability.
+        let feed = Arc::new(FeedSession::new());
         let engine = Arc::new(
-            GuardrailEngine::new_supervised_alpha(policy, keys)
+            GuardrailEngine::new_supervised_alpha(policy, keys, feed.clone())
                 .map_err(|error| error.to_string())?,
         );
-        let feed = Arc::new(FeedSession::new());
         let alerts = Arc::new(
             AlertStore::open(dir.join("alerts-testnet.db")).map_err(|error| error.to_string())?,
         );
@@ -176,7 +176,6 @@ impl Prepared {
             Arc::new(
                 Journal::open(dir.join("journal-testnet.db")).map_err(|error| error.to_string())?,
             ),
-            feed.clone(),
             alerts.clone(),
             quotes.clone(),
         )
@@ -1293,12 +1292,60 @@ mod tests {
         fixture.prepare().unwrap();
     }
 
+    fn reconcile_controller_feed(prepared: &Prepared) {
+        struct NoSubscriptions;
+        impl oppen_core::feed::pump::FeedSubscriber for NoSubscriptions {
+            fn subscribe(&self, _: Subscription) -> Result<(), oppen_hl::ws::PoolError> {
+                panic!("seed fixture must not subscribe");
+            }
+            fn unsubscribe(&self, _: &Subscription) -> Result<(), oppen_hl::ws::PoolError> {
+                panic!("seed fixture has no subscriptions");
+            }
+        }
+        let feed = prepared.engine.feed();
+        assert!(Arc::ptr_eq(&feed, &prepared.feed));
+        if feed.state().reconciled {
+            return;
+        }
+        // Run genuine startup reconciliation without nesting the test's runtime.
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap()
+                        .block_on(async {
+                            let pump = FeedPump::new(
+                                &feed,
+                                &prepared.ledger,
+                                prepared.binding.account,
+                                FixtureSource,
+                                &prepared.alerts,
+                                &prepared.quotes,
+                                &NoSubscriptions,
+                            )
+                            .unwrap();
+                            let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+                            drop(tx);
+                            pump.run(&mut rx).await;
+                        });
+                })
+                .join()
+                .unwrap();
+        });
+        assert!(feed.state().reconciled);
+        assert!(feed.state().failure.is_none());
+    }
+
     fn controller_proposal(prepared: &Prepared) -> String {
         use oppen_core::guardrail::{
             AccountSnapshot, Exposure, FeedQuality, KillScope, MarketRef, OrderIntent, Refusal,
             RestingExposure,
         };
         use oppen_hl::wire::{Cloid, Grouping, Tif};
+        reconcile_controller_feed(prepared);
+        let stamp = prepared.engine.feed().stamp();
         let at = u64::try_from(now_ms()).unwrap();
         let engine = &prepared.engine;
         let agent = &prepared.binding.agent;
@@ -1350,6 +1397,7 @@ mod tests {
         };
         let exposure = Exposure {
             account: prepared.binding.account,
+            feed_stamp: Some(stamp),
             fleet: None,
             agent: AccountSnapshot {
                 as_of_ms: at,
@@ -1719,6 +1767,8 @@ mod tests {
             PositionSnapshot, Refusal, RestingExposure,
         };
         use oppen_hl::wire::{Cloid, Grouping, Tpsl};
+        reconcile_controller_feed(prepared);
+        let stamp = prepared.engine.feed().stamp();
         let at = u64::try_from(now_ms()).unwrap();
         let intent = OrderIntent {
             symbol: "TEST".into(),
@@ -1762,6 +1812,7 @@ mod tests {
         };
         let exposure = Exposure {
             account: prepared.binding.account,
+            feed_stamp: Some(stamp),
             fleet: None,
             agent: AccountSnapshot {
                 as_of_ms: at,
@@ -2048,6 +2099,7 @@ mod tests {
             GuardrailEngine::new_supervised_alpha(
                 Arc::new(PolicyJournal::new(registry)),
                 Arc::new(FixtureKeys),
+                prepared.feed.clone(),
             )
             .unwrap(),
         );
@@ -2057,7 +2109,6 @@ mod tests {
             prepared.engine.clone(),
             EventViews::new(ledger),
             Arc::new(Journal::open(fixture.dir.path().join("journal-testnet.db")).unwrap()),
-            prepared.feed.clone(),
             prepared.alerts.clone(),
             prepared.quotes.clone(),
         )
@@ -2149,6 +2200,7 @@ mod tests {
         let engine = GuardrailEngine::new_supervised_alpha(
             Arc::new(PolicyJournal::new(registry)),
             Arc::new(FixtureKeys),
+            Arc::new(FeedSession::new()),
         )
         .unwrap();
         assert!(

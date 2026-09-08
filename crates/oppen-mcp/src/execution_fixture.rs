@@ -238,13 +238,15 @@ impl Runtime {
             replacement.guardrails.insert(agent.clone(), policy);
             policy_journal.initialize(&review, replacement, at).unwrap();
         }
-        let engine = Arc::new(GuardrailEngine::new(policy_journal, keys.clone()).unwrap());
+        let engine = Arc::new(
+            GuardrailEngine::new(policy_journal, keys.clone(), Arc::new(FeedSession::new()))
+                .unwrap(),
+        );
         let mut gateway = Gateway::new(
             Network::Testnet,
             engine,
             EventViews::new(ledger.clone()),
             Arc::new(Journal::open(path.join("notes.db")).unwrap()),
-            Arc::new(FeedSession::new()),
             Arc::new(AlertStore::open(":memory:").unwrap()),
             Arc::new(QuoteCache::new()),
         )

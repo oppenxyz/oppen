@@ -773,6 +773,8 @@ mod tests {
     use std::sync::mpsc;
     use std::time::Duration;
 
+    use oppen_core::feed::FeedSession;
+    use oppen_core::feed::pump::{FeedPump, FeedSubscriber};
     use oppen_core::guardrail::{
         AccountSnapshot, AgentGuardrails, AgentId, Exposure, FeedQuality, KillScope,
         LegacyPolicyReview, MarketRef, OrderIntent, PersistedState, Refusal, RestingExposure,
@@ -782,6 +784,7 @@ mod tests {
         Anchor, FileAnchor, HeadAnchor, Ledger, LedgerError, PolicyJournal, RegistryBinding,
         RegistryJournal,
     };
+    use oppen_core::reconcile::ReconcileSource;
     use oppen_hl::meta::Asset;
     use oppen_hl::order::OrderKind;
     use oppen_hl::types::AssetInfo;
@@ -842,11 +845,53 @@ mod tests {
     struct Fixture {
         _dir: tempfile::TempDir,
         engine: Arc<GuardrailEngine>,
+        beta_engine: Arc<GuardrailEngine>,
         ledger: Arc<Ledger>,
         fail_seq: Arc<AtomicU64>,
         alpha: Binding,
         beta: Binding,
         at_ms: u64,
+    }
+
+    struct EmptyVenue;
+
+    impl ReconcileSource for EmptyVenue {
+        fn network(&self) -> Network {
+            Network::Testnet
+        }
+        async fn user_fills_by_time(
+            &self,
+            _: Address,
+            _: u64,
+            _: Option<u64>,
+        ) -> Result<Vec<oppen_hl::types::Fill>, oppen_hl::Error> {
+            Ok(Vec::new())
+        }
+        async fn frontend_open_orders(
+            &self,
+            _: Address,
+        ) -> Result<Vec<oppen_hl::types::OpenOrder>, oppen_hl::Error> {
+            Ok(Vec::new())
+        }
+        async fn order_status(
+            &self,
+            _: Address,
+            _: oppen_hl::OrderRef,
+        ) -> Result<oppen_hl::types::OrderStatusResponse, oppen_hl::Error> {
+            panic!("queue fixture has no submitted orders");
+        }
+    }
+
+    impl FeedSubscriber for EmptyVenue {
+        fn subscribe(&self, _: oppen_hl::ws::Subscription) -> Result<(), oppen_hl::ws::PoolError> {
+            panic!("queue fixture must not subscribe");
+        }
+        fn unsubscribe(
+            &self,
+            _: &oppen_hl::ws::Subscription,
+        ) -> Result<(), oppen_hl::ws::PoolError> {
+            panic!("queue fixture has no subscriptions");
+        }
     }
 
     impl Fixture {
@@ -913,16 +958,26 @@ mod tests {
             )
             .unwrap();
             policy.initialize(&legacy, state, at_ms).unwrap();
-            let engine = Arc::new(GuardrailEngine::new(policy, keys).unwrap());
+            let engine = Arc::new(
+                GuardrailEngine::new(policy.clone(), keys.clone(), Arc::new(FeedSession::new()))
+                    .unwrap(),
+            );
             engine
                 .operator_release_kill(&KillScope::Global, at_ms)
                 .unwrap();
             engine
                 .operator_acknowledge_policy(engine.policy_observation().unwrap(), at_ms)
                 .unwrap();
+            let beta_engine =
+                Arc::new(GuardrailEngine::new(policy, keys, Arc::new(FeedSession::new())).unwrap());
+            beta_engine
+                .operator_acknowledge_policy(beta_engine.policy_observation().unwrap(), at_ms)
+                .unwrap();
+            assert!(!Arc::ptr_eq(&engine.feed(), &beta_engine.feed()));
             Self {
                 _dir: dir,
                 engine,
+                beta_engine,
                 ledger,
                 fail_seq,
                 alpha,
@@ -932,6 +987,50 @@ mod tests {
         }
 
         fn propose(&self, binding: &Binding, id: u8) -> String {
+            let engine = if binding == &self.alpha {
+                &self.engine
+            } else {
+                assert_eq!(binding, &self.beta);
+                &self.beta_engine
+            };
+            let feed = engine.feed();
+            if !feed.state().reconciled {
+                // Use the real startup fold, including its durable gap closure.
+                std::thread::scope(|scope| {
+                    scope
+                        .spawn(|| {
+                            let alerts = oppen_core::alert::AlertStore::open(
+                                self._dir.path().join("alerts.db"),
+                            )
+                            .unwrap();
+                            let quotes = oppen_core::features::quotes::QuoteCache::new();
+                            tokio::runtime::Builder::new_current_thread()
+                                .enable_all()
+                                .build()
+                                .unwrap()
+                                .block_on(async {
+                                    let pump = FeedPump::new(
+                                        &feed,
+                                        &self.ledger,
+                                        binding.account,
+                                        EmptyVenue,
+                                        &alerts,
+                                        &quotes,
+                                        &EmptyVenue,
+                                    )
+                                    .unwrap();
+                                    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+                                    drop(tx);
+                                    pump.run(&mut rx).await;
+                                });
+                        })
+                        .join()
+                        .unwrap();
+                });
+            }
+            assert!(feed.state().reconciled);
+            assert!(feed.state().failure.is_none());
+            let stamp = feed.stamp();
             let intent = OrderIntent {
                 symbol: "TEST".into(),
                 is_buy: true,
@@ -970,6 +1069,7 @@ mod tests {
             };
             let exposure = Exposure {
                 account: binding.account,
+                feed_stamp: Some(stamp),
                 fleet: None,
                 agent: AccountSnapshot {
                     as_of_ms: self.at_ms,
@@ -991,7 +1091,7 @@ mod tests {
                     }),
                 },
             };
-            match self.engine.evaluate(
+            match engine.evaluate(
                 &binding.agent,
                 &intent,
                 &asset,

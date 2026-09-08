@@ -481,6 +481,9 @@ pub enum Unevaluable {
     /// are unknown, so no order clears.
     #[error("account state has not been reconciled (snapshot at {as_of_ms})")]
     UnreconciledAccount { as_of_ms: u64 },
+    /// Missing, invalidated or foreign feed provenance, or a session not ready.
+    #[error("feed admission requires a current reconciled snapshot from this session")]
+    FeedAdmission,
 
     #[error("account state is {age_ms}ms old, past the {max_age_ms}ms limit")]
     StaleAccountState { age_ms: u64, max_age_ms: u64 },

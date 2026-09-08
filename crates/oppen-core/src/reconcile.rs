@@ -213,6 +213,8 @@ const FIRST_RUN_LOOKBACK_MS: u64 = 30 * 24 * 60 * 60 * 1_000;
 /// idempotent.
 #[derive(Debug, thiserror::Error)]
 pub enum ReconcileError {
+    #[error("feed session is already bound to another network or account")]
+    FeedScopeMismatch,
     /// The ledger refused a read or a write.
     #[error("reconcile ledger error: {0}")]
     Ledger(#[from] LedgerError),

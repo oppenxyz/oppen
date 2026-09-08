@@ -146,6 +146,7 @@ fn signing_fixture() -> (TempDir, Arc<Ledger>, Arc<PolicyJournal>, Clearance) {
     let engine = crate::guardrail::GuardrailEngine::new(
         policy.clone(),
         Arc::new(crate::keys::MemoryKeyStore::new(Network::Testnet)),
+        crate::feed::test_session(oppen_hl::Address::from_bytes([1; 20])),
     )
     .unwrap();
     engine
@@ -237,6 +238,7 @@ fn supervised_orders_require_consent_at_reservation_and_final_signing() {
         let engine = GuardrailEngine::new_supervised_alpha(
             policy.clone(),
             Arc::new(crate::keys::MemoryKeyStore::new(Network::Testnet)),
+            crate::feed::test_session(oppen_hl::Address::from_bytes([1; 20])),
         )
         .unwrap();
         engine

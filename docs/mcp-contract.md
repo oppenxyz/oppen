@@ -141,6 +141,14 @@ Carried on `status: "rejected"`. Nothing was signed and nothing reached the venu
 
 `guardrail_reject` covers the fail-closed refusals too — a stale feed, a missing reference price, an unreconciled account. Those are **not** retryable even though the condition may pass on its own: telling an agent to retry into a degraded feed is how a quiet outage becomes a retry storm.
 
+`refusal.unevaluable: "feed_admission"` means the order's snapshot no longer
+matches the engine's reconciled network/account feed, or that evidence is absent
+or failed. Rust checks this after signing waits and before first HTTP dispatch.
+A disconnect followed by successful reconciliation does not revive an old
+clearance. Read current state and obtain a fresh evaluation after recovery;
+never resend an uncertain submission. This applies to reduce-only orders too.
+Runtime HALT cleanup keeps its separate authority.
+
 The optional operator-set `risk.max_open_exposure_usd` caps gross marked positions
 plus opening resting orders across the container, including a proposed opening
 order. Opposite orders do not net. Its `open_exposure` refusal carries
@@ -235,7 +243,7 @@ Any of these is absent when its input is: no liquidation price, no σ yet, or a 
 
 **An asset the venue has stopped quoting has no price here, and cannot be traded.** `markPx` keeps being published for a dead market — it is the last print, frozen — so oppen reads the venue's asset contexts and treats a null `midPx` as "not quoted", which is what it means. Those assets carry no liquidation distance and every order on them is refused for a missing reference price rather than sized against a number that can be an order of magnitude stale. This is 24% of the main dex, so it is the ordinary case and not an edge one.
 
-**Two moments where that is expected rather than broken.** oppen walks a catch-up window at startup and again after every socket drop, and until that window returns the account is unreconciled and every order is refused — the window may hold fills nothing has seen, and sizing against a position oppen has mis-stated is the failure this exists to prevent. Both are seconds, not minutes. Poll `get_state` rather than retrying the order: the refusal names the condition, and it clears on its own.
+**Two moments where that is expected rather than broken.** oppen walks a catch-up window at startup and again after every socket drop, and until that window returns the account is unreconciled and every order is refused — the window may hold fills nothing has seen, and sizing against a position oppen has mis-stated is the failure this exists to prevent. Recovery duration depends on the venue and the outstanding evidence. Poll `get_state` rather than retrying the order; a persistent local evidence failure requires operator recovery and does not clear merely because the socket reconnects.
 
 ### `set_alert(condition)`
 

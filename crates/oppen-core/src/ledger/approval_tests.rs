@@ -627,6 +627,7 @@ impl Fixture {
         let engine = GuardrailEngine::new(
             self.policy.clone(),
             Arc::new(crate::keys::MemoryKeyStore::new(Network::Testnet)),
+            crate::feed::test_session(oppen_hl::Address::from_bytes([1; 20])),
         )
         .unwrap();
         engine
@@ -673,6 +674,9 @@ impl Fixture {
             vol_ratio: None,
         };
         let exposure = Exposure {
+            feed_stamp: Some(
+                crate::feed::test_session(oppen_hl::Address::from_bytes([1; 20])).stamp(),
+            ),
             account: self.route.binding.container,
             agent: AccountSnapshot {
                 as_of_ms: at_ms,

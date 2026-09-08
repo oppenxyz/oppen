@@ -477,6 +477,7 @@ pub struct Clearance {
 /// be replayed into a second order.
 #[derive(Debug)]
 pub struct Cleared {
+    feed_stamp: Option<crate::feed::FeedStamp>,
     action: Action,
     clearance: Clearance,
     approval_deadline_ms: Option<u64>,
@@ -487,6 +488,7 @@ impl Cleared {
     /// adding a second constructor breaks `AGENTS.md` invariant 1.
     fn new(action: Action, clearance: Clearance) -> Self {
         Cleared {
+            feed_stamp: None,
             action,
             clearance,
             approval_deadline_ms: None,
@@ -516,8 +518,20 @@ impl Cleared {
         &self.action == action
     }
 
-    fn into_parts(self) -> (Action, Clearance, Option<u64>) {
-        (self.action, self.clearance, self.approval_deadline_ms)
+    fn into_parts(
+        self,
+    ) -> (
+        Action,
+        Clearance,
+        Option<u64>,
+        Option<crate::feed::FeedStamp>,
+    ) {
+        (
+            self.action,
+            self.clearance,
+            self.approval_deadline_ms,
+            self.feed_stamp,
+        )
     }
 }
 
@@ -658,6 +672,7 @@ impl GuardedSignature<'_> {
 /// One in-memory transport capability. The ledger stores its digest, never
 /// executable request bytes. Dropping this does not release a reservation.
 pub struct SignedSubmission {
+    feed_stamp: Option<crate::feed::FeedStamp>,
     owner: Arc<()>,
     journal: SubmissionJournal,
     receipt: SubmissionReceipt,
@@ -938,6 +953,7 @@ impl EngineState {
 /// gateway and the workflow runner all hold the same instance, and a type
 /// parameter would leak into every one of their signatures.
 pub struct GuardrailEngine {
+    feed: Arc<crate::feed::FeedSession>,
     submission_owner: Arc<()>,
     submissions: Option<crate::ledger::SubmissionJournal>,
     approvals: Option<ApprovalJournal>,
@@ -972,6 +988,7 @@ impl GuardrailEngine {
     pub fn new(
         authority: Arc<PolicyJournal>,
         keys: Arc<dyn KeyStore>,
+        feed: Arc<crate::feed::FeedSession>,
     ) -> Result<Self, GuardrailError> {
         let network = authority.network();
         let submissions = authority.submissions(false);
@@ -981,6 +998,7 @@ impl GuardrailEngine {
             Arc::new(LedgerAuditSink::new(authority)),
             keys,
             network,
+            feed,
         )?;
         engine.submissions = Some(submissions);
         engine.approvals = Some(approvals);
@@ -992,6 +1010,7 @@ impl GuardrailEngine {
     pub fn new_supervised_alpha(
         authority: Arc<PolicyJournal>,
         keys: Arc<dyn KeyStore>,
+        feed: Arc<crate::feed::FeedSession>,
     ) -> Result<Self, GuardrailError> {
         let network = authority.network();
         if network != Network::Testnet {
@@ -1007,6 +1026,7 @@ impl GuardrailEngine {
             Arc::new(LedgerAuditSink::supervised(authority)),
             keys,
             network,
+            feed,
         )?;
         engine.submissions = Some(submissions);
         engine.approvals = Some(approvals);
@@ -1029,8 +1049,9 @@ impl GuardrailEngine {
         sink: Arc<dyn AuditSink>,
         keys: Arc<dyn KeyStore>,
         network: Network,
+        feed: Arc<crate::feed::FeedSession>,
     ) -> Result<Self, GuardrailError> {
-        Self::build(store, sink, keys, network)
+        Self::build(store, sink, keys, network, feed)
     }
 
     fn build(
@@ -1038,6 +1059,7 @@ impl GuardrailEngine {
         sink: Arc<dyn AuditSink>,
         keys: Arc<dyn KeyStore>,
         network: Network,
+        feed: Arc<crate::feed::FeedSession>,
     ) -> Result<Self, GuardrailError> {
         if keys.network() != network {
             return Err(GuardrailError::InvalidConfig {
@@ -1071,6 +1093,7 @@ impl GuardrailEngine {
             let _ = state.publish(version);
         }
         Ok(Self {
+            feed,
             submissions: None,
             submission_owner: Arc::new(()),
             approvals: None,
@@ -1081,6 +1104,11 @@ impl GuardrailEngine {
             state: Mutex::new(state),
             mutations: Mutex::new(()),
         })
+    }
+
+    /// The exact live session used by every order signing and dispatch gate.
+    pub fn feed(&self) -> Arc<crate::feed::FeedSession> {
+        self.feed.clone()
     }
 
     fn mutation_lock(&self) -> Result<MutexGuard<'_, ()>, GuardrailError> {
@@ -2403,6 +2431,10 @@ impl GuardrailEngine {
 
         let account = &exposure.agent;
         check_account(account, &config, now_ms)?;
+        drop(
+            self.feed
+                .admit(exposure.feed_stamp.as_ref(), self.network, exposure.account)?,
+        );
 
         let account_limits = state.account_limits;
         if !account_limits.is_unset() {
@@ -2727,6 +2759,9 @@ impl GuardrailEngine {
         // the token was spent when the proposal was minted, below.
         let rate = config.order_rate;
         let bucket = state.bucket_mut(agent, rate, now_ms);
+        let feed_admission =
+            self.feed
+                .admit(exposure.feed_stamp.as_ref(), self.network, exposure.account)?;
         let spend = match mode {
             // Refill without taking. Refilling is time-based and idempotent —
             // it only advances the bucket to the clock it would reach on the
@@ -2771,6 +2806,7 @@ impl GuardrailEngine {
         if config.approval_required && mode == Mode::Fresh {
             if let Some(journal) = &self.approvals {
                 let policy_revision = state.policy_revision;
+                drop(feed_admission);
                 drop(state);
                 let proposal = journal
                     .mint(Candidate {
@@ -2849,7 +2885,9 @@ impl GuardrailEngine {
                 global_tokens_remaining,
             },
         };
-        Ok(Cleared::new(action, clearance))
+        let mut cleared = Cleared::new(action, clearance);
+        cleared.feed_stamp = exposure.feed_stamp.clone();
+        Ok(cleared)
     }
 
     /// Clears a cancel by order id.
@@ -3145,6 +3183,7 @@ impl GuardrailEngine {
         clock: impl Fn() -> u64,
         authorize: impl Fn() -> Result<G, Refusal>,
     ) -> Result<SignedSubmission, SignClearedError> {
+        let feed_stamp = cleared.feed_stamp.clone();
         let deadline = cleared.approval_deadline_ms;
         let final_authorize = || authorize().map(drop);
         let (request, clearance, signed, wallet, signer) = self.sign_common(
@@ -3160,6 +3199,7 @@ impl GuardrailEngine {
             SignClearedError::Refused(submission_refusal("missing signing publication"))
         })?;
         Ok(SignedSubmission {
+            feed_stamp,
             owner: self.submission_owner.clone(),
             journal: journal.clone(),
             receipt: receipt.clone(),
@@ -3202,7 +3242,7 @@ impl GuardrailEngine {
                 return Err(SignClearedError::Refused(refusal));
             }
         }
-        let (action, clearance, approval_deadline_ms) = cleared.into_parts();
+        let (action, clearance, approval_deadline_ms, feed_stamp) = cleared.into_parts();
         let (key, wallet): (AgentKey, AgentWallet) =
             self.keys.load_agent_key_with_wallet(&clearance.agent)?;
         let caller_authority = authorize().map_err(|refusal| {
@@ -3211,6 +3251,8 @@ impl GuardrailEngine {
         })?;
         let actual_signer = key.address();
         let gate = PreSignGate {
+            feed_stamp: feed_stamp.as_ref(),
+            held_feed: std::cell::RefCell::new(None),
             engine: self,
             clearance: &clearance,
             approval_deadline_ms,
@@ -3237,6 +3279,7 @@ impl GuardrailEngine {
                 let signed_at_ms = gate.observed_at_ms.get().ok_or_else(|| {
                     SignError::Refused(submission_refusal("signing clock missing"))
                 })?;
+                gate.held_feed.borrow_mut().take();
                 gate.held_state.borrow_mut().take();
                 let evidence = GuardedSignature {
                     journal,
@@ -3402,6 +3445,10 @@ impl GuardrailEngine {
                     let caller = authorize()?;
                     let final_authorize = || authorize().map(drop);
                     let gate = PreSignGate {
+                        feed_stamp: signed
+                            .submission
+                            .and_then(|submission| submission.feed_stamp.as_ref()),
+                        held_feed: std::cell::RefCell::new(None),
                         engine: self,
                         clearance: signed.clearance,
                         approval_deadline_ms: signed.deadline,
@@ -3420,6 +3467,7 @@ impl GuardrailEngine {
                         expires_after: signed.request.expires_after(),
                         network: signed.clearance.network,
                     })?;
+                    gate.held_feed.borrow_mut().take();
                     if let Some(submission) = signed.submission {
                         gate.held_authority
                             .borrow()
@@ -3545,6 +3593,9 @@ impl GuardrailEngine {
 /// cancelling resting orders part of what engaging the switch *does*, and
 /// item 10 requires headroom for risk-reducing actions.
 struct PreSignGate<'a> {
+    feed_stamp: Option<&'a crate::feed::FeedStamp>,
+    // Reverse lock order on release: feed, engine state, ledger authority.
+    held_feed: std::cell::RefCell<Option<crate::feed::AdmissionGuard<'a>>>,
     engine: &'a GuardrailEngine,
     /// The evaluation that authorises this signature, and the only place the
     /// gate reads an identity from.
@@ -3562,6 +3613,14 @@ struct PreSignGate<'a> {
 
 impl PreSignGate<'_> {
     fn check_state(&self, state: &EngineState, action: &Action) -> Result<(), Refusal> {
+        self.held_feed.borrow_mut().take();
+        if matches!(self.clearance.kind, ClearedKind::Order { .. }) {
+            *self.held_feed.borrow_mut() = Some(self.engine.feed.admit(
+                self.feed_stamp,
+                self.clearance.network,
+                self.clearance.route.binding.container,
+            )?);
+        }
         if let Some(authorize) = self.final_authorize {
             authorize()?;
         }
@@ -4254,6 +4313,7 @@ mod stop_generation_tests {
             Arc::new(AuditOnly),
             Arc::new(crate::keys::MemoryKeyStore::new(Network::Testnet)),
             Network::Testnet,
+            crate::feed::test_session(oppen_hl::Address::from_bytes([1; 20])),
         )
         .unwrap();
         engine.state().stop_generation = u64::MAX - 1;
