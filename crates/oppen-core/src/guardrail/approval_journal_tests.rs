@@ -593,3 +593,233 @@ fn publication_failure_does_not_reapprove(disposition: bool) {
     );
     assert_eq!(f.events(EventKind::ApprovalClaimed), claims);
 }
+
+#[test]
+fn production_reserved_approval_expires_before_signature_and_stays_consumed() {
+    reserved_approval_deadline(false, false);
+}
+
+#[test]
+fn production_reserved_approval_deadline_is_sampled_after_key_loading() {
+    reserved_approval_deadline(true, false);
+}
+
+#[test]
+fn production_reserved_approval_deadline_is_sampled_after_ledger_authority_lock() {
+    reserved_approval_deadline(true, true);
+}
+
+fn reserved_approval_deadline(wait_for_keys: bool, wait_for_authority: bool) {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    use crate::ledger::SubmissionResolution;
+
+    for reduce_only in [false, true] {
+        let mut f = DurableFixture::new();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let mut order = approval_order();
+        order.reduce_only = reduce_only;
+        let mut loaded = exposure(d("100000"));
+        if reduce_only {
+            loaded
+                .agent
+                .positions
+                .insert("BTC".into(), PositionSnapshot { szi: -Decimal::ONE });
+            loaded.agent.total_position_notional_usd = d("100");
+        }
+        let result = f.engine.evaluate(
+            &AgentId::new("alpha"),
+            &order,
+            &asset("BTC", 2, 40),
+            &MarketRef::fresh("BTC", d("100"), NOW_MS),
+            &loaded,
+            NOW_MS,
+        );
+        let Err(Refusal::ApprovalRequired {
+            approval_id,
+            expires_at_ms,
+            ..
+        }) = result
+        else {
+            panic!("expected durable proposal, reduce_only={reduce_only}: {result:?}");
+        };
+        assert_eq!(expires_at_ms, NOW_MS + APPROVAL_TTL_MS);
+        let approved_at = expires_at_ms - 1;
+        let proposed = f.engine.pending_proposals(NOW_MS).unwrap();
+        f = f.reopen();
+        assert_eq!(f.engine.pending_proposals(approved_at).unwrap(), proposed);
+        let keys = Arc::new(WaitingKeys {
+            inner: f.keys.clone(),
+            wait: wait_for_keys.then(|| (entered_tx, Mutex::new(release_rx))),
+        });
+        f.engine = GuardrailEngine::new(f.policy.clone(), keys).unwrap();
+        acknowledge(&f.engine);
+        let wallet = f
+            .keys
+            .agent_wallet(&AgentId::new("alpha"))
+            .unwrap()
+            .unwrap();
+        assert!(wallet.approved_at_ms <= approved_at && wallet.valid_until_ms > expires_at_ms);
+        loaded.agent.as_of_ms = approved_at;
+        let cleared = f
+            .engine
+            .operator_approve_proposal(
+                &approval_id,
+                &asset("BTC", 2, 40),
+                &MarketRef::fresh("BTC", d("100"), approved_at),
+                &loaded,
+                approved_at,
+            )
+            .unwrap();
+        assert_eq!(cleared.clearance().evaluated_at_ms, expires_at_ms - 1);
+        let claims = f.events(EventKind::ApprovalClaimed);
+        let intents = f.events(EventKind::OrderIntent);
+        let dispositions = f.events(EventKind::ApprovalDisposed);
+        assert_eq!(claims.len(), 1);
+        assert_eq!(intents.len(), 1);
+        assert_eq!(dispositions.len(), 1);
+        assert!(claims[0].seq < intents[0].seq && intents[0].seq < dispositions[0].seq);
+        let submissions = f.engine.submissions().unwrap();
+        let before = submissions.state(vault()).unwrap();
+        let receipt = submissions
+            .begin(vault(), cleared.clearance(), before.revision, approved_at)
+            .unwrap();
+        assert_eq!(
+            submissions
+                .state(vault())
+                .unwrap()
+                .pending
+                .as_ref()
+                .unwrap()
+                .cloid(),
+            receipt.cloid()
+        );
+
+        let clock = AtomicU64::new(if wait_for_keys {
+            approved_at
+        } else {
+            expires_at_ms
+        });
+        let samples = AtomicUsize::new(0);
+        let previous_refusals = f.events(EventKind::Refusal).len();
+        let result = std::thread::scope(|scope| {
+            let coordination = wait_for_authority.then(|| {
+                let file = std::fs::File::options()
+                    .read(true)
+                    .write(true)
+                    .open(f.dir.path().join("approval.db.lock"))
+                    .unwrap();
+                file.lock().unwrap();
+                file
+            });
+            let (done_tx, done_rx) = mpsc::channel();
+            let engine = &f.engine;
+            let clock = &clock;
+            let samples = &samples;
+            scope.spawn(move || {
+                let result = engine.sign_cleared(cleared, 1, None, || {
+                    samples.fetch_add(1, Ordering::SeqCst);
+                    clock.load(Ordering::SeqCst)
+                });
+                done_tx.send(result).unwrap();
+            });
+            if wait_for_keys {
+                entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                if wait_for_authority {
+                    release_tx.send(()).unwrap();
+                }
+                let waiting = done_rx.recv_timeout(Duration::from_millis(50));
+                let samples_while_blocked = samples.load(Ordering::SeqCst);
+                clock.store(expires_at_ms, Ordering::SeqCst);
+                drop(coordination);
+                if !wait_for_authority {
+                    release_tx.send(()).unwrap();
+                }
+                assert!(matches!(waiting, Err(mpsc::RecvTimeoutError::Timeout)));
+                assert_eq!(
+                    samples_while_blocked, 0,
+                    "deadline must follow key loading and authority locking"
+                );
+            }
+            done_rx.recv_timeout(Duration::from_secs(2)).unwrap()
+        });
+        assert!(
+            matches!(result,
+                Err(SignClearedError::Refused(Refusal::Unevaluable(
+                    Unevaluable::ApprovalExpired { expires_at_ms: expiry, now_ms }
+                ))) if expiry == expires_at_ms && now_ms == expires_at_ms
+            ),
+            "expired durable approval returned a signature or wrong refusal: {result:?}"
+        );
+        assert_eq!(samples.load(Ordering::SeqCst), 1);
+        let refusals = f.events(EventKind::Refusal);
+        assert_eq!(refusals.len(), previous_refusals + 1);
+        let audit = refusals.last().unwrap();
+        assert_eq!(audit.ts_ms, expires_at_ms as i64);
+        assert_eq!(audit.agent_id.as_deref(), Some("alpha"));
+        assert_eq!(
+            audit.payload.as_ref().unwrap().get("refusal_detail"),
+            Some(
+                &serde_json::to_value(Refusal::Unevaluable(Unevaluable::ApprovalExpired {
+                    expires_at_ms,
+                    now_ms: expires_at_ms,
+                }))
+                .unwrap()
+            )
+        );
+        assert_eq!(
+            submissions
+                .state(vault())
+                .unwrap()
+                .pending
+                .as_ref()
+                .unwrap()
+                .cloid(),
+            receipt.cloid()
+        );
+        submissions
+            .resolve(
+                &receipt,
+                SubmissionResolution::NotSent {
+                    detail: "synthetic signing gate refused expired approval".into(),
+                },
+                expires_at_ms,
+            )
+            .unwrap();
+        assert!(submissions.state(vault()).unwrap().pending.is_none());
+        drop(submissions);
+
+        let f = f.reopen();
+        assert!(
+            f.engine
+                .pending_proposals(expires_at_ms + 1)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(matches!(
+            f.engine.operator_approve_proposal(
+                &approval_id,
+                &asset("BTC", 2, 40),
+                &MarketRef::fresh("BTC", d("100"), expires_at_ms + 1),
+                &loaded,
+                expires_at_ms + 1,
+            ),
+            Err(Refusal::Unevaluable(Unevaluable::UnknownProposal { .. }))
+        ));
+        assert!(
+            f.engine
+                .submissions()
+                .unwrap()
+                .state(vault())
+                .unwrap()
+                .pending
+                .is_none()
+        );
+        assert_eq!(f.events(EventKind::ApprovalClaimed), claims);
+        assert_eq!(f.events(EventKind::OrderIntent), intents);
+        assert_eq!(f.events(EventKind::ApprovalDisposed), dispositions);
+        assert!(f.ledger.verify().unwrap().is_intact());
+    }
+}

@@ -294,13 +294,18 @@ pub struct Clearance {
 pub struct Cleared {
     action: Action,
     clearance: Clearance,
+    approval_deadline_ms: Option<u64>,
 }
 
 impl Cleared {
     /// Private on purpose. Moving this line, widening it to `pub(crate)`, or
     /// adding a second constructor breaks `AGENTS.md` invariant 1.
     fn new(action: Action, clearance: Clearance) -> Self {
-        Cleared { action, clearance }
+        Cleared {
+            action,
+            clearance,
+            approval_deadline_ms: None,
+        }
     }
 
     /// The exact action that was evaluated. Built by the engine from the
@@ -322,8 +327,8 @@ impl Cleared {
         &self.clearance
     }
 
-    fn into_parts(self) -> (Action, Clearance) {
-        (self.action, self.clearance)
+    fn into_parts(self) -> (Action, Clearance, Option<u64>) {
+        (self.action, self.clearance, self.approval_deadline_ms)
     }
 }
 
@@ -1277,15 +1282,20 @@ impl GuardrailEngine {
                     approval_id: approval_id.to_owned(),
                 })?
         };
-        let outcome = self.decide(
-            &proposal.agent,
-            &proposal.intent,
-            asset,
-            market,
-            exposure,
-            now_ms,
-            Mode::Approved(&proposal.route),
-        );
+        let outcome = self
+            .decide(
+                &proposal.agent,
+                &proposal.intent,
+                asset,
+                market,
+                exposure,
+                now_ms,
+                Mode::Approved(&proposal.route),
+            )
+            .map(|mut cleared| {
+                cleared.approval_deadline_ms = Some(proposal.expires_at_ms);
+                cleared
+            });
         let receipt = self.record(
             Some(&proposal.agent),
             now_ms,
@@ -2269,13 +2279,14 @@ impl GuardrailEngine {
         expires_after: Option<u64>,
         clock: impl Fn() -> u64,
     ) -> Result<(ExchangeRequest, Clearance), SignClearedError> {
-        let (action, clearance) = cleared.into_parts();
+        let (action, clearance, approval_deadline_ms) = cleared.into_parts();
         let (key, wallet): (AgentKey, AgentWallet) =
             self.keys.load_agent_key_with_wallet(&clearance.agent)?;
         let actual_signer = key.address();
         let gate = PreSignGate {
             engine: self,
             clearance: &clearance,
+            approval_deadline_ms,
             clock: &clock,
             observed_at_ms: std::cell::Cell::new(None),
             actual_signer,
@@ -2403,6 +2414,7 @@ struct PreSignGate<'a> {
     /// The evaluation that authorises this signature, and the only place the
     /// gate reads an identity from.
     clearance: &'a Clearance,
+    approval_deadline_ms: Option<u64>,
     clock: &'a dyn Fn() -> u64,
     observed_at_ms: std::cell::Cell<Option<u64>>,
     actual_signer: Address,
@@ -2452,6 +2464,15 @@ impl PreSignCheck for PreSignGate<'_> {
         // answer here to "what does this clearance's age make untrue?".
         match &self.clearance.kind {
             ClearedKind::Order { .. } => {
+                if let Some(expires_at_ms) = self.approval_deadline_ms
+                    && now_ms >= expires_at_ms
+                {
+                    return Err(Unevaluable::ApprovalExpired {
+                        expires_at_ms,
+                        now_ms,
+                    }
+                    .into());
+                }
                 check_order_approval_window(&self.clearance.route, now_ms)?;
                 if self.clearance.policy_revision != state.policy_revision {
                     return Err(Unevaluable::PolicyChanged.into());

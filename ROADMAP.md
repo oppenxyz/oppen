@@ -163,7 +163,15 @@ before expanding features:
    origins, historical-unknown handling and same-CLOID quote-observation retries.
    Local workspace verification passes 1,020 Rust tests (15 live-gated ignored),
    152 frontend tests, build, formatting and all-target Clippy; independent review
-   and exact-head CI remain gates;
+   and exact-head CI remain gates. PR #66 at `bfad1b0` has separate exact-head
+   automated review; CI run `34187897072` also did not start due to the GitHub
+   payment/spending-limit gate. While tracing native approval execution, ES27
+   reproduced a signature at proposal expiry after approval one millisecond
+   earlier. `fix/approval-signing-deadline` carries the private deadline through
+   final signing. Local verification passes 43 focused approval tests and 1,024
+   Rust workspace tests (15 live-gated ignored), 152 frontend tests, build,
+   formatting and all-target Clippy. Separate diff review found no blocking
+   issues; exact-head review and CI remain gates;
    original-request repricing and native approval UI remain open. This is not a
    completed live gate.
    No dedicated-account activity has been performed during this development.

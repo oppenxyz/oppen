@@ -4825,6 +4825,62 @@ fn a_proposal_expires_and_cannot_be_approved_afterwards() {
     ));
 }
 
+#[test]
+fn an_approved_proposal_deadline_remains_exclusive_at_final_signing() {
+    for at_expiry in [false, true] {
+        let mut config = permissive(&["BTC"]);
+        config.approval_required = true;
+        let f = Fixture::new(config);
+        let btc = asset("BTC", 2, 40);
+        let market = MarketRef::fresh("BTC", d("100"), NOW_MS);
+        let Err(Refusal::ApprovalRequired {
+            approval_id,
+            expires_at_ms,
+            ..
+        }) = f.evaluate(
+            &intent("BTC", true, d("100"), d("1")),
+            &btc,
+            &market,
+            &exposure(d("100000")),
+        )
+        else {
+            panic!("expected a proposal")
+        };
+        let approved_at = expires_at_ms - 1;
+        let fresh_market = MarketRef::fresh("BTC", d("100"), approved_at);
+        let mut fresh_exposure = exposure(d("100000"));
+        fresh_exposure.agent.as_of_ms = approved_at;
+        let cleared = f
+            .engine
+            .operator_approve_proposal(
+                &approval_id,
+                &btc,
+                &fresh_market,
+                &fresh_exposure,
+                approved_at,
+            )
+            .unwrap();
+        let result = f.engine.sign_cleared(cleared, 1, None, || {
+            if at_expiry {
+                expires_at_ms
+            } else {
+                approved_at
+            }
+        });
+        assert_eq!(
+            result.is_ok(),
+            !at_expiry,
+            "proposal deadline must survive approval and be exclusive: {result:?}"
+        );
+        if at_expiry {
+            assert!(
+                matches!(result, Err(SignClearedError::Refused(Refusal::Unevaluable(Unevaluable::ApprovalExpired { expires_at_ms: expiry, now_ms: observed }))) if expiry == expires_at_ms && observed == expires_at_ms)
+            );
+        }
+        assert!(f.engine.pending_proposals(approved_at).unwrap().is_empty());
+    }
+}
+
 /// An approval is not a waiver. Every hard predicate runs again against the
 /// state at approval time, which is what item 28's "re-priced at approval
 /// time" means for the guardrails.
