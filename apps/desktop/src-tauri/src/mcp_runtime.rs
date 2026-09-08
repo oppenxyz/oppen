@@ -24,6 +24,7 @@ use serde::Serialize;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
+use crate::operator_approvals::ApprovalQueueControl;
 use crate::operator_halt::{HaltControl, HaltStatus};
 
 const PORT: u16 = 7433;
@@ -199,6 +200,7 @@ pub(crate) struct OwnedMcp {
     task: Option<tauri::async_runtime::JoinHandle<Result<(), String>>>,
     completed: Option<Result<(), String>>,
     halt: Option<Arc<HaltControl>>,
+    approvals: Option<Arc<ApprovalQueueControl>>,
 }
 
 impl Drop for OwnedMcp {
@@ -231,6 +233,7 @@ impl OwnedMcp {
                 task: None,
                 completed: Some(Ok(())),
                 halt: None,
+                approvals: None,
             });
         }
         let source = VenueSource::new(Network::Testnet).map_err(|error| error.to_string())?;
@@ -297,9 +300,13 @@ impl OwnedMcp {
             task: Some(task),
             completed: None,
             halt: None,
+            approvals: None,
         };
         match observing.await {
-            Ok(halt) => owned.halt = Some(halt),
+            Ok((halt, approvals)) => {
+                owned.halt = Some(halt);
+                owned.approvals = Some(approvals);
+            }
             Err(_) => owned.shutdown_and_drain().await?,
         }
         Ok(owned)
@@ -312,20 +319,46 @@ impl OwnedMcp {
             .request(binding)
     }
 
+    pub(crate) fn approvals(&self) -> Result<&Arc<ApprovalQueueControl>, String> {
+        self.approvals
+            .as_ref()
+            .ok_or_else(|| "MCP approval queue is not available".into())
+    }
+
     pub(crate) async fn shutdown_and_drain(&mut self) -> Result<(), String> {
         self.stop.cancel();
-        if let Some(result) = &self.completed {
-            return result.clone();
-        }
-        let result = match self.task.as_mut() {
-            Some(task) => task
-                .await
-                .map_err(|error| format!("MCP owner task: {error}"))
-                .and_then(|result| result),
-            None => Ok(()),
+        let close_error = self
+            .approvals
+            .as_ref()
+            .and_then(|queue| queue.close().err());
+        let mut result = if let Some(result) = &self.completed {
+            result.clone()
+        } else {
+            match self.task.as_mut() {
+                Some(task) => task
+                    .await
+                    .map_err(|error| format!("MCP owner task: {error}"))
+                    .and_then(|result| result),
+                None => Ok(()),
+            }
         };
         self.task = None;
+        if result.is_ok()
+            && let Some(error) = close_error
+        {
+            result = Err(error);
+        }
+        // Save the parent result before another await: a dropped drain waiter
+        // must not poll the completed parent handle twice or lose its failure.
+        self.completed = Some(result.clone());
+        if let Some(queue) = &self.approvals
+            && let Err(error) = queue.close_and_drain().await
+            && result.is_ok()
+        {
+            result = Err(error);
+        }
         self.halt = None;
+        self.approvals = None;
         self.completed = Some(result.clone());
         result
     }
@@ -338,7 +371,7 @@ async fn run<S, F>(
     pool: F,
     status: SharedStatus,
     stop: CancellationToken,
-    ready: oneshot::Sender<Arc<HaltControl>>,
+    ready: oneshot::Sender<(Arc<HaltControl>, Arc<ApprovalQueueControl>)>,
 ) -> Result<(), String>
 where
     S: ReconcileSource + Send + 'static,
@@ -362,6 +395,7 @@ where
         bound.supervision_control(),
         status.clone(),
     );
+    let approvals = ApprovalQueueControl::new(prepared.engine.clone(), prepared.binding.clone())?;
     let (pool, mut events) = pool().map_err(|error| error.to_string())?;
     let pool = Arc::new(pool);
     let (pump_stop, stopping) = oneshot::channel();
@@ -463,13 +497,16 @@ where
                 }
             }
         });
-        let _ = ready.send(halt.clone());
+        let _ = ready.send((halt.clone(), approvals.clone()));
         failure = match monitor.await {
             Ok(failure) => failure,
             Err(error) => Some(format!("MCP monitor task: {error}")),
         };
     }
     status_lock(&status).phase = McpPhase::Stopping;
+    if let Err(error) = approvals.close_and_drain().await {
+        failure.get_or_insert(error);
+    }
     // Keep the existing cancellation supervisor alive through every admitted
     // mutation and its first subsequent sweep attempt, even after IPC drop.
     if let Err(error) = halt.close_and_drain().await {
@@ -1096,6 +1133,85 @@ mod tests {
         drop(prepared);
         let reopened = fixture.prepare().unwrap();
         assert_eq!(reopened.ledger.chain_head().unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn failed_parent_retains_blocked_queue_across_dropped_shutdown_waiter() {
+        for panics in [false, true] {
+            let fixture = Fixture::authorized();
+            let prepared = fixture.prepare().unwrap();
+            let queue = ApprovalQueueControl::new(prepared.engine.clone(), fixture.binding.clone())
+                .unwrap();
+            let (entered, started) = oneshot::channel();
+            let (release, released) = std::sync::mpsc::channel();
+            queue
+                .blocked_refresh(&fixture.binding, entered, released)
+                .unwrap();
+            started.await.unwrap();
+            let parent = tauri::async_runtime::spawn(async move {
+                assert!(!panics, "synthetic MCP parent panic");
+                Err::<(), String>("synthetic MCP parent failure".into())
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while !parent.inner().is_finished() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let mut owned = OwnedMcp {
+                stop: CancellationToken::new(),
+                task: Some(parent),
+                completed: None,
+                halt: None,
+                approvals: Some(queue.clone()),
+            };
+            assert!(
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(25),
+                    owned.shutdown_and_drain(),
+                )
+                .await
+                .is_err()
+            );
+            assert!(owned.stop.is_cancelled());
+            assert!(owned.task.is_none());
+            let first_failure = owned.completed.clone().unwrap().unwrap_err();
+            assert!(first_failure.contains(if panics {
+                "MCP owner task"
+            } else {
+                "synthetic MCP parent failure"
+            }));
+            assert!(
+                owned.approvals.is_some(),
+                "blocked work must retain its owner"
+            );
+            assert!(queue.refresh(&fixture.binding).is_err());
+            assert_eq!(
+                queue.status(&fixture.binding).unwrap().phase,
+                crate::operator_approvals::QueuePhase::Closed
+            );
+
+            release.send(()).unwrap();
+            assert_eq!(
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    owned.shutdown_and_drain(),
+                )
+                .await
+                .unwrap(),
+                Err(first_failure.clone())
+            );
+            assert!(owned.approvals.is_none());
+            assert!(
+                queue
+                    .status(&fixture.binding)
+                    .unwrap()
+                    .observed_at_ms
+                    .is_some()
+            );
+            assert_eq!(owned.shutdown_and_drain().await, Err(first_failure));
+        }
     }
 
     #[tokio::test]

@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
 import DecisionStream from "../components/DecisionStream.vue";
+import ApprovalQueuePanel from "../components/ApprovalQueuePanel.vue";
 import EmptyState from "../components/housing/EmptyState.vue";
 import PanelHousing from "../components/housing/PanelHousing.vue";
 import ReadoutRows from "../components/housing/ReadoutRows.vue";
@@ -59,9 +60,7 @@ const policyRows = computed(() => policy.value ? [
             <p class="agents__note">{{ operator.policyReadMs ? `Read ${new Date(operator.policyReadMs).toLocaleTimeString()}` : 'Not read' }} · Paused policy setup requires existing TESTNET authority and idle MCP.</p>
             <UiButton size="sm" @click="openPolicySettings">Set up paused policy</UiButton>
           </PanelHousing>
-          <PanelHousing inset label="Live approvals" meta="Not connected" :brackets="['br']">
-            <EmptyState line="Pending proposals live in the gateway. Recorded approval decisions are in the log; they do not prove the current queue is empty." />
-          </PanelHousing>
+          <ApprovalQueuePanel />
           <PanelHousing inset label="Runtime state">
             <ReadoutRows :rows="[{ k: 'Active pairing', v: 'Not read' }, { k: 'Dead-man coverage', v: 'Not read' }, { k: 'Cancel completion', v: 'Not read' }]" />
           </PanelHousing>
