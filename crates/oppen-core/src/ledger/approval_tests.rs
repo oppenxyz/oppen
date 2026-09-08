@@ -945,9 +945,9 @@ fn legacy_claim_and_disposition_omit_review_fields_and_preserve_canonical_bytes(
 }
 
 #[test]
-fn cancellation_finish_requires_actual_review_digest_and_cannot_use_legacy_claim() {
+fn cancellation_mint_refuses_manual_targets_without_authenticated_acceptance() {
     use crate::guardrail::{CancelContext, CancelTarget};
-    for wrong in [false, true] {
+    {
         let f = Fixture::new();
         let engine = f.evaluation_engine();
         let intent = CancelIntent {
@@ -963,6 +963,7 @@ fn cancellation_finish_requires_actual_review_digest_and_cannot_use_legacy_claim
                 orig_sz: Decimal::ONE,
                 timestamp: NOW - 1,
                 order_type: "Limit".into(),
+                tif: Some(oppen_hl::wire::Tif::Gtc),
                 reduce_only: true,
                 is_trigger: false,
                 trigger_px: None,
@@ -970,67 +971,77 @@ fn cancellation_finish_requires_actual_review_digest_and_cannot_use_legacy_claim
                 is_position_tpsl: false,
             }],
         };
-        let proposal = f
-            .journal
-            .mint_cancel(
-                f.route.binding.agent.clone(),
-                intent.clone(),
-                f.route.clone(),
-                f.policy.current().unwrap().revision,
-                NOW,
-            )
-            .unwrap();
         let head = f.ledger.chain_head().unwrap();
-        assert!(f.journal.claim(proposal.id(), NOW).is_err());
+        assert!(
+            f.journal
+                .mint_cancel(
+                    f.route.binding.agent.clone(),
+                    intent.clone(),
+                    f.route.clone(),
+                    f.policy.current().unwrap().revision,
+                    NOW
+                )
+                .is_err()
+        );
         assert_eq!(f.ledger.chain_head().unwrap(), head);
         let context = CancelContext {
-            account: proposal.account(),
+            account: f.route.binding.container,
             observed_at_ms: NOW,
             targets: intent.targets.clone(),
         };
-        let evaluated = engine
-            .evaluate_cancel(proposal.agent(), &intent, &context, NOW)
-            .unwrap();
-        let evidence = f.journal.prepare(proposal.id(), NOW).unwrap().unwrap();
-        let review = ReviewCommitment::new_cancel(
-            &evidence,
-            &intent,
-            evaluated.action().clone(),
-            evaluated.clearance(),
-            NOW,
-            NOW,
-        )
-        .unwrap();
-        let claim = f
-            .journal
-            .claim_review(evidence, review, NOW + 1)
-            .unwrap()
-            .unwrap();
-        let cleared = engine
-            .evaluate_cancel(proposal.agent(), &intent, &context, NOW + 2)
-            .unwrap();
-        let mut payload = serde_json::to_value(cleared.clearance()).unwrap();
-        payload["reason"] = json!(intent.reason);
-        if wrong {
-            payload["approval_review_digest"] = json!("0".repeat(64));
-        }
-        let receipt = f
-            .ledger
-            .append(&NewEvent {
-                kind: EventKind::AgentDecision,
-                ts_ms: (NOW + 2) as i64,
-                agent_id: Some(proposal.agent().as_str()),
-                payload: &payload,
-                snapshot: None,
-            })
-            .unwrap();
-        let head = f.ledger.chain_head().unwrap();
         assert!(
-            matches!(f.journal.finish(claim, &Ok(cleared), Some(&receipt), NOW + 2), Err(ApprovalError::Unavailable { detail }) if detail.contains("reviewed commitment"))
+            engine
+                .evaluate_cancel(&f.route.binding.agent, &intent, &context, NOW)
+                .is_err()
         );
-        assert_eq!(f.ledger.chain_head().unwrap(), head);
-        assert!(f.reopened().pending(NOW + 3).unwrap().is_empty());
+        assert!(f.reopened().pending(NOW).unwrap().is_empty());
     }
+}
+
+#[test]
+fn v14_absent_cancellation_provenance_and_tif_preserve_historical_bytes() {
+    let f = Fixture::new();
+    let target = json!({
+        "symbol":"BTC", "asset_index":0, "oid":1, "cloid":null, "is_buy":false,
+        "limit_px":"100", "sz":"1", "orig_sz":"1", "timestamp":NOW,
+        "order_type":"Limit", "reduce_only":true, "is_trigger":false,
+        "trigger_px":null, "trigger_condition":null, "is_position_tpsl":false
+    });
+    let intent = json!({"targets":[target], "reason":"historical cancellation"});
+    let historical = json!({
+        "agent": f.route.binding.agent, "intent":intent, "route": f.route,
+        "route_hash":"historical-route-hash", "policy":{"seq":2,"hash":"historical-policy-hash"},
+        "expires_at_ms": NOW + APPROVAL_TTL_MS
+    });
+    let raw = super::super::hash::canonical_json(&historical).unwrap();
+    let proposal: Proposed = serde_json::from_str(&raw).unwrap();
+    assert!(proposal.cancel_provenance.is_none());
+    assert_eq!(
+        super::super::hash::canonical_json(&serde_json::to_value(proposal).unwrap()).unwrap(),
+        raw
+    );
+    let review = json!({
+        "proposal_root":{"seq":3,"hash":"historical-proposal-hash"}, "route": f.route,
+        "candidate":intent, "action":{"type":"cancel","cancels":[{"a":0,"o":1}]},
+        "policy":{"seq":2,"hash":"historical-policy-hash"}, "reviewed_at_ms":NOW,
+        "observed_at_ms":NOW, "expires_at_ms":NOW + APPROVAL_TTL_MS
+    });
+    let raw = super::super::hash::canonical_json(&review).unwrap();
+    let decoded: ReviewCommitment = serde_json::from_str(&raw).unwrap();
+    assert!(
+        matches!(&decoded, ReviewCommitment::Cancel(cancel) if cancel.provenance.is_none() && cancel.candidate.targets[0].tif.is_none())
+    );
+    assert_eq!(
+        super::super::hash::canonical_json(&serde_json::to_value(decoded).unwrap()).unwrap(),
+        raw
+    );
+    assert!(
+        f.ledger
+            .events_of_kind(EventKind::ApprovalClaimed)
+            .unwrap()
+            .is_empty(),
+        "decoding historical evidence does not claim or adopt it"
+    );
 }
 
 #[test]

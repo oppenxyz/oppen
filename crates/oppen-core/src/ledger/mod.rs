@@ -2613,6 +2613,30 @@ impl LedgerAuditSink {
                 });
             }
         }
+        if let crate::guardrail::ClearedKind::DiscretionaryCancel {
+            targets,
+            provenance,
+            ..
+        } = &clearance.kind
+        {
+            let current = self
+                .policy
+                .submissions(self.pilot_required)
+                .cancellation_ownership_in(connection, &clearance.route, targets)
+                .map_err(|error| {
+                    crate::guardrail::Refusal::from(
+                        crate::guardrail::Unevaluable::SubmissionAuthority {
+                            detail: error.to_string(),
+                        },
+                    )
+                })?;
+            if provenance.as_ref() != Some(&current) {
+                return Err(crate::guardrail::Unevaluable::SubmissionAuthority {
+                    detail: "cancellation ownership receipt missing or changed".into(),
+                }
+                .into());
+            }
+        }
         pilot::check_authenticated_before_sign(
             registry,
             connection,

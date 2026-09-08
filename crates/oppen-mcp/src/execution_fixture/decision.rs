@@ -33,7 +33,7 @@ impl HeadAnchor for AnchorHandle {
     }
 }
 
-fn request(
+pub(super) fn request(
     addr: std::net::SocketAddr,
     token: &str,
     session: Option<&str>,
@@ -186,7 +186,7 @@ async fn blocked_supervisor_policy_refresh_retains_owner_until_shutdown_drain() 
     venue.shutdown().await;
 }
 
-async fn initialize(addr: std::net::SocketAddr, token: &str) -> String {
+pub(super) async fn initialize(addr: std::net::SocketAddr, token: &str) -> String {
     let (status, headers, mut body) = transport::http_request(addr, request(addr, token, None, json!({
         "jsonrpc":"2.0", "id":1, "method":"initialize",
         "params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"decision-fixture","version":"0"}}

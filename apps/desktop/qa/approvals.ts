@@ -30,7 +30,7 @@ if (scenario.startsWith("cancel")) status.pending.unshift({
       limit_px: "59900.12", sz: "0.0002", orig_sz: "0.0003", timestamp: observed - 60000, order_type: "Stop Market",
       reduce_only: true, is_trigger: true, trigger_px: "60000", trigger_condition: "Price below 60000", is_position_tpsl: true },
     { symbol: "ETH", asset_index: 1, oid: 1043, cloid: null, is_buy: true, limit_px: "3000", sz: "0.004", orig_sz: "0.004",
-      timestamp: observed - 60000, order_type: "Limit", reduce_only: false, is_trigger: false, trigger_px: null, trigger_condition: null, is_position_tpsl: false },
+      timestamp: observed - 60000, order_type: "Limit", tif: "Gtc", reduce_only: false, is_trigger: false, trigger_px: "0", trigger_condition: "N/A", is_position_tpsl: false },
   ],
 });
 if (scenario === "empty") status.pending = [];

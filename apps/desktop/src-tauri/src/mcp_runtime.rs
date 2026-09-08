@@ -673,6 +673,7 @@ mod tests {
         task: Option<tokio::task::JoinHandle<()>>,
         info_gate: Arc<Mutex<Option<InfoGate>>>,
         orders: Arc<Mutex<Vec<serde_json::Value>>>,
+        accepted_order: Arc<Mutex<Option<serde_json::Value>>>,
     }
 
     struct InfoGate {
@@ -704,6 +705,8 @@ mod tests {
             let gates = info_gate.clone();
             let orders = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
             let open_orders = orders.clone();
+            let accepted_order = Arc::new(Mutex::new(None::<serde_json::Value>));
+            let acceptance = accepted_order.clone();
             let task = tokio::spawn(async move {
                 let mut clients = tokio::task::JoinSet::new();
                 loop {
@@ -716,6 +719,7 @@ mod tests {
                             let gates = gates.clone();
                             let stopped = stopping.clone();
                             let open_orders = open_orders.clone();
+                            let acceptance = acceptance.clone();
                             clients.spawn(async move {
                                 let mut socket = BufReader::new(socket);
                                 let mut line = String::new();
@@ -744,6 +748,14 @@ mod tests {
                                 let (code, response) = if websocket {
                                     // No public venue, and no fictional healthy account socket.
                                     ("503 Service Unavailable", String::new())
+                                } else if path == "/exchange" {
+                                    let expected = acceptance.lock().unwrap().take().expect("this fixture did not authorize an exchange response");
+                                    let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                                    assert_eq!(request["action"], expected);
+                                    assert!(request["signature"]["r"].is_string());
+                                    assert!(request["signature"]["s"].is_string());
+                                    assert!(request["nonce"].is_u64());
+                                    ("200 OK", serde_json::json!({"status":"ok","response":{"type":"order","data":{"statuses":[{"resting":{"oid":501}}]}}}).to_string())
                                 } else {
                                     assert_eq!(path, "/info", "unexpected venue operation");
                                     let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
@@ -780,6 +792,7 @@ mod tests {
                 task: Some(task),
                 info_gate,
                 orders,
+                accepted_order,
             }
         }
 
@@ -1615,35 +1628,246 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct CancellationFixtureKeys(Mutex<std::collections::HashMap<EntryName, String>>);
+
+    impl KeyStore for CancellationFixtureKeys {
+        fn network(&self) -> Network {
+            Network::Testnet
+        }
+        fn read(&self, entry: &EntryName) -> Result<Option<SecretText>, KeyStoreError> {
+            Ok(self
+                .0
+                .lock()
+                .unwrap()
+                .get(entry)
+                .cloned()
+                .map(SecretText::new))
+        }
+        fn write(&self, entry: &EntryName, value: &str) -> Result<(), KeyStoreError> {
+            self.0.lock().unwrap().insert(entry.clone(), value.into());
+            Ok(())
+        }
+        fn remove(&self, entry: &EntryName) -> Result<(), KeyStoreError> {
+            self.0.lock().unwrap().remove(entry);
+            Ok(())
+        }
+    }
+
+    fn cancellation_signing_fixture() -> (Fixture, Arc<CancellationFixtureKeys>) {
+        let dir = tempfile::tempdir().unwrap();
+        let binding = Fixture::binding();
+        let at = u64::try_from(now_ms()).unwrap();
+        let keys = Arc::new(CancellationFixtureKeys::default());
+        let hmac = Arc::new(HmacKey::from_bytes([11; 32]));
+        keys.store_hmac_key(&hmac).unwrap();
+        keys.create_agent_key(
+            &binding.agent,
+            SecretText::new(format!("{:064x}", 91)),
+            at + 86_400_000,
+            at,
+        )
+        .unwrap();
+        let ledger = Arc::new(
+            Ledger::open_at(
+                &dir.path().join(oppen_core::db_file_name(Network::Testnet)),
+                Network::Testnet,
+            )
+            .unwrap(),
+        );
+        let registry = Arc::new(RegistryJournal::open(ledger.clone(), hmac.clone()).unwrap());
+        registry
+            .grant(
+                RegistryBinding {
+                    agent: binding.agent.clone(),
+                    container: binding.account,
+                    vault_address: None,
+                    wallet: keys.agent_wallet(&binding.agent).unwrap().unwrap(),
+                },
+                at,
+            )
+            .unwrap();
+        let policy = PolicyJournal::new(registry.clone());
+        let legacy =
+            LegacyPolicyReview::open(dir.path().join("legacy.db"), Network::Testnet, at).unwrap();
+        let mut state = PersistedState::paused(at);
+        state
+            .guardrails
+            .insert(binding.agent.clone(), AgentGuardrails::default());
+        policy.initialize(&legacy, state, at).unwrap();
+        PilotJournal::new(registry)
+            .authorize(binding.agent.clone(), binding.account, at)
+            .unwrap();
+        let mut pairings = TokenStore::open(PairingJournal::open(ledger, hmac).unwrap()).unwrap();
+        let token = Some(pairings.issue(binding.clone()).unwrap().reveal().to_owned());
+        (
+            Fixture {
+                dir,
+                binding,
+                token,
+            },
+            keys,
+        )
+    }
+
+    async fn accept_protective_order(
+        prepared: &Prepared,
+        venue: &LocalVenue,
+    ) -> oppen_core::guardrail::CancelTarget {
+        use oppen_core::guardrail::{
+            AccountSnapshot, CancelTarget, Exposure, FeedQuality, MarketRef, OrderIntent,
+            PositionSnapshot, Refusal, RestingExposure,
+        };
+        use oppen_hl::wire::{Cloid, Grouping, Tpsl};
+        let at = u64::try_from(now_ms()).unwrap();
+        let intent = OrderIntent {
+            symbol: "TEST".into(),
+            is_buy: false,
+            px: 100.into(),
+            sz: "0.15".parse().unwrap(),
+            kind: oppen_hl::order::OrderKind::Trigger {
+                is_market: true,
+                trigger_px: 99.into(),
+                tpsl: Tpsl::Sl,
+            },
+            reduce_only: true,
+            cloid: Some(Cloid::from_bytes([122; 16])),
+            grouping: Grouping::PositionTpsl,
+            builder: None,
+            max_slippage_bps: None,
+            reason: "Synthetic protective order ownership".into(),
+            original: None,
+        };
+        let asset = oppen_hl::meta::Asset {
+            index: 0,
+            info: oppen_hl::types::AssetInfo {
+                name: "TEST".into(),
+                sz_decimals: 2,
+                max_leverage: 10,
+                margin_table_id: 0,
+                is_delisted: false,
+                only_isolated: false,
+            },
+        };
+        let market = MarketRef {
+            symbol: "TEST".into(),
+            reference_px: Some(100.into()),
+            as_of_ms: at,
+            quality: FeedQuality::Ok,
+            mark_divergence_bps: None,
+            mark_divergent_since_ms: None,
+            snapshot: None,
+            sigma_day: None,
+            vol_ratio: None,
+        };
+        let exposure = Exposure {
+            account: prepared.binding.account,
+            fleet: None,
+            agent: AccountSnapshot {
+                as_of_ms: at,
+                reconciled: true,
+                equity_usd: 100.into(),
+                peak_equity_usd: 100.into(),
+                realized_pnl_today_usd: 0.into(),
+                unrealized_pnl_usd: 0.into(),
+                day_start_ms: at / 86_400_000 * 86_400_000,
+                total_position_notional_usd: 15.into(),
+                positions: [("TEST".into(), PositionSnapshot { szi: intent.sz })].into(),
+                resting: Some(RestingExposure {
+                    buys: Default::default(),
+                    sells: Default::default(),
+                    reduce_buys: Default::default(),
+                    reduce_sells: Default::default(),
+                    notional_by_symbol: Default::default(),
+                    notional_usd: 0.into(),
+                }),
+            },
+        };
+        let engine = &prepared.engine;
+        let proposal = match engine.evaluate(
+            &prepared.binding.agent,
+            &intent,
+            &asset,
+            &market,
+            &exposure,
+            at,
+        ) {
+            Err(Refusal::ApprovalRequired { approval_id, .. }) => approval_id,
+            other => panic!("protective order must pass guards into approval: {other:?}"),
+        };
+        let cleared = engine
+            .operator_approve_proposal(&proposal, &asset, &market, &exposure, at)
+            .unwrap();
+        let submissions = engine.submissions().unwrap();
+        let revision = submissions
+            .state(prepared.binding.account)
+            .unwrap()
+            .revision;
+        let receipt = submissions
+            .begin(prepared.binding.account, cleared.clearance(), revision, at)
+            .unwrap();
+        let clock = || u64::try_from(now_ms()).unwrap();
+        let signed = engine
+            .sign_submission_authorized(
+                cleared,
+                &submissions,
+                &receipt,
+                clock(),
+                None,
+                clock,
+                || Ok(()),
+            )
+            .unwrap();
+        *venue.accepted_order.lock().unwrap() = Some(serde_json::json!({
+            "type":"order","orders":[{"a":0,"b":false,"p":"100","s":"0.15","r":true,
+                "t":{"trigger":{"isMarket":true,"triggerPx":"99","tpsl":"sl"}},"c":intent.cloid}],"grouping":"positionTpsl"
+        }));
+        let exchange = oppen_hl::exchange::ExchangeClient::loopback_fixture(venue.port).unwrap();
+        engine
+            .post_submission_authorized(signed, &exchange, clock, || Ok(()))
+            .await
+            .unwrap();
+        assert!(venue.accepted_order.lock().unwrap().is_none());
+        let pending = submissions
+            .state(prepared.binding.account)
+            .unwrap()
+            .pending
+            .expect("direct acceptance retains submission liability");
+        assert_eq!(pending.cloid(), receipt.cloid());
+        CancelTarget {
+            symbol: intent.symbol,
+            asset_index: 0,
+            oid: 501,
+            cloid: intent.cloid,
+            is_buy: false,
+            limit_px: intent.px,
+            sz: "0.12".parse().unwrap(),
+            orig_sz: intent.sz,
+            timestamp: at,
+            order_type: "Stop Market".into(),
+            tif: None,
+            reduce_only: true,
+            is_trigger: true,
+            trigger_px: Some(99.into()),
+            trigger_condition: Some("Price below 99".into()),
+            is_position_tpsl: true,
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn native_controller_cancellation_exact_targets_changed_snapshot_refuses_without_retry() {
         use crate::operator_approvals::QueuePhase;
-        use oppen_core::guardrail::{CancelContext, CancelIntent, CancelTarget, Refusal};
-        let fixture = Fixture::authorized();
+        use oppen_core::guardrail::{CancelContext, CancelIntent, Refusal};
+        let (fixture, keys) = cancellation_signing_fixture();
         let venue = LocalVenue::start_with_pending_handshake(true).await;
-        let mut prepared = fixture.prepare().unwrap();
+        let mut prepared =
+            Prepared::open(fixture.dir.path(), fixture.binding.clone(), keys).unwrap();
         let order_id = controller_proposal(&prepared);
+        let target = accept_protective_order(&prepared, &venue).await;
         let at = u64::try_from(now_ms()).unwrap();
-        let target = CancelTarget {
-            symbol: "TEST".into(),
-            asset_index: 0,
-            oid: 501,
-            cloid: Some(oppen_hl::wire::Cloid::from_bytes([122; 16])),
-            is_buy: false,
-            limit_px: 100.into(),
-            sz: "0.12".parse().unwrap(),
-            orig_sz: "0.15".parse().unwrap(),
-            timestamp: at,
-            order_type: "Stop Market".into(),
-            reduce_only: true,
-            is_trigger: true,
-            trigger_px: Some(101.into()),
-            trigger_condition: Some("<script>display only</script>".into()),
-            is_position_tpsl: true,
-        };
         *venue.orders.lock().unwrap() = vec![serde_json::json!({
             "coin":target.symbol, "oid":target.oid,"cloid":target.cloid,"side":"A","limitPx":"100","sz":"0.12","origSz":"0.15",
-            "timestamp":at,"orderType":target.order_type,"reduceOnly":true,"isTrigger":true,"triggerPx":"101",
+            "timestamp":target.timestamp,"orderType":target.order_type,"tif":target.tif,"reduceOnly":true,"isTrigger":true,"triggerPx":"99",
             "triggerCondition":target.trigger_condition,"isPositionTpsl":true,
         })];
         let intent = CancelIntent {
@@ -1664,6 +1888,14 @@ mod tests {
                 other => panic!("expected durable cancellation proposal: {other:?}"),
             };
         let ledger = prepared.ledger.clone();
+        let owned_rows = ledger.get_events(0, 1000).unwrap().events;
+        for kind in [
+            oppen_core::ledger::EventKind::SubmissionStarted,
+            oppen_core::ledger::EventKind::SubmissionSigned,
+            oppen_core::ledger::EventKind::SubmissionAccepted,
+        ] {
+            assert_eq!(owned_rows.iter().filter(|row| row.kind == kind).count(), 1);
+        }
         let feed = prepared.feed.clone();
         let port = venue.port;
         prepared.gateway = prepared.gateway.with_loopback_fixture(port).unwrap();
@@ -1733,21 +1965,26 @@ mod tests {
                 .confirm(&fixture.binding, &review.owner_id, review.id)
                 .is_err()
         );
-        assert!(
-            !ledger
+        assert_eq!(
+            ledger
                 .get_events(0, 1000)
                 .unwrap()
                 .events
                 .iter()
-                .any(|row| row.kind == oppen_core::ledger::EventKind::SubmissionStarted)
+                .filter(|row| row.kind == oppen_core::ledger::EventKind::SubmissionStarted)
+                .count(),
+            1
         );
-        assert!(
+        assert_eq!(
             venue
                 .requests
                 .lock()
                 .unwrap()
                 .iter()
-                .all(|request| request.path != "/exchange")
+                .filter(|request| request.path == "/exchange")
+                .count(),
+            1,
+            "changed cancellation must not submit another exchange request"
         );
         tokio::time::timeout(Duration::from_secs(5), owned.shutdown_and_drain())
             .await

@@ -88,6 +88,58 @@ fn open_orders() {
     let orders: Vec<OpenOrder> = serde_json::from_str(json).unwrap();
     assert_eq!(orders[0].oid, 91490942);
     assert!(orders[0].cloid.is_none());
+    assert!(
+        orders[0].tif.is_none(),
+        "historical missing TIF must stay unknown"
+    );
+}
+
+/// Shapes from the official Python SDK frontend-open-orders cassette:
+/// tests/cassettes/info_test/test_get_frontend_open_orders.yaml.
+#[test]
+fn frontend_order_tif_and_protective_metadata_are_preserved() {
+    let rows = serde_json::json!([
+        {"coin":"INJ","isPositionTpsl":false,"isTrigger":true,"limitPx":"9.2037",
+         "oid":3184595907_u64,"orderType":"Take Profit Market","origSz":"12.5",
+         "reduceOnly":true,"side":"A","sz":"12.5","tif":null,"timestamp":1700126022555_u64,
+         "triggerCondition":"Price above 10.004","triggerPx":"10.004"},
+        {"coin":"INJ","isPositionTpsl":false,"isTrigger":true,"limitPx":"9.1954",
+         "oid":3184595906_u64,"orderType":"Stop Market","origSz":"12.5",
+         "reduceOnly":true,"side":"A","sz":"12.5","tif":null,"timestamp":1700126022555_u64,
+         "triggerCondition":"Price below 9.995","triggerPx":"9.995"},
+        {"coin":"INJ","isPositionTpsl":false,"isTrigger":false,"limitPx":"10.0",
+         "oid":3184595905_u64,"orderType":"Limit","origSz":"12.5",
+         "reduceOnly":false,"side":"B","sz":"12.5","tif":"Gtc","timestamp":1700126022555_u64,
+         "triggerCondition":"N/A","triggerPx":"0.0"}
+    ]);
+    let orders: Vec<OpenOrder> = serde_json::from_value(rows.clone()).unwrap();
+    assert_eq!(
+        orders[0].trigger_condition.as_deref(),
+        Some("Price above 10.004")
+    );
+    assert_eq!(orders[0].trigger_px, Some("10.004".parse().unwrap()));
+    assert_eq!(
+        orders[1].trigger_condition.as_deref(),
+        Some("Price below 9.995")
+    );
+    assert_eq!(orders[1].trigger_px, Some("9.995".parse().unwrap()));
+    assert!(
+        orders[..2]
+            .iter()
+            .all(|order| order.is_trigger && order.tif.is_none())
+    );
+    assert_eq!(orders[2].tif, Some(oppen_hl::wire::Tif::Gtc));
+    assert_eq!(orders[2].trigger_condition.as_deref(), Some("N/A"));
+    assert_eq!(orders[2].trigger_px, Some(rust_decimal::Decimal::ZERO));
+    for tif in ["Gtc", "Alo", "Ioc"] {
+        let mut row = rows[2].clone();
+        row["tif"] = serde_json::json!(tif);
+        let order: OpenOrder = serde_json::from_value(row).unwrap();
+        assert_eq!(serde_json::to_value(order.tif.unwrap()).unwrap(), tif);
+    }
+    let mut unknown = rows[2].clone();
+    unknown["tif"] = serde_json::json!("UnknownTif");
+    assert!(serde_json::from_value::<OpenOrder>(unknown).is_err());
 }
 
 /// `docs/specs/fair-value.md` §14.5: `HlPerp.nextFundingTime` names a

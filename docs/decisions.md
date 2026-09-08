@@ -11,6 +11,51 @@ decisions" section until then.
 
 ---
 
+## 2026-09-08 · Discretionary cancellation ownership
+
+ES31c implements D1's own-order requirement for ordinary `cancel` and
+`cancel_all`, in both approval modes. Require authenticated signed and accepted
+evidence for every requested target, bound to the exact historical registry
+route, account, agent and signer generation. Pin the evidence links in retained
+review and revalidate at proposal creation, native preparation, confirmation
+and the final Rust signing permit. Missing, contradictory or redacted evidence
+refuses the whole target set; cancel-all must not silently filter manual orders.
+Operator review cannot adopt an external order. Runtime HALT cleanup remains a
+separate registry-authorized path.
+
+Compare immutable order attributes to the guarded signed action, not just OID
+and CLOID. Preserve original size; a partial fill may decrease remaining size
+without changing ownership or the frozen cancel action. An increase, missing
+target or changed protective attribute requires refusal. Limit time-in-force
+must be observed and match the signed action; missing historical metadata must
+not be inferred. Trigger direction and threshold must agree with the signed
+TP/SL semantics, alongside price, type, reduce-only and grouping evidence.
+
+The official Python SDK's
+[frontend-order cassette](https://github.com/hyperliquid-dex/hyperliquid-python-sdk/blob/master/tests/cassettes/info_test/test_get_frontend_open_orders.yaml)
+includes limit TIF and full numeric trigger conditions (inspected 2026-09-08).
+Use these observed shapes in fixtures; they do not prove every live order type.
+Preserve historical canonical bytes when extending target/review metadata.
+V14 stops older writers; rollback preserves all history and cumulative budgets.
+
+Discretionary cancellation shares retained bounded submission work with orders,
+including account-lock and actual session/operator ownership until completion.
+Cleanup keeps separate capacity. A caller disappearing cannot release a worker's
+account guard or bypass its final authority checks. A core-owned consuming
+dispatch capability revalidates route, policy, provenance and deadlines under
+the signing permit before first HTTP poll; a session check alone is insufficient.
+Pre-dispatch refusal is audited after guards release, while failures after
+dispatch admission remain uncertain. No new service, dependency,
+credential authority, live activation, historical adoption or resend is implied.
+Lost-response ownership recovery remains a distinct unresolved evidence gate.
+
+The cancellation drain fixture reproduced retained legacy MCP sessions after
+HTTP shutdown in the pinned rmcp implementation. Oppen explicitly closes the
+session-manager snapshot after HTTP connection tasks stop, then waits for both
+actual handler destruction and retained execution through the existing lifetime
+tracker. Enqueuing session closure alone is not completion. This preserves
+physical ledger release on restart without weakening active-worker ownership.
+
 ## 2026-09-08 · Non-replayable submission commitments
 
 ES31b implements the evidence boundary required by D1, using the existing

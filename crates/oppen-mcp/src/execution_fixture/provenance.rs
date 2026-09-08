@@ -606,3 +606,148 @@ async fn uncertain_http_results_persist_only_signed_evidence_and_pending_liabili
         venue.shutdown().await;
     }
 }
+
+#[tokio::test]
+async fn canceled_discretionary_cancel_retains_account_worker_and_server_until_key_read_drains() {
+    use crate::server::BoundServer;
+    use tokio::io::AsyncReadExt;
+    use tokio::time::timeout;
+    use tokio_util::sync::CancellationToken;
+
+    let dir = tempfile::tempdir().unwrap();
+    let venue = Venue::start().await;
+    let keys = Arc::new(FixtureKeys::default());
+    let runtime = Runtime::open(dir.path(), venue.port(), keys.clone()).await;
+    runtime.activate_orders().await;
+    let cloid = Cloid::from_bytes([178; 16]);
+    let placed = runtime.call("place", place(cloid.as_str(), "0.12")).await;
+    assert_eq!(placed["status"], "resting", "{placed}");
+    assert_eq!(evidence(&runtime, EventKind::SubmissionAccepted).len(), 1);
+    runtime.reconcile().await;
+    let bound = BoundServer::bind(0, &runtime.gateway, &runtime.pairings)
+        .await
+        .unwrap();
+    let addr = bound.local_addr();
+    let mut status = bound.supervision_status();
+    let stop = CancellationToken::new();
+    let _stop_on_drop = stop.clone().drop_guard();
+    let mut server = tokio::spawn(bound.serve(
+        runtime.gateway.clone(),
+        runtime.pairings.clone(),
+        stop.clone(),
+    ));
+    timeout(Duration::from_secs(5), async {
+        while status.borrow_and_update().completed_sequence == 0 {
+            status.changed().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    let session = decision::initialize(addr, &runtime.token).await;
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let (release, wait) = std::sync::mpsc::channel();
+    *keys.read_gate.lock().unwrap() = Some(KeyReadGate {
+        entered: entered.clone(),
+        release: wait,
+    });
+    let mut response = transport::send_http_request(
+        addr,
+        decision::request(
+            addr,
+            &runtime.token,
+            Some(&session),
+            json!({"jsonrpc":"2.0","id":61,"method":"tools/call","params":{"name":"cancel",
+            "arguments":{"oid":placed["oid"],"reason":"retained cancellation worker"}}}),
+        ),
+    )
+    .await;
+    timeout(Duration::from_secs(3), entered.notified())
+        .await
+        .expect("cancel never reached the actual key read");
+    let queue = runtime.gateway.execution_queue(runtime.account);
+    assert!(queue.try_lock().is_err());
+    assert_eq!(
+        runtime.gateway.inner.submission_worker.available_permits(),
+        0
+    );
+    let heartbeat = Request::builder()
+        .uri(crate::server::MCP_PATH)
+        .header("host", addr.to_string())
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        timeout(
+            Duration::from_millis(500),
+            transport::http_request(addr, heartbeat)
+        )
+        .await
+        .expect("cancel key read blocked the current-thread HTTP runtime")
+        .0,
+        401
+    );
+    let notification = decision::request(
+        addr,
+        &runtime.token,
+        Some(&session),
+        json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":61,"reason":"stop synthetic cancel"}}),
+    );
+    assert_eq!(
+        timeout(
+            Duration::from_millis(500),
+            transport::http_request(addr, notification)
+        )
+        .await
+        .unwrap()
+        .0,
+        202
+    );
+    timeout(
+        Duration::from_secs(2),
+        response.read_to_end(&mut Vec::new()),
+    )
+    .await
+    .expect("method observer failed to cancel while key read was blocked")
+    .unwrap();
+    assert_eq!(venue.submissions().len(), 1);
+    assert!(
+        queue.try_lock().is_err(),
+        "observer cancellation released the account slot"
+    );
+    assert_eq!(
+        runtime.gateway.inner.submission_worker.available_permits(),
+        0
+    );
+    stop.cancel();
+    assert!(
+        timeout(Duration::from_millis(100), &mut server)
+            .await
+            .is_err(),
+        "serve returned while the actual cancel worker retained key loading"
+    );
+    release.send(()).unwrap();
+    timeout(Duration::from_secs(5), server)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(queue.try_lock().is_ok());
+    assert_eq!(
+        runtime.gateway.inner.submission_worker.available_permits(),
+        1
+    );
+    assert_eq!(
+        venue.submissions().len(),
+        1,
+        "canceled worker submitted a cancellation"
+    );
+    assert_eq!(evidence(&runtime, EventKind::SubmissionSigned).len(), 1);
+    assert_eq!(evidence(&runtime, EventKind::SubmissionAccepted).len(), 1);
+    assert_eq!(
+        runtime
+            .call("get_order_status", json!({"oid":placed["oid"]}))
+            .await["status"],
+        "open"
+    );
+    runtime.shutdown().await;
+    venue.shutdown().await;
+}

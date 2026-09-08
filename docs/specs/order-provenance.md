@@ -61,10 +61,29 @@ checks run after ledger waits, before signing and initial HTTP dispatch admissio
 These local checks do not prove socket delivery or venue acceptance. Evidence
 replay reuses one verified chain walk, rather than replaying for each signed row.
 
-This does not yet enforce discretionary cancellation ownership or recover
-ownership after a lost response. Signed-only evidence is not acceptance; no
-historical adoption, reconstructed transport capability, re-signing or resend is
-provided. Synthetic tests and automated review are not live acceptance evidence.
+ES31c adds discretionary cancellation enforcement across proposal, retained
+review, signing and consuming dispatch. Each target must match authenticated
+signed/direct-accepted evidence for the exact historical route. The V14 proposal,
+review and clearance pin receipt links; historical absent fields preserve their
+canonical bytes but grant no ownership. Limit TIF and protective metadata must
+match the signed action. Partial fills may decrease remaining size without
+changing the frozen identity or action; increases and changed attributes refuse.
+The operator review displays observed TIF without inferring historical defaults.
+
+Cancellation uses the retained account worker and the core dispatch check;
+legacy raw-request signing methods refuse discretionary cancellation. Runtime
+cleanup remains separate. Legacy MCP sessions are explicitly closed after HTTP
+shutdown, and shutdown waits for actual handler destruction and execution drain.
+The regression first reproduced retained ledger ownership and then passed with
+the session-lifetime fix. The full workspace passed 1,139 Rust tests with 15
+live/keychain-gated tests ignored; 175 frontend tests, build, QA typecheck, lint
+and dependency checks passed. Separate automated working-diff review found no
+blocking issues. Exact-head review and green CI remain required before merging.
+
+Ownership recovery after a lost response remains open. Signed-only evidence is
+not acceptance; no historical adoption, reconstructed transport capability,
+re-signing or resend is provided. Synthetic tests and automated review are not
+live acceptance evidence.
 
 ## Decision Status
 
@@ -81,9 +100,11 @@ provided. Synthetic tests and automated review are not live acceptance evidence.
    cannot distinguish a signed-but-unsubmitted request from an external order
    with identical identifiers, document and resolve that boundary before claiming
    recovered ownership. Expand typed venue evidence only where required.
-4. Define immutable identity comparisons for partial fills and trigger orders;
-   remaining size can change, original order identity cannot. The current Rust
-   order-status model omits protective fields present in the documented response.
+4. ES31c implements immutable identity comparisons for direct-accepted orders
+   using frontend-order observations, including TIF and protective metadata;
+   remaining size can decrease, original order identity cannot. Recovery still
+   requires sufficient authenticated execution association, not just an expanded
+   order-status response model.
 
 Protocol references inspected 2026-09-08: [exchange endpoint](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/exchange-endpoint)
 and [order-status info endpoint](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint).

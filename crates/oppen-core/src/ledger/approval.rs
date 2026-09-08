@@ -111,6 +111,8 @@ pub(crate) struct CancelReviewCommitment {
     reviewed_at_ms: u64,
     observed_at_ms: u64,
     expires_at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    provenance: Option<crate::guardrail::CancelProvenance>,
 }
 
 impl ReviewCommitment {
@@ -164,13 +166,24 @@ impl ReviewCommitment {
         reviewed_at_ms: u64,
         observed_at_ms: u64,
     ) -> Result<Self> {
+        let ClearedKind::DiscretionaryCancel {
+            provenance: Some(provenance),
+            ..
+        } = &clearance.kind
+        else {
+            return Err(unavailable(
+                "cancellation review requires authenticated ownership",
+            ));
+        };
         if !matches!(&clearance.kind, ClearedKind::DiscretionaryCancel { targets, .. } if targets == &candidate.targets)
             || clearance.policy_revision != evidence.policy_revision
             || clearance.route != evidence.proposal.route
+            || evidence.proposal.cancel_provenance.as_ref() != Some(provenance)
         {
             return Err(conflict("cancellation review authority or targets changed"));
         }
         Ok(Self::Cancel(CancelReviewCommitment {
+            provenance: Some(provenance.clone()),
             proposal_root: evidence.root.clone(),
             route: clearance.route.clone(),
             candidate: candidate.clone(),
@@ -223,7 +236,14 @@ impl ReviewCommitment {
             return Ok(payload.pointer("/kind/cleared").and_then(|v| v.as_str())
                 == Some("discretionary_cancel")
                 && payload.pointer("/kind/targets")
-                    == Some(&serde_json::to_value(&review.candidate.targets)?));
+                    == Some(&serde_json::to_value(&review.candidate.targets)?)
+                && match &review.provenance {
+                    Some(provenance) => {
+                        payload.pointer("/kind/provenance")
+                            == Some(&serde_json::to_value(provenance)?)
+                    }
+                    None => payload.pointer("/kind/provenance").is_none(),
+                });
         };
         let expected = serde_json::json!({
             "px": review.px, "sz": review.sz, "notional_usd": review.notional_usd,
@@ -421,6 +441,8 @@ struct Proposed {
     route_hash: String,
     policy: Link,
     expires_at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cancel_provenance: Option<crate::guardrail::CancelProvenance>,
 }
 
 // Untagged only on the durable boundary: legacy order bytes stay identical.
@@ -569,6 +591,7 @@ impl Entry {
             intent: self.data.intent.intent(),
             route: self.data.route.clone(),
             expires_at_ms: self.data.expires_at_ms,
+            cancel_provenance: self.data.cancel_provenance.clone(),
         }
     }
 }
@@ -645,6 +668,7 @@ impl ApprovalJournal {
             if !matches!(&entry.data.intent, StoredIntent::Cancel(intent) if intent == &review.candidate)
                 || review.proposal_root != entry.root
                 || review.route != entry.data.route
+                || review.provenance != entry.data.cancel_provenance
                 || review.reviewed_at_ms < entry.minted_at_ms
                 || review.reviewed_at_ms > at_ms
                 || review.observed_at_ms > review.reviewed_at_ms
@@ -1220,6 +1244,15 @@ impl ApprovalJournal {
         {
             return Err(conflict("proposal route or policy changed"));
         }
+        let cancel_provenance = match &intent {
+            StoredIntent::Cancel(intent) => Some(
+                self.0
+                    .submissions(false)
+                    .cancellation_ownership_in(&tx, &route, &intent.targets)
+                    .map_err(unavailable)?,
+            ),
+            StoredIntent::Order(_) => None,
+        };
         if let Some(existing) = entries.values().find(|e| {
             e.data.route.binding.container == route.binding.container
                 && e.data.intent.same_identity(&intent)
@@ -1231,6 +1264,7 @@ impl ApprovalJournal {
             if !existing.data.intent.same_request(&intent)
                 || existing.data.agent != agent
                 || existing.data.route != route
+                || existing.data.cancel_provenance != cancel_provenance
                 || (matches!(intent, StoredIntent::Order(_))
                     && existing.data.policy.seq != policy_revision)
             {
@@ -1253,6 +1287,7 @@ impl ApprovalJournal {
             .checked_add(APPROVAL_TTL_MS)
             .ok_or_else(|| unavailable("approval TTL overflow"))?;
         let data = Proposed {
+            cancel_provenance,
             agent,
             intent,
             route_hash: row(&tx, route.binding_seq)?.hash,
@@ -1375,6 +1410,11 @@ impl ApprovalJournal {
             return Ok(None);
         }
         let review = if let Some((evidence, review)) = reviewed {
+            if matches!(&review, ReviewCommitment::Cancel(cancel) if cancel.provenance.is_none()) {
+                return Err(unavailable(
+                    "historical cancellation review has no ownership authority",
+                ));
+            }
             let current = self.0.current_in(&tx).map_err(unavailable)?;
             if entry.root != evidence.root
                 || entry.proposal(self.ledger().network) != evidence.proposal

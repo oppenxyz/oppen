@@ -9,6 +9,8 @@ use tokio_util::sync::CancellationToken;
 
 #[path = "approvals/cancellations.rs"]
 mod cancellations;
+#[path = "approvals/ownership.rs"]
+mod ownership;
 
 struct Serving {
     control: OperatorControl,

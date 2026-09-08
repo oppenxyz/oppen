@@ -116,6 +116,7 @@ pub struct Proposal {
     pub(crate) intent: ProposalIntent,
     pub(crate) route: AuthorizedRoute,
     pub(crate) expires_at_ms: u64,
+    pub(crate) cancel_provenance: Option<super::CancelProvenance>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -418,6 +419,8 @@ pub enum ClearedKind {
     DiscretionaryCancel {
         targets: Vec<CancelTarget>,
         observed_at_ms: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        provenance: Option<super::CancelProvenance>,
     },
     /// The dead-man's switch (spec item 27). `None` disarms.
     ScheduleCancel { cancel_at_ms: Option<u64> },
@@ -664,6 +667,26 @@ pub struct SignedSubmission {
     deadline: Option<u64>,
     wallet: AgentWallet,
     signer: Address,
+}
+
+/// One engine-owned discretionary cancellation; no public request extraction.
+pub struct SignedCancellation {
+    owner: Arc<()>,
+    request: ExchangeRequest,
+    clearance: Clearance,
+    deadline: Option<u64>,
+    wallet: AgentWallet,
+    signer: Address,
+}
+
+struct Dispatch<'a> {
+    owner: &'a Arc<()>,
+    request: &'a ExchangeRequest,
+    clearance: &'a Clearance,
+    deadline: Option<u64>,
+    wallet: &'a AgentWallet,
+    signer: Address,
+    submission: Option<&'a SignedSubmission>,
 }
 
 impl SignedSubmission {
@@ -1784,6 +1807,12 @@ impl GuardrailEngine {
             Some(&proposal.route),
             true,
         )?;
+        if !matches!(&cleared.clearance.kind, ClearedKind::DiscretionaryCancel { provenance: Some(current), .. } if Some(current) == proposal.cancel_provenance.as_ref())
+        {
+            return Err(submission_refusal(
+                "cancellation proposal lacks matching authenticated ownership",
+            ));
+        }
         let commitment = crate::ledger::approval::ReviewCommitment::new_cancel(
             &evidence,
             &candidate,
@@ -1852,6 +1881,7 @@ impl GuardrailEngine {
             .as_ref()
             .ok_or_else(|| approval_refusal("durable approval authority required"))?;
         let digest = commitment.digest().map_err(approval_refusal)?;
+        let expected_provenance = evidence.proposal.cancel_provenance.clone();
         let claim = journal
             .claim_review(evidence, commitment, now_ms)
             .map_err(approval_refusal)?
@@ -1870,6 +1900,7 @@ impl GuardrailEngine {
             .and_then(|mut cleared| {
                 if cleared.action != action
                     || cleared.clearance.policy_revision != display.policy_revision
+                    || !matches!(&cleared.clearance.kind, ClearedKind::DiscretionaryCancel { provenance: Some(current), .. } if Some(current) == expected_provenance.as_ref())
                 {
                     return Err(Unevaluable::ApprovalReviewChanged {
                         detail: "cancellation action or policy changed".into(),
@@ -1906,15 +1937,16 @@ impl GuardrailEngine {
         if reviewed_route.is_some_and(|expected| expected != &route) {
             return Err(route_refusal("cancellation proposal route changed"));
         }
-        let mut state = self.state();
-        let config =
-            state
-                .guardrails
-                .get(agent)
-                .cloned()
-                .ok_or_else(|| Unevaluable::UnknownAgent {
-                    agent: agent.clone(),
+        let (config, policy_revision) =
+            {
+                let state = self.state();
+                let config = state.guardrails.get(agent).cloned().ok_or_else(|| {
+                    Unevaluable::UnknownAgent {
+                        agent: agent.clone(),
+                    }
                 })?;
+                (config, state.policy_revision)
+            };
         if let Err((field, detail)) = config.validate() {
             return Err(Unevaluable::InvalidGuardrailConfig {
                 field: field.into(),
@@ -1928,7 +1960,15 @@ impl GuardrailEngine {
             config.freshness.max_account_age_ms,
             now_ms,
         )?;
-        let policy_revision = state.policy_revision;
+        let provenance = self
+            .submissions()
+            .map_err(submission_refusal)?
+            .cancellation_ownership(&route, &intent.targets)
+            .map_err(submission_refusal)?;
+        let mut state = self.state();
+        if state.policy_revision != policy_revision {
+            return Err(Unevaluable::PolicyChanged.into());
+        }
         if config.approval_required && reviewed_route.is_none() {
             drop(state);
             let journal = self.approvals.as_ref().ok_or_else(|| {
@@ -1967,6 +2007,7 @@ impl GuardrailEngine {
                 kind: ClearedKind::DiscretionaryCancel {
                     targets: intent.targets.clone(),
                     observed_at_ms: context.observed_at_ms,
+                    provenance: Some(provenance),
                 },
                 utilization: Utilization::none_with_global(remaining),
             },
@@ -3032,8 +3073,56 @@ impl GuardrailEngine {
         clock: impl Fn() -> u64,
         authorize: impl FnOnce() -> Result<G, Refusal>,
     ) -> Result<(ExchangeRequest, Clearance), SignClearedError> {
+        if matches!(
+            cleared.clearance.kind,
+            ClearedKind::DiscretionaryCancel { .. }
+        ) {
+            return Err(SignClearedError::Refused(submission_refusal(
+                "discretionary cancellations require the consuming dispatch capability",
+            )));
+        }
         self.sign_common(cleared, nonce, expires_after, clock, authorize, None, None)
             .map(|(request, clearance, _, _, _)| (request, clearance))
+    }
+
+    /// Signs only a discretionary cancellation, with observational, nonblocking
+    /// caller checks after ledger/state waits. The initial guard remains held;
+    /// a cancellation after the last pre-crypto observation may race with signing.
+    pub fn sign_discretionary_cancel_authorized<G>(
+        &self,
+        cleared: Cleared,
+        nonce: u64,
+        expires_after: Option<u64>,
+        clock: impl Fn() -> u64,
+        authorize: impl Fn() -> Result<G, Refusal>,
+    ) -> Result<SignedCancellation, SignClearedError> {
+        if !matches!(
+            cleared.clearance.kind,
+            ClearedKind::DiscretionaryCancel { .. }
+        ) {
+            return Err(SignClearedError::Refused(submission_refusal(
+                "discretionary cancellation clearance required",
+            )));
+        }
+        let final_authorize = || authorize().map(drop);
+        let deadline = cleared.approval_deadline_ms;
+        let (request, clearance, _, wallet, signer) = self.sign_common(
+            cleared,
+            nonce,
+            expires_after,
+            clock,
+            &authorize,
+            None,
+            Some(&final_authorize),
+        )?;
+        Ok(SignedCancellation {
+            owner: self.submission_owner.clone(),
+            request,
+            clearance,
+            deadline,
+            wallet,
+            signer,
+        })
     }
 
     /// Signs and publishes digest-only evidence before granting one dispatch.
@@ -3219,28 +3308,104 @@ impl GuardrailEngine {
         C: Fn() -> u64 + Send + Sync,
         A: Fn() -> Result<G, Refusal> + Send,
     {
+        let response = self
+            .post_authorized(
+                Dispatch {
+                    owner: &signed.owner,
+                    request: &signed.request,
+                    clearance: &signed.clearance,
+                    deadline: signed.deadline,
+                    wallet: &signed.wallet,
+                    signer: signed.signer,
+                    submission: Some(&signed),
+                },
+                exchange,
+                &clock,
+                authorize,
+            )
+            .await;
+        signed
+            .journal
+            .record_post_result(
+                &signed.receipt,
+                &signed.signed,
+                &signed.request,
+                &signed.clearance,
+                &response,
+                clock(),
+            )
+            .map_err(SubmissionPostError::JournalUncertain)?;
+        response
+    }
+
+    /// Consumes a cancellation after rechecking route, policy, ownership, TTL and
+    /// observational caller authority. Run on the retained blocking order worker;
+    /// first polling is local admission, not proof of socket or venue delivery.
+    pub async fn post_cancellation_authorized<G, C, A>(
+        &self,
+        signed: SignedCancellation,
+        exchange: &oppen_hl::exchange::ExchangeClient,
+        clock: C,
+        authorize: A,
+    ) -> Result<oppen_hl::exchange::ExchangeResponse, SubmissionPostError>
+    where
+        C: Fn() -> u64 + Send + Sync,
+        A: Fn() -> Result<G, Refusal> + Send,
+    {
+        self.post_authorized(
+            Dispatch {
+                owner: &signed.owner,
+                request: &signed.request,
+                clearance: &signed.clearance,
+                deadline: signed.deadline,
+                wallet: &signed.wallet,
+                signer: signed.signer,
+                submission: None,
+            },
+            exchange,
+            &clock,
+            authorize,
+        )
+        .await
+    }
+
+    async fn post_authorized<G, C, A>(
+        &self,
+        signed: Dispatch<'_>,
+        exchange: &oppen_hl::exchange::ExchangeClient,
+        clock: &C,
+        authorize: A,
+    ) -> Result<oppen_hl::exchange::ExchangeResponse, SubmissionPostError>
+    where
+        C: Fn() -> u64 + Send + Sync,
+        A: Fn() -> Result<G, Refusal> + Send,
+    {
         use std::future::Future;
         let mut authorize = Some(authorize);
-        let mut post = std::pin::pin!(exchange.post(&signed.request));
-        let response = std::future::poll_fn(|cx| {
+        let mut post = std::pin::pin!(exchange.post(signed.request));
+        std::future::poll_fn(|cx| {
             if let Some(authorize) = authorize.take() {
                 let mut admit = || -> Result<_, Refusal> {
-                    if !Arc::ptr_eq(&self.submission_owner, &signed.owner)
+                    if !Arc::ptr_eq(&self.submission_owner, signed.owner)
                         || exchange.network() != signed.clearance.network
-                        || !self
-                            .submissions()
-                            .map_err(submission_refusal)?
-                            .same_authority(&signed.journal)
                     {
                         return Err(submission_refusal("dispatch network or authority mismatch"));
+                    }
+                    if let Some(submission) = signed.submission
+                        && !self
+                            .submissions()
+                            .map_err(submission_refusal)?
+                            .same_authority(&submission.journal)
+                    {
+                        return Err(submission_refusal("dispatch submission authority mismatch"));
                     }
                     let caller = authorize()?;
                     let final_authorize = || authorize().map(drop);
                     let gate = PreSignGate {
                         engine: self,
-                        clearance: &signed.clearance,
+                        clearance: signed.clearance,
                         approval_deadline_ms: signed.deadline,
-                        clock: &clock,
+                        clock,
                         final_authorize: Some(&final_authorize),
                         observed_at_ms: std::cell::Cell::new(None),
                         actual_signer: signed.signer,
@@ -3255,11 +3420,13 @@ impl GuardrailEngine {
                         expires_after: signed.request.expires_after(),
                         network: signed.clearance.network,
                     })?;
-                    gate.held_authority
-                        .borrow()
-                        .as_ref()
-                        .ok_or_else(|| submission_refusal("dispatch authority missing"))?
-                        .validate_submission(&signed)?;
+                    if let Some(submission) = signed.submission {
+                        gate.held_authority
+                            .borrow()
+                            .as_ref()
+                            .ok_or_else(|| submission_refusal("dispatch authority missing"))?
+                            .validate_submission(submission)?;
+                    }
                     // Evidence verification may block; sample the same predicates again.
                     gate.check_state(
                         gate.held_state
@@ -3286,19 +3453,7 @@ impl GuardrailEngine {
                     .map_err(SubmissionPostError::Transport)
             }
         })
-        .await;
-        signed
-            .journal
-            .record_post_result(
-                &signed.receipt,
-                &signed.signed,
-                &signed.request,
-                &signed.clearance,
-                &response,
-                clock(),
-            )
-            .map_err(SubmissionPostError::JournalUncertain)?;
-        response
+        .await
     }
 
     /// Writes the ledger row for a refusal that happened at the signer rather
@@ -3618,6 +3773,7 @@ impl EngineState {
                 id: id.clone(),
                 agent: agent.clone(),
                 intent: ProposalIntent::Order(intent.clone()),
+                cancel_provenance: None,
                 route: route.clone(),
                 expires_at_ms: now_ms.saturating_add(APPROVAL_TTL_MS),
             },

@@ -17,7 +17,7 @@ use std::fmt;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::wire::Cloid;
+use crate::wire::{Cloid, Tif};
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -737,6 +737,9 @@ pub struct OpenOrder {
     pub oid: u64,
     pub timestamp: u64,
     pub order_type: String,
+    /// Missing historical observations remain unknown, never inferred as GTC.
+    #[serde(default)]
+    pub tif: Option<Tif>,
     pub reduce_only: bool,
     pub is_trigger: bool,
     pub trigger_px: Option<Decimal>,

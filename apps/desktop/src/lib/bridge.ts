@@ -457,7 +457,7 @@ interface PendingApprovalIdentity {
 export interface CancelTarget {
   symbol: string; asset_index: number; oid: number; cloid: string | null;
   is_buy: boolean; limit_px: string; sz: string; orig_sz: string; timestamp: number;
-  order_type: string; reduce_only: boolean; is_trigger: boolean;
+  order_type: string; tif?: "Alo" | "Ioc" | "Gtc" | null; reduce_only: boolean; is_trigger: boolean;
   trigger_px: string | null; trigger_condition: string | null; is_position_tpsl: boolean;
 }
 export type PendingApprovalView = PendingApprovalIdentity & (

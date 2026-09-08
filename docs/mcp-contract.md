@@ -182,7 +182,7 @@ Protocol errors, carrying the taxonomy in the JSON-RPC error's `data` — `{cont
 | `code` | `retryable` | Means |
 |---|---|---|
 | `venue_error` | `429` and `5xx` only | The venue saw the request and refused it. A nonce was spent. `detail` is the venue's own words, **display-only** — never branch on it |
-| `timeout_unknown_outcome` | never | The request left the process and no answer came back. The order may be live |
+| `timeout_unknown_outcome` | never | Dispatch or its outcome is uncertain. The order may be live; reconcile, never resend |
 | `unavailable` | `true` | oppen could not read what it needed. Nothing was signed |
 | `worker_failed` | never | A retained worker failed; stop and require controlled recovery before further execution |
 | `invalid_params` | `false` | The caller's own input, refused as sent |
@@ -380,7 +380,10 @@ The guardrail check runs immediately before signing, in Rust, on the single path
 
 ### `cancel(oid? | cloid?, reason)`
 
-One resting order. Supply `oid` or `cloid`. In approval mode this retains the
+One proven own resting order. Supply `oid` or `cloid`. Authenticated guarded
+signing and direct acceptance must link the OID to this exact agent/account and
+registry route. Manual orders, signed-only requests and historical records with
+unknown ownership refuse; operator review cannot adopt them. In approval mode this retains the
 exact target for native operator review, including protective-order details;
 it does not sign or cancel on receipt. Cancellations cost no order-rate token.
 An order already absent from the initial read is reported as `canceled` with
@@ -388,12 +391,19 @@ that cancel in `failed[]`, not as an acknowledgment from the venue.
 
 ### `cancel_all(symbol?, reason)`
 
-Every resting order, or every one on a symbol. Approval mode freezes the selected
+Every resting order, or every one on a symbol, only when every selected target
+has authenticated ownership evidence. A mixed owned/manual set refuses as a
+whole, never silently cancels an owned subset. Approval mode freezes the selected
 targets; approval cannot include an order created afterward. Native review and
 confirmation recheck the retained target evidence, route, policy and original
-expiry. Missing or changed targets require a fresh request/review, never a
+expiry. Missing targets or changed immutable attributes require a fresh request/review, never a
 replacement target or an implicit subset. Approval-off cancellation still pins
 policy at final signing so enabling approval during a wait cannot be bypassed.
+Partial fills may decrease remaining size while original size and all immutable
+identity fields remain unchanged. Limit TIF and protective-order semantics must
+match the authenticated signed action. Missing required metadata is unknown,
+not an inferred default. Evidence links are pinned in review and revalidated
+before signing and first dispatch admission through the same Rust safeguards.
 
 Partial success is normal: `failed[]` itemises what the venue would not take,
 paired positionally with the submitted targets. Only a complete response of
@@ -422,4 +432,9 @@ A close is not privileged. It passes the same gate as `place`, and is refused wh
 
 ### `get_order_status(oid? | cloid?)`
 
-The venue's own status for one order. `{contract_version, known, ...}`; `known: false` means the venue never saw it, which after a `timeout_unknown_outcome` is the answer that makes it safe to place again. Anything else means it did see it.
+The venue's current lookup result for one order. `{contract_version, known, ...}`;
+`known: false` means this lookup did not identify an order, not proof that the
+venue never accepted it. It never authorizes resend, releases a pending
+reservation, or establishes cancellation ownership by itself. Known status also
+does not prove that the guarded Oppen submission opened the order. Reconcile
+against durable evidence; lost-response ownership recovery remains a separate gate.

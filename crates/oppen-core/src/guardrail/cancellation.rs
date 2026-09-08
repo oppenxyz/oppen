@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 
-use oppen_hl::wire::{CancelWire, Cloid};
+use oppen_hl::wire::{CancelWire, Cloid, Tif};
 use oppen_hl::{Action, Address};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -25,6 +25,8 @@ pub struct CancelTarget {
     pub orig_sz: Decimal,
     pub timestamp: u64,
     pub order_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tif: Option<Tif>,
     pub reduce_only: bool,
     pub is_trigger: bool,
     #[serde(
@@ -34,6 +36,24 @@ pub struct CancelTarget {
     pub trigger_px: Option<Decimal>,
     pub trigger_condition: Option<String>,
     pub is_position_tpsl: bool,
+}
+
+/// Exact authenticated receipts, not caller-supplied cancellation authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CancelProvenance {
+    pub(crate) links: Vec<CancelOwnershipLink>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CancelOwnershipLink {
+    pub oid: u64,
+    pub signed_seq: u64,
+    pub signed_hash: String,
+    pub accepted_seq: u64,
+    pub accepted_hash: String,
+    pub request_digest: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -141,7 +161,12 @@ impl CancelIntent {
             let actual = context.targets.iter().find(|actual| {
                 actual.oid == target.oid && actual.asset_index == target.asset_index
             });
-            if actual != Some(target) {
+            let unchanged = actual.is_some_and(|actual| {
+                let mut identity = actual.clone();
+                identity.sz = target.sz;
+                actual.sz > Decimal::ZERO && actual.sz <= target.sz && identity == *target
+            });
+            if !unchanged {
                 return Err(changed(
                     "frozen cancellation target missing or changed; request a fresh proposal",
                 ));

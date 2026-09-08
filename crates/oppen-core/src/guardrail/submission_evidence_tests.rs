@@ -38,13 +38,13 @@ fn payload(f: &DurableFixture, kind: EventKind) -> Value {
     rows[0].payload.clone().unwrap()
 }
 
-async fn transport() -> (ExchangeClient, TcpListener) {
+pub(super) async fn transport() -> (ExchangeClient, TcpListener) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let client = ExchangeClient::loopback_fixture(listener.local_addr().unwrap().port()).unwrap();
     (client, listener)
 }
 
-async fn reply(listener: TcpListener, body: &'static str) -> Value {
+pub(super) async fn reply(listener: TcpListener, body: &'static str) -> Value {
     let (mut stream, _) =
         tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept())
             .await

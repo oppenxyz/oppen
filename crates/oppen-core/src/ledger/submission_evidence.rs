@@ -2,7 +2,9 @@
 //! alone is never evidence of dispatch, acceptance, or current resting state.
 
 use super::*;
-use crate::guardrail::{GuardedSignature, SubmissionPostError};
+use crate::guardrail::{
+    CancelOwnershipLink, CancelProvenance, CancelTarget, GuardedSignature, SubmissionPostError,
+};
 use crate::ledger::{Appended, AuthorizedRoute, RegistryJournal};
 use oppen_hl::exchange::{ExchangeResponse, ExchangeResponseKind, Status};
 use oppen_hl::{Action, ExchangeRequest, Network};
@@ -145,6 +147,67 @@ fn digest_preimage(preimage: &Value) -> Result<String> {
 }
 
 impl SubmissionJournal {
+    pub(crate) fn cancellation_ownership(
+        &self,
+        route: &AuthorizedRoute,
+        targets: &[CancelTarget],
+    ) -> Result<CancelProvenance> {
+        let mut guard = self.0.lock()?;
+        let tx = guard.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        self.cancellation_ownership_in(&tx, route, targets)
+    }
+
+    pub(crate) fn cancellation_ownership_in(
+        &self,
+        connection: &Connection,
+        route: &AuthorizedRoute,
+        targets: &[CancelTarget],
+    ) -> Result<CancelProvenance> {
+        let evidence = self.evidence_in(connection)?;
+        let mut by_oid = HashMap::new();
+        for (seq, (accepted, oid, status)) in &evidence.accepted {
+            let (signed, request) = evidence
+                .signed
+                .get(seq)
+                .ok_or_else(|| invalid("acceptance lacks signed evidence"))?;
+            if request.route.binding.container == route.binding.container
+                && by_oid
+                    .insert(*oid, (signed, accepted, request, status))
+                    .is_some()
+            {
+                return Err(invalid("ambiguous accepted order identity"));
+            }
+        }
+        if targets.is_empty() {
+            return Err(invalid("ownership requires frozen targets"));
+        }
+        let mut seen = HashSet::new();
+        let mut links = Vec::with_capacity(targets.len());
+        for target in targets {
+            if !seen.insert(target.oid) {
+                return Err(invalid("duplicate cancellation OID"));
+            }
+            let (signed, accepted, request, status) = by_oid
+                .get(&target.oid)
+                .ok_or_else(|| invalid("target has no authenticated direct acceptance"))?;
+            if &request.route != route {
+                return Err(invalid(
+                    "accepted order belongs to a different historical route",
+                ));
+            }
+            matches_cancel_target(request, status, target)?;
+            links.push(CancelOwnershipLink {
+                oid: target.oid,
+                signed_seq: signed.seq,
+                signed_hash: signed.hash.clone(),
+                accepted_seq: accepted.seq,
+                accepted_hash: accepted.hash.clone(),
+                request_digest: request.request_digest.clone(),
+            });
+        }
+        Ok(CancelProvenance { links })
+    }
+
     pub(super) fn verify_evidence_in(&self, connection: &Connection) -> Result<()> {
         self.evidence_in(connection).map(|_| ())
     }
@@ -554,6 +617,100 @@ impl SubmissionJournal {
         )?
         .ok_or_else(|| invalid("submission evidence already recorded"))
     }
+}
+
+fn matches_cancel_target(
+    request: &SignedRequest,
+    accepted: &AcceptedStatus,
+    target: &CancelTarget,
+) -> Result<()> {
+    use oppen_hl::wire::{Grouping, OrderType, Tpsl};
+    let Action::Order {
+        orders, grouping, ..
+    } = &request.action
+    else {
+        return Err(invalid("ownership action is not an order"));
+    };
+    let [order] = orders.as_slice() else {
+        return Err(invalid("ambiguous signed order"));
+    };
+    let decimal = |wire: &str| {
+        wire.parse::<Decimal>()
+            .map_err(|_| invalid("invalid signed decimal"))
+    };
+    let original_size = decimal(order.s.as_str())?;
+    if request
+        .clearance
+        .pointer("/kind/symbol")
+        .and_then(Value::as_str)
+        != Some(target.symbol.as_str())
+        || order.a != target.asset_index
+        || order.b != target.is_buy
+        || order.r != target.reduce_only
+        || target.cloid.as_ref() != Some(&request.cloid)
+        || target.limit_px != decimal(order.p.as_str())?
+        || target.orig_sz != original_size
+        || target.sz <= Decimal::ZERO
+        || target.sz > original_size
+        || target.is_position_tpsl != (*grouping == Grouping::PositionTpsl)
+    {
+        return Err(invalid(
+            "observed order differs from authenticated signed identity",
+        ));
+    }
+    if let AcceptedStatus::Filled { total_sz, .. } = accepted
+        && target.sz > original_size - total_sz
+    {
+        return Err(invalid(
+            "remaining order contradicts direct filled acceptance",
+        ));
+    }
+    match &order.t {
+        OrderType::Limit { tif } => {
+            if target.tif != Some(*tif)
+                || target.order_type != "Limit"
+                || target.is_trigger
+                || target.trigger_px != Some(Decimal::ZERO)
+                || target.trigger_condition.as_deref() != Some("N/A")
+            {
+                return Err(invalid("limit order immutable evidence missing or changed"));
+            }
+        }
+        OrderType::Trigger {
+            is_market,
+            trigger_px,
+            tpsl,
+        } => {
+            let name = match (tpsl, is_market) {
+                (Tpsl::Tp, true) => "Take Profit Market",
+                (Tpsl::Tp, false) => "Take Profit Limit",
+                (Tpsl::Sl, true) => "Stop Market",
+                (Tpsl::Sl, false) => "Stop Limit",
+            };
+            let price = decimal(trigger_px.as_str())?;
+            let above = matches!((tpsl, order.b), (Tpsl::Tp, false) | (Tpsl::Sl, true));
+            let prefix = if above {
+                "Price above "
+            } else {
+                "Price below "
+            };
+            let condition = target
+                .trigger_condition
+                .as_deref()
+                .and_then(|s| s.strip_prefix(prefix))
+                .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit() || b == b'.'))
+                .and_then(|s| s.parse::<Decimal>().ok());
+            if target.tif.is_some()
+                || !target.is_trigger
+                || target.order_type != name
+                || target.trigger_px != Some(price)
+                || condition != Some(price)
+            {
+                return Err(invalid("trigger immutable evidence missing or changed"));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_acceptance(
