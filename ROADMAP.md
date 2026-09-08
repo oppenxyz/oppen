@@ -106,8 +106,16 @@ before expanding features:
    The agent pause survives account reassignment; cleanup cannot redirect to
    the replacement account. The full local workspace passes; native desktop
    coverage has 56 tests and the frontend has 132. Independent automated
-   working-diff review found no blockers. Exact-head review and CI remain gates.
+   working-diff review found no blockers. PR #59 has green exact-head CI and
+   separate automated review at `4b3f8a6`; the publication hold prevents merging.
    See [desktop-operator-halt.md](docs/specs/desktop-operator-halt.md).
+   Before operator activation, authenticate pilot consent: current consent is
+   hash-chain checked but not HMAC-authenticated, and core pilot checks remain
+   optional when no applicable consent exists. Repair must preserve the original
+   cumulative budget and all liabilities/stops, with explicit legacy review and
+   no automatic trust or reset. This is an open safety gate, not an unconditional
+   signing-bypass claim. See
+   [pilot-consent-authority.md](docs/specs/pilot-consent-authority.md).
    No dedicated-account activity has been performed during this development.
 4. **Recovery:** PR #44 merged as `06fc0e3` after green CI and separate automated
    review. The durable submission journal has SQLite reopen, independent
