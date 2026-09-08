@@ -202,6 +202,15 @@ before expanding features:
    review and CI remain gates. Healthy live WebSocket acceptance and dedicated
    native route-read timeout regression coverage remain open. This is not a
    live-activation or release-readiness claim.
+   Follow-up `test/native-route-timeout-drain` adds a dedicated actual five-second
+   route-read timeout fixture: the caller times out while server drain retains
+   the blocking worker, then completes only after release. All 154 affected MCP
+   tests pass. Removing native route tracking made the exact drain assertion
+   fail; production code was restored. Separate automated diff review found no
+   blocking issues; exact-head review and CI remain gates. Next approval scope is discretionary agent
+   cancellation with a frozen reviewed target set; HALT/pause cleanup must remain
+   immediate. Dead-man supervision is a separate unwired requirement, not an
+   existing agent-accessible disarm tool.
    No dedicated-account activity has been performed during this development.
 4. **Recovery:** PR #44 merged as `06fc0e3` after green CI and separate automated
    review. The durable submission journal has SQLite reopen, independent

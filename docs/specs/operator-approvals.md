@@ -125,7 +125,11 @@ New integration fixtures cover one-shot confirmation, shutdown ownership and
 post-claim panic/reopen. Local workspace tests pass (1,062; 15 live-gated ignored)
 and separate automated working-diff review found no blocking issues. Exact-head
 review, CI and live acceptance remain gates; dedicated native route-read timeout
-coverage and healthy live WebSocket proof are still open.
+coverage and healthy live WebSocket proof were still open at ES29. The follow-up
+`test/native-route-timeout-drain` covers the real five-second native route timeout
+and retained server drain, with a failing sensitivity check when native route
+tracking is removed and a passing affected MCP suite after restoration. This
+test-only follow-up does not establish healthy live WebSocket acceptance.
 
 Ledger V11 is a reader barrier for reviewed commitments and receipt links; old
 event bytes are preserved. Stop all older writers before upgrading. Rollback
