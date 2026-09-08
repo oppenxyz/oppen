@@ -1,5 +1,6 @@
 {
   "extends": "../tsconfig.json",
+  "compilerOptions": { "types": ["bun"] },
   "include": ["./**/*.ts", "./**/*.vue", "../src/**/*.ts", "../src/**/*.vue"],
   "references": []
 }

@@ -7,6 +7,7 @@
     "dev": "vite",
     "build": "vue-tsc --noEmit && vite build",
     "test": "bun test",
+    "typecheck:qa": "vue-tsc --noEmit -p qa/tsconfig.json",
     "preview": "vite preview",
     "tauri": "tauri"
   },
@@ -16,6 +17,7 @@
     "@tauri-apps/plugin-opener": "^2"
   },
   "devDependencies": {
+    "@types/bun": "1.2.19",
     "@vitejs/plugin-vue": "^5.2.1",
     "typescript": "~5.6.2",
     "vite": "^6.0.3",

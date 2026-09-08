@@ -49,6 +49,7 @@ jobs:
           bun-version: 1.2.19
       - run: bun install --frozen-lockfile --ignore-scripts
       - run: bun run build
+      - run: bun run typecheck:qa
       - run: bun run test
       - run: python3 -m unittest discover -s ../../scripts -p "test_*.py"
 

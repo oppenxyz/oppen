@@ -187,6 +187,12 @@ before expanding features:
    it is not a passing gate. Exact-head review and CI remain pending.
    Native pricing review, approval execution, exact-head CI and live gates remain
    open. This queue/rejection work does not enable order submission.
+   Follow-up `fix/desktop-qa-typecheck` supplies the missing Bun development
+   declarations and adds the QA typecheck to the existing web CI job without
+   changing release behavior. QA1 keeps browser and test globals explicit;
+   frozen install, QA typecheck, production build, 168 frontend tests and three
+   release-script unit tests pass. Independent automated diff review found no
+   blocking issues; exact-head review/CI remain separate from live gates.
    No dedicated-account activity has been performed during this development.
 4. **Recovery:** PR #44 merged as `06fc0e3` after green CI and separate automated
    review. The durable submission journal has SQLite reopen, independent
