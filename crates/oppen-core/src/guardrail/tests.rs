@@ -833,6 +833,7 @@ fn permissive(symbols: &[&str]) -> AgentGuardrails {
 #[derive(Debug)]
 struct CountingSink {
     routes: TestRoutes,
+    route_reads: AtomicUsize,
     cleared: AtomicUsize,
     refused: AtomicUsize,
     operator: Mutex<Vec<OperatorAction>>,
@@ -840,6 +841,7 @@ struct CountingSink {
 
 impl AuditSink for CountingSink {
     fn route_for_agent(&self, agent: &AgentId) -> Result<AuthorizedRoute, Refusal> {
+        self.route_reads.fetch_add(1, Ordering::Relaxed);
         self.routes.get(agent)
     }
     fn before_sign(
@@ -873,6 +875,7 @@ impl CountingSink {
     fn new(routes: impl IntoIterator<Item = AuthorizedRoute>) -> Self {
         Self {
             routes: TestRoutes::new(routes),
+            route_reads: AtomicUsize::new(0),
             cleared: AtomicUsize::new(0),
             refused: AtomicUsize::new(0),
             operator: Mutex::new(Vec::new()),
@@ -4418,6 +4421,173 @@ fn refusals_are_recorded_too() {
 }
 
 // ---- item 28: approval mode ---------------------------------------------
+
+fn approval_route_fixture() -> (Fixture, Arc<CountingSink>, AuthorizedRoute) {
+    let agent = AgentId::new("alpha");
+    let route = AuthorizedRoute {
+        network: Network::Testnet,
+        binding_seq: 1,
+        binding: RegistryBinding {
+            agent: agent.clone(),
+            container: exposure(d("100000")).account,
+            vault_address: None,
+            wallet: crate::keys::AgentWallet {
+                generation: 0,
+                address: oppen_hl::Address::from_bytes([19; 20]),
+                approved_at_ms: NOW_MS - 1,
+                valid_until_ms: NOW_MS + APPROVAL_TTL_MS,
+            },
+        },
+    };
+    let sink = Arc::new(CountingSink::new([route.clone()]));
+    let engine = GuardrailEngine::from_parts(
+        Arc::new(test_store()),
+        sink.clone(),
+        Arc::new(crate::keys::MemoryKeyStore::new(Network::Testnet)),
+        Network::Testnet,
+    )
+    .unwrap();
+    engine.register_agent(&agent, NOW_MS).unwrap();
+    let mut config = permissive(&["BTC"]);
+    config.approval_required = true;
+    config.max_position_usd = d("200");
+    engine
+        .operator_set_guardrails(&agent, config, NOW_MS)
+        .unwrap();
+    acknowledge(&engine);
+    (Fixture { engine, agent }, sink, route)
+}
+
+#[test]
+fn approval_route_binding_rejects_replacement_account_revision_and_wallet_changes() {
+    for change in [
+        "replacement_account",
+        "binding_revision",
+        "signer",
+        "wallet_generation",
+        "wallet_window",
+        "vault",
+    ] {
+        let (f, sink, original) = approval_route_fixture();
+        let btc = asset("BTC", 2, 40);
+        let market = MarketRef::fresh("BTC", d("100"), NOW_MS);
+        let mut fresh_exposure = exposure(d("100000"));
+        let Err(Refusal::ApprovalRequired { approval_id, .. }) = f.evaluate(
+            &intent("BTC", true, d("100"), d("1")),
+            &btc,
+            &market,
+            &fresh_exposure,
+        ) else {
+            panic!("expected a proposal");
+        };
+        let mut replacement = original.clone();
+        match change {
+            "replacement_account" => {
+                replacement.binding_seq += 1;
+                replacement.binding.container = oppen_hl::Address::from_bytes([23; 20]);
+                replacement.binding.wallet.address = oppen_hl::Address::from_bytes([24; 20]);
+                fresh_exposure.account = replacement.binding.container;
+            }
+            "binding_revision" => replacement.binding_seq += 1,
+            "signer" => {
+                replacement.binding.wallet.address = oppen_hl::Address::from_bytes([24; 20])
+            }
+            "wallet_generation" => replacement.binding.wallet.generation += 1,
+            "wallet_window" => replacement.binding.wallet.valid_until_ms += 1,
+            "vault" => replacement.binding.vault_address = Some(replacement.binding.container),
+            _ => unreachable!(),
+        }
+        {
+            let mut routes = sink.routes.0.lock().unwrap();
+            assert_eq!(routes.remove(&f.agent), Some(original));
+            routes.insert(f.agent.clone(), replacement);
+        }
+        let route_reads = sink.route_reads.load(Ordering::Relaxed);
+        let result = f.engine.operator_approve_proposal(
+            &approval_id,
+            &btc,
+            &market,
+            &fresh_exposure,
+            NOW_MS,
+        );
+        assert_eq!(
+            sink.route_reads.load(Ordering::Relaxed),
+            route_reads + 1,
+            "{change}: compare and clearance must use one route lookup"
+        );
+        assert!(
+            matches!(
+                result,
+                Err(Refusal::Unevaluable(Unevaluable::RouteAuthority { .. }))
+            ),
+            "{change}: {result:?}"
+        );
+        assert_eq!(sink.cleared.load(Ordering::Relaxed), 0, "{change}");
+        assert!(f.engine.pending_proposals(NOW_MS).is_empty());
+        assert!(matches!(
+            f.engine.operator_approve_proposal(
+                &approval_id,
+                &btc,
+                &market,
+                &fresh_exposure,
+                NOW_MS
+            ),
+            Err(Refusal::Unevaluable(Unevaluable::UnknownProposal { .. }))
+        ));
+    }
+}
+
+#[test]
+fn approval_route_binding_unchanged_still_checks_fresh_exposure_and_kill() {
+    for change in ["unchanged", "position", "kill"] {
+        let (f, sink, route) = approval_route_fixture();
+        let btc = asset("BTC", 2, 40);
+        let market = MarketRef::fresh("BTC", d("100"), NOW_MS);
+        let mut fresh_exposure = exposure(d("100000"));
+        let Err(Refusal::ApprovalRequired { approval_id, .. }) = f.evaluate(
+            &intent("BTC", true, d("100"), d("1")),
+            &btc,
+            &market,
+            &fresh_exposure,
+        ) else {
+            panic!("expected a proposal");
+        };
+        if change == "position" {
+            fresh_exposure
+                .agent
+                .positions
+                .insert("BTC".into(), PositionSnapshot { szi: d("2") });
+            fresh_exposure.agent.total_position_notional_usd = d("200");
+        } else if change == "kill" {
+            f.engine
+                .operator_engage_kill(
+                    KillScope::agent(f.agent.clone()),
+                    KillReason::Operator,
+                    NOW_MS,
+                )
+                .unwrap();
+        }
+        let route_reads = sink.route_reads.load(Ordering::Relaxed);
+        let result = f.engine.operator_approve_proposal(
+            &approval_id,
+            &btc,
+            &market,
+            &fresh_exposure,
+            NOW_MS,
+        );
+        assert_eq!(sink.route_reads.load(Ordering::Relaxed), route_reads + 1);
+        match change {
+            "unchanged" => assert_eq!(result.unwrap().clearance().route, route),
+            "position" => assert!(matches!(result, Err(Refusal::PositionNotional { .. }))),
+            "kill" => assert!(matches!(result, Err(Refusal::TradingPaused { .. }))),
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            sink.cleared.load(Ordering::Relaxed),
+            usize::from(change == "unchanged")
+        );
+    }
+}
 
 #[test]
 fn approval_is_the_last_check_and_is_not_charged_twice() {
