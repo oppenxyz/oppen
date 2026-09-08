@@ -11,6 +11,34 @@ decisions" section until then.
 
 ---
 
+## 2026-09-08 · Feed-bound order admission
+
+ES32 addresses spec items 9, 24 and 34: a processed disconnect must invalidate
+an order evaluated before that disconnect, even while its price clearance is
+still young. The key-loading regression reproduced an accepted resting order
+after the session had already become unreconciled. A copied `reconciled` boolean
+in an account snapshot is therefore insufficient final signing authority.
+
+Production engines must own the exact feed session used by the gateway and
+reconciliation pump. Capture an opaque runtime stamp before account reads and
+carry it through evaluation, clearance and signed transport capability. Every
+invalidation changes the stamp; reconciliation cannot make an older stamp
+current again. Reconciliation completion must refer to the invalidation it
+actually worked on. Missing, foreign or invalidated evidence refuses all orders,
+including reduce-only orders, in the final Rust gate.
+
+Retain feed admission through crypto and the first HTTP poll, after ledger and
+engine-state acquisition. Release in reverse order before publication I/O, then
+revalidate. Sample authorization and deadline clocks after potentially blocking
+admission waits. Runtime cancellation and schedule-cancel keep their independent
+cleanup authority; feed admission must not prevent the cleanup a disconnect needs.
+
+The stamp is process-local authority, not persisted ownership evidence or a new
+ledger format. This does not recover a lost response, authorize resending, reset
+budgets or prove that an unprocessed socket event has been observed. Buffered-frame
+handling after a long process pause remains a separate transport investigation.
+No new dependency, service, credential or live-account activity is authorized.
+
 ## 2026-09-08 · Discretionary cancellation ownership
 
 ES31c implements D1's own-order requirement for ordinary `cancel` and

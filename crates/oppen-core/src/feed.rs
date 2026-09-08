@@ -32,8 +32,29 @@
 
 pub mod pump;
 
+/// Explicit ready-session fixture shared by constructor/snapshot helpers on
+/// one test thread. Production always begins unreconciled.
+#[cfg(test)]
+pub(crate) fn test_session(account: oppen_hl::Address) -> std::sync::Arc<FeedSession> {
+    thread_local! {
+        static SESSIONS: std::cell::RefCell<std::collections::BTreeMap<String, Arc<FeedSession>>> = const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
+    }
+    SESSIONS.with(|sessions| {
+        sessions
+            .borrow_mut()
+            .entry(account.to_string())
+            .or_insert_with(|| {
+                let session = Arc::new(FeedSession::new());
+                session.bind(oppen_hl::Network::Testnet, account).unwrap();
+                session.reconciled(&session.stamp(), 0);
+                session
+            })
+            .clone()
+    })
+}
+
 use std::collections::BTreeSet;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use oppen_hl::types::Fill;
 use oppen_hl::ws::{Subscription, WsEvent};
@@ -77,9 +98,27 @@ pub enum Action {
 
 #[derive(Debug)]
 struct Inner {
+    epoch: FeedStamp,
+    scope: Option<(oppen_hl::Network, oppen_hl::Address)>,
     last_tick_ms: Option<u64>,
     reconciled: bool,
     failure: Option<String>,
+}
+
+/// Runtime-only snapshot provenance. Invalidations replace the identity;
+/// retaining an old stamp cannot make it current again after reconciliation.
+#[derive(Debug, Clone)]
+pub struct FeedStamp(Arc<()>);
+
+impl PartialEq for FeedStamp {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+impl Eq for FeedStamp {}
+
+pub(crate) struct AdmissionGuard<'a> {
+    _held: MutexGuard<'a, Inner>,
 }
 
 /// The live view of one network's feeds.
@@ -97,6 +136,8 @@ impl FeedSession {
     pub fn new() -> Self {
         FeedSession {
             inner: Mutex::new(Inner {
+                epoch: FeedStamp(Arc::new(())),
+                scope: None,
                 last_tick_ms: None,
                 reconciled: false,
                 failure: None,
@@ -113,6 +154,49 @@ impl FeedSession {
         }
     }
 
+    /// Capture before gathering the account snapshot, never after its reads.
+    pub fn stamp(&self) -> FeedStamp {
+        self.lock().epoch.clone()
+    }
+
+    pub(crate) fn bind(
+        &self,
+        network: oppen_hl::Network,
+        account: oppen_hl::Address,
+    ) -> Result<(), crate::reconcile::ReconcileError> {
+        let mut inner = self.lock();
+        let requested = (network, account);
+        match inner.scope {
+            Some(scope) if scope != requested => {
+                Err(crate::reconcile::ReconcileError::FeedScopeMismatch)
+            }
+            Some(_) => Ok(()),
+            None => {
+                inner.scope = Some(requested);
+                inner.reconciled = false;
+                inner.epoch = FeedStamp(Arc::new(()));
+                Ok(())
+            }
+        }
+    }
+
+    pub(crate) fn admit(
+        &self,
+        stamp: Option<&FeedStamp>,
+        network: oppen_hl::Network,
+        account: oppen_hl::Address,
+    ) -> Result<AdmissionGuard<'_>, crate::guardrail::Refusal> {
+        let inner = self.lock();
+        if stamp != Some(&inner.epoch)
+            || inner.scope != Some((network, account))
+            || !inner.reconciled
+            || inner.failure.is_some()
+        {
+            return Err(crate::guardrail::Unevaluable::FeedAdmission.into());
+        }
+        Ok(AdmissionGuard { _held: inner })
+    }
+
     /// Record that a reconcile over the last gap has returned.
     ///
     /// Separate from [`Action::Reconcile`] because the call between them can
@@ -121,8 +205,11 @@ impl FeedSession {
     ///
     /// Crate-visible: the runtime owner that reports back is [`pump::FeedPump`]
     /// and nothing outside oppen-core drives the flag.
-    pub(crate) fn reconciled(&self, at_ms: u64) {
+    pub(crate) fn reconciled(&self, stamp: &FeedStamp, at_ms: u64) {
         let mut inner = self.lock();
+        if stamp != &inner.epoch {
+            return;
+        }
         inner.reconciled = inner.failure.is_none();
         // A reconcile is itself evidence the venue answered, so it counts as a
         // tick. Without this, an account that reconnects into a quiet market
@@ -139,14 +226,18 @@ impl FeedSession {
     ///
     /// The tick clock is untouched. Freshness and completeness are different
     /// questions, and this answers only the second.
-    pub(crate) fn unreconciled(&self) {
-        self.lock().reconciled = false;
+    pub(crate) fn unreconciled(&self) -> FeedStamp {
+        let mut inner = self.lock();
+        inner.reconciled = false;
+        inner.epoch = FeedStamp(Arc::new(()));
+        inner.epoch.clone()
     }
 
     /// Latch the first persistent failure without changing the freshness clock.
     /// There is deliberately no reset within this session's lifetime.
     pub(crate) fn record_failure(&self, detail: String) {
         let mut inner = self.lock();
+        inner.epoch = FeedStamp(Arc::new(()));
         inner.failure.get_or_insert(detail);
         inner.reconciled = false;
     }
@@ -352,6 +443,66 @@ mod tests {
 
     const NOW: u64 = 1_756_000_000_000;
 
+    #[test]
+    fn admission_rejects_foreign_scope_session_and_stale_reconciliation_completion() {
+        let account = account().parse().unwrap();
+        let session = FeedSession::new();
+        session.bind(Network::Testnet, account).unwrap();
+        let initial = session.stamp();
+        session.reconciled(&initial, NOW);
+        assert!(
+            session
+                .admit(Some(&initial), Network::Testnet, account)
+                .is_ok()
+        );
+        assert!(session.admit(None, Network::Testnet, account).is_err());
+        assert!(
+            session
+                .admit(Some(&initial), Network::Mainnet, account)
+                .is_err()
+        );
+        let foreign_account = oppen_hl::Address::from_bytes([8; 20]);
+        assert!(
+            session
+                .admit(Some(&initial), Network::Testnet, foreign_account)
+                .is_err()
+        );
+        assert!(session.bind(Network::Testnet, foreign_account).is_err());
+        let foreign = FeedSession::new();
+        foreign.bind(Network::Testnet, account).unwrap();
+        foreign.reconciled(&foreign.stamp(), NOW);
+        assert!(
+            session
+                .admit(Some(&foreign.stamp()), Network::Testnet, account)
+                .is_err()
+        );
+
+        let walking = session.unreconciled();
+        let after_disconnect = session.unreconciled();
+        session.reconciled(&walking, NOW + 1);
+        assert!(
+            !session.state().reconciled,
+            "an older walk cannot clear a newer outage"
+        );
+        session.reconciled(&after_disconnect, NOW + 2);
+        assert!(session.state().reconciled);
+        assert!(
+            session
+                .admit(Some(&initial), Network::Testnet, account)
+                .is_err()
+        );
+        assert!(
+            session
+                .admit(Some(&walking), Network::Testnet, account)
+                .is_err()
+        );
+        assert!(
+            session
+                .admit(Some(&after_disconnect), Network::Testnet, account)
+                .is_ok()
+        );
+    }
+
     fn ledger(dir: &TempDir) -> Ledger {
         Ledger::open(dir.path(), Network::Testnet).expect("ledger")
     }
@@ -514,7 +665,7 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let ledger = ledger(&dir);
         let session = FeedSession::new();
-        session.reconciled(NOW);
+        session.reconciled(&session.stamp(), NOW);
         assert!(session.state().reconciled);
 
         session
@@ -540,7 +691,7 @@ mod tests {
             "the socket is back; the account is not caught up until the gap is read"
         );
 
-        session.reconciled(NOW + 30_100);
+        session.reconciled(&session.stamp(), NOW + 30_100);
         assert!(session.state().reconciled);
     }
 
@@ -587,7 +738,7 @@ mod tests {
     #[test]
     fn a_completed_reconcile_counts_as_a_tick() {
         let session = FeedSession::new();
-        session.reconciled(NOW);
+        session.reconciled(&session.stamp(), NOW);
         assert_eq!(session.state().last_tick_ms, Some(NOW));
     }
 
@@ -596,18 +747,18 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let ledger = ledger(&dir);
         let session = FeedSession::new();
-        session.reconciled(NOW);
+        session.reconciled(&session.stamp(), NOW);
         session.record_failure("fill was not persisted".into());
         assert_eq!(session.state().last_tick_ms, Some(NOW));
         assert!(!session.state().reconciled);
 
         session.record_failure("later failure".into());
-        session.reconciled(NOW + 1);
+        session.reconciled(&session.stamp(), NOW + 1);
         assert_eq!(session.state().last_tick_ms, Some(NOW + 1));
         session
             .apply(&ledger, account(), &bbo(NOW + 2), NOW + 2)
             .expect("tick");
-        session.reconciled(NOW);
+        session.reconciled(&session.stamp(), NOW);
         let failed = session.state();
         assert!(!failed.reconciled);
         assert_eq!(failed.failure.as_deref(), Some("fill was not persisted"));
@@ -616,7 +767,7 @@ mod tests {
         let fresh = FeedSession::new();
         assert_eq!(fresh.state().failure, None);
         assert_eq!(fresh.state().last_tick_ms, None);
-        fresh.reconciled(NOW + 3);
+        fresh.reconciled(&fresh.stamp(), NOW + 3);
         assert!(fresh.state().reconciled);
         assert_eq!(session.state(), failed);
     }

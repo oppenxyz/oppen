@@ -29,6 +29,280 @@ fn assert_pending(runtime: &Runtime, cloid: &Cloid) {
 }
 
 #[tokio::test]
+async fn processed_disconnect_during_key_loading_refuses_order_before_signing() {
+    disconnect_during_key_loading(false, false).await;
+}
+
+#[tokio::test]
+async fn processed_disconnect_then_reconcile_refuses_old_order_snapshot() {
+    disconnect_during_key_loading(false, true).await;
+}
+
+#[tokio::test]
+async fn processed_disconnect_during_key_loading_refuses_reduce_only_order() {
+    disconnect_during_key_loading(true, false).await;
+}
+
+#[tokio::test]
+async fn processed_disconnect_then_reconcile_during_account_read_refuses_old_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let venue = Venue::start().await;
+    let keys = Arc::new(FixtureKeys::default());
+    let runtime = Arc::new(Runtime::open(dir.path(), venue.port(), keys.clone()).await);
+    runtime.activate_orders().await;
+    let reads_before = keys.read_heads.lock().unwrap().len();
+    // The venue freezes this response before notification, then releases its
+    // book lock. Recovery reads are independent because the gate is one-shot.
+    let gate = venue.hold_info("clearinghouseState");
+    let calling = runtime.clone();
+    let order = tokio::spawn(async move {
+        calling
+            .call(
+                "place",
+                place(Cloid::from_bytes([183; 16]).as_str(), "0.12"),
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(3), gate.entered.notified())
+        .await
+        .expect("order never reached the captured account HTTP response");
+    assert!(evidence(&runtime, EventKind::SubmissionStarted).is_empty());
+    assert!(venue.submissions().is_empty());
+    process_disconnect(&runtime);
+    runtime.reconcile().await;
+    assert!(runtime.gateway.inner.feed.state().reconciled);
+    gate.release.notify_one();
+    let reply = tokio::time::timeout(Duration::from_secs(5), order)
+        .await
+        .unwrap()
+        .unwrap();
+    let started = evidence(&runtime, EventKind::SubmissionStarted);
+    let signed = evidence(&runtime, EventKind::SubmissionSigned);
+    let accepted = evidence(&runtime, EventKind::SubmissionAccepted);
+    let posts = venue.submissions();
+    let reads_after = keys.read_heads.lock().unwrap().len();
+    let pending = runtime
+        .gateway
+        .inner
+        .submissions
+        .state(runtime.account)
+        .unwrap()
+        .pending;
+    let runtime = Arc::try_unwrap(runtime)
+        .ok()
+        .expect("order observer retains runtime");
+    runtime.shutdown().await;
+    venue.shutdown().await;
+
+    assert_eq!(reply["status"], "rejected", "{reply}");
+    assert_eq!(reply["refusal"]["unevaluable"], "feed_admission", "{reply}");
+    assert_eq!(
+        reads_after, reads_before,
+        "old snapshot reached key loading"
+    );
+    assert!(started.is_empty(), "old snapshot reached submission begin");
+    assert!(signed.is_empty());
+    assert!(accepted.is_empty());
+    assert!(posts.is_empty());
+    assert!(pending.is_none());
+}
+
+async fn disconnect_during_key_loading(reduce_only: bool, recover: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let venue = Venue::start().await;
+    let keys = Arc::new(FixtureKeys::default());
+    let runtime = Arc::new(Runtime::open(dir.path(), venue.port(), keys.clone()).await);
+    runtime.activate_orders().await;
+    if reduce_only {
+        let seed = Cloid::from_bytes([181; 16]);
+        let reply = runtime.call("place", place(seed.as_str(), "0.12")).await;
+        assert_eq!(reply["status"], "resting", "{reply}");
+        venue.fill(seed.as_str(), Decimal::new(12, 2));
+        runtime.reconcile().await;
+    }
+    assert!(runtime.gateway.inner.feed.state().reconciled);
+    let started_before = evidence(&runtime, EventKind::SubmissionStarted).len();
+    let signed_before = evidence(&runtime, EventKind::SubmissionSigned);
+    let accepted_before = evidence(&runtime, EventKind::SubmissionAccepted);
+    let posts_before = venue.submissions();
+    let cloid = Cloid::from_bytes([180; 16]);
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let (release, wait) = std::sync::mpsc::channel();
+    *keys.read_gate.lock().unwrap() = Some(KeyReadGate {
+        entered: entered.clone(),
+        release: wait,
+    });
+    let mut arguments = place(cloid.as_str(), "0.12");
+    if reduce_only {
+        arguments["is_buy"] = json!(false);
+        arguments["reduce_only"] = json!(true);
+    }
+    let calling = runtime.clone();
+    let order = tokio::spawn(async move { calling.call("place", arguments).await });
+    tokio::time::timeout(Duration::from_secs(3), entered.notified())
+        .await
+        .expect("evaluated order never reached key loading");
+    assert_eq!(
+        evidence(&runtime, EventKind::SubmissionStarted).len(),
+        started_before + 1
+    );
+    let starts: Vec<_> = evidence(&runtime, EventKind::SubmissionStarted)
+        .into_iter()
+        .filter(|event| event.payload.as_ref().unwrap()["cloid"] == cloid.as_str())
+        .collect();
+    assert_eq!(starts.len(), 1, "exactly one start for the gated order");
+    assert_eq!(
+        evidence(&runtime, EventKind::SubmissionSigned),
+        signed_before
+    );
+    assert_eq!(venue.submissions(), posts_before);
+
+    process_disconnect(&runtime);
+    if recover {
+        // Only the actual pump can complete recovery; do not flip the feed flag.
+        runtime.reconcile().await;
+        assert!(runtime.gateway.inner.feed.state().reconciled);
+    }
+    release.send(()).unwrap();
+    let reply = tokio::time::timeout(Duration::from_secs(5), order)
+        .await
+        .unwrap()
+        .unwrap();
+    let signed = evidence(&runtime, EventKind::SubmissionSigned);
+    let accepted = evidence(&runtime, EventKind::SubmissionAccepted);
+    let resolved: Vec<_> = evidence(&runtime, EventKind::SubmissionResolved)
+        .into_iter()
+        .filter(|event| {
+            let payload = event.payload.as_ref().unwrap();
+            payload["start_seq"] == starts[0].seq && payload["start_hash"] == starts[0].hash
+        })
+        .collect();
+    let pending = runtime
+        .gateway
+        .inner
+        .submissions
+        .state(runtime.account)
+        .unwrap()
+        .pending;
+    let posts = venue.submissions();
+    let runtime = Arc::try_unwrap(runtime)
+        .ok()
+        .expect("order observer retains runtime");
+    runtime.shutdown().await;
+    venue.shutdown().await;
+
+    assert_eq!(reply["status"], "rejected", "{reply}");
+    assert_eq!(reply["refusal"]["unevaluable"], "feed_admission", "{reply}");
+    assert_eq!(
+        signed, signed_before,
+        "disconnect must prevent signature publication"
+    );
+    assert_eq!(accepted, accepted_before);
+    assert_eq!(
+        posts, posts_before,
+        "disconnect must prevent the actual exchange POST"
+    );
+    assert_eq!(
+        resolved.len(),
+        1,
+        "exactly one resolution for the gated order"
+    );
+    assert_eq!(
+        resolved[0].payload.as_ref().unwrap()["outcome"]["resolution"],
+        "not_sent"
+    );
+    assert!(pending.is_none());
+}
+
+fn process_disconnect(runtime: &Runtime) {
+    use oppen_hl::ws::{ConnectionId, Disconnected, Subscription, WsEvent};
+
+    let at_ms = now_ms();
+    let subscription = Subscription::UserFills {
+        user: runtime.account,
+    };
+    runtime
+        .gateway
+        .inner
+        .feed
+        .apply(
+            &runtime.ledger,
+            &runtime.account.to_string(),
+            &WsEvent::Disconnected(Box::new(Disconnected {
+                connection: ConnectionId::new(0),
+                at_ms,
+                last_message_ms: Some(at_ms),
+                subscriptions: vec![subscription.clone()],
+                unacked: Vec::new(),
+                reason: "synthetic disconnect after order evaluation".into(),
+            })),
+            at_ms,
+        )
+        .unwrap();
+    assert!(!runtime.gateway.inner.feed.state().reconciled);
+    assert!(
+        runtime
+            .ledger
+            .unreconciled_gaps()
+            .unwrap()
+            .iter()
+            .any(|gap| { gap.scope == subscription.key() && gap.closed_ts_ms.is_none() })
+    );
+}
+
+#[tokio::test]
+async fn processed_disconnect_preserves_runtime_halt_cleanup() {
+    let dir = tempfile::tempdir().unwrap();
+    let venue = Venue::start().await;
+    let runtime = Runtime::open(dir.path(), venue.port(), Arc::new(FixtureKeys::default())).await;
+    runtime.activate_orders().await;
+    let reply = runtime
+        .call(
+            "place",
+            place(Cloid::from_bytes([182; 16]).as_str(), "0.12"),
+        )
+        .await;
+    assert_eq!(reply["status"], "resting", "{reply}");
+    runtime.reconcile().await;
+    process_disconnect(&runtime);
+    runtime
+        .gateway
+        .inner
+        .engine
+        .operator_engage_kill(
+            KillScope::Global,
+            oppen_core::guardrail::KillReason::Operator,
+            now_ms(),
+        )
+        .unwrap();
+    runtime
+        .gateway
+        .enforce_pauses(
+            &[Binding {
+                agent: AgentId::new("fixture-agent"),
+                account: runtime.account,
+            }],
+            runtime.tracker(),
+        )
+        .await
+        .unwrap();
+    assert!(!runtime.gateway.inner.feed.state().reconciled);
+    let posts = venue.submissions();
+    assert_eq!(posts.len(), 2);
+    assert_eq!(posts[1]["action"]["type"], "cancel");
+    assert_eq!(
+        posts[1]["action"]["cancels"],
+        json!([{"a":0,"o":reply["oid"]}])
+    );
+    let status = runtime
+        .call("get_order_status", json!({"oid":reply["oid"]}))
+        .await;
+    assert_eq!(status["status"], "canceled", "{status}");
+    runtime.shutdown().await;
+    venue.shutdown().await;
+}
+
+#[tokio::test]
 async fn guarded_acknowledgment_persists_linked_non_executable_evidence_across_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let venue = Venue::start().await;

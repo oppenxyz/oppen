@@ -555,10 +555,10 @@ impl Gateway {
         engine: Arc<GuardrailEngine>,
         events: EventViews,
         journal: Arc<Journal>,
-        feed: Arc<FeedSession>,
         alerts: Arc<AlertStore>,
         quotes: Arc<QuoteCache>,
     ) -> Result<Self, GatewayInitError> {
+        let feed = engine.feed();
         Ok(Self {
             inner: Arc::new(GatewayInner {
                 execution: Mutex::new(HashMap::new()),
@@ -2288,6 +2288,7 @@ impl Gateway {
     ) -> Result<EvaluationContext, ToolError> {
         self.require_route_tracked(bound, tracker).await?;
         let inner = &self.inner;
+        let feed_stamp = inner.feed.stamp();
         let account = bound.account;
         let universe = self.universe().await?;
         let state = self.read_state(account, now_ms).await?;
@@ -2306,7 +2307,7 @@ impl Gateway {
             .await
             .map_err(|e| ToolError::unavailable("portfolio", e))?;
 
-        let exposure = exposure_from(
+        let mut exposure = exposure_from(
             &state,
             realized_pnl_since(&fills, day_start_ms),
             portfolio.window("day").and_then(|w| w.peak_account_value()),
@@ -2317,6 +2318,7 @@ impl Gateway {
             inner.feed.state().reconciled,
             day_start_ms,
         );
+        exposure.feed_stamp = Some(feed_stamp);
 
         // A missing price is a refusal, never a fallback. This used to read
         // `allMids`, which answers for an unquoted asset with a frozen last
@@ -3687,7 +3689,12 @@ mod tests {
                 .unwrap();
         }
         let engine = std::sync::Arc::new(
-            GuardrailEngine::new(policy, std::sync::Arc::new(NoKeys)).expect("engine"),
+            GuardrailEngine::new(
+                policy,
+                std::sync::Arc::new(NoKeys),
+                Arc::new(FeedSession::new()),
+            )
+            .expect("engine"),
         );
         if initialize_policy {
             engine
@@ -3708,7 +3715,6 @@ mod tests {
             engine,
             EventViews::new(ledger),
             journal,
-            std::sync::Arc::new(oppen_core::feed::FeedSession::new()),
             std::sync::Arc::new(oppen_core::alert::AlertStore::open(":memory:").expect("alerts")),
             std::sync::Arc::new(oppen_core::features::quotes::QuoteCache::new()),
         )
@@ -3855,6 +3861,7 @@ mod tests {
     fn cleared_test_order(gateway: &Gateway, bound: &Binding, cloid: Cloid) -> Cleared {
         use oppen_core::guardrail::{AccountSnapshot, Exposure, RestingExposure};
         grant_test_route(gateway, bound);
+        reconcile_test_feed(gateway, bound.account);
         let at = now_ms();
         let mut config = gateway
             .inner
@@ -3896,6 +3903,7 @@ mod tests {
         };
         let exposure = Exposure {
             account: bound.account,
+            feed_stamp: Some(gateway.inner.feed.stamp()),
             agent: AccountSnapshot {
                 as_of_ms: at,
                 reconciled: true,
@@ -3924,6 +3932,93 @@ mod tests {
             .expect("evaluated and durably audited")
     }
 
+    fn reconcile_test_feed(gateway: &Gateway, account: Address) {
+        use oppen_core::feed::pump::{FeedPump, FeedSubscriber};
+        use oppen_core::reconcile::ReconcileSource;
+        use oppen_hl::types::{Fill, OpenOrder};
+        use oppen_hl::ws::{PoolError, Subscription};
+
+        struct EmptyVenue;
+        impl ReconcileSource for EmptyVenue {
+            fn network(&self) -> Network {
+                Network::Testnet
+            }
+            async fn user_fills_by_time(
+                &self,
+                _: Address,
+                _: u64,
+                _: Option<u64>,
+            ) -> Result<Vec<Fill>, oppen_hl::Error> {
+                Ok(Vec::new())
+            }
+            async fn frontend_open_orders(
+                &self,
+                _: Address,
+            ) -> Result<Vec<OpenOrder>, oppen_hl::Error> {
+                Ok(Vec::new())
+            }
+            async fn order_status(
+                &self,
+                _: Address,
+                _: OrderRef,
+            ) -> Result<OrderStatusResponse, oppen_hl::Error> {
+                panic!("empty fixture has no orders to reconcile")
+            }
+        }
+        impl FeedSubscriber for EmptyVenue {
+            fn subscribe(&self, _: Subscription) -> Result<(), PoolError> {
+                panic!("ledger fixture must not subscribe")
+            }
+            fn unsubscribe(&self, _: &Subscription) -> Result<(), PoolError> {
+                panic!("ledger fixture has no subscriptions")
+            }
+        }
+
+        if gateway.inner.feed.state().reconciled {
+            return;
+        }
+        // These helpers also run inside Tokio tests; join a separate runtime
+        // rather than nesting block_on or exposing a production readiness setter.
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let ledger = oppen_core::ledger::Ledger::open_at(
+                        &gateway
+                            .inner
+                            ._test_dir
+                            .as_ref()
+                            .unwrap()
+                            .path()
+                            .join("testnet.db"),
+                        Network::Testnet,
+                    )
+                    .unwrap();
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap()
+                        .block_on(async {
+                            let pump = FeedPump::new(
+                                &gateway.inner.feed,
+                                &ledger,
+                                account,
+                                EmptyVenue,
+                                &gateway.inner.alerts,
+                                &gateway.inner.quotes,
+                                &EmptyVenue,
+                            )
+                            .unwrap();
+                            let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+                            drop(tx);
+                            pump.run(&mut rx).await;
+                        });
+                })
+                .join()
+                .unwrap();
+        });
+        assert!(gateway.inner.feed.state().reconciled);
+    }
+
     fn pending_fixture() -> (Gateway, Binding, SubmissionReceipt) {
         let gateway = activated_gateway();
         let bound = binding_for("alpha");
@@ -3944,7 +4039,6 @@ mod tests {
             gateway.inner.engine.clone(),
             gateway.inner.events.clone(),
             gateway.inner.journal.clone(),
-            gateway.inner.feed.clone(),
             gateway.inner.alerts.clone(),
             gateway.inner.quotes.clone(),
         )
@@ -4808,6 +4902,7 @@ mod tests {
                     RegistryJournal::open(ledger.clone(), hmac.clone()).unwrap(),
                 ))),
                 Arc::new(NoKeys),
+                inner.feed.clone(),
             )
             .unwrap(),
         );

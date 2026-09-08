@@ -167,6 +167,7 @@ fn expiring_wallet_fixture(config: AgentGuardrails) -> Fixture {
         Arc::new(NullAuditSink::new([route])),
         keys,
         Network::Testnet,
+        crate::feed::test_session(vault()),
     )
     .unwrap();
     engine.register_agent(&agent, NOW_MS).unwrap();
@@ -390,6 +391,7 @@ fn expiry_during_signing_wait(key_wait: bool) {
             sink.clone(),
             keys,
             Network::Testnet,
+            crate::feed::test_session(vault()),
         )
         .unwrap();
         engine.register_agent(&agent, NOW_MS).unwrap();
@@ -614,6 +616,7 @@ fn policy_registration_and_restart_never_grant_route_authority() {
             Arc::new(NullAuditSink::new([])),
             key_store(&["alpha"]),
             Network::Testnet,
+            crate::feed::test_session(vault()),
         )
         .unwrap();
         let agent = AgentId::new("alpha");
@@ -783,6 +786,7 @@ fn with_resting(mut exposure: Exposure, symbol: &str, szi: Decimal, px: Decimal)
 
 fn exposure(equity: Decimal) -> Exposure {
     Exposure {
+        feed_stamp: Some(crate::feed::test_session(vault()).stamp()),
         account: vault(),
         agent: account(equity),
         fleet: None,
@@ -1031,6 +1035,7 @@ fn startup_and_independent_policy_changes_require_explicit_acknowledgment() {
         Arc::new(NullAuditSink::new([alpha_route()])),
         key_store(&["alpha"]),
         Network::Testnet,
+        crate::feed::test_session(vault()),
     )
     .unwrap();
     let rejected = || {
@@ -1118,6 +1123,7 @@ fn unavailable_policy_preserves_registry_cleanup_and_local_stop_visibility() {
         Arc::new(NullAuditSink::new([alpha_route()])),
         key_store(&["alpha"]),
         Network::Testnet,
+        crate::feed::test_session(vault()),
     )
     .unwrap();
     let f = Fixture {
@@ -1165,7 +1171,7 @@ fn production_constructor_without_policy_still_signs_registry_verified_cleanup()
         .unwrap();
     let policy = Arc::new(crate::ledger::PolicyJournal::new(Arc::new(registry)));
     assert!(policy.current().is_err());
-    let engine = GuardrailEngine::new(policy, keys).unwrap();
+    let engine = GuardrailEngine::new(policy, keys, crate::feed::test_session(vault())).unwrap();
     let f = Fixture {
         engine,
         agent: AgentId::new("alpha"),
@@ -1249,6 +1255,7 @@ fn uncertain_cas_and_reload_cannot_clear_emergency_stop_or_enable_restart() {
         Arc::new(NullAuditSink::new([alpha_route()])),
         key_store(&["alpha"]),
         Network::Testnet,
+        crate::feed::test_session(vault()),
     )
     .unwrap();
     assert!(reopened.cancellation_needed(&f.agent));
@@ -1460,6 +1467,7 @@ impl Fixture {
             Arc::new(NullAuditSink::new([alpha_route()])),
             Arc::new(crate::keys::MemoryKeyStore::new(Network::Testnet)),
             Network::Testnet,
+            crate::feed::test_session(vault()),
         )
         .expect("engine without signing credentials");
         let agent = AgentId::new("alpha");
@@ -1489,6 +1497,7 @@ impl Fixture {
             sink,
             key_store(&["alpha"]) as Arc<dyn KeyStore>,
             Network::Testnet,
+            crate::feed::test_session(vault()),
         )
         .expect("engine");
         let agent = AgentId::new("alpha");
@@ -1511,6 +1520,7 @@ impl Fixture {
             Arc::new(NullAuditSink::new([route])),
             key_store(&["alpha"]) as Arc<dyn KeyStore>,
             Network::Testnet,
+            crate::feed::test_session(vault()),
         )
         .expect("engine");
         let agent = AgentId::new("alpha");
@@ -1574,6 +1584,7 @@ fn a_freshly_paired_agent_is_refused_and_told_which_limit_to_raise() {
         Arc::new(NullAuditSink::new([alpha_route()])),
         key_store(&["alpha"]) as Arc<dyn KeyStore>,
         Network::Testnet,
+        crate::feed::test_session(vault()),
     )
     .expect("engine");
     let agent = AgentId::new("alpha");
@@ -2290,6 +2301,7 @@ fn the_gauge_shows_the_shared_budget_an_agent_would_otherwise_never_see() {
     let rows = f.engine.loss_budget(
         &f.agent,
         &Exposure {
+            feed_stamp: Some(crate::feed::test_session(vault()).stamp()),
             account: vault(),
             agent: agent_account,
             fleet: Some(fleet),
@@ -2390,6 +2402,7 @@ fn a_preflight_reports_the_drawdown_budget_it_used_to_omit() {
         &asset("BTC", 2, 40),
         &MarketRef::fresh("BTC", d("100"), NOW_MS),
         &Exposure {
+            feed_stamp: Some(crate::feed::test_session(vault()).stamp()),
             account: vault(),
             agent: down,
             fleet: None,
@@ -2801,6 +2814,7 @@ fn an_account_wide_breach_stops_every_agent() {
     fleet.realized_pnl_today_usd = d("-400");
     fleet.peak_equity_usd = d("5000");
     let with_fleet = Exposure {
+        feed_stamp: Some(crate::feed::test_session(vault()).stamp()),
         account: vault(),
         agent: account(d("1000")),
         fleet: Some(fleet),
@@ -2931,6 +2945,7 @@ fn leverage_replaces_the_exact_limit_notional_from_production_state() {
         orders: vec![order(true, d("50")), order(false, d("110"))],
     };
     let mut exposure = crate::state::exposure_from(&state, Decimal::ZERO, None, true, MIDNIGHT_MS);
+    exposure.feed_stamp = Some(crate::feed::test_session(vault()).stamp());
     let resting = exposure.agent.resting.as_ref().expect("working book");
     assert_eq!(resting.notional_usd, d("160"));
     assert_eq!(resting.notional_by_symbol["BTC"], d("160"));
@@ -3339,6 +3354,7 @@ fn open_exposure_config_defaults_validation_and_sqlite_round_trip() {
         ))),
         Arc::new(crate::keys::MemoryKeyStore::new(Network::Testnet)),
         Network::Testnet,
+        crate::feed::test_session(vault()),
     )
     .unwrap();
     acknowledge(&engine);
@@ -3530,6 +3546,7 @@ fn the_kill_switch_survives_a_restart() {
             Arc::new(NullAuditSink::new([alpha_route()])),
             key_store(&["alpha"]) as Arc<dyn KeyStore>,
             Network::Testnet,
+            crate::feed::test_session(vault()),
         )
         .expect("engine");
         engine.register_agent(&agent, NOW_MS).expect("register");
@@ -3559,6 +3576,7 @@ fn the_kill_switch_survives_a_restart() {
         Arc::new(NullAuditSink::new([alpha_route()])),
         key_store(&["alpha"]) as Arc<dyn KeyStore>,
         Network::Testnet,
+        crate::feed::test_session(vault()),
     )
     .expect("engine");
     assert!(
@@ -3714,6 +3732,7 @@ fn a_global_breaker_trip_names_every_agent() {
     let mut fleet = account(d("4600"));
     fleet.realized_pnl_today_usd = d("-400");
     let with_fleet = Exposure {
+        feed_stamp: Some(crate::feed::test_session(vault()).stamp()),
         account: vault(),
         agent: account(d("1000")),
         fleet: Some(fleet),
@@ -4449,6 +4468,7 @@ fn approval_route_fixture() -> (Fixture, Arc<CountingSink>, AuthorizedRoute) {
         sink.clone(),
         Arc::new(crate::keys::MemoryKeyStore::new(Network::Testnet)),
         Network::Testnet,
+        crate::feed::test_session(vault()),
     )
     .unwrap();
     engine.register_agent(&agent, NOW_MS).unwrap();
@@ -5366,11 +5386,15 @@ fn a_clearance_is_signed_for_the_network_and_sub_account_it_was_evaluated_for() 
         other_vault,
         Some(other_vault),
     );
+    let mainnet_feed = Arc::new(crate::feed::FeedSession::new());
+    mainnet_feed.bind(Network::Mainnet, other_vault).unwrap();
+    mainnet_feed.reconciled(&mainnet_feed.stamp(), NOW_MS);
     let mainnet = GuardrailEngine::from_parts(
         Arc::new(test_store()),
         Arc::new(NullAuditSink::new([route])),
         mainnet_keys as Arc<dyn KeyStore>,
         Network::Mainnet,
+        mainnet_feed.clone(),
     )
     .expect("engine");
     let other = AgentId::new("beta");
@@ -5386,6 +5410,7 @@ fn a_clearance_is_signed_for_the_network_and_sub_account_it_was_evaluated_for() 
             &asset("BTC", 2, 40),
             &MarketRef::fresh("BTC", d("100"), NOW_MS),
             &Exposure {
+                feed_stamp: Some(mainnet_feed.stamp()),
                 account: other_vault,
                 ..exposure(d("100000"))
             },
@@ -5714,6 +5739,7 @@ fn no_input_produces_a_signable_value_without_passing_every_predicate() {
             },
         };
         let exposure = Exposure {
+            feed_stamp: Some(crate::feed::test_session(vault()).stamp()),
             account: vault(),
             agent: agent_account,
             fleet: None,
@@ -6355,6 +6381,7 @@ fn a_failed_ledger_write_never_turns_a_signer_refusal_into_a_signature() {
         }),
         key_store(&["alpha"]) as Arc<dyn KeyStore>,
         Network::Testnet,
+        crate::feed::test_session(vault()),
     )
     .expect("engine");
     let err = broken
@@ -6443,6 +6470,7 @@ fn a_clearance_cannot_be_signed_through_another_networks_engine() {
         )])),
         mainnet_keys as Arc<dyn KeyStore>,
         Network::Mainnet,
+        crate::feed::test_session(vault()),
     )
     .expect("engine");
     // Same agent, same sub-account: only the network differs.
@@ -6480,6 +6508,7 @@ fn a_clearance_cannot_be_signed_through_an_engine_that_does_not_know_its_agent()
             Arc::new(NullAuditSink::new([route])),
             key_store(&["alpha"]) as Arc<dyn KeyStore>,
             Network::Testnet,
+            crate::feed::test_session(vault()),
         )
         .expect("engine")
     };
@@ -6738,6 +6767,7 @@ fn a_clearance_is_signed_by_the_wallet_of_the_agent_it_names() {
             )])),
             keys as Arc<dyn KeyStore>,
             Network::Testnet,
+            crate::feed::test_session(vault()),
         )
         .expect("engine");
         let agent = AgentId::new(agent);
@@ -6863,6 +6893,7 @@ fn one_proposal_authorises_exactly_one_approval() {
             sink.clone() as Arc<dyn AuditSink>,
             key_store(&["alpha"]) as Arc<dyn KeyStore>,
             Network::Testnet,
+            crate::feed::test_session(vault()),
         )
         .expect("engine"),
     );
@@ -6897,11 +6928,13 @@ fn one_proposal_authorises_exactly_one_approval() {
         let engine = engine.clone();
         let id = approval_id.clone();
         move || {
+            let mut snapshot = exposure(d("100000"));
+            snapshot.feed_stamp = Some(engine.feed().stamp());
             engine.operator_approve_proposal(
                 &id,
                 &asset("BTC", 2, 40),
                 &MarketRef::fresh("BTC", d("100"), NOW_MS),
-                &exposure(d("100000")),
+                &snapshot,
                 NOW_MS,
             )
         }
@@ -6940,6 +6973,7 @@ fn the_dead_man_switch_is_armed_per_container() {
         Arc::new(NullAuditSink::new([alpha_route()])),
         key_store(&["alpha", "beta"]) as Arc<dyn KeyStore>,
         Network::Testnet,
+        crate::feed::test_session(vault()),
     )
     .expect("engine");
     let alpha = AgentId::new("alpha");
@@ -7156,6 +7190,7 @@ fn no_generated_intent_reaches_the_signer_without_an_evaluation() {
         let market = MarketRef::fresh(symbol, d("100"), now_ms);
         let instrument = asset(symbol, 2, 40);
         let exposure = Exposure {
+            feed_stamp: Some(crate::feed::test_session(vault()).stamp()),
             account: vault(),
             agent: account_at(d("1000000"), now_ms),
             fleet: None,

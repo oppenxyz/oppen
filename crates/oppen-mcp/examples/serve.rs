@@ -65,9 +65,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("OPPEN_TESTNET_USER differs from the authorized container; correct explicit operator setup".into());
     }
     let mut store = TokenStore::open(PairingJournal::open(ledger.clone(), hmac)?)?;
+    let feed = Arc::new(FeedSession::new());
     let engine = Arc::new(GuardrailEngine::new_supervised_alpha(
         Arc::new(PolicyJournal::new(Arc::new(registry))),
         keys,
+        feed.clone(),
     )?);
 
     // Opening never adopts legacy policy or acknowledges order admission.
@@ -95,7 +97,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The socket, and the thing that folds it into the session (item 9). The
     // pool must outlive the pump: dropping it closes every connection, which
     // ends the event stream and returns `FeedPump::run`.
-    let feed = Arc::new(FeedSession::new());
     // Item 22's alerts, per network for the reason everything is (R4).
     let alerts = Arc::new(AlertStore::open(dir.join("alerts-testnet.db"))?);
     // In memory on purpose: a quote is only useful while it is fresh, so
@@ -140,7 +141,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         engine,
         EventViews::new(ledger),
         journal,
-        feed,
         alerts,
         quotes,
     )?;

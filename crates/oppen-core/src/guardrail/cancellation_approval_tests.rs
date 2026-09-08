@@ -527,6 +527,7 @@ fn cancellation_review_deadline_is_checked_after_keys_and_authority_waits() {
                 inner: f.keys.clone(),
                 wait: Some((entered_tx, Mutex::new(release_rx))),
             }),
+            crate::feed::test_session(vault()),
         )
         .unwrap();
         let cleared = confirm(&f, &p, prepare(&f, &p, at), at).unwrap();
@@ -852,7 +853,12 @@ async fn cancellation_dispatch_rechecks_policy_route_deadline_provenance_and_own
             }
             _ => {}
         }
-        let another = GuardrailEngine::new(f.policy.clone(), f.keys.clone()).unwrap();
+        let another = GuardrailEngine::new(
+            f.policy.clone(),
+            f.keys.clone(),
+            crate::feed::test_session(vault()),
+        )
+        .unwrap();
         let engine = if change == "owner" {
             &another
         } else {
@@ -1080,6 +1086,7 @@ fn cancellation_legacy_raw_signers_refuse_before_key_loading() {
                 inner: f.keys.clone(),
                 wait: Some((entered, Mutex::new(wait))),
             }),
+            crate::feed::test_session(vault()),
         )
         .unwrap();
         let outcome = if authorized {

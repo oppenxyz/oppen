@@ -164,12 +164,14 @@ impl<'a, S: ReconcileSource, F: FeedSubscriber> FeedPump<'a, S, F> {
         quotes: &'a QuoteCache,
         feeds: &'a F,
     ) -> Result<Self, ReconcileError> {
+        let reconciler = Reconciler::new(ledger, source)?;
+        session.bind(ledger.network(), account)?;
         Ok(FeedPump {
             session,
             ledger,
             account,
             account_id: account.to_string(),
-            reconciler: Reconciler::new(ledger, source)?,
+            reconciler,
             alerts,
             quotes,
             feeds,
@@ -507,7 +509,7 @@ impl<'a, S: ReconcileSource, F: FeedSubscriber> FeedPump<'a, S, F> {
 
     /// Work every open window, and clear the flag only if none is outstanding.
     async fn reconcile(&self) {
-        self.session.unreconciled();
+        let stamp = self.session.unreconciled();
         // No pending cloids: item 19's settle-by-client-id needs the set of
         // orders the *gateway* believes live, which this has no access to. An
         // `orderUpdates` gap still re-reads the resting book, so what is
@@ -547,7 +549,7 @@ impl<'a, S: ReconcileSource, F: FeedSubscriber> FeedPump<'a, S, F> {
         }
 
         if outstanding == 0 {
-            self.session.reconciled(now_ms_u64());
+            self.session.reconciled(&stamp, now_ms_u64());
         }
     }
 

@@ -103,17 +103,16 @@ impl Fixture {
                         .expect("registry"),
                 ))),
                 Arc::new(NoKeys(network)),
+                Arc::new(FeedSession::new()),
             )
             .expect("engine"),
         );
         let journal = Arc::new(Journal::open(dir.path().join("journal.db")).expect("journal"));
-        let feed = Arc::new(FeedSession::new());
         let gateway = Gateway::new(
             network,
             engine,
             EventViews::new(ledger.clone()),
             journal,
-            feed,
             std::sync::Arc::new(oppen_core::alert::AlertStore::open(":memory:").expect("alerts")),
             std::sync::Arc::new(oppen_core::features::quotes::QuoteCache::new()),
         )

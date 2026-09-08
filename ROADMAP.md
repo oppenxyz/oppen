@@ -275,6 +275,19 @@ before expanding features:
    reconstruction are prerequisites to implementing recovery; see the
    [acquisition gate](docs/specs/order-provenance.md#acquisition-gate).
    No node provisioning, subscription or paid archive download is authorized.
+   ES32 on `fix/disconnect-signing-admission` addresses a separately reproduced
+   failure: a processed disconnect during key loading still allowed a previously
+   evaluated order to return resting. Bind snapshots and final Rust admission to
+   the engine's exact network/account feed and invalidation stamp, including
+   reduce-only orders. Reconciliation cannot revive old clearances; runtime
+   cleanup stays independent. The full workspace passes 1,153 Rust tests with
+   15 live/keychain-gated tests ignored; 175 frontend tests, build, QA typecheck,
+   all-target Clippy, formatting and dependency-policy checks pass. Separate
+   automated working-diff review found no remaining blockers. Exact-head review
+   and green CI remain required. Synthetic regressions cover account-read,
+   key/ledger/publication/dispatch waits and recovery epoch changes; they do not
+   pass the live disconnect or sleep/wake gate. Buffered frames after a long
+   process pause remain a separate transport investigation.
    No dedicated-account activity has been performed during this development.
 4. **Recovery:** PR #44 merged as `06fc0e3` after green CI and separate automated
    review. The durable submission journal has SQLite reopen, independent

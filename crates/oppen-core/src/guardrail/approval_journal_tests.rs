@@ -19,11 +19,22 @@ use crate::ledger::{
 };
 use tempfile::TempDir;
 
+type PublicationPause = Arc<
+    Mutex<
+        Option<(
+            u64,
+            std::sync::mpsc::Sender<()>,
+            std::sync::mpsc::Receiver<()>,
+        )>,
+    >,
+>;
+
 #[derive(Debug)]
 struct FailSequenceAnchor {
     inner: FileAnchor,
     fail_seq: Arc<AtomicU64>,
     failures: Arc<AtomicUsize>,
+    pause: PublicationPause,
 }
 
 impl HeadAnchor for FailSequenceAnchor {
@@ -32,6 +43,20 @@ impl HeadAnchor for FailSequenceAnchor {
     }
 
     fn store(&self, anchor: &Anchor) -> Result<(), LedgerError> {
+        let pause = {
+            let mut pause = self.pause.lock().unwrap();
+            if pause.as_ref().is_some_and(|(seq, _, _)| *seq == anchor.seq) {
+                pause.take()
+            } else {
+                None
+            }
+        };
+        if let Some((_, entered, release)) = pause {
+            entered.send(()).unwrap();
+            release
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+        }
         // Permit publication repair of the old head; fail only the new commit.
         if anchor.seq != 0 && anchor.seq == self.fail_seq.load(Ordering::SeqCst) {
             self.failures.fetch_add(1, Ordering::SeqCst);
@@ -51,6 +76,7 @@ struct DurableFixture {
     keys: Arc<MemoryKeyStore>,
     fail_seq: Arc<AtomicU64>,
     failures: Arc<AtomicUsize>,
+    pause: PublicationPause,
 }
 
 fn authority_key() -> Arc<HmacKey> {
@@ -61,6 +87,7 @@ fn open_approval_ledger(
     path: &Path,
     fail_seq: Arc<AtomicU64>,
     failures: Arc<AtomicUsize>,
+    pause: PublicationPause,
 ) -> Arc<Ledger> {
     Arc::new(
         Ledger::open_anchored(
@@ -70,6 +97,7 @@ fn open_approval_ledger(
                 inner: FileAnchor::beside(path),
                 fail_seq,
                 failures,
+                pause,
             })),
         )
         .unwrap(),
@@ -82,7 +110,8 @@ impl DurableFixture {
         let path = dir.path().join("approval.db");
         let fail_seq = Arc::new(AtomicU64::new(0));
         let failures = Arc::new(AtomicUsize::new(0));
-        let ledger = open_approval_ledger(&path, fail_seq.clone(), failures.clone());
+        let pause = Arc::new(Mutex::new(None));
+        let ledger = open_approval_ledger(&path, fail_seq.clone(), failures.clone(), pause.clone());
         let keys = key_store(&["alpha"]);
         let registry = RegistryJournal::open(ledger.clone(), authority_key()).unwrap();
         registry
@@ -99,7 +128,12 @@ impl DurableFixture {
         config.approval_required = true;
         next.guardrails.insert(AgentId::new("alpha"), config);
         policy.replace(current.revision, next, NOW_MS).unwrap();
-        let engine = GuardrailEngine::new(policy.clone(), keys.clone()).unwrap();
+        let engine = GuardrailEngine::new(
+            policy.clone(),
+            keys.clone(),
+            crate::feed::test_session(vault()),
+        )
+        .unwrap();
         assert!(engine.policy_status().admission_inhibited);
         acknowledge(&engine);
         Self {
@@ -110,6 +144,7 @@ impl DurableFixture {
             keys,
             fail_seq,
             failures,
+            pause,
         }
     }
 
@@ -122,6 +157,7 @@ impl DurableFixture {
             keys,
             fail_seq,
             failures,
+            pause,
         } = self;
         drop(engine);
         drop(policy);
@@ -130,10 +166,16 @@ impl DurableFixture {
             &dir.path().join("approval.db"),
             fail_seq.clone(),
             failures.clone(),
+            pause.clone(),
         );
         let registry = RegistryJournal::open(ledger.clone(), authority_key()).unwrap();
         let policy = Arc::new(PolicyJournal::new(Arc::new(registry)));
-        let engine = GuardrailEngine::new(policy.clone(), keys.clone()).unwrap();
+        let engine = GuardrailEngine::new(
+            policy.clone(),
+            keys.clone(),
+            crate::feed::test_session(vault()),
+        )
+        .unwrap();
         Self {
             dir,
             engine,
@@ -142,6 +184,7 @@ impl DurableFixture {
             keys,
             fail_seq,
             failures,
+            pause,
         }
     }
 
@@ -663,7 +706,8 @@ fn reserved_approval_deadline(wait_for_keys: bool, wait_for_authority: bool) {
             inner: f.keys.clone(),
             wait: wait_for_keys.then(|| (entered_tx, Mutex::new(release_rx))),
         });
-        f.engine = GuardrailEngine::new(f.policy.clone(), keys).unwrap();
+        f.engine = GuardrailEngine::new(f.policy.clone(), keys, crate::feed::test_session(vault()))
+            .unwrap();
         acknowledge(&f.engine);
         let wallet = f
             .keys

@@ -127,7 +127,12 @@ fn production_audit_sink_persists_orders_decisions_and_typed_refusals() {
             1_000,
         );
         let sink = Arc::new(LedgerAuditSink::new(policy.clone()));
-        let engine = GuardrailEngine::new(policy.clone(), keys).expect("engine");
+        let engine = GuardrailEngine::new(
+            policy.clone(),
+            keys,
+            crate::feed::test_session(oppen_hl::Address::from_bytes([1; 20])),
+        )
+        .expect("engine");
         engine.register_agent(&agent, 1_000).expect("register");
         let cancel = engine
             .clear_cancel(
@@ -284,7 +289,12 @@ fn engine_order_signing(change_policy: bool) {
         agent.clone(),
         now_ms,
     );
-    let engine = GuardrailEngine::new(policy.clone(), keys.clone()).expect("engine");
+    let engine = GuardrailEngine::new(
+        policy.clone(),
+        keys.clone(),
+        crate::feed::test_session(oppen_hl::Address::from_bytes([1; 20])),
+    )
+    .expect("engine");
     engine.register_agent(&agent, now_ms).expect("register");
     engine
         .operator_set_guardrails(
@@ -344,6 +354,7 @@ fn engine_order_signing(change_policy: bool) {
         vol_ratio: None,
     };
     let exposure = Exposure {
+        feed_stamp: Some(crate::feed::test_session(account).stamp()),
         account,
         agent: AccountSnapshot {
             as_of_ms: now_ms,
@@ -360,8 +371,12 @@ fn engine_order_signing(change_policy: bool) {
         fleet: None,
     };
     if !change_policy {
-        let supervised =
-            GuardrailEngine::new_supervised_alpha(policy.clone(), keys.clone()).unwrap();
+        let supervised = GuardrailEngine::new_supervised_alpha(
+            policy.clone(),
+            keys.clone(),
+            crate::feed::test_session(oppen_hl::Address::from_bytes([1; 20])),
+        )
+        .unwrap();
         supervised
             .operator_acknowledge_policy(supervised.policy_observation().unwrap(), now_ms)
             .unwrap();
@@ -431,7 +446,12 @@ fn engine_order_signing(change_policy: bool) {
             ))
         ));
         assert_eq!(ledger.event(stored.seq).unwrap().as_ref(), Some(stored));
-        let restarted = GuardrailEngine::new(policy.clone(), keys).unwrap();
+        let restarted = GuardrailEngine::new(
+            policy.clone(),
+            keys,
+            crate::feed::test_session(oppen_hl::Address::from_bytes([1; 20])),
+        )
+        .unwrap();
         assert!(matches!(
             restarted.evaluate(&agent, &intent, &asset, &market, &exposure, now_ms),
             Err(crate::guardrail::Refusal::Unevaluable(
