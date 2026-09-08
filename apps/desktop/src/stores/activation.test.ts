@@ -1,5 +1,5 @@
-import type { ActivationDisplay, ActivationStatus } from "../lib/bridge";
-import { activationReviewBlocker, createActivation, type ActivationContext } from "./activation";
+import type { ActivationDisplay, ActivationStatus, McpStatus } from "../lib/bridge";
+import { activationContext, activationReviewBlocker, createActivation, type ActivationContext } from "./activation";
 import { ref, watch } from "vue";
 import { activationConsentKey, activationSections } from "../lib/activation-review";
 
@@ -61,6 +61,54 @@ function fixture() {
 }
 
 describe("operator activation", () => {
+  it("continues review polling and explicit confirmation after inhibition advances the engine generation", async () => {
+    const mcp: McpStatus = { phase: "listening", network: "testnet", agent: context.agent, account: context.account,
+      listener: "127.0.0.1:7433", reconciled: true, account_feeds_ready: true, supervision_last_completed_ms: null,
+      supervision_in_progress: false, supervision_error: null, orders_inhibited: true, detail: null,
+      policy_status: { cached_revision: 2, acknowledgment: null, stop_generation: 7, admission_inhibited: true },
+      cached_effective_kill: { global: null, agents: {} },
+      halt: { owner_id: "halt-owner", stop_generation: 1, released_stop_generation: 1, released_engine_stop_generation: 7,
+        previous: null, phase: "persisted", cancellation: "acknowledged", requested_at_ms: at, durable_revision: null, error: null, cancellation_error: null } };
+    const observation = { status: mcp, command: null, error: null, stopRequested: false, haltRequested: false };
+    const f = fixture(); await f.open();
+    f.store.setContext(activationContext("testnet", observation));
+    const command = f.store.review();
+    f.writes[0]!.reply.resolve({ ...ready, phase: "reviewing", review: null }); await command;
+    mcp.policy_status = { ...mcp.policy_status!, stop_generation: 8 };
+    expect(activationContext("testnet", observation)?.blocked).toBe(null);
+    f.store.setContext(activationContext("testnet", observation));
+    f.reads[1]!.resolve({ ...ready, review: { ...ready.review!, display: { ...display, stop_generation: 8 } } }); await settle();
+    const confirming = f.store.confirm("owner-1", "review-1", true);
+    expect(f.writes).toHaveLength(2);
+    expect(f.store.state.status?.receipt).toBeNull();
+    f.writes[1]!.reply.resolve({ ...ready, ...confirmation, phase: "acknowledged", review: null,
+      receipt: { route: display.route, policy_revision: 2, stop_generation: 8, acknowledged_at_ms: at, audit_seq: 10, audit_hash: "native-receipt" } }); await confirming;
+    expect(f.store.state.status?.receipt?.stop_generation).toBe(8);
+    observation.haltRequested = true;
+    expect(activationContext("testnet", observation)?.blocked).toContain("HALT");
+    f.store.stopPolling();
+  });
+  it("unlocks a hung confirmation only on correlated terminal evidence and fences its late reply from a new review", async () => {
+    const f = fixture(); await f.open(ready);
+    const hanging = f.store.confirm("owner-1", "review-1", true);
+    const reading = f.store.refresh();
+    const receipt = { route: display.route, policy_revision: 2, stop_generation: 3, acknowledged_at_ms: at, audit_seq: 9, audit_hash: "native-fixture-receipt" };
+    f.reads[1]!.resolve({ ...ready, ...confirmation, phase: "acknowledged", review: null, receipt }); await reading;
+    expect(f.store.state.command).toBeNull();
+    expect(f.store.state.status?.receipt).toEqual(receipt);
+    expect(f.writes).toHaveLength(1);
+    const next = f.store.review();
+    expect(f.writes).toHaveLength(2); expect(f.store.state.command).toBe("review");
+    f.writes[0]!.reply.resolve({ ...ready, ...confirmation, phase: "confirming", review: null }); await hanging;
+    expect(f.store.state.command).toBe("review"); expect(f.store.state.outcomeUnknown).toBe(true);
+    expect(f.store.state.status?.phase).toBe("acknowledged");
+    f.writes[1]!.reply.resolve({ ...ready, operation_seq: 3, last_operation: { kind: "review" },
+      review: { ...ready.review!, id: "review-2" } }); await next;
+    expect(f.store.state.command).toBeNull();
+    expect(f.store.state.status?.phase).toBe("review_ready");
+    expect(f.store.state.status?.receipt).toBeNull();
+    expect(f.writes).toHaveLength(2); f.store.stopPolling();
+  });
   it("retains an old owner's unknown outcome informationally while allowing explicit work for a verified replacement", async () => {
     const f = fixture(); await f.open(ready);
     const command = f.store.confirm("owner-1", "review-1", true);

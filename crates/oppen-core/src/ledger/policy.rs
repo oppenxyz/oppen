@@ -10,6 +10,9 @@ use serde_json::Value;
 use super::{EventKind, LedgerError, NewEvent, RegistryJournal};
 use crate::guardrail::{LegacyPolicyEvidence, LegacyPolicyReview, PersistedState};
 
+#[path = "policy_release.rs"]
+pub(crate) mod release;
+
 type Result<T> = std::result::Result<T, PolicyError>;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -84,13 +87,16 @@ enum Operation {
         rechecked_at_ms: u64,
     },
     PolicyReplaced,
+    KillReleased {
+        request: Box<release::ReleaseRequest>,
+    },
 }
 
 impl Operation {
     fn kind(&self) -> EventKind {
         match self {
             Self::PolicyInitialized { .. } => EventKind::PolicyInitialized,
-            Self::PolicyReplaced => EventKind::PolicyReplaced,
+            Self::PolicyReplaced | Self::KillReleased { .. } => EventKind::PolicyReplaced,
         }
     }
 }
@@ -380,7 +386,22 @@ impl PolicyJournal {
         state: PersistedState,
         at_ms: u64,
     ) -> Result<PolicyVersion> {
-        let (head_seq, prev_hash) = super::head(&tx)?;
+        let (version, appended) =
+            self.append_in_tx(&tx, previous_policy, operation, state, at_ms)?;
+        tx.commit()?;
+        self.registry.ledger().note_head(&appended)?;
+        Ok(version)
+    }
+
+    fn append_in_tx(
+        &self,
+        tx: &Transaction<'_>,
+        previous_policy: Option<PolicyLink>,
+        operation: Operation,
+        state: PersistedState,
+        at_ms: u64,
+    ) -> Result<(PolicyVersion, super::Appended)> {
+        let (head_seq, prev_hash) = super::head(tx)?;
         let seq = head_seq.checked_add(1).ok_or(LedgerError::SeqOutOfRange)?;
         let kind = operation.kind();
         let idem_key = match &previous_policy {
@@ -407,7 +428,7 @@ impl PolicyJournal {
             mac: hex::encode(mac),
         })?;
         let appended = super::append_keyed_in_tx(
-            &tx,
+            tx,
             &NewEvent {
                 kind,
                 ts_ms: timestamp(at_ms)?,
@@ -418,12 +439,13 @@ impl PolicyJournal {
             &idem_key,
         )?
         .ok_or_else(|| unavailable("policy key without authenticated transition"))?;
-        tx.commit()?;
-        self.registry.ledger().note_head(&appended)?;
-        Ok(PolicyVersion {
-            revision: seq,
-            state,
-        })
+        Ok((
+            PolicyVersion {
+                revision: seq,
+                state,
+            },
+            appended,
+        ))
     }
 
     fn publish_verified_head(&self, tx: Transaction<'_>) -> Result<()> {
@@ -462,6 +484,7 @@ impl PolicyJournal {
             )));
         }
         let mut latest: Option<Entry> = None;
+        let mut release_ids = std::collections::BTreeSet::new();
         let mut statement = connection.prepare(&format!(
             "SELECT {}, idem_key FROM events WHERE kind IN ('policy_initialized', 'policy_replaced') ORDER BY seq",
             super::SELECT_EVENT_COLUMNS
@@ -534,6 +557,13 @@ impl PolicyJournal {
                     "policy_initialized".to_owned()
                 }
                 (Operation::PolicyReplaced, Some(previous)) => {
+                    format!("policy_after:{}", previous.version.revision)
+                }
+                (Operation::KillReleased { request }, Some(previous)) => {
+                    release::validate_transition(request, &previous.version, &envelope)?;
+                    if !release_ids.insert(request.display.operation_id.clone()) {
+                        return Err(unavailable("duplicate kill release operation"));
+                    }
                     format!("policy_after:{}", previous.version.revision)
                 }
                 _ => return Err(unavailable("policy initialization is missing or repeated")),

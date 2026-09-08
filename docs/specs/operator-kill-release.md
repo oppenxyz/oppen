@@ -1,7 +1,7 @@
 # Reviewed TESTNET Kill Release
 
-ES38 follows the locally implemented activation boundary (ES37). Planned, not
-implemented or authorized for a real account. Trace: spec 24-29 and 32, the
+ES38 follows the locally implemented activation boundary (ES37). Implementation
+is local, not accepted or authorized for a real account. Trace: spec 24-29 and 32, the
 operator-only mutation invariant, and the supervised testnet delivery goal.
 
 ## Outcome And Non-Goals
@@ -38,6 +38,10 @@ members, not silently omitted. Empty membership refuses. Every affected route
 must have known authenticated pilot accounting without a permanent stop; one
 unknown or permanently halted affected pilot refuses the entire global release.
 Current pairings and the selected runtime are not authoritative membership.
+The current pilot journal allows one immutable pilot per ledger. Consequently,
+a multi-agent roster cannot satisfy this release contract today and must refuse
+as a whole; a single-member fixture is not proof of multi-agent release support.
+Do not relax consent or omit members to make global release available.
 No additional binding may be released outside the displayed, confirmed scope.
 Per-agent kills survive global release. Agent release never removes a global
 or another agent's kill. The UI distinguishes these remaining stops.
@@ -54,6 +58,9 @@ Verify checkpoint, policy, routes, affected membership and pilot state under
 the write transaction. Persist correlated release evidence with the transition
 and retain ownership through anchor publication. No engine-state lock spans
 disk I/O and no synchronous guard spans async I/O.
+Resample and validate the confirmation deadline after acquiring the write lock
+and replaying authority, immediately before append. A timestamp sampled before
+a blocking wait cannot authorize an expired durable removal.
 
 Recheck local stop generation after publication. A concurrent stop wins; never
 clear its emergency overlay. If the policy removal may already be durable,
@@ -67,9 +74,15 @@ committed, not committed, or still unknown without issuing another release
 write. A committed classification requires the exact correlated authenticated
 transition and verified chain/checkpoint, not a matching current kill boolean.
 Absence can mean not committed only after actual work is terminal or exclusive
-runtime ownership proves the previous owner cannot still commit. Pending work,
+runtime ownership proves the specific operation's previous owner cannot still
+commit. A native runtime lease does not cover arbitrary core release callers;
+unattributed absent operation IDs remain unknown. Pending work,
 unverifiable history or ambiguous publication remains unknown. A later stop is
 reported separately and prevents an old receipt from re-arming over that stop.
+Receipts bind the reviewed stop generation. Reconciliation distinguishes the
+persisted policy kill from effective local emergency stops and reports the
+current local generation; a committed policy transition alone cannot imply
+that an emergency overlay has been released.
 
 ## Native And UI Ownership
 
@@ -84,6 +97,14 @@ as successful no-ops. Re-arm only through a verified release outcome and proper
 prior-worker lifecycle handling. Fence worker callbacks, observer sweep baselines
 and frontend polls by the relevant HALT/release generation. Preserve historical
 HALT/cancellation receipts separately from the current effective stop state.
+Release markers identify the released HALT and the engine generation at that
+release separately. They are historical evidence, not current eligibility.
+Beginning a fresh activation review itself advances inhibition generation; this
+must not invalidate the UI's release prerequisite or halt activation polling.
+Reject regressing engine-generation observations and preserve later HALT request
+fences, effective kills and unknown command outcomes. A definitively rejected
+HALT may become explicitly retryable after a fresh matching-owner observation,
+including when the previous HALT is released but its receipt remains visible.
 
 A HALT during release invalidates that release and remains actionable. Stale
 release completion cannot clear a new HALT. Explicit release permits a new
@@ -94,6 +115,28 @@ stop/release fence and inhibit orders even if the old HALT request is latched
 or its worker is still retained. The ordinary already-requested fast path must
 not swallow that press. Durable work can remain serialized and owned; local
 inhibition cannot wait for prior release completion or worker drain.
+After a release commits but a newer HALT prevents local publication, that HALT's
+retained persistence must obtain current authenticated policy and durably engage
+its scope without an external refresh or stale full-policy overwrite. A healthy
+ledger must not leave the requested stop memory-only because release advanced
+the revision.
+
+## Reader Compatibility
+
+The first committed authenticated `kill_released` operation is a ledger-reader
+barrier, including a commit whose anchor publication reports uncertainty.
+Installing the build or reviewing a release alone does not cross this boundary.
+Pre-ES38 readers reject this operation while replaying policy history; a later
+ordinary policy replacement does not make that history readable again. Native
+startup requires policy replay, so this can block cleanup supervision as well
+as order activation. Surface this consequence before confirmation.
+
+The new reader retains the prior initialized/replaced operation shapes and reads
+existing history without rewriting it. After crossing the boundary, recovery
+requires an ES38-compatible reader or a corrective forward build. Do not delete
+events, adopt missing anchors, restore stale accounting or reset pilot consent
+to run an older binary. Source inspection confirms the pre-ES38 refusal; exact
+installed-artifact upgrade/recovery verification remains a separate gate.
 
 ## Acceptance
 
@@ -101,11 +144,14 @@ inhibition cannot wait for prior release completion or worker drain.
    stops, absent acknowledgment, unchanged original consent/budgets and intact
    ledger across physical restart.
 2. Repeated engagement with identical fields, policy/route/pilot/membership
-   changes, expiry and clock rollback all invalidate old review.
+   changes, expiry (including write-lock waits) and clock rollback all invalidate
+   old review before durable removal.
 3. Real HALT during publication retains the stop and produces the appropriate
    refused/uncertain outcome. Audit/anchor failures never imply successful
    release or restore admission. Read-only outcome reconciliation never writes
    another release and cannot classify absent-but-running work as not committed.
+   The actual retained HALT worker persists after an overlapping committed
+   release without a fixture-only refresh; the stop survives physical reopen.
 4. HALT -> release -> HALT works through the same native owner. Delayed old
    callbacks and polls cannot overwrite the second HALT. Lost replies,
    cancellation, panic and shutdown retain actual ownership until drain.
@@ -115,3 +161,22 @@ inhibition cannot wait for prior release completion or worker drain.
 6. Focused and integrated checks, independent exact-head review and green CI.
    Installed-artifact and explicitly authorized real-testnet gates remain
    separate; this specification authorizes no account activity or publication.
+
+## Local Verification Checkpoint
+
+On 2026-09-08, the full Rust workspace passed 1,236 tests with 15 ignored;
+strict all-target clippy and formatting passed. All 207 frontend tests,
+production build and QA typecheck passed. The 13 focused core release tests
+cover nonzero accounting and permanent stops across physical reopen.
+Native tests cover actual release/activation-review/HALT sequencing, retained
+publication races, lock contention and truthful failed-cleanup shutdown.
+The expiry test proves post-acquisition clock resampling and refusal before
+append, not a measured blocked write-lock interval.
+
+Mock browser checks cover confirmation, receipts, expiry, unknown outcomes,
+release followed by activation review across supervision polling, and renewed
+HALT disabling confirmation. Desktop and 390px standalone-panel screenshots
+were inspected; this is not mobile-console or native-artifact acceptance.
+Combined independent automated working-tree review found no remaining safety
+blockers. Exact-head review, remote CI, installed-artifact verification and
+explicitly authorized real-testnet acceptance remain separate pending gates.

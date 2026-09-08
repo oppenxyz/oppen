@@ -391,6 +391,14 @@ impl RegistryJournal {
             .map(|grant| grant.route))
     }
 
+    pub(super) fn active_routes_in(&self, connection: &Connection) -> Result<Vec<AuthorizedRoute>> {
+        Ok(replay(&self.ledger, connection, &self.key)?
+            .into_values()
+            .filter(|grant| !grant.retired)
+            .map(|grant| grant.route)
+            .collect())
+    }
+
     /// Caller keeps the same ledger guard through the cryptographic signing step.
     pub(super) fn verify_route_in(
         &self,

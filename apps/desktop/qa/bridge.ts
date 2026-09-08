@@ -5,6 +5,9 @@ export { isConsoleError } from "../src/lib/bridge";
 export { fetchPolicySetupStatus, reviewPolicySetup, persistPolicySetup, discardPolicySetup } from "./policy-setup";
 export { fetchApprovalQueueStatus, refreshApprovalQueue, rejectApprovalProposal, prepareApprovalReview, confirmApprovalReview, discardApprovalReview } from "./approvals";
 export { fetchActivationStatus, reviewActivation, confirmActivation, discardActivation } from "./activation";
+export { fetchKillReleaseStatus, reviewKillRelease, confirmKillRelease, discardKillRelease, reconcileKillRelease } from "./release";
+import { connectReleaseFixture } from "./release";
+import { connectActivationFixture } from "./activation";
 export let failedRead = false;
 export function failNextReads(): void { failedRead = true; }
 const scenario = new URLSearchParams(location.search).get("state") ?? "positions";
@@ -58,9 +61,11 @@ export async function fetchRuntimeStatus(): Promise<RuntimeStatus> {
 }
 
 const haltScenario = new URLSearchParams(location.search).get("halt");
-const mcpScenario = new URLSearchParams(location.search).get("mcp") ?? (haltScenario ? "listening" : "idle");
+const releaseScenario = new URLSearchParams(location.search).get("release");
+const mcpScenario = new URLSearchParams(location.search).get("mcp") ?? (haltScenario || releaseScenario ? "listening" : "idle");
 let mcpStatus: McpStatus = {
-  halt: { phase: "idle", cancellation: "not_requested", requested_at_ms: null, durable_revision: null, error: null, cancellation_error: null },
+  halt: { owner_id: "fixture-halt-1", stop_generation: 0, released_stop_generation: null, released_engine_stop_generation: null, previous: null, phase: "idle", cancellation: "not_requested", requested_at_ms: null, durable_revision: null, error: null, cancellation_error: null },
+  policy_status: null, cached_effective_kill: null,
   phase: mcpScenario === "listening" || mcpScenario === "sweep_error" ? "listening" : mcpScenario === "failed" ? "failed" : "idle",
   network: "testnet", agent: null, account: null, listener: null,
   reconciled: null, account_feeds_ready: null, orders_inhibited: true,
@@ -91,6 +96,8 @@ export async function stopMcp(): Promise<RuntimeStatus> {
 /** Local visual-test control only; no native or venue call. */
 export function setHaltFixture(phase: "persisting" | "persisted" | "uncertain" | "retrying" | "acknowledged"): void {
   mcpStatus.halt = {
+    owner_id: mcpStatus.halt.owner_id, stop_generation: mcpStatus.halt.stop_generation || 1,
+    released_stop_generation: null, released_engine_stop_generation: null, previous: mcpStatus.halt.previous,
     phase: phase === "retrying" || phase === "acknowledged" ? "persisted" : phase,
     cancellation: phase === "retrying" ? "retrying" : phase === "acknowledged" ? "acknowledged" : "pending",
     requested_at_ms: 1_788_998_400_000,
@@ -99,16 +106,42 @@ export function setHaltFixture(phase: "persisting" | "persisted" | "uncertain" |
     cancellation_error: phase === "retrying" ? "UI fixture: cancellation failed; supervision will retry. " + "cancel-evidence/".repeat(16) : null,
   };
   mcpStatus.orders_inhibited = true;
+  mcpStatus.policy_status = { cached_revision: mcpStatus.policy_status?.cached_revision ?? 42, acknowledgment: null, stop_generation: mcpStatus.policy_status?.stop_generation ?? 7, admission_inhibited: true };
+  mcpStatus.cached_effective_kill = { global: null, agents: { "fixture-agent": { engaged_at_ms: 1_788_998_400_000, reason: { reason: "operator" } } } };
 }
 if (haltScenario === "persisting" || haltScenario === "persisted" || haltScenario === "uncertain" || haltScenario === "retrying" || haltScenario === "acknowledged") setHaltFixture(haltScenario);
+if (releaseScenario && releaseScenario !== "idle") {
+  setHaltFixture("acknowledged");
+  if (releaseScenario !== "rearm") mcpStatus.cached_effective_kill!.global = { engaged_at_ms: 1_788_998_399_000, reason: { reason: "operator" } };
+}
 
 export async function haltMcp(agent: string, requestedAccount: string): Promise<McpStatus> {
   if (stoppedRuntime || mcpStatus.phase !== "listening" || agent !== mcpStatus.agent || requestedAccount !== mcpStatus.account) {
     throw { detail: "UI fixture: no matching listening runtime binding." };
   }
-  if (mcpStatus.halt.phase === "idle") setHaltFixture("persisting");
+  const { owner_id: _owner, durable_revision: _revision, previous: _previous, released_stop_generation: _released, released_engine_stop_generation: _engineReleased, ...previous } = mcpStatus.halt;
+  mcpStatus.halt.previous = previous;
+  mcpStatus.halt.stop_generation += 1;
+  if (mcpStatus.policy_status) mcpStatus.policy_status.stop_generation += 1;
+  setHaltFixture("persisted");
   return copyMcpStatus();
 }
+connectReleaseFixture(() => ({ generation: mcpStatus.policy_status?.stop_generation ?? 0, kill: structuredClone(mcpStatus.cached_effective_kill ?? { global: null, agents: {} }) }), status => {
+  const receipt = status.receipt;
+  if (!receipt || receipt.reviewed_stop_generation !== mcpStatus.policy_status?.stop_generation) return;
+  mcpStatus.policy_status = structuredClone(status.policy_status);
+  mcpStatus.cached_effective_kill = structuredClone(status.cached_effective_kill);
+  if (!status.cached_effective_kill.global && Object.keys(status.cached_effective_kill.agents).length === 0) {
+    mcpStatus.halt.released_stop_generation = mcpStatus.halt.stop_generation;
+    mcpStatus.halt.released_engine_stop_generation = receipt.reviewed_stop_generation;
+  }
+});
+connectActivationFixture({
+  read: () => ({ policy: structuredClone(mcpStatus.policy_status ?? { cached_revision: 42, acknowledgment: null,
+    stop_generation: mcpStatus.halt.stop_generation, admission_inhibited: true }),
+    blocked: mcpStatus.phase !== "listening" || !!mcpStatus.cached_effective_kill?.global || !!mcpStatus.cached_effective_kill?.agents[mcpStatus.agent ?? ""] }),
+  publish: policy => { mcpStatus.policy_status = structuredClone(policy); mcpStatus.orders_inhibited = policy.admission_inhibited; },
+});
 
 export async function checkUpdate() { throw { kind: "unavailable", detail: "Updates are unavailable in the UI fixture." }; }
 export async function downloadUpdate() { throw new Error("UI fixture: no updates."); }

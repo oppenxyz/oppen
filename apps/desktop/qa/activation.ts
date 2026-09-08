@@ -1,10 +1,17 @@
 // Local visual fixtures only. No native invocation, account request or authority mutation.
-import type { ActivationDisplay, ActivationStatus } from "../src/lib/bridge";
+import type { ActivationDisplay, ActivationStatus, PolicyStatus } from "../src/lib/bridge";
 
 export const activationAccount = "0x0000000000000000000000000000000000000001";
 export const activationAgent = "fixture-agent";
 
-export function createActivationFixture(scenario = "idle", clock = Date.now) {
+interface ActivationRuntimeFixture {
+  read(): { policy: PolicyStatus; blocked: boolean };
+  publish(policy: PolicyStatus): void;
+}
+let runtimeFixture: ActivationRuntimeFixture | undefined;
+export function connectActivationFixture(runtime: ActivationRuntimeFixture) { runtimeFixture = runtime; }
+
+export function createActivationFixture(scenario = "idle", clock = Date.now, runtime?: ActivationRuntimeFixture) {
   let serial = 0;
   let next: ActivationStatus | null = null;
   let status: ActivationStatus = {
@@ -16,11 +23,12 @@ export function createActivationFixture(scenario = "idle", clock = Date.now) {
   const copy = () => structuredClone(status);
   function display(): ActivationDisplay {
     const now = clock();
+    const policy = runtime?.read().policy ?? status.policy_status;
     const signer = "0x1234567890abcdef1234567890abcdef12345678";
     return {
       route: { network: "testnet", binding_seq: 2, binding: { agent: activationAgent, container: activationAccount, vault_address: null,
         wallet: { generation: 1, address: signer, approved_at_ms: now - 86_400_000, valid_until_ms: now + 86_400_000 } } },
-      policy_revision: 42, stop_generation: 7,
+      policy_revision: policy.cached_revision ?? 42, stop_generation: policy.stop_generation,
       policy: { symbols: ["BTC", "ETH"], max_order_usd: "15", max_position_usd: "25", max_slippage_bps: "50",
         order_rate: { count: 3, per_ms: 60_000 }, reduce_only: false, approval_required: true,
         risk: { max_leverage: 1, margin_mode: "cross", max_open_exposure_usd: "25", max_risk_usd: null },
@@ -39,7 +47,7 @@ export function createActivationFixture(scenario = "idle", clock = Date.now) {
   function ready(): ActivationStatus {
     return { ...copy(), operation_seq: status.operation_seq + 1, last_operation: { kind: "review" }, phase: "review_ready", receipt: null, error: null,
       review: { id: String(++serial), display: display() },
-      policy_status: { ...status.policy_status, admission_inhibited: true } };
+      policy_status: { ...(runtime?.read().policy ?? status.policy_status), acknowledgment: null, admission_inhibited: true } };
   }
   function outcome(evidence: ActivationDisplay, phase: "acknowledged" | "refused" | "uncertain"): ActivationStatus {
     return { ...copy(), operation_seq: status.operation_seq + 1, last_operation: { kind: "confirm", review_id: status.review!.id }, phase, review: null,
@@ -48,7 +56,7 @@ export function createActivationFixture(scenario = "idle", clock = Date.now) {
       error: phase === "acknowledged" ? null : { kind: phase === "refused" ? "refusal" : "worker",
         detail: `Synthetic ${phase} confirmation. <img src=x> ` + "retained-activation-diagnostic/".repeat(12) },
       policy_status: { ...status.policy_status, admission_inhibited: phase !== "acknowledged",
-        acknowledgment: phase === "acknowledged" ? { revision: 42, stop_generation: 7 } : null } };
+        acknowledgment: phase === "acknowledged" ? { revision: evidence.policy_revision, stop_generation: evidence.stop_generation } : null } };
   }
   function scope(agent: string, account: string) {
     if (agent !== status.agent || account !== status.account) throw new Error("Synthetic activation binding mismatch.");
@@ -74,21 +82,38 @@ export function createActivationFixture(scenario = "idle", clock = Date.now) {
     async fetchActivationStatus(agent: string, account: string) {
       scope(agent, account);
       if (scenario === "error") throw new Error("Synthetic status unavailable. " + "activation-read-diagnostic/".repeat(12));
-      if (next) { status = next; next = null; }
+      if (next) {
+        status = next; next = null;
+        if (status.phase === "acknowledged" && status.receipt) {
+          const current = runtime?.read();
+          if (current && (current.blocked || current.policy.stop_generation !== status.receipt.stop_generation || current.policy.cached_revision !== status.receipt.policy_revision)) {
+            status = { ...status, phase: "refused", receipt: null, error: { kind: "refusal", detail: "Synthetic authority changed before completion." } };
+          } else runtime?.publish(status.policy_status);
+        }
+      }
+      if (runtime) status.policy_status = structuredClone(runtime.read().policy);
       return copy();
     },
     async reviewActivation(agent: string, account: string) {
       scope(agent, account);
       if (!["idle", "acknowledged", "refused"].includes(status.phase)) throw new Error("Synthetic review admission refused.");
+      if (runtime?.read().blocked) throw new Error("Synthetic activation refused: an effective stop remains.");
+      if (runtime) {
+        const policy = runtime.read().policy;
+        runtime.publish({ ...policy, stop_generation: policy.stop_generation + 1, acknowledgment: null, admission_inhibited: true });
+      }
       next = ready();
+      runtime?.publish(next.policy_status);
       status = { ...next, phase: "reviewing", review: null, receipt: null, error: null,
-        policy_status: { ...status.policy_status, admission_inhibited: true } };
+        policy_status: { ...next.policy_status } };
       return copy();
     },
     async confirmActivation(agent: string, account: string, ownerId: string, reviewId: string) {
       reviewScope(agent, account, ownerId, reviewId);
       const evidence = status.review!.display;
-      const result = evidence.expires_at_ms <= clock() || scenario === "refused" ? "refused"
+      const current = runtime?.read();
+      const result = evidence.expires_at_ms <= clock() || scenario === "refused"
+        || (current && (current.blocked || current.policy.stop_generation !== evidence.stop_generation || current.policy.cached_revision !== evidence.policy_revision)) ? "refused"
         : scenario === "unknown" || scenario === "uncertain" ? "uncertain" : "acknowledged";
       next = outcome(evidence, result);
       status = { ...status, operation_seq: next.operation_seq, last_operation: next.last_operation, phase: "confirming", review: null, receipt: null, error: null };
@@ -104,7 +129,7 @@ export function createActivationFixture(scenario = "idle", clock = Date.now) {
 }
 
 let fixture: ReturnType<typeof createActivationFixture> | undefined;
-function local() { return fixture ??= createActivationFixture(new URLSearchParams(location.search).get("activation") ?? "idle"); }
+function local() { return fixture ??= createActivationFixture(new URLSearchParams(location.search).get("activation") ?? "idle", Date.now, runtimeFixture); }
 export const fetchActivationStatus = (...args: Parameters<ReturnType<typeof createActivationFixture>["fetchActivationStatus"]>) => local().fetchActivationStatus(...args);
 export const reviewActivation = (...args: Parameters<ReturnType<typeof createActivationFixture>["reviewActivation"]>) => local().reviewActivation(...args);
 export const confirmActivation = (...args: Parameters<ReturnType<typeof createActivationFixture>["confirmActivation"]>) => local().confirmActivation(...args);

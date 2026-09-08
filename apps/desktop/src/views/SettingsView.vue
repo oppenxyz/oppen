@@ -6,6 +6,8 @@ import ReadoutRows from "../components/housing/ReadoutRows.vue";
 import UiButton from "../components/ui/UiButton.vue";
 import PolicySetupPanel from "../components/PolicySetupPanel.vue";
 import ActivationPanel from "../components/ActivationPanel.vue";
+import ReleasePanel from "../components/ReleasePanel.vue";
+import { release } from "../stores/release";
 import { policySetup, policySetupOwnsContext } from "../stores/policy-setup";
 import { setNetwork, shell, refreshKeychain, type Network } from "../stores/shell";
 import { decimal } from "../lib/display";
@@ -157,6 +159,7 @@ const local = computed(() => [
           <p v-if="mcp.stopRequested" class="copy supervision-warning" role="status">Runtime shutdown requested. {{ mcp.runtime?.phase === 'stopped' ? 'Desktop tasks stopped.' : mcp.runtime?.phase === 'stopped_with_error' ? 'Desktop tasks stopped with errors.' : 'Completion is not confirmed here.' }} Restarting the app is required; this panel cannot reopen it.</p>
           <p v-if="mcp.runtime?.detail" class="copy supervision-warning">{{ mcp.runtime.detail }}</p>
           <ActivationPanel />
+          <ReleasePanel :controller="release" />
         </template>
         <template v-else>
           <p class="copy">Dark theme · Space Mono + Archivo. Bright values carry facts; subdued rules define the housings.</p>

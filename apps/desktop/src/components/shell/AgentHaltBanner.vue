@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed } from "vue";
-import { haltNotice, supervision } from "../../stores/supervision";
+import { haltNotice, haltReleased, supervision } from "../../stores/supervision";
 
 const reading = supervision.state;
 const notice = computed(() => haltNotice(reading));
@@ -14,7 +14,8 @@ const notice = computed(() => haltNotice(reading));
       <span>{{ reading.status?.account }}</span>
     </div>
     <p>{{ notice.cancellation }}. Durable revision: {{ notice.revision ?? 'Unconfirmed' }}.</p>
-    <p>Pauses this agent identity, including later account assignments. Requests cancellation only for the supervised account shown. A changed registry route prevents cancellation confirmation.</p>
+    <p v-if="!reading.haltRequested && haltReleased(reading.status)">Historical HALT evidence retained. The verified release does not acknowledge activation or reset pilot accounting.</p>
+    <p v-else>Pauses this agent identity, including later account assignments. Requests cancellation only for the supervised account shown. A changed registry route prevents cancellation confirmation.</p>
     <p>Cancellation acknowledgments do not prove the venue is flat. Positions may remain open. No resume is performed.</p>
     <p v-if="reading.status?.halt.error">Persistence: {{ reading.status.halt.error }}</p>
     <p v-if="reading.status?.halt.cancellation_error">Cancellation: {{ reading.status.halt.cancellation_error }}</p>

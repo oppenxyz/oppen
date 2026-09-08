@@ -15,6 +15,7 @@ use crate::local_reads::{LocalReads, ReadKind};
 use crate::mcp_runtime::{McpPhase, McpStatus, OwnedMcp, SharedStatus, status_lock};
 use crate::operator_activation::{ActivationControl, ActivationStatus};
 use crate::operator_approvals::{ApprovalQueueControl, ApprovalQueueStatus};
+use crate::operator_release::{ReleaseControl, ReleaseStatus};
 use crate::policy_setup::{
     ErrorKind as SetupErrorKind, Phase as SetupPhase, PolicyEdits, PreparedReview, SetupError,
     Status as SetupStatus,
@@ -1697,6 +1698,90 @@ impl Runtime {
         self.launch_mcp(agent, account, OwnedMcp::start)
     }
 
+    fn with_release(
+        &self,
+        agent: String,
+        account: String,
+        operation: impl FnOnce(&Arc<ReleaseControl>, &Binding) -> Result<ReleaseStatus, String>,
+    ) -> Result<ReleaseStatus, RuntimeError> {
+        let binding = Binding {
+            agent: AgentId::new(agent),
+            account: account
+                .parse()
+                .map_err(|error| RuntimeError::Failed(format!("invalid MCP account: {error}")))?,
+        };
+        let mut control = self.control();
+        Self::admit(&mut control, Network::Testnet)?;
+        if control.mcp_binding.as_ref() != Some(&binding) {
+            return Err(RuntimeError::ContextChanged);
+        }
+        if status_lock(&self.0.mcp_status).phase != McpPhase::Listening {
+            return Err(RuntimeError::Busy);
+        }
+        let owned = self.0.mcp.try_lock().map_err(|_| RuntimeError::Busy)?;
+        let release = owned
+            .as_ref()
+            .ok_or(RuntimeError::Busy)?
+            .release()
+            .map_err(RuntimeError::Failed)?;
+        operation(release, &binding).map_err(RuntimeError::Failed)
+    }
+
+    pub(crate) fn kill_release_status(
+        &self,
+        agent: String,
+        account: String,
+    ) -> Result<ReleaseStatus, RuntimeError> {
+        self.with_release(agent, account, |owner, binding| owner.snapshot(binding))
+    }
+
+    pub(crate) fn review_kill_release(
+        &self,
+        agent: String,
+        account: String,
+        scope: oppen_core::guardrail::KillScope,
+    ) -> Result<ReleaseStatus, RuntimeError> {
+        self.with_release(agent, account, |owner, binding| {
+            owner.review(binding, scope)
+        })
+    }
+
+    pub(crate) fn confirm_kill_release(
+        &self,
+        agent: String,
+        account: String,
+        owner_id: String,
+        review_id: String,
+    ) -> Result<ReleaseStatus, RuntimeError> {
+        self.with_release(agent, account, |owner, binding| {
+            owner.confirm(binding, &owner_id, review_id)
+        })
+    }
+
+    pub(crate) fn discard_kill_release(
+        &self,
+        agent: String,
+        account: String,
+        owner_id: String,
+        review_id: String,
+    ) -> Result<ReleaseStatus, RuntimeError> {
+        self.with_release(agent, account, |owner, binding| {
+            owner.discard(binding, &owner_id, &review_id)
+        })
+    }
+
+    pub(crate) fn reconcile_kill_release(
+        &self,
+        agent: String,
+        account: String,
+        owner_id: String,
+        operation_id: String,
+    ) -> Result<ReleaseStatus, RuntimeError> {
+        self.with_release(agent, account, |owner, binding| {
+            owner.reconcile(binding, &owner_id, operation_id)
+        })
+    }
+
     fn with_activation(
         &self,
         agent: String,
@@ -2299,6 +2384,8 @@ impl Runtime {
                 status.phase = McpPhase::Stopping;
                 status.orders_inhibited = true;
                 status.policy_status = None;
+                status.cached_effective_kill = None;
+                status.kill_release_in_progress = false;
             }
         }
         if matches!(
