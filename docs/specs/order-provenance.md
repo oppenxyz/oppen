@@ -122,6 +122,60 @@ building a verifier. A dispatch marker or matching timestamp cannot replace
 that evidence. Running a node or subscribing to a provider is not authorized by
 this investigation and is not an implicit desktop installation requirement.
 
+### Acquisition Gate
+
+Follow-up inspection on 2026-09-08 narrows the next step to acquiring trusted
+testnet execution evidence, not adding another order-status lookup. No suitable
+authenticated testnet capture was obtained. This does not establish that none
+exists. The following candidates have different unresolved boundaries:
+
+| Candidate | Documented capability | Remaining gate |
+| --- | --- | --- |
+| Operator-controlled official node | Testnet configuration, signed binary verification and action/response output | Operator approval of the capture trust boundary; actual complete testnet record and protected acquisition path |
+| Official historical archive | Historical L1 transactions in `hl-mainnet-node-data/replica_cmds`; requester-paid transfer | Neither testnet coverage nor full responses established by these docs; transfer costs not authorized |
+| Dwellir full blocks | Bundle-hash join, action/response index association and successful order OID | Explicit provider trust decision, confirmed testnet coverage and real capture; no subscription authorized |
+
+Sources: [official node](https://github.com/hyperliquid-dex/node),
+[historical archive](https://hyperliquid.gitbook.io/hyperliquid-docs/historical-data),
+[provider block format](https://www.dwellir.com/docs/hyperliquid/stream_blocks).
+The provider's [gRPC access contract](https://www.dwellir.com/docs/hyperliquid/grpc)
+uses TLS and an API key; that contract does not by itself establish testnet block
+availability. The block documentation's commented example is not an authenticated
+testnet fixture. Its response `user` label also needs verification for agent-wallet
+and vault account routing before it can authorize cancellation.
+
+Security inference: verifying a node binary authenticates the software artifact,
+not an arbitrary exported JSON file. Likewise, a wallet signature binds an action,
+not its attached execution response. A matching bundle hash is an association key,
+not by itself proof of the response's authenticity. The inspected documentation
+does not establish a standalone response-inclusion verification procedure.
+
+Before implementing recovery, require all of the following:
+
+1. An explicitly accepted source and protected acquisition path. Record the
+   source, network, node/software version where available, acquisition time and
+   raw artifact digest. A self-declared manifest or digest is not a trust root.
+   Source approval does not authorize node installation, paid access or trading.
+2. A bounded, complete, unmodified testnet execution record with a successful
+   order response. Preserve its sequential block identifier separately from
+   consensus round; the provider documents that rounds can skip. Establish
+   response-account semantics rather than inferring them from a signer label.
+3. Demonstrated reconstruction of the existing signed-submission digest from
+   that record: exact action strings, nonce, vault, expiry, fixed-width signature
+   components, explicit nulls, network and local ledger genesis. Do not normalize
+   wire prices/sizes or invent omitted signed fields to make a sample match.
+4. A reviewed ingestion contract that links only an already authenticated local
+   signed receipt to the corresponding successful response. Reject ambiguous
+   associations, conflicting OIDs, wrong networks/accounts and incomplete records.
+   Preserve pending accounting until reconciliation independently proves its
+   resolution; ownership evidence alone must not release liability.
+
+Next operator decision: whether to trust an operator-controlled official testnet
+node capture, with provisioning and costs separately approved. No source has been
+selected or enabled. Do not implement a speculative importer or claim this gate
+passed using fabricated capture provenance. Account confirmation and the existing
+live-activity gates still apply to any later supervised recovery exercise.
+
 ## Acceptance Evidence
 
 - Owned orders cancel through both approval modes and native review; manual,
