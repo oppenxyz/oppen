@@ -2,7 +2,49 @@
 
 Everything mapped so far, from the v1 MVP through the versions after it. Numbers in brackets are spec items in [docs/spec.md](docs/spec.md); D1–D8 are the settled architecture decisions there and are not re-opened here. Each phase has a gate: the phase is done when the gate passes on testnet, not on mocks.
 
-Legend: `[x]` shipped on `main` or in an open PR · `[ ]` not started · **gate** = what proves the phase.
+Legend: `[x]` implementation on `main` or in an open PR · `[ ]` incomplete (may
+include partial/local implementation) · **gate** = what proves the phase.
+Neither a checkbox nor an open PR proves installed or live acceptance.
+
+## Active delivery queue — recovered 2026-09-08
+
+The owner's original goal is a supervised Hyperliquid **testnet alpha**:
+guarded execution, durable reconciliation, desktop supervision, failure/recovery
+gates, onboarding and an installable macOS build. Continue through the later
+roadmap after that goal, in milestone order. Quantoppen's detailed design starts
+at its scheduled milestone. The subsequent venue reprioritization puts Lighter
+and Aster in v1.2 before v1.5.
+
+This queue tracks delivery separately from implementation. The detailed phase
+lists below remain the feature inventory; avoid treating old unchecked rows as
+proof that code is absent. GitHub gates [#41](https://github.com/oppenxyz/oppen/issues/41),
+[#42](https://github.com/oppenxyz/oppen/issues/42) and
+[#43](https://github.com/oppenxyz/oppen/issues/43) are still open at recovery.
+
+| Order | Work | Current evidence | Remaining completion gate |
+| --- | --- | --- | --- |
+| 1 | Finish TRADE realtime correction: bid/ask/depth, chart source handling, per-channel health and selected-stream ownership | PRs #88–91; selected head `effafee` passed independent exact-head review; 1,298 Rust and 246 frontend tests pass | Green CI and dependency-ordered merges, installed/native-to-UI and public testnet observation; broader subscription adoption remains separately scoped |
+| 2 | Deliver activation, reviewed kill release and initial pilot consent (ES37–39) | PRs #85–87; commits `7208956`, `97806dc`, `ddb576b` have recorded independent exact-head reviews | Green CI and dependency-ordered merges, installed explicit consent/review/activation workflow; no implicit account activity |
+| 3 | Close execution, supervision and recovery gates #41–43 | Guarded lifecycle, durable accounting, pairing/policy/approval/HALT and adverse-order fixture coverage exist | Authorized venue lifecycle and failure matrix, physical restart, dead-man accounting/confirmed coverage, trustworthy ambiguous-order evidence; preserve unresolved liabilities |
+| 4 | Complete remaining v1 operator and onboarding surfaces | Detailed P1–P7 rows below distinguish implemented portions from omissions | Account/container model, Connect Agent and verified client matrix, first-run ceremony, UI/notification/manual-action gaps, signing questions and measured ten-minute onboarding |
+| 5 | Deliver and harden the alpha artifact | Public repo and macOS release pipeline exist; last recorded installed version 0.1.178 | Verify current installed artifact, provenance/checksums, signing-host isolation and recovery drills; PR84 credential migration and Apple signing account remain owner-dependent |
+| 6 | v1.1 hardening, then v1.2 Lighter/Aster | Scheduled below, not delivered by the current feed changes | Complete each milestone's implementation/review/CI and actual acceptance before venue execution or v1.5 expansion |
+| 7 | v1.5 Quantoppen/harness/workflows, then v2+ | Scheduled contracts and feature lists below | Plan agent-consumable quant features when reached; implement and verify each milestone without weakening shared safeguards |
+
+Standing authorization: focused branches, issues and PRs, with merges only after
+green CI and separate review. Before any trading, cancellation or position
+cleanup, obtain the owner's dedicated-testnet-account identity confirmation.
+Preserve cumulative limits across sessions: $15/order, $25 total open exposure
+including resting orders, $150 executed notional, $5 realized loss including
+fees, maximum 1x leverage. Exhaustion requires a new owner decision, never a reset.
+Mainnet, new wallet-owner signatures, funding, credential replacement and paid
+services are outside this authorization. PR84's previously rejected credential
+migration is a separate explicit approval gate. Progress on unaffected work
+continues while owner-dependent gates remain open.
+
+Current action: complete CI and merge the reviewed #85–91 dependency stack,
+then verify the resulting artifact and advance the remaining recovery gates.
+The interrupted workspace validation has completed; the larger goal has not.
 
 ## Execution audit follow-up (2026-09-07)
 
@@ -13,9 +55,109 @@ before expanding features:
 Next activation implementation contract: [operator-activation.md](docs/specs/operator-activation.md).
 Review and explicit confirmation must bind fresh account evidence to the existing
 runtime's authority; initial consent and kill release stay separate operations.
-PR #82 (ES36) has green exact-head CI and separate automated review at
-`7c6d43ea`; its private update job was skipped. It remains unmerged under the
-publication approval hold. This is not an account activation or live gate.
+Initial consent and reviewed kill release are implemented locally, with the
+verification evidence below. They remain delivery gates until remote CI,
+installed-artifact checks and authorized live acceptance pass; do not satisfy
+them by editing a real ledger or auto-releasing stops. Synthetic operator
+tests do not prove the first-run desktop order workflow.
+The reviewed kill-release contract is
+[reviewed kill release](docs/specs/operator-kill-release.md) (ES38), including
+HALT re-arming and stale-generation refusal. Initial consent remains separate.
+ES38 is implemented locally, not installed or accepted for a real account.
+The final combined Rust suite passed 1,236 tests with 15 ignored. All 207 frontend
+tests, production build, QA typecheck, strict all-target clippy and formatting
+passed. Thirteen core release regressions cover scoped release, nonzero pilot
+accounting, permanent stops, physical reopen and publication races. Deadline
+coverage proves post-acquisition clock resampling, not a measured blocked wait.
+Native tests cover retained HALT persistence, lock contention, fresh activation
+review after release, and truthful failed-cleanup shutdown without false
+acknowledgment. The UI preserves historical release evidence across activation's
+own inhibition-generation advance while fencing newer HALTs and stale polls.
+Mock browser confirmation, receipt, expiry, unknown outcome and complete
+release/activation-review/renewed-HALT checks passed. Desktop and 390px standalone
+panel screenshots were inspected; mobile-console support is not claimed.
+Combined independent automated working-tree review found no remaining safety
+blockers. Local implementation commit
+`97806dc2183d6df61a6f1e5c767fb365570be46d` received independent automated
+exact-head review with no blocking findings; this is not human approval. Remote
+CI, installed-artifact checks and authorized real-testnet gates remain pending.
+Explicit publication approval for the local activation/release commits has been
+requested; the local audit and security handoff remain excluded. Initial consent
+was implemented as a separate gate. Its
+[ES39 contract](docs/specs/operator-pilot-consent.md), committed as `e1eff9e`,
+passed independent design review and is now implemented locally. Consent owns
+the pre-MCP runtime, binds fresh evidence and the exact baseline transactionally,
+requires explicit never-used attestation, and refuses prior execution requiring
+preservation. Fill-walk coverage is bound to the same ledger instance and retained
+across other gap retries, but discarded on monitor replacement. Existing consent
+is inspection-only; no signing key, implicit activation or stop release is added.
+
+Combined Rust validation passed 1,258 tests with zero failures and 15 ignored.
+All 221 frontend tests, production build, QA typecheck, strict all-target workspace
+Clippy and formatting passed. The native quiet-account regression confirms after
+the original freshness window using actual loopback WebSocket frames and seven
+fresh REST reads, preserving policy and exact review correlation. Native tests
+also prove retained startup-drain failures, late teardown recovery-required,
+receipt preservation and physical reopen. All remain synthetic, not live gates.
+
+Browser checks passed initial review/discard/fresh review, confirmation, receipt,
+expiry, existing/legacy inspection, unknown-outcome reconciliation and terminal
+recovery-required fencing. Desktop and 390px standalone-panel screenshots were
+inspected without text/control overlap; mobile-console support is not claimed.
+Late status replies cannot overwrite newer work; definitive refusal permits
+identity correction without polling overwriting the draft. Unknown/terminal
+failure cannot be cleared by stale success or an unrelated owner observation.
+
+Aggregate independent automated working-tree review found no remaining blocking
+findings. Local implementation commit
+`ddb576b6310565778abfab627d25b76df18636f2` received independent automated
+exact-head review with no blocking findings; this is not human approval.
+Remote CI, installed-artifact verification and
+authorized live acceptance remain pending. No publication or account action is
+implied by these local checks.
+Current checkpoint (2026-09-08): PRs #55-83 were merged after their checks;
+fetched main is `14e478ae86034e44a14a12f96a3cbbee26cf7fd8`, with the same source
+tree as reviewed PR83. Earlier publication-hold notes below are historical,
+not current merge blockers. `oppenxyz/oppen` is public; the website repository
+remains private. Installed macOS version is 0.1.178. None of this proves
+account activation or a live gate.
+
+ES37 activation remains local and unaccepted. Final combined Rust validation
+passed 1,218 tests with 15 ignored, including core and native publication/ingress
+race proofs. All 194 frontend tests, build/QA typechecking, strict clippy and
+formatting passed. Mock-only browser checks passed confirmation, receipt,
+stale and unknown states. Offline dependency checks passed with existing
+warnings. Aggregate automated working-tree review and focused final race-test
+review found no remaining blockers. Local commit
+`7208956244e68b04447e75e73b9e9837f02106b5` received separate automated exact-head
+review with no blocking findings; this is not human approval. Remote CI and
+installed-artifact verification remain pending. The TRADE audit and local
+security handoff are excluded from that commit and have not been published.
+These local checks do not establish current remote CI. See the activation
+contract for remaining acceptance evidence; real testnet identity/activity
+authorization is still required. Repository hardening PR84 is separately
+owned, and its specific credential-migration approval remains unresolved.
+
+Security handoff follow-through (2026-09-08; all remain acceptance gates):
+- [ ] Prove applied-but-lost replies, partial fills, network loss, sleep/wake,
+  crashes, cancellation retries, update/quit during activity and physical restart
+  without duplicate orders, budget resets or silent reactivation. Synthetic
+  regressions supplement, but do not replace, authorized venue acceptance.
+- [ ] Complete trustworthy ambiguous-order recovery and venue dead-man coverage.
+  Preserve unresolved liability; the provenance acquisition trust decision stays
+  open. Cancellation does not establish position closure.
+- [ ] Document and test signing-host isolation for untrusted shell-capable agents.
+  Keep MCP loopback-only unless a separately reviewed authenticated connectivity
+  design is approved; do not equate a pairing token with host isolation.
+- [ ] Before broad distribution, verify build provenance/attestations and updater
+  signing compromise/recovery drills. Apple Developer ID, Hardened Runtime and
+  notarization require the owner's account; independent security review remains
+  required before real-funds use. Maintainer MFA/recovery and legal review are
+  owner-dependent and unverified.
+- [ ] Resolve the Linux `glib` 0.18.5 advisory GHSA-wrw7-89jp-8q8g /
+  RUSTSEC-2024-0429 before Linux distribution. The handoff reports the published
+  Apple Silicon dependency graph excludes it; the alert remains open. Passing
+  cached offline dependency checks is not evidence of zero open alerts.
 
 1. **Baseline:** repositories moved to `oppenxyz` with private visibility and
    history preserved; local remotes updated. PR #40 merged as `df4fdbd` after
@@ -449,15 +591,115 @@ a test, and an ungated judgement resolves as schedule drift.
 
 **In the gate:**
 
+- [ ] **TRADE realtime correctness follow-up** [30, 31, 34] - the
+  local, unpublished 2026-09-08 TRADE audit found stale derived
+  spread, missing explicit bid/ask, absent-side retention, REST/WS ordering
+  gaps, bootstrap failure recovery gaps, and coarse channel health. Existing
+  live-feed checkmarks below describe delivered plumbing, not completion of
+  these newly reproduced defects. Repair quote/chart correctness first, then
+  expand aggregate-market and account subscriptions with separate durable
+  accounting review. Public testnet sampling is not a live trading gate.
+  Quote remediation is implemented locally on `fix/trade-live-quotes`: separate
+  touch/depth observations from REST-derived features, clear missing sides,
+  fence late L2/REST, recover live books without REST bootstrap, and show explicit
+  bid/ask/latest-observed spread with advancing observation ages. All 228 frontend
+  tests, production build and QA typecheck passed. Browser replays proved live
+  quote bootstrap despite REST failure, missing-side clearing, independent depth
+  ordering, identical reconnect observations and age unaffected by context ticks.
+  Screenshots were inspected at 1440px and the supported 1280px minimum. Aggregate
+  independent automated working-tree and exact-head review found no blockers in
+  local commit `55657ad29a80058bfb20ac13e8b87d2d13b4ec03`; this is not human
+  approval. Venue and host timestamps stay separate; quiet change-driven BBO
+  is not a disconnect signal. No Rust, execution or account behavior changed.
+  Delayed same-generation/same-symbol WS A-B-A frames remain indistinguishable
+  under the current native event contract. Chart/health/subscription remediation,
+  public-feed and installed-artifact verification remain open.
+  Chart remediation is implemented locally on `fix/trade-live-chart`. The
+  [source-separated chart contract](docs/specs/live-chart-observations.md), local
+  commit `743c20b`, passed independent automated design review. It replaces
+  optimistic venue/tape blending with Rust-owned venue-preferred bars and a
+  separate trade marker, bounded deduplication, and exact selection/history
+  ownership. A fresh chart-only receiver incarnation addresses queued A-B-A
+  frames without replacing account supervision. Combined Rust validation passed
+  1,282 tests with zero failures and 15 ignored, including all 119 native tests.
+  All 233 frontend tests, production build, QA typecheck, strict all-target
+  workspace Clippy and formatting passed.
+  Loopback regressions cover stale wire incarnations, retained drain, quiet
+  rollover without false freshness, emission/consumer failure and chart-only
+  refusal/retry without stopping account supervision. A reproduced shutdown race
+  now preserves Stopping while actual account drain remains held. Host-clock
+  rollback cannot reopen elapsed bars; chart projections cannot restore shared
+  market health. Independent automated working-tree review found no remaining
+  blockers. Browser replays and 1440px/1280px screenshots prove mock UI behavior,
+  not installed or live acceptance. Remote CI, public-feed and installed-artifact
+  verification remain pending; no account or publication action was performed.
+  Local commit `47421844a6419c81ad1774ae3b21b0adaa009456` received independent
+  automated exact-head review with no blocking findings; this is not human
+  approval. Coarse per-channel health, broader subscription coverage and quote
+  wire-incarnation follow-up remain open in the audit.
+  Per-channel health work is now on `fix/trade-channel-health`, following the
+  [console channel health contract](docs/specs/console-channel-health.md).
+  A fresh production-shell diagnostic replay reproduced three defects with nine
+  assertions: reconnect-without-data remains OK, quarantine/context traffic masks
+  channel problems, and mixed venue/host timestamps poison the aggregate clock.
+  Passing this replay proves the baseline defects, not their correction. Reuse
+  native registry facts through nonblocking, selection-bound status observations;
+  retain independent five-second status freshness, channel age budgets and quote
+  validity. No signing threshold or subscription has changed. The local
+  implementation now exposes five expected channels, nonblocking pool samples,
+  selection-bound publication, independent age budgets, retained scoped losses
+  and terminal consumer failures. Independent automated aggregate source review
+  found no remaining blockers. Frontend: 240 tests passed; production build and
+  QA typecheck passed. Browser replay and inspected 1280px/1440px screenshots
+  verified null-poll expiry, selection rejection, inert retained diagnostics and
+  quote/health separation. These synthetic checks are not installed or live
+  acceptance. Full-workspace Rust validation passed with 1,291 tests and 15
+  intentionally ignored live/environment gates. The first sandbox-only attempt
+  failed on denied loopback fixture binds; the permitted local-fixture rerun
+  passed. Strict workspace lint, formatting and diff checks passed. Local commit
+  `4b23774383cfd3a36a714755ad970ebd651d8ede` received independent automated
+  exact-head review with no blocking findings; remote CI and installed/live
+  verification remain pending. No publication or account action was performed;
+  the broader subscription inventory is in the contract.
+  Contract commit `e101cd9eb7fd5f58a9a731369fc3947319969dba` passed separate
+  automated design review with no blocking gaps. This is implementation guidance,
+  not a live gate.
+  The next correction is on `fix/selected-market-incarnation`: production
+  controller replay reproduced delayed first-BTC quote/context acceptance after
+  BTC -> ETH -> BTC (one diagnostic test, three assertions). Contract `abcc1e7`
+  in [selected market incarnation](docs/specs/selected-market-incarnation.md)
+  received independent design review. Reuse the existing selected socket for
+  all five public streams with immutable producer binding, preserve the account
+  owner, and separate applied account observations from market/reconnect ticks.
+  Implementation is complete locally; the original diagnostic proves the defect,
+  while the subsequent regressions exercise the correction.
+  Frontend validation now passes 246 tests, build and QA typecheck. Browser
+  replay through the actual frontend listener rejects retired quote/context/book,
+  status and failure payloads, missing scope and interval round trips. Account
+  status leaves public quotes unchanged; selected failure is recoverable without
+  clearing an account failure. Inspected 1280px/1440px screenshots preserve quote
+  clocks and position visibility, including expanded inert account diagnostics.
+  The prior channel-health browser replay also passes under selected ownership.
+  Independent source review cleared frontend and native findings, including the
+  missed-first-ack account failure and canceled-drain failure-scope cases. Native
+  validation passed all 132 tests. Resumed full-workspace verification passed
+  1,298 Rust tests with zero failures and 15 intentionally ignored live/environment
+  gates; strict workspace lint, formatting, diff checks, 246 frontend tests,
+  production build, QA typecheck and three release-script tests passed.
+  Dependency checks passed using the cached advisory database (`--offline`).
+  Independent exact-head review of `effafee39a2305bd714d101e820f5b590ca5cc73`
+  found no issues. PR #91 is open; installed, remote-CI and live acceptance
+  remain pending. No account activity has occurred.
+
 - [x] **Market data in the console** [30, 31] — [decisions.md](docs/decisions.md) Z1–Z4. `oppen-core::market` projects the rail and a per-symbol snapshot; TradeView's Markets, strip, Book and Features panels read them. A bookless asset is dimmed rather than hidden and a market with no mid keeps its row, because `allMids` answers for exactly those with a frozen print (H1). `micro_tilt_bps` is still absent, but no longer for the reason given here: the console now subscribes `bbo` (see the live feed line below), so the input exists and only the computation is unbuilt
 - [ ] Activity stream with rejection explainability: guardrail versus venue versus auth, attempted versus limit, inline link to edit [31]
 - [ ] Agents / Control: roster with real PnL, last-seen, idle-with-open-position alert, guardrail utilization; policy panel; approvals queue; risk console with exposure, rate budget, feed health, kill switches [32]
 - [ ] Manual escape hatch drawer; manual actions land as `manual · external` [33]
-- [x] **Staleness: per-feed status, last-tick timestamps, stale overlay** [34] — [decisions.md](docs/decisions.md) W1, W4. `account_state` reports the socket's own `last_tick_ms` instead of the constant `None` it carried since P5 began; the market feed's indicator is owned by the socket rather than by the account poll, because the two now have different clocks, and a one-second timer ages it to `stale` after five seconds of silence. **Execution failing closed during a disconnect is not in this line** — the console has no order path yet, and the gateway already fails closed from `FeedSession`
+- [x] **Initial staleness display** [34] — [decisions.md](docs/decisions.md) W1, W4. The original aggregate indicator is superseded locally by per-channel native observations in `4b23774`; delivery and live gates remain open above. The selected-market incarnation follow-up also corrects desktop account-observation semantics. Neither display is proof of reconciliation or signing eligibility; those remain owned by the guarded runtime.
 - [ ] Persistent MAINNET/TESTNET badge; boot sequence bound to real state [36, D4]
 - [ ] Agent `reason` strings rendered as inert plain text, labelled agent-authored [30]
 - [x] **ASCII candle renderer** promoted from the marketing site: real X and Y axes on nice numbers at the asset's own precision, `--up` / `--down` colour with the glyph as a redundant channel — [charts.md](docs/specs/charts.md) §2, [decisions.md](docs/decisions.md) E1–E4. `oppen-core::market::chart` splits the venue's rows into closed buckets and the one still forming; `CandleChart.vue` measures its grid and maps the renderer's ink codes to tokens. **Native intervals only** — `1m 5m 15m 1h 4h 1d`; the resampler exists in `oppen-core::candles` and nothing calls it yet, which is the v1.5 arbitrary-intervals line
-- [x] **The console's own live feed** [31, 34] — [decisions.md](docs/decisions.md) W1–W6. Five channels for the selected symbol: `activeAssetCtx` for the strip, `bbo` for the spread, `l2Book` for the ladder, `trades` for the bar as it forms, and `candle` to reconcile that bar against the venue's own aggregation. **The tape drives the chart, not the candle channel** — measured on testnet BTC at eight candle frames a minute with a seventeen-second tail carrying none (W2). The rail keeps a 10 s poll because no channel answers for the whole universe at once (W3). Proved by `apps/desktop/src-tauri/tests/live_feed.rs`, which opens a real socket and asserts each channel delivered separately; it is not a CI gate because it needs the venue
+- [x] **Initial console live feed** [31, 34] — [decisions.md](docs/decisions.md) W1–W6. Five selected-symbol channels remain: `activeAssetCtx`, `bbo`, `l2Book`, `trades` and `candle`. Local chart correction `4742184` keeps venue candles separate from partial observed-trade bars and an independent latest-trade marker. The rail still polls every 10 seconds; aggregate venue channels exist but are not adopted. Earlier public-feed tests and short measurements do not establish current installed behavior or a cadence guarantee. The selected transport and broader-subscription acceptance work remains open above.
 - **Gate:** every surface above renders correctly, and the stale overlay appears on socket loss
 
 **Deferred to v1.1:**
@@ -497,6 +739,26 @@ a test, and an ungated judgement resolves as schedule drift.
 
 ---
 
+## Agent harness direction
+
+Owner direction (2026-09-08): Oppen is a trading-specific data, controlled
+execution and durable supervision layer for external agent harnesses. Bring
+your agent; keep the model and its orchestration replaceable. Do not prioritize
+a competing general-purpose harness, proprietary model hosting or elaborate
+multi-agent orchestration ahead of reliable execution and onboarding.
+
+- **MVP/beta:** deliver the existing Connect Agent plan for external harnesses and local-model runners. Preserve compatible-versus-verified support and identical Rust-enforced account permissions, budgets, exposure limits and approvals. MCP connectivity is not host isolation; cloud connectivity retains its separate security review.
+- **Shared foundation:** expose versioned, typed observations with units, timestamps, provenance and explicit stale/missing/uncertain states. Use the existing append-only ledger for action receipts, outstanding liabilities and recovery evidence; model context is never the source of truth for orders or budgets. Operator review, activation, HALT and revocation remain outside agent authority.
+- **v1.1 evaluation foundation:** extend developer scenario/replay tests for harness integration, measuring duplicate actions, stale-data use, recovery correctness and execution latency. Measure model cost when model calls are actually observable; otherwise mark it unavailable. These are reliability evaluations, not evidence of profitable strategies or substitutes for live acceptance.
+- **v1.5 Quantoppen and workflows:** at that milestone, plan an agent-consumable contract covering typed market/risk observations, uncertainty, event subscriptions and condition-triggered wakeups, constrained proposals/actions, and execution/outcome evidence. Reuse the feature, alert, TCA and workflow infrastructure rather than introducing a parallel tool surface or agent loop. Detailed Quantoppen design remains deferred until its scheduled work begins.
+- **Optional in-app harness:** retain the planned v1.5 BYO-model runtime and later workflow capabilities behind the same execution path. External harness support must not require adopting Oppen's own runtime. Customer-facing replay remains outside MVP; developer regression fixtures do not imply that product has shipped.
+- **Engineering practice:** use reproducible environments, bounded implementation tasks, independent review and verified completion when agents build Oppen. Track repeated failures and recovery outcomes; internal coding-harness improvements are not customer-facing feature completion.
+
+This direction does not move work ahead of the current safety gates or the
+v1.2 Lighter/Aster integrations. Harness-facing contracts must preserve their
+meaning and safeguards across clients, models and venues; none grants new
+authority to sign, change policy or bypass execution checks.
+
 ## Specified but not scheduled
 
 These have written specs in [docs/specs/](docs/specs/). Most slot into the
@@ -507,7 +769,7 @@ open decisions that need an answer before it starts.
 | Spec | Feature | Target |
 |---|---|---|
 | [onboarding.md](docs/specs/onboarding.md) | First-run ceremony: container per agent, agent wallet, builder fee, pairing | v1 · P7 |
-| [venue-containers.md](docs/specs/venue-containers.md) | The container model and what Hyperliquid, Aster and Lighter each grant | v1 · P2 (model) / v2 (Aster, Lighter) |
+| [venue-containers.md](docs/specs/venue-containers.md) | The container model and what Hyperliquid, Aster and Lighter each grant | v1 · P2 (model) / v1.2 (Aster, Lighter) |
 | [workflows.md](docs/specs/workflows.md) | Trading workflows, triggers, schedulers, agent profiles | v1.5 / v2 |
 | [history.md](docs/specs/history.md) | Durable trading history in the Portfolio tab | v1.1 |
 | [charts.md](docs/specs/charts.md) | ASCII candles with real axes, arbitrary intervals, line chart, Quantoppen | v1 / v1.1 |
@@ -531,6 +793,22 @@ open decisions that need an answer before it starts.
 - [ ] **Arbitrary chart intervals**: native, exact resampling, and forward-only local aggregation for sub-minute — [charts.md](docs/specs/charts.md) §3
 - [ ] **Line chart mode** and the **Quantoppen** multi-asset watch grid — [charts.md](docs/specs/charts.md) §4–5
 
+## v1.2 · Lighter and Aster integrations
+
+Owner reprioritization (2026-09-08): bring both venues forward from v2+ to
+before v1.5. Keep the Hyperliquid supervised-alpha live acceptance, onboarding,
+recovery and v1.1 hardening gates first. Deliver one venue at a time; integration
+order remains to be selected. This is a sequencing commitment, not a calendar
+date or authorization for live activity, funding, signatures or credentials.
+
+- [ ] Complete venue-aware account identity and accounting before enabling another execution adapter. Preserve existing ledger history, cumulative limits and separate venue margin pools; positions across venues never net for exposure checks.
+- [ ] **Lighter integration:** read-only market/account feeds and desktop/MCP visibility first, then reviewed onboarding and supervised execution through the shared Rust safeguards — [venue-containers.md](docs/specs/venue-containers.md).
+- [ ] **Aster integration:** read-only market/account feeds and desktop/MCP visibility first, then reviewed onboarding and supervised execution through the shared Rust safeguards — [venue-containers.md](docs/specs/venue-containers.md).
+- **Gate per venue:** verify current API, account and signer capabilities; independent adapter/signing review; green CI; explicitly authorized test-environment acceptance covering orders, fills, cancellation, disconnects and physical restart without duplicate orders, accounting resets or silent activation. Mock-only success does not complete integration. If a suitable test environment is unavailable, pause execution acceptance rather than substituting mainnet.
+
+Cross-venue aggregation/routing remains v2+; v1.5 quant and workflow expansion
+follows these integrations.
+
 ## v1.5 · Quant depth and the fleet
 
 - [ ] `*_pctile_7d` self-normalization on every feature (gives the LLM the baseline it lacks)
@@ -543,10 +821,10 @@ open decisions that need an answer before it starts.
 - [ ] **Fair value engine**: mark replication, funding dead-zone censoring, min-variance component combination, `basis_bp` / `z` / `z_sigma`, and the five `fair_value.*` MCP tools — [fair-value.md](docs/specs/fair-value.md)
 - [ ] **Workflow engine, layer one**: triggers, cron scheduler, conditions, loops, approval gates, `await_agent` nodes for external agents, run state on the existing ledger — [workflows.md](docs/specs/workflows.md) §4.1
 - [ ] **Workflow templates**: `funding-carry`, `basis-dislocation`, `vol-regime`, `position-guardian`, `research-only`, `custom` — structure only, no alpha — [workflows.md](docs/specs/workflows.md) §10
+- [ ] **Agent-consumable Quantoppen contract:** typed observations, event-driven wakeups, constrained actions and outcome evidence, as scoped in [Agent harness direction](#agent-harness-direction); detailed planning begins with this milestone.
 
-## v2+ · Venues, strategies, scripts
+## v2+ · Cross-venue routing, strategies, scripts
 
-- [ ] **Aster and Lighter venues.** Both grant sub-accounts with no volume gate — Aster at "All VIP levels", Lighter tier-capped at 4 free / 16 / 64 — so the container model lands on them more cleanly than on Hyperliquid, which is the worst of the three for this architecture [decisions.md V4] — [venue-containers.md](docs/specs/venue-containers.md)
 - [ ] **Cross-venue aggregation and routing.** Positions on different venues never net: three venues is three margin pools and three liquidation prices, an economically flat book posts full margin on both legs, and one leg can liquidate while the other survives. Aggregate exposure is an oppen-enforced guardrail with no venue behind it, and is labelled as containment rather than a boundary [decisions.md V6]
 - [ ] TWAP and scale orders
 - [ ] Backtesting and strategy templates
