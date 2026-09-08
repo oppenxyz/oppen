@@ -27,7 +27,9 @@ const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 pub use action::Action;
 pub use address::Address;
-pub use exchange::{ExchangeClient, ExchangeRequest, ExchangeResponse, NonceAllocator, Status};
+pub use exchange::{
+    ExchangeClient, ExchangeRequest, ExchangeResponse, ExchangeResponseKind, NonceAllocator, Status,
+};
 pub use info::{InfoClient, OrderRef};
 pub use meta::{Asset, Universe, ValidationError};
 pub use order::{OrderKind, OrderSpec};

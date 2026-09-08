@@ -682,6 +682,72 @@ async fn operator_halt_requested_sweep_retries_real_cancellation_without_closing
 }
 
 #[tokio::test]
+async fn wrong_exchange_identity_or_extra_status_remains_unknown_over_real_http() {
+    for behavior in [
+        Behavior::WrongKind,
+        Behavior::WrongKindError,
+        Behavior::ExtraStatus,
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let venue = Venue::start().await;
+        let runtime =
+            Runtime::open(dir.path(), venue.port(), Arc::new(FixtureKeys::default())).await;
+        runtime.activate_orders().await;
+        let cloid = Cloid::from_bytes([153; 16]);
+        venue.next_response(behavior);
+        let reply = runtime.call("place", place(cloid.as_str(), "0.12")).await;
+        let error = &reply["protocol_error"]["data"];
+        assert_eq!(
+            error["code"], "timeout_unknown_outcome",
+            "{behavior:?}: {reply}"
+        );
+        assert_eq!(error["retryable"], false);
+        assert_eq!(error["cloid"], cloid.as_str());
+        let pending = runtime
+            .gateway
+            .inner
+            .submissions
+            .state(runtime.account)
+            .unwrap()
+            .pending
+            .unwrap();
+        assert_eq!(pending.cloid(), &cloid);
+        assert_eq!(venue.submissions().len(), 1);
+        let events = runtime.ledger.get_events(0, 1000).unwrap().events;
+        assert!(
+            !events
+                .iter()
+                .any(|event| event.kind == EventKind::SubmissionResolved)
+        );
+        // The fixture actually applied the request. Only a subsequent venue
+        // query, not the mismatched synchronous reply, can establish its state.
+        let observed = runtime
+            .call("get_order_status", json!({"cloid":cloid.as_str()}))
+            .await;
+        assert_eq!(observed["status"], "open", "{observed}");
+        venue.next_response(Behavior::WrongKind);
+        let canceled = runtime
+            .call(
+                "cancel",
+                json!({"cloid":cloid.as_str(),"reason":"identity regression"}),
+            )
+            .await;
+        assert_eq!(
+            canceled["protocol_error"]["data"]["code"], "timeout_unknown_outcome",
+            "{canceled}"
+        );
+        assert_eq!(canceled["protocol_error"]["data"]["retryable"], false);
+        assert_eq!(venue.submissions().len(), 2);
+        let observed = runtime
+            .call("get_order_status", json!({"cloid":cloid.as_str()}))
+            .await;
+        assert_eq!(observed["status"], "canceled", "{observed}");
+        runtime.shutdown().await;
+        venue.shutdown().await;
+    }
+}
+
+#[tokio::test]
 async fn real_mcp_signs_reconciles_partial_fill_cancels_and_closes() {
     let dir = tempfile::tempdir().unwrap();
     let venue = Venue::start().await;

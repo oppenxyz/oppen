@@ -67,6 +67,18 @@ Protocol references inspected 2026-09-08: [exchange endpoint](https://hyperliqui
 and [order-status info endpoint](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint).
 These document request/response shapes, not an Oppen ownership guarantee.
 
+### Recovery Investigation
+
+The official [node documentation](https://github.com/hyperliquid-dex/node)
+offers `--replica-cmds-style actions-and-responses`. However, its linked
+[L1 schemas](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/nodes/l1-data-schemas)
+do not specify the signed-action/response association needed here (inspected
+2026-09-08). This is a candidate evidence source, not a verified recovery API.
+Validate a representative association and its acquisition trust boundary before
+building a verifier. A dispatch marker or matching timestamp cannot replace
+that evidence. Running a node or subscribing to a provider is not authorized by
+this investigation and is not an implicit desktop installation requirement.
+
 ## Acceptance Evidence
 
 - Owned orders cancel through both approval modes and native review; manual,
