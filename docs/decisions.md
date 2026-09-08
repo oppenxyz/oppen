@@ -399,6 +399,17 @@ operator-only gateway execution and recovery acceptance are tracked in
 [operator-approvals.md](specs/operator-approvals.md). No dependency or live
 authorization is introduced.
 
+### Approval deadline at signing (ES27)
+
+Spec item 28's exclusive proposal expiry must survive operator approval. Carry
+the retained proposal deadline privately in the non-cloneable `Cleared` value;
+callers cannot supply, remove or extend it. The final signing gate checks this
+deadline after key loading and authority/state acquisition, alongside current
+route, policy, pause and freshness checks. A refused signature does not restore
+the consumed proposal. This is local signing admission, not a venue-side order
+expiration or proof that a previously sent order was canceled. Existing durable
+proposal history already records the TTL; no ledger migration is needed.
+
 ### Original approval request evidence (ES26)
 
 Spec items 12/19/28 require preserving a typed original request alongside its

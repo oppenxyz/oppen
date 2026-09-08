@@ -56,6 +56,34 @@ grant approval through an agent-reachable MCP tool.
 
 ## Required Proof
 
+The native pricing implementation must preserve these ownership boundaries:
+
+- Retain one opaque, non-cloneable/non-deserializable review in an operator-only
+  controller owned by `OwnedMcp`. IPC confirms only its ID; never accept edited
+  candidate fields or a client-supplied approval flag. Bind the owner generation,
+  exact route/policy, original proposal, displayed rounded action and deadline.
+- Authenticate the reviewed candidate commitment in the one-shot claimed event,
+  then validate the actual approval audit receipt against that commitment. An
+  actual receipt alone proves what was cleared, not what the operator reviewed.
+  Preserve older claim bytes and never replay an executable review or clearance.
+- Keep explicit limits/TIF and stop trigger/TPSL fixed. Reprice market requests
+  only from retained original semantics. A changed position-close size/direction
+  requires another review, not silent resizing or reversal. Unknown historical
+  source cannot become a market request by inference.
+- Confirmation uses the existing account reservation, fresh context, core
+  decision, durable submission begin, signer and reconciliation path. Pin the
+  displayed candidate; a material change requires a new review, never a silent
+  second repricing. Recheck the effective approval deadline at final signing.
+- Obtain tracked operator work from the actual server admission/drain owner,
+  not a detached gateway clone. Close admission synchronously on stop; retain
+  admitted work through lost IPC and dropped drain waiters until it really ends.
+- Pin a live pairing lease for review/confirmation instead of treating a cached
+  binding as live authority. Proposals currently do not record originating token
+  identity; do not claim otherwise. Revocation must prevent new execution and
+  preserve uncertain/submitted outcomes for reconciliation, not assert not-sent.
+
+These are implementation requirements, not an implemented native approval flow.
+
 - Approve/approve and approve/reject races produce one disposition, never two
   executable clearances; restart and same-time ID generation cannot revive one.
 - Reassignment and retirement/regrant between mint, review, decision and final
@@ -141,6 +169,23 @@ committed event; never lower `user_version`, discard new decisions or restore an
 old budget snapshot to make an older binary run. A verified backup is evidence,
 not authorization to erase later execution or reset cumulative limits. No local
 operator ledger is migrated by the synthetic development checks.
+
+## Signing Deadline Evidence
+
+ES27 on `fix/approval-signing-deadline` reproduced a synthetic signature at the
+proposal's exclusive expiry after approval one millisecond earlier. The private
+deadline now survives consumption and is checked after key loading and durable
+authority/state locks. It does not introduce venue-side expiry or cancel already
+sent orders. A refused signature leaves the approval consumed.
+
+Verification passes 43 focused approval tests and the full workspace (1,024 Rust
+passed, 15 live-gated ignored), formatting, all-target Clippy, 152 frontend tests
+and typecheck/build. Production-constructor fixtures reopen pending approval,
+approve at TTL-1, reserve through the real submission journal, then cross expiry
+during key-loading or ledger-lock waits. Opening and reduce-only orders refuse
+with the final observed audit timestamp, and consumed state survives reopen.
+Separate automated diff review found no blockers; exact-head review and CI remain
+required. No live signing, account activity, budget use or ledger migration.
 
 ## Route-Binding Evidence
 

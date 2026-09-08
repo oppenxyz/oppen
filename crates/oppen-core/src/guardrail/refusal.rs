@@ -372,6 +372,8 @@ impl From<OrderError> for VenueRule {
 #[serde(tag = "unevaluable", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum Unevaluable {
+    #[error("operator approval expired at {expires_at_ms}; signing observed {now_ms}")]
+    ApprovalExpired { expires_at_ms: u64, now_ms: u64 },
     #[error("original request evidence does not match the normalized order")]
     OriginalRequestMismatch,
     #[error("approval authority unavailable: {detail}")]
