@@ -79,6 +79,7 @@
 mod breaker;
 mod bucket;
 mod config;
+pub(crate) use config::{APPROVAL_TTL_MS, MAX_REASON_BYTES};
 mod deadman;
 mod engine;
 mod kill;

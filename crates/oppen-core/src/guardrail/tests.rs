@@ -37,6 +37,9 @@ use super::store::MemoryStore;
 use super::*;
 use crate::ledger::{AuthorizedRoute, RegistryBinding};
 
+#[path = "approval_journal_tests.rs"]
+mod approval_journal_tests;
+
 // ---- fixtures -----------------------------------------------------------
 
 fn test_store() -> MemoryStore {
@@ -196,12 +199,12 @@ fn order_approval_window_is_start_inclusive_end_exclusive_without_admission_effe
                     .preflight(&f.agent, &order, &instrument, &market, &state, at_ms)
                     .would_clear
             );
-            assert!(f.engine.pending_proposals(at_ms).is_empty());
+            assert!(f.engine.pending_proposals(at_ms).unwrap().is_empty());
         }
         let result = f.evaluate(&order, &instrument, &market, &state);
         if approval_required {
             assert!(matches!(result, Err(Refusal::ApprovalRequired { .. })));
-            assert_eq!(f.engine.pending_proposals(NOW_MS).len(), 1);
+            assert_eq!(f.engine.pending_proposals(NOW_MS).unwrap().len(), 1);
         } else {
             assert_eq!(
                 result
@@ -1862,7 +1865,7 @@ fn a_preflight_reports_approval_without_minting_a_proposal() {
         other => panic!("expected approval_required, got {other:?}"),
     }
     assert!(
-        f.engine.pending_proposals(NOW_MS).is_empty(),
+        f.engine.pending_proposals(NOW_MS).unwrap().is_empty(),
         "a preflight left a proposal in the operator's queue"
     );
 }
@@ -2351,7 +2354,7 @@ fn reading_the_gauge_spends_no_rate_budget_and_mints_no_proposal() {
             1
         );
     }
-    assert!(gated.engine.pending_proposals(NOW_MS).is_empty());
+    assert!(gated.engine.pending_proposals(NOW_MS).unwrap().is_empty());
 }
 
 /// An agent nobody registered has no guardrails, so it has no budget to
@@ -4523,7 +4526,7 @@ fn approval_route_binding_rejects_replacement_account_revision_and_wallet_change
             "{change}: {result:?}"
         );
         assert_eq!(sink.cleared.load(Ordering::Relaxed), 0, "{change}");
-        assert!(f.engine.pending_proposals(NOW_MS).is_empty());
+        assert!(f.engine.pending_proposals(NOW_MS).unwrap().is_empty());
         assert!(matches!(
             f.engine.operator_approve_proposal(
                 &approval_id,
@@ -4612,7 +4615,7 @@ fn approval_is_the_last_check_and_is_not_charged_twice() {
         ),
         Err(Refusal::OrderNotional { .. })
     ));
-    assert!(f.engine.pending_proposals(NOW_MS).is_empty());
+    assert!(f.engine.pending_proposals(NOW_MS).unwrap().is_empty());
 
     // A good order becomes a proposal, and spends the single rate token.
     let order = intent("BTC", true, d("25"), d("1"));
@@ -4625,7 +4628,7 @@ fn approval_is_the_last_check_and_is_not_charged_twice() {
         panic!("a good order under approval mode becomes a proposal");
     };
     assert_eq!(expires_at_ms, NOW_MS + APPROVAL_TTL_MS);
-    let pending = f.engine.pending_proposals(NOW_MS);
+    let pending = f.engine.pending_proposals(NOW_MS).unwrap();
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].id(), approval_id);
     assert_eq!(pending[0].intent(), &order);
@@ -4638,7 +4641,7 @@ fn approval_is_the_last_check_and_is_not_charged_twice() {
         "an approved proposal does not pay the rate token twice"
     );
     // And it is spent: one approval, one evaluation.
-    assert!(f.engine.pending_proposals(NOW_MS).is_empty());
+    assert!(f.engine.pending_proposals(NOW_MS).unwrap().is_empty());
     assert!(matches!(
         f.engine.operator_approve_proposal(
             &approval_id,
@@ -4717,8 +4720,8 @@ fn a_proposal_expires_and_cannot_be_approved_afterwards() {
     };
 
     let expiry = NOW_MS + APPROVAL_TTL_MS;
-    assert_eq!(f.engine.pending_proposals(expiry - 1).len(), 1);
-    assert!(f.engine.pending_proposals(expiry).is_empty());
+    assert_eq!(f.engine.pending_proposals(expiry - 1).unwrap().len(), 1);
+    assert!(f.engine.pending_proposals(expiry).unwrap().is_empty());
     let mut late_market = market.clone();
     late_market.as_of_ms = expiry;
     let mut late = exposure(d("100000"));
@@ -4779,9 +4782,17 @@ fn a_rejected_proposal_is_gone() {
     ) else {
         panic!("expected a proposal");
     };
-    assert!(f.engine.operator_reject_proposal(&approval_id, NOW_MS));
-    assert!(!f.engine.operator_reject_proposal(&approval_id, NOW_MS));
-    assert!(f.engine.pending_proposals(NOW_MS).is_empty());
+    assert!(
+        f.engine
+            .operator_reject_proposal(&approval_id, NOW_MS)
+            .unwrap()
+    );
+    assert!(
+        !f.engine
+            .operator_reject_proposal(&approval_id, NOW_MS)
+            .unwrap()
+    );
+    assert!(f.engine.pending_proposals(NOW_MS).unwrap().is_empty());
 }
 
 // ---- what gets signed is what was checked -------------------------------
@@ -6758,7 +6769,7 @@ fn one_proposal_authorises_exactly_one_approval() {
         "a second approval of one proposal minted a second clearance past a cap of \
          one order per hour, got {second:?}"
     );
-    assert!(engine.pending_proposals(NOW_MS).is_empty());
+    assert!(engine.pending_proposals(NOW_MS).unwrap().is_empty());
 }
 
 /// **The dead-man's switch is armed per container.**

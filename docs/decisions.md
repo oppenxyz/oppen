@@ -399,6 +399,34 @@ operator-only gateway execution and recovery acceptance are tracked in
 [operator-approvals.md](specs/operator-approvals.md). No dependency or live
 authorization is introduced.
 
+### Durable approval lifecycle (ES25)
+
+Spec items 18, 19 and 28 require recoverable approval evidence before operator
+execution is exposed. Both production engine constructors use a concrete
+approval journal rooted in their existing authenticated policy/registry ledger.
+Only explicit synthetic test construction may use an in-memory queue. Signed,
+versioned proposal, claim and disposition records bind route, policy, normalized
+intent, original expiry and predecessor links in the existing event chain.
+Production requests require a stable cloid, deduplicated for the account without
+resetting its original lifetime. V9 excludes readers that cannot enforce this
+lifecycle; migration never rewrites existing events or adopts old proposals.
+
+Persist proposal publication before returning a pending receipt. Approval
+atomically claims once, then re-evaluates with the existing exact-route and
+guard checks. Publish its linked disposition before returning a clearance.
+Claimed or approved history is never replayed into executable consent. Rejection
+and expiry compete atomically with claim; failed persistence is typed unavailable,
+not a successful empty queue or recorded rejection. Publication-only recovery
+may repair a committed head but cannot return a new claim permit or clearance.
+
+Do not perform journal I/O while holding engine state: signing already acquires
+ledger authority before engine state. Reuse actual audit receipts to link an
+approved disposition to its intent row; do not infer a row from the latest head.
+Keep one committed lifecycle row per anchor publication. No new event store,
+dependency, key, activation, pricing semantics or desktop approval control is
+introduced. Original market requests and native execution/UI remain subsequent
+stages in [operator-approvals.md](specs/operator-approvals.md).
+
 ## 2026-09-07 · The console's own socket
 
 Item 34 asks for per-feed status, last-tick timestamps and a stale overlay. The

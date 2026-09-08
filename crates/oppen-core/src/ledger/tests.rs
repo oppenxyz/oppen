@@ -1664,6 +1664,9 @@ fn every_event_kind_round_trips_through_its_stored_name() {
         EventKind::RegistryRetired,
         EventKind::PolicyInitialized,
         EventKind::PolicyReplaced,
+        EventKind::ApprovalProposed,
+        EventKind::ApprovalClaimed,
+        EventKind::ApprovalDisposed,
         EventKind::PayloadRedacted,
     ];
     for kind in kinds {
@@ -2733,12 +2736,22 @@ fn generic_writers_cannot_forge_submission_lifecycle_events() {
             Err(LedgerError::UseRegistryJournal)
         ));
     }
+    for kind in [
+        EventKind::ApprovalProposed,
+        EventKind::ApprovalClaimed,
+        EventKind::ApprovalDisposed,
+    ] {
+        assert!(matches!(
+            ledger.record_outcome(&receipt, kind, 2, &json!({})),
+            Err(LedgerError::UseApprovalJournal)
+        ));
+    }
     assert_eq!(ledger.get_events(0, 10).expect("events").events.len(), 1);
 }
 
 #[test]
 fn authority_reader_barriers_preserve_the_existing_chain_on_upgrade() {
-    for prior_version in [3, 4, 5, 6, 7] {
+    for prior_version in [3, 4, 5, 6, 7, 8] {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("testnet.db");
         let (head, original) = {
@@ -2773,7 +2786,7 @@ fn authority_reader_barriers_preserve_the_existing_chain_on_upgrade() {
             .unwrap()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 8);
+        assert_eq!(version, 9);
     }
 }
 
@@ -2800,6 +2813,47 @@ fn generic_writers_cannot_forge_policy_authority() {
 }
 
 #[test]
+fn approval_authority_rejects_generic_writes_and_is_operator_only() {
+    let dir = TempDir::new().unwrap();
+    let ledger = Arc::new(Ledger::open(dir.path(), Network::Testnet).unwrap());
+    for kind in [
+        EventKind::ApprovalProposed,
+        EventKind::ApprovalClaimed,
+        EventKind::ApprovalDisposed,
+    ] {
+        let payload = json!({"fixture": "operator approval evidence"});
+        let event = NewEvent {
+            kind,
+            ts_ms: 1,
+            agent_id: Some("alpha"),
+            payload: &payload,
+            snapshot: None,
+        };
+        assert!(matches!(
+            ledger.append(&event),
+            Err(LedgerError::UseApprovalJournal)
+        ));
+        let written = ledger.append_committed(&event).unwrap();
+        assert!(
+            ledger
+                .get_events_for_agent("alpha", 0, 100)
+                .unwrap()
+                .events
+                .is_empty()
+        );
+        let views = EventViews::new(ledger.clone());
+        assert!(
+            views
+                .for_agent("alpha")
+                .event(written.seq)
+                .unwrap()
+                .is_none()
+        );
+        assert!(ledger.event(written.seq).unwrap().is_some());
+    }
+}
+
+#[test]
 fn a_reader_refuses_a_newer_authority_schema_without_rewriting_history() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("testnet.db");
@@ -2809,14 +2863,14 @@ fn a_reader_refuses_a_newer_authority_schema_without_rewriting_history() {
         .connection
         .lock()
         .unwrap()
-        .pragma_update(None, "user_version", 9)
+        .pragma_update(None, "user_version", 10)
         .unwrap();
     drop(ledger);
     assert!(matches!(
         Ledger::open_at(&path, Network::Testnet),
         Err(LedgerError::SchemaTooNew {
-            found: 9,
-            supported: 8
+            found: 10,
+            supported: 9
         })
     ));
     let connection = rusqlite::Connection::open(&path).unwrap();
@@ -2824,7 +2878,7 @@ fn a_reader_refuses_a_newer_authority_schema_without_rewriting_history() {
         connection
             .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
             .unwrap(),
-        9
+        10
     );
     let (seq, hash) = super::head(&connection).unwrap();
     assert_eq!(Anchor { seq, hash }, head);

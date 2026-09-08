@@ -166,7 +166,8 @@ CREATE INDEX events_submission_account
 // V6 requires authenticated registry authority at the signing boundary.
 // V7 requires authenticated policy and revision-bound runtime admission.
 // V8 requires authenticated pilot consent; legacy history is never auto-adopted.
-const MIGRATIONS: &[&str] = &[V1, V2, V3, "", "", "", "", ""];
+// V9 requires authenticated, one-shot approval lifecycle authority.
+const MIGRATIONS: &[&str] = &[V1, V2, V3, "", "", "", "", "", ""];
 
 pub(super) const CURRENT_VERSION: usize = MIGRATIONS.len();
 
