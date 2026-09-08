@@ -11,6 +11,29 @@ decisions" section until then.
 
 ---
 
+## 2026-09-08 · Halted pilot supervision after restart
+
+ES35 addresses spec items 25, 26 and 34. A durable pilot halt inhibits trading;
+it must not, by itself, prevent the desktop from opening the same authenticated
+account's cancellation supervisor after restart. The gateway already includes
+exhausted pilot budgets in its periodic cleanup predicate. Rejecting every
+halted pilot at desktop startup makes that recovery path unreachable.
+
+Allow existing-authority-only supervision when the pilot identity matches and
+its accounting is known, including when it is halted. Preserve the original
+authorization, baseline, executed notional, reservations, realized result and
+stop. Startup neither authorizes a new pilot nor acknowledges policy, releases
+kills, enables orders or flattens positions. Retain all registry, policy,
+pairing, ledger, key and network checks. Reuse the existing cancellation worker,
+retry rules and final signing authority; do not add another cleanup path.
+
+Authenticated but unavailable accounting still refuses startup in this slice;
+its recovery remains separate. Feed failure may terminate supervision. A
+listening endpoint is not completed cancellation, and restart does not establish
+a flat account or permit another trade. Implementation tests use synthetic
+authority and loopback venues only. Real startup can cancel resting orders and
+still requires the dedicated account's explicit identity confirmation.
+
 ## 2026-09-08 · Account ingress remains pending through durable application
 
 ES34 addresses spec items 9, 24, 25 and 34. A parsed account fill can wait in

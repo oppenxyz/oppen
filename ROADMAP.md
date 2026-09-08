@@ -315,6 +315,19 @@ before expanding features:
    dependency checks pass. Aggregate automated review found no blockers;
    exact-head review and green CI remain required. This is not a completed live
    gate.
+   ES35 on `fix/halted-pilot-supervision` corrects a reproduced restart gap:
+   desktop startup refused a halted pilot before the existing cancellation
+   supervisor could retry cleanup. The startup regression failed before the
+   narrow fix and passes afterward, preserving authenticated identity, known
+   accounting, the original cumulative budget and order inhibition through
+   physical ledger reopen. Unavailable-accounting startup remains a separate
+   limitation. Three focused regressions cover reopen, assembled cancellation
+   failure/retry with an actual MCP order refusal, and unavailable-accounting
+   startup refusal. Full workspace: 1,178 Rust tests pass, 15 live/keychain
+   tests ignored; all-target Clippy, formatting and offline dependency checks
+   pass. Independent review corrected an overclaim about the cleanup trigger;
+   startup inhibition remains active. Exact-head review and green CI remain
+   required; no live recovery gate is claimed.
    No dedicated-account activity has been performed during this development.
 4. **Recovery:** PR #44 merged as `06fc0e3` after green CI and separate automated
    review. The durable submission journal has SQLite reopen, independent
