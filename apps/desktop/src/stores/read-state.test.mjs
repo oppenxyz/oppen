@@ -11,13 +11,14 @@ const account = {
   positions: [], orders: [],
 };
 mock.module('../lib/bridge', () => ({
-  ...bridge, inTauri: () => true, fetchOperatorState: () => operatorRead(), fetchAccountState: () => accountRead(), watchMarket: async () => {},
+  ...bridge, inTauri: () => true, fetchOperatorState: () => operatorRead(), fetchAccountState: () => accountRead(),
+  watchMarket: async (network, symbol, interval) => ({ feed: { network, generation: '1' }, chart: { network, generation: '1', selection_id: '1', symbol, interval } }),
   fetchMarketSnapshot: (_network, symbol) => new Promise((resolve, reject) => { pendingSnapshots.set(symbol, resolve); failedSnapshots.set(symbol, reject); }),
-  fetchChartSeries: async (_network, symbol, interval) => ({ symbol, interval, interval_ms: 3600000, price_decimals: 2, closed: [] }),
+  fetchChartSeries: async () => { throw new Error('No chart history fixture'); },
 }));
 const { operator, refreshOperator, recordedAgents, storedPolicy, policySourceLabel } = await import('./operator');
 const { shell, refreshAccount, setNetwork } = await import('./shell');
-const { market, quotes, select, refreshSnapshot, applyFeed } = await import('./market');
+const { market, chartObservation, quotes, select, refreshSnapshot, applyFeed } = await import('./market');
 const snapshot = (symbol, at) => ({ symbol, as_of_ms: at, bids: [], asks: [], book: { depth: [] }, funding: {}, vol: {} });
 it('persists an explicit network choice before reload and leaves the session intact if saving fails', () => {
   const previousWindow = globalThis.window;
@@ -82,13 +83,13 @@ describe('market selection and derived freshness', () => {
     expect(market.snapshot.as_of_ms).toBe(2000);
     expect(quotes.touch.venueMs).toBe(3000);
     expect(market.featuresReadMs).toBe(2000);
-    const chart = market.chart;
+    const chart = chartObservation.data;
     pendingSnapshots.delete('ETH');
     const reading = refreshSnapshot(); await untilSnapshot('ETH');
-    expect(market.chart).toBe(chart);
+    expect(chartObservation.data).toBe(chart);
     expect(market.snapshot.as_of_ms).toBe(2000);
     pendingSnapshots.get('ETH')(snapshot('ETH', 4000)); await reading;
-    expect(market.chart).toBe(chart);
+    expect(chartObservation.data).toBe(chart);
     expect(market.featuresReadMs).toBe(4000);
     expect(quotes.touch.venueMs).toBe(3000);
   });

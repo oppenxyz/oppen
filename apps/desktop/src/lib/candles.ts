@@ -109,6 +109,8 @@ export interface CandleInput {
   closed: readonly Readonly<Bar>[];
   /** The in-progress bar, drawn with the forming glyph. */
   forming?: Readonly<Bar> | null;
+  /** Independent observed trade price; never modifies candle OHLCV. */
+  latestTrade?: Readonly<{ timeMs: number; price: number; ambiguous: boolean }> | null;
   /** Candle slots across the plot. Plot width is `cols * 4` characters. */
   cols: number;
   /** Host width in character cells, including the price gutter (chart spec §2.2). */
@@ -459,6 +461,12 @@ function paint(grid: Grid, input: CandleInput): FrameStatus {
     const volume = Number.isFinite(bar.volume) ? Math.abs(bar.volume) : 0;
     if (volume > maxVolume) maxVolume = volume;
   }
+  const marker = input.latestTrade && Number.isFinite(input.latestTrade.price)
+    && input.latestTrade.price > 0 && Number.isFinite(input.latestTrade.timeMs) ? input.latestTrade : null;
+  if (marker) {
+    min = Math.min(min, marker.price);
+    max = Math.max(max, marker.price);
+  }
   // A flat window — every visible bar at one price — has a zero span. Substituting 1
   // collapses every price onto the bottom plot row and leaves at most one tick, so the Y
   // axis vanishes; §2.2 requires four to eight gridlines in the visible range. Pad
@@ -489,7 +497,8 @@ function paint(grid: Grid, input: CandleInput): FrameStatus {
   const decimals = tickDecimals(step, input.priceDecimals);
   const tickLabels = ticks.map((value) => priceLabel(value, decimals));
   const lastBar = visible[visible.length - 1];
-  const lastLabel = priceLabel(lastBar.close, clampDecimals(input.priceDecimals));
+  const lastPrice = marker?.price ?? lastBar.close;
+  const lastLabel = `${marker?.ambiguous ? "?" : ""}${priceLabel(lastPrice, clampDecimals(input.priceDecimals))}`;
 
   let gutterText = lastLabel.length;
   for (const label of tickLabels) if (label.length > gutterText) gutterText = label.length;
@@ -573,8 +582,10 @@ function paint(grid: Grid, input: CandleInput): FrameStatus {
 
   // The last price is the one live element on the surface, so it takes uranium and
   // replaces — not overlays — whatever tick label shares its row.
-  const lastRow = rowOf(lastBar.close);
-  grid.put(slots[slots.length - 1].x + 3, lastRow, GLYPH_LAST, INK.last);
+  const lastRow = rowOf(lastPrice);
+  const markerSlot = marker ? slots.find(slot => marker.timeMs >= slot.bar.time
+    && marker.timeMs < slot.bar.time + input.intervalMs) : slots[slots.length - 1];
+  if (markerSlot) grid.put(markerSlot.x + 3, lastRow, GLYPH_LAST, INK.last);
   grid.writeRight(gutterX, lastRow, gutterText, lastLabel, INK.last);
 
   return "ok";

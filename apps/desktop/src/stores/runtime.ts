@@ -1,5 +1,6 @@
 import { reactive, readonly } from "vue";
 import { fetchRuntimeStatus, inTauri, isConsoleError, type RuntimeStatus } from "../lib/bridge";
+import { reportChartFailure } from "./market";
 
 interface RuntimeReading {
   status: RuntimeStatus | null;
@@ -17,6 +18,7 @@ function after(callback: () => void, delayMs: number): () => void {
 export function createRuntimeMonitor(
   read: () => Promise<RuntimeStatus>,
   schedule: typeof after = after,
+  observe: (status: RuntimeStatus) => void = () => {},
 ) {
   const state = reactive<RuntimeReading>({ status: null, error: null, checkedAt: null, pending: false });
   let active = false;
@@ -50,6 +52,7 @@ export function createRuntimeMonitor(
       state.status = status;
       state.error = null;
       state.checkedAt = Date.now();
+      observe(status);
     } catch (error) {
       if (!active || current !== generation || expiredRead) return;
       state.error = isConsoleError(error) ? error.detail : error instanceof Error ? error.message : String(error);
@@ -95,7 +98,9 @@ export function createRuntimeMonitor(
   return { state: readonly(state), start, stop, refresh };
 }
 
-const monitor = createRuntimeMonitor(fetchRuntimeStatus);
+const monitor = createRuntimeMonitor(fetchRuntimeStatus, after, status => {
+  if (status.chart_failure) reportChartFailure(status.chart_failure);
+});
 export const runtime = monitor.state;
 
 export function startRuntimePolling(): void {

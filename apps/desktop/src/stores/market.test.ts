@@ -14,7 +14,7 @@
 
 import { reactive } from "vue";
 import type { FeedBinding, FeedEnvelope, FeedUpdate, MarketSnapshot } from "../lib/bridge";
-import { createMarketFeed, createQuotes, quoteSpread, foldForming, foldTrade, parseBar } from "./market";
+import { createMarketFeed, createQuotes, quoteSpread, parseBar } from "./market";
 
 interface Assertions {
   toBe(expected: unknown): void;
@@ -63,7 +63,8 @@ function feedFixture() {
       watch: (network, coin, interval) => {
         const reply = deferred<FeedBinding>();
         calls.push({ network, coin, interval, reply });
-        return reply.promise;
+        const selection = calls.length;
+        return reply.promise.then(feed => ({ feed, chart: { ...feed, selection_id: String(selection), symbol: coin, interval } }));
       },
       listen: (emit) => {
         const ready = deferred<() => void>();
@@ -75,6 +76,7 @@ function feedFixture() {
       invalidate: () => { healthy = false; },
       failure: () => { healthy = false; },
       error: (detail) => { error = detail; },
+      chartBinding: () => {},
       update: (update, failure) => {
         healthy = failure === undefined && (update.kind !== "status" || update.connected);
         updates.push(update);
@@ -93,6 +95,30 @@ function feedFixture() {
 }
 
 describe("scoped market feed ownership", () => {
+  it("filters chart selection incarnations even when the market feed generation is reused", async () => {
+    const f = feedFixture();
+    const chart = (selection_id: string, interval = "1h"): FeedUpdate => ({ kind: "chart", projection: {
+      selection_id, revision: "1", symbol: "BTC", interval, interval_ms: 3600000, price_decimals: null,
+      closed: [], forming: null, latest_trade: null, history_error: null, observation_error: null,
+      last_observation_received_at_ms: null, tape_status: "observing",
+    } });
+    try {
+      const started = f.controller.start(); f.listen(0); await started;
+      f.emit("1", "testnet", 0, chart("1"));
+      expect(f.updates.length).toBe(0);
+      f.calls[0]!.reply.resolve({ network: "testnet", generation: "1" }); await settle();
+      f.emit("1", "testnet", 0, chart("1")); expect(f.updates.length).toBe(1);
+      f.scope.interval = "5m";
+      f.calls[1]!.reply.resolve({ network: "testnet", generation: "1" }); await settle();
+      f.scope.interval = "1h";
+      f.calls[2]!.reply.resolve({ network: "testnet", generation: "1" }); await settle();
+      f.emit("1", "testnet", 0, chart("1"));
+      f.emit("1", "testnet", 0, chart("2", "5m"));
+      expect(f.updates.length).toBe(1);
+      f.emit("1", "testnet", 0, chart("3")); expect(f.updates.length).toBe(2);
+    } finally { f.controller.stop(); }
+  });
+
   it("keeps the first owner failure through later payloads and same-owner watches until a new binding", async () => {
     const f = feedFixture();
     try {
@@ -447,120 +473,5 @@ describe("independent quote observations", () => {
     expect(quoteSpread("103", "102")).toBe(null);
     expect(quoteSpread("100", "100")).toBe(0);
     expect(quoteSpread("99", "101")).toBe(200);
-  });
-});
-
-describe("foldForming", () => {
-  const BAR = { time: 1_000, open: 1, high: 2, low: 0.5, close: 1.5, volume: 10 };
-  const CHART = { closed: [], forming: BAR, intervalMs: 60_000, priceDecimals: 2 };
-
-  it("replaces the forming bar when the frame is the same bucket", () => {
-    const next = foldForming(CHART, { ...BAR, close: 1.9 });
-    expect(next.closed.length).toBe(0);
-    expect(next.forming?.close).toBe(1.9);
-  });
-
-  it("closes the forming bar when the bucket has rolled", () => {
-    const next = foldForming(CHART, { ...BAR, time: 61_000, close: 2.1 });
-    // The bar that was forming is now history, and the new one takes its
-    // place — this is what makes the chart grow without a REST read.
-    expect(next.closed.length).toBe(1);
-    expect(next.closed[0]?.time).toBe(1_000);
-    expect(next.forming?.time).toBe(61_000);
-  });
-
-  it("never drops the bar that was forming", () => {
-    const next = foldForming({ ...CHART, closed: [BAR] }, { ...BAR, time: 61_000 });
-    expect(next.closed.length).toBe(2);
-  });
-});
-
-/**
- * The forming bar is driven by the tape, corrected by the venue.
- *
- * Measured on testnet BTC: the `candle` channel delivered 8 frames in a minute
- * with a 17-second tail carrying none, while the tape kept printing. A chart
- * driven by the venue's aggregation alone sits still through those prints, so
- * the tape drives and `foldForming` reconciles.
- */
-describe("foldTrade", () => {
-  const CHART = { closed: [], forming: null, intervalMs: 60_000, priceDecimals: 2 };
-
-  it("opens a bar at the print's own price when none is forming", () => {
-    const next = foldTrade(CHART, { px: 100, high: 100, low: 100, sz: 2 }, 61_000);
-    // Bucket start, not the print instant: the bar belongs to its interval.
-    expect(next.forming?.time).toBe(60_000);
-    expect(next.forming?.open).toBe(100);
-    expect(next.forming?.close).toBe(100);
-    expect(next.forming?.volume).toBe(2);
-  });
-
-  it("extends the range and accumulates volume within the bucket", () => {
-    const opened = foldTrade(CHART, { px: 100, high: 100, low: 100, sz: 2 }, 61_000);
-    const high = foldTrade(opened, { px: 105, high: 105, low: 105, sz: 1 }, 62_000);
-    const low = foldTrade(high, { px: 95, high: 95, low: 95, sz: 3 }, 63_000);
-    expect(low.forming?.high).toBe(105);
-    expect(low.forming?.low).toBe(95);
-    // The close is the latest print, not the extreme.
-    expect(low.forming?.close).toBe(95);
-    expect(low.forming?.volume).toBe(6);
-    expect(low.closed.length).toBe(0);
-  });
-
-  it("closes the bar and opens the next one across a bucket boundary", () => {
-    const opened = foldTrade(CHART, { px: 100, high: 100, low: 100, sz: 2 }, 61_000);
-    const rolled = foldTrade(opened, { px: 110, high: 110, low: 110, sz: 1 }, 121_000);
-    expect(rolled.closed.length).toBe(1);
-    expect(rolled.closed[0]?.time).toBe(60_000);
-    expect(rolled.forming?.time).toBe(120_000);
-    // The new bar opens at the print, not at the previous close.
-    expect(rolled.forming?.open).toBe(110);
-    expect(rolled.forming?.volume).toBe(1);
-  });
-
-  it("drops a print older than the bar being drawn", () => {
-    const opened = foldTrade(CHART, { px: 100, high: 100, low: 100, sz: 2 }, 121_000);
-    // A late frame must not reopen a bucket the chart has moved past, or the
-    // bar would take a price that belongs to history.
-    expect(foldTrade(opened, { px: 50, high: 50, low: 50, sz: 9 }, 61_000)).toEqual(opened);
-  });
-
-  it("lets the venue's own bar overwrite what the tape composed", () => {
-    const composed = foldTrade(CHART, { px: 100, high: 100, low: 100, sz: 2 }, 61_000);
-    const venue = { time: 60_000, open: 99, high: 106, low: 94, close: 101, volume: 12 };
-    const reconciled = foldForming(composed, venue);
-    // Same bucket, so the optimistic bar is replaced rather than closed: the
-    // venue's OHLCV is authoritative and the tape's was an estimate.
-    expect(reconciled.closed.length).toBe(0);
-    expect(reconciled.forming).toEqual(venue);
-  });
-});
-
-/**
- * A batched frame carries extremes its close does not show.
- *
- * The venue batches the tape, so one frame can hold twenty prints. A bar built
- * from the last print alone misses the high the market actually traded, and
- * stays wrong until the venue's next candle frame corrects it — which W2
- * measured at up to seventeen seconds away.
- */
-describe("foldTrade · batched frames", () => {
-  const CHART = { closed: [], forming: null, intervalMs: 60_000, priceDecimals: 2 };
-
-  it("opens a bar reaching the frame's extremes, not just its close", () => {
-    const next = foldTrade(CHART, { px: 100, high: 120, low: 90, sz: 5 }, 61_000);
-    expect(next.forming?.high).toBe(120);
-    expect(next.forming?.low).toBe(90);
-    expect(next.forming?.close).toBe(100);
-  });
-
-  it("widens an open bar to a spike that the close does not show", () => {
-    const opened = foldTrade(CHART, { px: 100, high: 100, low: 100, sz: 1 }, 61_000);
-    const spiked = foldTrade(opened, { px: 101, high: 150, low: 80, sz: 4 }, 62_000);
-    expect(spiked.forming?.high).toBe(150);
-    expect(spiked.forming?.low).toBe(80);
-    // The close is still the last print, not the extreme.
-    expect(spiked.forming?.close).toBe(101);
-    expect(spiked.forming?.volume).toBe(5);
   });
 });

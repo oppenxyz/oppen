@@ -1,5 +1,5 @@
 // UI fixture transport only. Every read is local; no invoke, venue, key or signer call.
-import type { AccountState, ChartSeries, FeedBinding, MarketSnapshot, McpStatus, OperatorRead, RuntimeStatus } from "../src/lib/bridge";
+import type { AccountState, ChartBinding, ChartProjection, FeedBinding, WatchMarketReply, MarketSnapshot, McpStatus, OperatorRead, RuntimeStatus } from "../src/lib/bridge";
 export type * from "../src/lib/bridge";
 export { isConsoleError } from "../src/lib/bridge";
 export { fetchPolicySetupStatus, reviewPolicySetup, persistPolicySetup, discardPolicySetup } from "./policy-setup";
@@ -41,9 +41,13 @@ export async function fetchOperatorState(): Promise<OperatorRead> {
     ledger: { status: "ready", value: { events: [], head_seq: 0, next_cursor: 0, resync_required: false } } };
 }
 export async function fetchMarkets() { return []; }
-export async function fetchChartSeries(): Promise<ChartSeries> { throw new Error("UI fixture: chart not supplied."); }
+export async function fetchChartSeries(_binding: ChartBinding): Promise<ChartProjection> { throw new Error("UI fixture: chart history not supplied."); }
 export async function fetchMarketSnapshot(): Promise<MarketSnapshot> { throw new Error("UI fixture: market snapshot not supplied."); }
-export async function watchMarket(network: FeedBinding["network"]): Promise<FeedBinding> { return { network, generation: "1" }; }
+let chartSelection = 0;
+export async function watchMarket(network: FeedBinding["network"], symbol: string, interval: string): Promise<WatchMarketReply> {
+  const feed = { network, generation: "1" };
+  return { feed, chart: { ...feed, selection_id: String(++chartSelection), symbol, interval } };
+}
 export async function onFeedUpdate() { return () => {}; }
 
 let stoppedRuntime: RuntimeStatus | null = null;
@@ -56,6 +60,7 @@ export async function fetchRuntimeStatus(): Promise<RuntimeStatus> {
     : "UI fixture: waiting for retained desktop work to finish before shutdown or replacement. Update installation has not started. Diagnostic=";
   return {
     phase,
+    chart_failure: null,
     binding: phase === "running" ? { network: "testnet", generation: "1" } : null,
     detail: phase === "running" || phase === "stopped" ? null : detail + "retained-task-context/".repeat(24),
   };
@@ -90,7 +95,7 @@ export async function startMcp(agent: string, requestedAccount: string): Promise
 }
 export async function stopMcp(): Promise<RuntimeStatus> {
   mcpStatus = { ...mcpStatus, phase: "stopped", listener: null, reconciled: null, account_feeds_ready: null, supervision_in_progress: false };
-  stoppedRuntime = { phase: "stopped", binding: null, detail: "UI fixture: desktop tasks stopped. Restart required." };
+  stoppedRuntime = { phase: "stopped", binding: null, chart_failure: null, detail: "UI fixture: desktop tasks stopped. Restart required." };
   return { ...stoppedRuntime };
 }
 

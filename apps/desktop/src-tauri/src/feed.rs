@@ -24,6 +24,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use crate::chart_transport::{ChartBinding, ChartTransport};
 use oppen_core::feed::FeedSession;
 use oppen_core::ledger::Ledger;
 use oppen_core::market::{BookLevel, MarketRow};
@@ -73,7 +74,10 @@ impl FeedEnvelope {
 /// and the pixel rounds.
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub enum FeedUpdate {
+pub(crate) enum FeedUpdate {
+    Chart {
+        projection: Box<crate::chart_transport::Projection>,
+    },
     /// `activeAssetCtx`, ~1 s. The rail row, and the strip that reads it.
     ///
     /// A whole [`MarketRow`], not the three fields the strip shows: the frame
@@ -100,41 +104,6 @@ pub enum FeedUpdate {
         at_ms: u64,
         bids: Vec<BookLevel>,
         asks: Vec<BookLevel>,
-    },
-    /// `candle`. The forming bar, which is the only one that moves.
-    Candle {
-        coin: String,
-        interval: String,
-        time_ms: u64,
-        open: String,
-        high: String,
-        low: String,
-        close: String,
-        volume: String,
-    },
-    /// The public tape. Every print, as it happens.
-    ///
-    /// **This is what moves the forming bar**, not the `candle` channel. The
-    /// venue aggregates candles on its own clock — measured on testnet BTC at
-    /// eight frames a minute with a seventeen-second tail carrying none — so a
-    /// chart driven only by that channel sits still through prints the operator
-    /// can see on the tape beside it. The bar is composed here optimistically
-    /// and corrected when the venue's own bar arrives, which is the same
-    /// optimistic-first / reconcile shape the rest of the real-time surface
-    /// uses.
-    Trade {
-        coin: String,
-        at_ms: u64,
-        /// The last print in the frame, which sets the bar's close.
-        px: String,
-        /// The frame's own extremes. **Not derivable from `px`**: the venue
-        /// batches the tape, so a frame can carry a spike in the middle and a
-        /// bar built from the last print alone would miss the high the market
-        /// actually traded — wrong until the venue's next candle corrects it.
-        high: String,
-        low: String,
-        /// Every print in the frame, summed.
-        sz: String,
     },
     /// The socket's own state, so item 34's overlay has something to read.
     ///
@@ -167,12 +136,31 @@ pub(crate) struct ConsoleFeed {
     event_task: Option<JoinHandle<Result<(), String>>>,
     failure: Arc<Mutex<Option<String>>>,
     drained: Option<Result<(), String>>,
+    chart: Option<ChartTransport>,
     /// What the operator is looking at. Swapped whole on every selection, so
     /// the console never holds a feed for a symbol it stopped drawing.
     watching: Mutex<Vec<Subscription>>,
 }
 
 impl ConsoleFeed {
+    pub(crate) fn emit_chart(
+        app: &AppHandle,
+        binding: &ChartBinding,
+        projection: crate::chart_transport::Projection,
+    ) -> Result<(), String> {
+        app.emit(
+            CHANNEL,
+            FeedEnvelope {
+                network: binding.network,
+                generation: binding.generation.clone(),
+                failure: None,
+                update: FeedUpdate::Chart {
+                    projection: Box::new(projection),
+                },
+            },
+        )
+        .map_err(|error| format!("chart emission: {error}"))
+    }
     /// Open the socket for one network and start folding its events.
     ///
     /// The account channels are subscribed only when an account is configured.
@@ -279,6 +267,7 @@ impl ConsoleFeed {
             event_task: Some(event_task),
             failure,
             drained: None,
+            chart: None,
             watching: Mutex::new(Vec::new()),
         })
     }
@@ -289,6 +278,9 @@ impl ConsoleFeed {
     pub(crate) async fn shutdown_and_drain(&mut self) -> Result<(), String> {
         if let Some(result) = &self.drained {
             return result.clone();
+        }
+        if let Err(error) = self.retire_chart().await {
+            remember_failure(&self.failure, error);
         }
         if let Some(pool) = &self.pool
             && let Err(error) = pool.shutdown_and_drain().await
@@ -336,24 +328,16 @@ impl ConsoleFeed {
 
     /// Point the socket at the symbol the operator selected.
     ///
-    /// Five channels because they answer five different questions at five
-    /// different cadences, and the panels want all of them: `activeAssetCtx`
-    /// for the strip, `bbo` for the spread, `l2Book` for the ladder, `trades`
-    /// for the bar as it forms, and `candle` to correct that bar against the
-    /// venue's own aggregation. Everything held for the previous symbol is given
+    /// Context, BBO and book stay on the common feed. Trades and candles belong
+    /// to a separately drained chart transport incarnation. Everything held for the previous symbol is given
     /// back in the same pass — a console that accumulated subscriptions as the
     /// operator browsed would walk into the venue's per-IP ceiling.
-    pub(crate) fn watch(&self, coin: &str, interval: &str) -> Result<(), String> {
+    pub(crate) fn watch(&self, coin: &str, _interval: &str) -> Result<(), String> {
         let pool = self.pool.as_ref().ok_or("feed is stopping")?;
         let wanted = vec![
             Subscription::ActiveAssetCtx { coin: coin.into() },
             Subscription::Bbo { coin: coin.into() },
             Subscription::L2Book { coin: coin.into() },
-            Subscription::Trades { coin: coin.into() },
-            Subscription::Candle {
-                coin: coin.into(),
-                interval: interval.into(),
-            },
         ];
         let mut held = self.watching.lock().map_err(|_| "feed lock poisoned")?;
         // Recorded as each one is taken, never assumed. Returning early on a
@@ -391,6 +375,34 @@ impl ConsoleFeed {
             Some(error) => Err(error),
             None => Ok(()),
         }
+    }
+
+    pub(crate) async fn retire_chart(&mut self) -> Result<(), String> {
+        let result = match &mut self.chart {
+            Some(chart) => chart.shutdown_and_drain().await,
+            None => Ok(()),
+        };
+        // Err is a completed consumer/socket diagnostic, not a live task.
+        // Cancellation before completion leaves the owner in this slot.
+        self.chart = None;
+        result
+    }
+
+    pub(crate) fn start_chart(
+        &mut self,
+        binding: ChartBinding,
+        failure: Arc<Mutex<Option<String>>>,
+        apply: impl FnMut(&ChartBinding, Option<&WsEvent>, u64) -> Result<(), String> + Send + 'static,
+    ) -> Result<(), String> {
+        if self.chart.is_some() {
+            return Err("previous chart transport has not drained".into());
+        }
+        self.chart = Some(ChartTransport::start(binding, failure, apply)?);
+        Ok(())
+    }
+
+    pub(crate) fn chart_failure(&self) -> Option<crate::chart_transport::ChartFailure> {
+        self.chart.as_ref().and_then(ChartTransport::failure)
     }
 }
 
@@ -475,16 +487,7 @@ fn translate(event: &WsEvent, last_tick_ms: Option<u64>) -> Option<FeedUpdate> {
             bids: book.bids().iter().map(level).collect(),
             asks: book.asks().iter().map(level).collect(),
         }),
-        WsEvent::Candle(candle) => Some(FeedUpdate::Candle {
-            coin: candle.s.clone(),
-            interval: candle.i.clone(),
-            time_ms: candle.t,
-            open: candle.o.to_string(),
-            high: candle.h.to_string(),
-            low: candle.l.to_string(),
-            close: candle.c.to_string(),
-            volume: candle.v.to_string(),
-        }),
+        WsEvent::Candle(_) | WsEvent::Trades { .. } => None,
         WsEvent::Disconnected(dropped) => Some(FeedUpdate::Status {
             last_tick_ms,
             connected: false,
@@ -512,30 +515,6 @@ fn translate(event: &WsEvent, last_tick_ms: Option<u64>) -> Option<FeedUpdate> {
         // reads the ledger this loop has already written. Emitting them here
         // too would give the activity stream two sources for one fill.
         WsEvent::UserFills { .. } | WsEvent::OrderUpdates { .. } => None,
-        // One update per frame, not per print: the venue batches the tape and
-        // the bar folds the whole batch the same way either way, so a frame
-        // carrying twenty prints costs one message to the renderer instead of
-        // twenty. The last print in the frame is the one that sets the close.
-        WsEvent::Trades { coin, trades } => trades.last().map(|last| {
-            // One pass for the three facts a bar needs from a batch. Folded
-            // from the first print rather than summed from a typed zero, which
-            // would mean naming `rust_decimal` here — a dependency this crate
-            // does not have and does not need for one addition.
-            let (high, low, volume) = trades.iter().skip(1).fold(
-                (trades[0].px, trades[0].px, trades[0].sz),
-                |(high, low, volume), trade| {
-                    (high.max(trade.px), low.min(trade.px), volume + trade.sz)
-                },
-            );
-            FeedUpdate::Trade {
-                coin: coin.clone(),
-                at_ms: last.time,
-                px: last.px.to_string(),
-                high: high.to_string(),
-                low: low.to_string(),
-                sz: volume.to_string(),
-            }
-        }),
         // Carries no price, and the pool's own staleness bookkeeping already
         // reports a frame it could not read.
         WsEvent::MessageDropped { .. } => None,
@@ -559,6 +538,7 @@ mod tests {
             event_task: Some(event_task),
             failure,
             drained: None,
+            chart: None,
             watching: Mutex::new(Vec::new()),
         }
     }
@@ -588,6 +568,40 @@ mod tests {
         assert_eq!(first["update"]["kind"], "bbo");
         assert_eq!(first["update"]["at_ms"], 7);
         assert!(first.get("failure").is_none());
+    }
+
+    #[test]
+    fn boxed_chart_projection_preserves_frontend_wire_shape() {
+        let mut chart = oppen_core::live_chart::LiveChart::new(
+            "BTC".into(),
+            oppen_core::candles::Interval::parse("1m").unwrap(),
+            None,
+        )
+        .unwrap();
+        let envelope = FeedEnvelope::new(
+            Network::Testnet,
+            "7",
+            FeedUpdate::Chart {
+                projection: Box::new(crate::chart_transport::Projection {
+                    selection_id: "11".into(),
+                    chart: chart.projection(0),
+                }),
+            },
+            &Mutex::new(None),
+        );
+        let wire = serde_json::to_value(envelope).unwrap();
+        assert_eq!(wire["network"], "testnet");
+        assert_eq!(wire["generation"], "7");
+        assert_eq!(wire["update"]["kind"], "chart");
+        let projection = &wire["update"]["projection"];
+        assert_eq!(projection["selection_id"], "11");
+        assert_eq!(projection["symbol"], "BTC");
+        assert_eq!(projection["interval"], "1m");
+        assert_eq!(projection["interval_ms"], 60_000);
+        assert!(projection["revision"].is_string());
+        assert!(projection["price_decimals"].is_null());
+        assert!(projection["closed"].is_array());
+        assert!(projection.get("chart").is_none());
     }
 
     #[test]
@@ -894,7 +908,7 @@ mod tests {
     }
 
     #[test]
-    fn the_forming_bar_keeps_the_venue_bucket_boundary() {
+    fn the_common_feed_cannot_publish_unbound_chart_frames() {
         let candle: Candle = serde_json::from_value(serde_json::json!({
             "t": 1_788_000_000_000u64,
             "T": 1_788_000_059_999u64,
@@ -902,22 +916,7 @@ mod tests {
             "o": "1.0", "c": "1.5", "h": "1.6", "l": "0.9", "v": "10", "n": 4
         }))
         .expect("a candle fixture");
-        let Some(FeedUpdate::Candle {
-            coin,
-            interval,
-            time_ms,
-            close,
-            ..
-        }) = translate(&WsEvent::Candle(Box::new(candle)), None)
-        else {
-            panic!("a candle frame must reach the chart");
-        };
-        assert_eq!(coin, "SOL");
-        assert_eq!(interval, "1m");
-        // The bucket start, not the arrival instant: the chart draws it into
-        // the bar it belongs to.
-        assert_eq!(time_ms, 1_788_000_000_000);
-        assert_eq!(close, "1.5");
+        assert!(translate(&WsEvent::Candle(Box::new(candle)), None).is_none());
     }
 
     #[test]

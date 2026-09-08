@@ -18,7 +18,7 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { INK, createCandleRenderer, frameRuns, type CandleFrame } from "../lib/candles";
 import type { ChartData } from "../stores/market";
 
-const props = defineProps<{ data: ChartData | null }>();
+const props = defineProps<{ data: ChartData | null; observationSummary?: string }>();
 
 /** Ink code to design token. The renderer emits codes so it can stay CSS-free. */
 const TOKEN: Record<string, string> = {
@@ -70,7 +70,8 @@ function paint(): void {
     maxWidth: width.value,
     rows: rows.value,
     intervalMs: data.intervalMs,
-    priceDecimals: data.priceDecimals,
+    priceDecimals: data.priceDecimals ?? 6,
+    latestTrade: data.latestTrade,
     tzOffsetMinutes: -new Date().getTimezoneOffset(),
   });
   // `changed: false` means the cells are identical to the last frame, so the
@@ -84,7 +85,8 @@ const lines = computed(() => (frame.value ? frameRuns(frame.value) : []));
 const summary = computed(() => {
   const data = props.data;
   const last = data?.forming ?? data?.closed[data.closed.length - 1];
-  return last ? `Candlestick chart. Last close ${last.close}. High ${last.high}, low ${last.low}. ${data!.forming ? 'Last candle is forming.' : 'Last candle is closed.'}` : 'Candlestick chart. No bars read yet.';
+  const bar = last ? `Last candle close ${last.close}. High ${last.high}, low ${last.low}. ${data!.forming ? 'Last candle is forming.' : 'Last bucket elapsed; completeness is separate.'}` : "No bars observed.";
+  return `Candlestick chart. ${bar} ${props.observationSummary ?? ""}`;
 });
 
 /**
@@ -93,10 +95,10 @@ const summary = computed(() => {
  * reads as downtime — which `charts.md` §3.2 names as the failure to avoid.
  */
 const blank = computed(() => {
-  if (props.data === null) return "No bars read yet.";
+  if (props.data === null) return "No chart observations yet.";
   switch (frame.value?.status) {
     case "no_bars":
-      return "The venue returned no bars for this window.";
+      return "No bars in the accepted chart observation.";
     case "no_finite_bars":
       return "Every bar in this window was unreadable.";
     case "grid_too_small":

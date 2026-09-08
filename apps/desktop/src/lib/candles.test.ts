@@ -62,6 +62,24 @@ const FORMING: Bar = {
   volume: 12,
 };
 
+describe("independent latest-trade marker", () => {
+  it("moves the marker outside candle extrema without changing venue OHLCV", () => {
+    const input = fixture();
+    const before = JSON.stringify(input);
+    const frame = renderCandles({ ...input, latestTrade: { timeMs: FORMING.time, price: 125, ambiguous: false } });
+    expect(frame.status).toBe("ok");
+    expect(frame.text.join("\n")).toContain("125.0");
+    expect(JSON.stringify(input)).toBe(before);
+    const ambiguous = renderCandles({ ...input, latestTrade: { timeMs: FORMING.time, price: 125, ambiguous: true } });
+    expect(ambiguous.text.join("\n")).toContain("?125.0");
+  });
+  it("does not synthesize a candle for a marker-only observation", () => {
+    const frame = renderCandles({ ...fixture(), closed: [], forming: null,
+      latestTrade: { timeMs: FORMING.time, price: 125, ambiguous: false } });
+    expect(frame.status).toBe("no_bars");
+  });
+});
+
 function fixture() {
   return {
     closed: CLOSED,

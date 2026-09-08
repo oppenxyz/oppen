@@ -10,6 +10,7 @@ use serde::Serialize;
 use tokio::sync::{Mutex as AsyncMutex, Notify, oneshot};
 use tokio_util::sync::CancellationToken;
 
+use crate::chart_transport::{ChartBinding, ChartOwner};
 use crate::feed::ConsoleFeed;
 use crate::local_reads::{LocalReads, ReadKind};
 use crate::mcp_runtime::{McpPhase, McpStatus, OwnedMcp, SharedStatus, status_lock};
@@ -25,6 +26,12 @@ use crate::policy_setup::{
 pub(crate) struct FeedBinding {
     pub network: Network,
     pub generation: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct WatchBinding {
+    pub feed: FeedBinding,
+    pub chart: ChartBinding,
 }
 
 #[cfg(test)]
@@ -101,6 +108,7 @@ mod tests {
             Ok(ControlledFeed {
                 driver: self.clone(),
                 work: Some(work),
+                chart: None,
             })
         }
     }
@@ -108,9 +116,18 @@ mod tests {
     pub(super) struct ControlledFeed {
         driver: Arc<Driver>,
         work: Option<tauri::async_runtime::JoinHandle<Result<(), String>>>,
+        pub(super) chart: Option<crate::chart_transport::ChartTransport>,
     }
 
     impl ControlledFeed {
+        pub(super) async fn retire_chart(&mut self) -> Result<(), String> {
+            let result = match self.chart.as_mut() {
+                Some(chart) => chart.shutdown_and_drain().await,
+                None => Ok(()),
+            };
+            self.chart = None;
+            result
+        }
         pub(super) fn failure(&self) -> Option<String> {
             self.driver.reported_failure.lock().unwrap().clone()
         }
@@ -132,6 +149,7 @@ mod tests {
 
         pub(super) async fn shutdown_and_drain(&mut self) -> Result<(), String> {
             let _ = self.driver.events.send(Event::Drain);
+            let chart = self.retire_chart().await;
             let result = if let Some(work) = self.work.as_mut() {
                 work.await.map_err(|error| error.to_string())?
             } else {
@@ -139,7 +157,7 @@ mod tests {
             };
             self.work = None;
             let _ = self.driver.events.send(Event::Joined);
-            result
+            result.and(chart)
         }
     }
 
@@ -556,7 +574,7 @@ mod tests {
         network: Network,
         account: Option<&str>,
         coin: &str,
-    ) -> oneshot::Receiver<Result<FeedBinding, RuntimeError>> {
+    ) -> oneshot::Receiver<Result<WatchBinding, RuntimeError>> {
         runtime
             .submit_watch(
                 FeedSource::Controlled(driver.clone()),
@@ -701,12 +719,13 @@ mod tests {
             .unwrap()
     }
 
-    async fn reply(reply: oneshot::Receiver<Result<FeedBinding, RuntimeError>>) -> FeedBinding {
+    async fn reply(reply: oneshot::Receiver<Result<WatchBinding, RuntimeError>>) -> FeedBinding {
         tokio::time::timeout(Duration::from_secs(3), reply)
             .await
             .unwrap()
             .unwrap()
             .unwrap()
+            .feed
     }
 
     async fn drained(runtime: &Runtime) -> Result<(), RuntimeError> {
@@ -771,6 +790,240 @@ mod tests {
         pending(&runtime).await;
         drop(lease);
         drained(&runtime).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn chart_admission_invalidates_synchronously_and_a_b_a_keeps_account_identity() {
+        let runtime = runtime();
+        let (driver, _events) = Driver::new();
+        let first = watch(&runtime, &driver, Network::Testnet, None, "BTC")
+            .await
+            .unwrap()
+            .unwrap();
+        let owner = runtime.chart_owner(&first.chart).unwrap();
+        let late_history = owner.begin_history().unwrap();
+        let second = watch(&runtime, &driver, Network::Testnet, None, "ETH");
+        assert!(matches!(
+            runtime.chart_owner(&first.chart),
+            Err(RuntimeError::Superseded)
+        ));
+        assert!(
+            owner
+                .finish_history(late_history, Err("late history".into()))
+                .is_err()
+        );
+        let second = second.await.unwrap().unwrap();
+        let third = watch(&runtime, &driver, Network::Testnet, None, "BTC")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.feed, second.feed);
+        assert_eq!(first.feed, third.feed);
+        assert_ne!(first.chart.selection_id, third.chart.selection_id);
+        assert!(matches!(
+            runtime.chart_owner(&first.chart),
+            Err(RuntimeError::Superseded)
+        ));
+        let mut wrong = third.chart.clone();
+        wrong.generation = "999".into();
+        assert!(matches!(
+            runtime.chart_owner(&wrong),
+            Err(RuntimeError::Superseded)
+        ));
+        wrong = third.chart.clone();
+        wrong.interval = "5m".into();
+        assert!(matches!(
+            runtime.chart_owner(&wrong),
+            Err(RuntimeError::Superseded)
+        ));
+        let interval_change = runtime
+            .submit_watch(
+                FeedSource::Controlled(driver.clone()),
+                Selection {
+                    network: Network::Testnet,
+                    account: None,
+                    coin: "BTC".into(),
+                    interval: "5m".into(),
+                },
+            )
+            .unwrap();
+        drop(interval_change); // The native watch worker, not this observer, owns replacement.
+        let back = watch(&runtime, &driver, Network::Testnet, None, "BTC")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(back.feed, first.feed);
+        assert_ne!(back.chart.selection_id, third.chart.selection_id);
+        let final_owner = runtime.chart_owner(&back.chart).unwrap();
+        runtime.begin_stop();
+        assert!(final_owner.begin_history().is_err());
+        drained(&runtime).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn completed_chart_failure_refuses_watch_but_keeps_account_owner_and_allows_retry() {
+        use crate::chart_transport::{
+            ChartTransport,
+            tests::{Socket, print},
+        };
+        let runtime = runtime();
+        let (driver, mut events) = Driver::new();
+        let first = watch(&runtime, &driver, Network::Testnet, None, "BTC")
+            .await
+            .unwrap()
+            .unwrap();
+        let owner = runtime.chart_owner(&first.chart).unwrap();
+        let socket = Socket::start();
+        let (pool, receiver) = oppen_hl::ws::WsPool::loopback_fixture(socket.port).unwrap();
+        let transport = ChartTransport::from_pool(
+            first.chart.clone(),
+            pool,
+            receiver,
+            owner.failure.clone(),
+            |_, event, _| {
+                if matches!(event, Some(oppen_hl::ws::WsEvent::Trades { .. })) {
+                    Err("synthetic chart emission failure".into())
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        {
+            let mut feed = runtime.0.feed.lock().await;
+            let Some(OwnedFeed::Controlled(feed)) = feed.as_mut() else {
+                panic!("controlled account owner");
+            };
+            feed.chart = Some(transport);
+        }
+        socket.trades(vec![print("BTC", 1, "100")]).await;
+        let failure = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let status = runtime.status();
+                assert_eq!(status.phase, RuntimePhase::Running);
+                if let Some(failure) = status.chart_failure {
+                    break failure;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(failure.binding, first.chart);
+        let refused = watch(&runtime, &driver, Network::Testnet, None, "ETH")
+            .await
+            .unwrap();
+        socket.task.await.unwrap();
+        assert!(
+            matches!(refused, Err(RuntimeError::ChartUnavailable(ref detail)) if detail.contains("synthetic chart emission failure"))
+        );
+        assert_eq!(runtime.status().phase, RuntimePhase::Running);
+        assert_eq!(runtime.status().binding.as_ref(), Some(&first.feed));
+        assert!(!runtime.control().terminal);
+        while let Ok(event) = events.try_recv() {
+            assert!(!matches!(event, Event::Drain | Event::Joined));
+        }
+        let retry = watch(&runtime, &driver, Network::Testnet, None, "ETH")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(retry.feed, first.feed);
+        assert_eq!(driver.starts.load(Ordering::SeqCst), 1);
+        assert!(runtime.status().chart_failure.is_none());
+        let invalid = watch(&runtime, &driver, Network::Testnet, None, "")
+            .await
+            .unwrap();
+        assert!(matches!(invalid, Err(RuntimeError::ChartUnavailable(_))));
+        assert_eq!(runtime.status().phase, RuntimePhase::Running);
+        let recovered = watch(&runtime, &driver, Network::Testnet, None, "BTC")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.feed, first.feed);
+        drained(&runtime).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn chart_retirement_error_cannot_report_running_during_retained_shutdown() {
+        use crate::chart_transport::{
+            ChartTransport,
+            tests::{Socket, print},
+        };
+        let runtime = runtime();
+        let (driver, mut account_events) = Driver::new();
+        let (release_account, account_gate) = mpsc::channel();
+        *driver.drain_gate.lock().unwrap() = Some(account_gate);
+        let first = watch(&runtime, &driver, Network::Testnet, None, "BTC")
+            .await
+            .unwrap()
+            .unwrap();
+        let owner = runtime.chart_owner(&first.chart).unwrap();
+        let socket = Socket::start();
+        let (pool, receiver) = oppen_hl::ws::WsPool::loopback_fixture(socket.port).unwrap();
+        let (release_chart, chart_gate) = mpsc::channel();
+        let (entered, observing) = oneshot::channel();
+        let mut entered = Some(entered);
+        let transport = ChartTransport::from_pool(
+            first.chart.clone(),
+            pool,
+            receiver,
+            owner.failure.clone(),
+            move |_, event, _| {
+                if matches!(event, Some(oppen_hl::ws::WsEvent::Trades { .. })) {
+                    if let Some(entered) = entered.take() {
+                        let _ = entered.send(());
+                    }
+                    let _ = chart_gate.recv();
+                    Err("held chart retirement failure".into())
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        {
+            let mut feed = runtime.0.feed.lock().await;
+            let Some(OwnedFeed::Controlled(feed)) = feed.as_mut() else {
+                panic!("controlled account owner");
+            };
+            feed.chart = Some(transport);
+        }
+        socket.trades(vec![print("BTC", 1, "100")]).await;
+        tokio::time::timeout(Duration::from_secs(3), observing)
+            .await
+            .unwrap()
+            .unwrap();
+        let replacement = watch(&runtime, &driver, Network::Testnet, None, "ETH");
+        // Producer completion proves retirement started; its consumer is still held.
+        tokio::time::timeout(Duration::from_secs(3), socket.task)
+            .await
+            .unwrap()
+            .unwrap();
+        runtime.begin_stop();
+        assert_eq!(runtime.status().phase, RuntimePhase::Stopping);
+        release_chart.send(()).unwrap();
+        let outcome = tokio::time::timeout(Duration::from_secs(3), replacement)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if account_events.recv().await == Some(Event::Drain) {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(runtime.status().phase, RuntimePhase::Stopping);
+        assert!(matches!(outcome, Err(RuntimeError::Stopping)));
+        assert!(runtime.control().terminal);
+        assert!(runtime.control().drain.is_some());
+        assert!(matches!(
+            runtime.read_lease(Network::Testnet),
+            Err(RuntimeError::Stopping)
+        ));
+        release_account.send(()).unwrap();
+        drained(&runtime).await.unwrap();
+        assert_eq!(runtime.status().phase, RuntimePhase::Stopped);
     }
 
     #[tokio::test]
@@ -1242,6 +1495,7 @@ pub(crate) enum RuntimePhase {
 
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct RuntimeStatus {
+    pub chart_failure: Option<crate::chart_transport::ChartFailure>,
     pub phase: RuntimePhase,
     pub binding: Option<FeedBinding>,
     pub detail: Option<String>,
@@ -1255,6 +1509,7 @@ pub(crate) enum RuntimeError {
     Busy,
     Superseded,
     ContextChanged,
+    ChartUnavailable(String),
     Failed(String),
 }
 
@@ -1265,7 +1520,7 @@ impl std::fmt::Display for RuntimeError {
             Self::Busy => f.write_str("desktop runtime is replacing its feed or a read is busy"),
             Self::Superseded => f.write_str("a newer selection superseded this watch"),
             Self::ContextChanged => f.write_str("desktop network context changed"),
-            Self::Failed(detail) => f.write_str(detail),
+            Self::Failed(detail) | Self::ChartUnavailable(detail) => f.write_str(detail),
         }
     }
 }
@@ -1284,7 +1539,7 @@ impl Selection {
     }
 }
 
-type WatchReply = oneshot::Sender<Result<FeedBinding, RuntimeError>>;
+type WatchReply = oneshot::Sender<Result<WatchBinding, RuntimeError>>;
 
 #[derive(Clone)]
 enum FeedSource {
@@ -1302,6 +1557,16 @@ enum OwnedFeed {
 }
 
 impl OwnedFeed {
+    fn chart_failure(&self) -> Option<crate::chart_transport::ChartFailure> {
+        match self {
+            Self::Desktop(feed) => feed.chart_failure(),
+            #[cfg(test)]
+            Self::Controlled(feed) => feed
+                .chart
+                .as_ref()
+                .and_then(crate::chart_transport::ChartTransport::failure),
+        }
+    }
     fn failure(&self) -> Option<String> {
         match self {
             Self::Desktop(feed) => feed.failure(),
@@ -1350,6 +1615,8 @@ struct Control {
     generation: u64,
     request_serial: u64,
     binding: Option<FeedBinding>,
+    chart_binding: Option<ChartBinding>,
+    chart_owner: Option<Arc<ChartOwner>>,
     selection: Option<Selection>,
     desired: Option<PendingWatch>,
     worker_running: bool,
@@ -1460,6 +1727,8 @@ impl Runtime {
                 generation: 0,
                 request_serial: 0,
                 binding: None,
+                chart_binding: None,
+                chart_owner: None,
                 selection: None,
                 desired: None,
                 worker_running: false,
@@ -1579,6 +1848,10 @@ impl Runtime {
         let status = owner.snapshot();
         control.pilot_consent = Some(owner);
         control.binding = None;
+        control.chart_binding = None;
+        if let Some(chart) = control.chart_owner.take() {
+            chart.retire();
+        }
         let previous = control.setup_worker.take();
         let runtime = self.clone();
         control.setup_worker = Some(tauri::async_runtime::spawn(async move {
@@ -1902,6 +2175,13 @@ impl Runtime {
 
     pub(crate) fn status(&self) -> RuntimeStatus {
         self.mcp_status();
+        // Chart transport health is not account or execution feed health.
+        let chart_failure = self
+            .0
+            .feed
+            .try_lock()
+            .ok()
+            .and_then(|feed| feed.as_ref().and_then(OwnedFeed::chart_failure));
         let failure = self
             .0
             .feed
@@ -1913,6 +2193,21 @@ impl Runtime {
         }
         let control = self.control();
         RuntimeStatus {
+            chart_failure: chart_failure
+                .filter(|failure| control.chart_binding.as_ref() == Some(&failure.binding))
+                .or_else(|| {
+                    control.chart_owner.as_ref().and_then(|owner| {
+                        owner
+                            .failure
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .clone()
+                            .map(|detail| crate::chart_transport::ChartFailure {
+                                binding: owner.binding.clone(),
+                                detail,
+                            })
+                    })
+                }),
             phase: control.phase,
             binding: control.binding.clone(),
             detail: control.detail.clone(),
@@ -2350,7 +2645,7 @@ impl Runtime {
         account: Option<String>,
         coin: String,
         interval: String,
-    ) -> Result<oneshot::Receiver<Result<FeedBinding, RuntimeError>>, RuntimeError> {
+    ) -> Result<oneshot::Receiver<Result<WatchBinding, RuntimeError>>, RuntimeError> {
         self.submit_watch(
             FeedSource::Desktop(app),
             Selection {
@@ -2366,7 +2661,7 @@ impl Runtime {
         &self,
         source: FeedSource,
         selection: Selection,
-    ) -> Result<oneshot::Receiver<Result<FeedBinding, RuntimeError>>, RuntimeError> {
+    ) -> Result<oneshot::Receiver<Result<WatchBinding, RuntimeError>>, RuntimeError> {
         self.status();
         let (reply, receiver) = oneshot::channel();
         let mut control = self.control();
@@ -2389,14 +2684,24 @@ impl Runtime {
         if !control.worker_running
             && control.selection.as_ref() == Some(&selection)
             && let Some(binding) = &control.binding
+            && let Some(chart) = &control.chart_binding
         {
-            let _ = reply.send(Ok(binding.clone()));
+            let _ = reply.send(Ok(WatchBinding {
+                feed: binding.clone(),
+                chart: chart.clone(),
+            }));
             return Ok(receiver);
         }
         control.request_serial = control
             .request_serial
             .checked_add(1)
             .ok_or_else(|| RuntimeError::Failed("watch request sequence exhausted".into()))?;
+        // Revoke accepted chart identity synchronously, before any retirement or
+        // startup await. This does not alter the account feed generation.
+        control.chart_binding = None;
+        if let Some(owner) = control.chart_owner.take() {
+            owner.retire();
+        }
         let pending = PendingWatch {
             source,
             selection,
@@ -2452,12 +2757,30 @@ impl Runtime {
                 Ok(_) if control.terminal => Err(RuntimeError::Stopping),
                 Ok(_) if control.request_serial != pending.serial => Err(RuntimeError::Superseded),
                 Ok(Some(binding)) => {
+                    let chart = ChartBinding {
+                        network: binding.network,
+                        generation: binding.generation.clone(),
+                        selection_id: pending.serial.to_string(),
+                        symbol: pending.selection.coin.clone(),
+                        interval: pending.selection.interval.clone(),
+                    };
                     control.selection = Some(pending.selection);
                     control.binding = Some(binding.clone());
+                    control.chart_binding = Some(chart.clone());
                     control.phase = RuntimePhase::Running;
-                    Ok(binding)
+                    Ok(WatchBinding {
+                        feed: binding,
+                        chart,
+                    })
                 }
                 Ok(None) => Err(RuntimeError::Superseded),
+                Err(RuntimeError::ChartUnavailable(_)) if control.terminal => {
+                    Err(RuntimeError::Stopping)
+                }
+                Err(error @ RuntimeError::ChartUnavailable(_)) => {
+                    control.phase = RuntimePhase::Running;
+                    Err(error)
+                }
                 Err(error) => {
                     control.terminal = true;
                     control.phase = RuntimePhase::Stopping;
@@ -2494,7 +2817,10 @@ impl Runtime {
                 .filter(|selection| selection.same_context(&pending.selection))
                 .and(control.binding.clone())
         };
-        if let (Some(feed), Some(binding)) = (slot.as_ref(), existing) {
+        if let (Some(feed), Some(binding)) = (slot.as_mut(), existing) {
+            if !self.replace_chart(feed, pending, &binding).await? {
+                return Ok(None);
+            }
             feed.watch(&pending.selection.coin, &pending.selection.interval)
                 .map_err(RuntimeError::Failed)?;
             return Ok(Some(binding));
@@ -2576,11 +2902,90 @@ impl Runtime {
                 return Ok(None);
             }
         }
-        slot.as_ref()
-            .expect("feed ownership installed")
-            .watch(&pending.selection.coin, &pending.selection.interval)
+        let feed = slot.as_mut().expect("feed ownership installed");
+        if !self.replace_chart(feed, pending, &binding).await? {
+            return Ok(None);
+        }
+        feed.watch(&pending.selection.coin, &pending.selection.interval)
             .map_err(RuntimeError::Failed)?;
         Ok(Some(binding))
+    }
+
+    async fn replace_chart(
+        &self,
+        feed: &mut OwnedFeed,
+        pending: &PendingWatch,
+        binding: &FeedBinding,
+    ) -> Result<bool, RuntimeError> {
+        match feed {
+            OwnedFeed::Desktop(feed) => {
+                // Err here is diagnostic after both actual joins. Refuse this
+                // chart request visibly, without terminating account supervision.
+                feed.retire_chart()
+                    .await
+                    .map_err(RuntimeError::ChartUnavailable)?;
+            }
+            #[cfg(test)]
+            OwnedFeed::Controlled(feed) => feed
+                .retire_chart()
+                .await
+                .map_err(RuntimeError::ChartUnavailable)?,
+        }
+        let owner = {
+            let mut control = self.control();
+            if control.terminal || control.request_serial != pending.serial {
+                return Ok(false);
+            }
+            let owner = Arc::new(
+                ChartOwner::new(ChartBinding {
+                    network: binding.network,
+                    generation: binding.generation.clone(),
+                    selection_id: pending.serial.to_string(),
+                    symbol: pending.selection.coin.clone(),
+                    interval: pending.selection.interval.clone(),
+                })
+                .map_err(RuntimeError::ChartUnavailable)?,
+            );
+            control.chart_owner = Some(owner.clone());
+            owner
+        };
+        match (feed, &pending.source) {
+            (OwnedFeed::Desktop(feed), FeedSource::Desktop(app)) => {
+                let app = app.clone();
+                let mut emitted_revision = None;
+                feed.start_chart(
+                    owner.binding.clone(),
+                    owner.failure.clone(),
+                    move |binding, event, received| {
+                        if let Some(projection) = owner.observe(binding, event, received)
+                            && emitted_revision.as_ref() != Some(&projection.chart.revision)
+                        {
+                            emitted_revision = Some(projection.chart.revision.clone());
+                            ConsoleFeed::emit_chart(&app, binding, projection)?;
+                        }
+                        Ok(())
+                    },
+                )
+                .map_err(RuntimeError::ChartUnavailable)?;
+            }
+            #[cfg(test)]
+            _ => {}
+        }
+        Ok(true)
+    }
+
+    pub(crate) fn chart_owner(
+        &self,
+        binding: &ChartBinding,
+    ) -> Result<Arc<ChartOwner>, RuntimeError> {
+        let control = self.control();
+        if control.terminal {
+            return Err(RuntimeError::Stopping);
+        }
+        if control.chart_binding.as_ref() != Some(binding) {
+            return Err(RuntimeError::Superseded);
+        }
+        control.chart_owner.clone().ok_or(RuntimeError::Superseded)
     }
 
     fn fail(&self, detail: String) {
@@ -2651,6 +3056,10 @@ impl Runtime {
     pub(crate) fn begin_stop(&self) {
         let mut control = self.control();
         control.terminal = true;
+        control.chart_binding = None;
+        if let Some(owner) = control.chart_owner.take() {
+            owner.retire();
+        }
         control.reads.begin_stop();
         self.0.mcp_stop.cancel();
         {
