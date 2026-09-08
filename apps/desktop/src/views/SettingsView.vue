@@ -5,6 +5,8 @@ import PanelHousing from "../components/housing/PanelHousing.vue";
 import ReadoutRows from "../components/housing/ReadoutRows.vue";
 import UiButton from "../components/ui/UiButton.vue";
 import PolicySetupPanel from "../components/PolicySetupPanel.vue";
+import PilotConsentPanel from "../components/PilotConsentPanel.vue";
+import { pilotConsent, consentOwnsContext } from "../stores/pilot-consent";
 import ActivationPanel from "../components/ActivationPanel.vue";
 import ReleasePanel from "../components/ReleasePanel.vue";
 import { release } from "../stores/release";
@@ -21,7 +23,7 @@ const supervisionAgent = ref("");
 const supervisionAccount = ref("");
 const confirmStop = ref(false);
 const mcp = supervision.state;
-const policyOwned = computed(() => policySetupOwnsContext(policySetup.state));
+const policyOwned = computed(() => policySetupOwnsContext(policySetup.state) || consentOwnsContext(pilotConsent.state));
 const inputError = computed(() => supervisionInputError(shell.network, supervisionAgent.value, supervisionAccount.value));
 const canStart = computed(() => inTauri() && inputError.value === null && mcp.command === null && !mcp.stopRequested
   && mcp.error === null && mcp.status?.phase === 'idle' && !policyOwned.value);
@@ -94,6 +96,7 @@ const local = computed(() => [
           <UiButton @click="refreshOperator" :disabled="operator.reading">Refresh stored policy</UiButton>
           <PolicySetupPanel />
         </template>
+        <template v-else-if="section === 'Pilot consent'"><PilotConsentPanel /></template>
         <template v-else-if="section === 'Keys & venues'">
           <p class="copy">Agent signing keys stay in the OS keychain. The console reads reachability only; private keys never enter the interface.</p>
           <ReadoutRows :rows="local" size="md" />

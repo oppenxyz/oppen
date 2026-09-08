@@ -50,6 +50,22 @@ this zero-baseline ceremony and requires the preservation decision instead.
 Known contradictory evidence overrides the attestation. Complete pagination
 over the claimed observation interval is mandatory; a bounded lookback is not
 permission to omit pages or suppress reconciliation findings within that window.
+The current fill query omits `endTime` and walks to a short page. Its coverage
+receipt must distinguish requested start, open-ended query semantics, completed
+page count and local observation times. It does not provide a venue-certified
+numeric end timestamp; do not invent one from the host clock or last fill.
+Publish usable coverage only after successful fill persistence and gap
+completion. Retain the initial completed observation across retries of other
+failed gaps; a healed gap disappearing from the work list must not erase it.
+Keep later narrower recovery observations separate rather than combining bounds
+into an invented continuous interval. Publish current readiness under the
+existing feed-stamp check. After restart, missing coverage must be recollected,
+not reconstructed from a `reconciled` boolean.
+Bind that monitored consumer to the same ledger authority used for consent.
+Matching only network/account is insufficient: coverage from another ledger
+cannot prove that its fetched fills reached the journal being authorized.
+Core must reject a same-account, foreign-ledger feed rather than rely solely on
+native construction conventions.
 
 ## Core Authority
 
@@ -92,6 +108,10 @@ identity and unchanged authority. A feed's `reconciled` flag is not proof that
 pending submissions are settled. Venue reads and local commit are not atomic;
 bound their age and preserve ledger/ingress fences, without claiming they prove
 exclusive use. An untrusted agent must not reach consent commands.
+Quiet, unused accounts must remain reviewable throughout the review lifetime
+while genuinely monitored traffic stays fresh. Do not manufacture account events,
+refresh a tick from a timer alone, or weaken ingress admission to support human
+reading time. Fresh account REST evidence remains independently required.
 
 The UI exposes review, explicit confirmation, discard before admission, current
 status and read-only outcome recovery. Show complete evidence, observation
@@ -101,6 +121,15 @@ Known terminal native evidence may release an observer's busy state, but late
 replies cannot clear newer work. Existing consent remains inspectable without
 offering replacement. Successful consent still leaves policy paused and
 activation unacknowledged.
+Distinguish a retained worker's reconcilable uncertainty from terminal
+`recovery_required` after worker or drain failure. Retain any committed receipt
+and exact correlation without presenting a healthy completion or offering a
+command a terminated worker cannot execute. Later same-operation safety failure
+must supersede an earlier success/refusal/closed observation and keep conflicting
+setup fenced; stale replies must not reverse that failure. Restart alone is not
+outcome proof. Identity corrections are permitted only after definitive
+refusal/discard without existing consent or unresolved authority; ordinary polls
+must not overwrite such a correction.
 
 ## Acceptance
 
@@ -113,6 +142,9 @@ activation unacknowledged.
    and concurrent ledger/ingress changes refuse. No lifetime-completeness claim.
 4. Lost IPC, competing confirmations, panic, shutdown and replacement preserve
    actual ownership and exact outcome identity. Reconciliation performs no write.
+   Include native confirmation after human delay on a quiet account and a late
+   teardown failure observed after success. Prove both the native ownership fence
+   and the UI's terminal recovery state, not only mocked command responses.
 5. Real UI review/confirm/receipt/refusal/unknown flow works before MCP startup;
    synthetic checks prove zero signatures or exchange mutations.
 6. Focused and workspace tests, independent exact-head review and green CI.

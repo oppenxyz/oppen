@@ -5,6 +5,7 @@
  */
 
 import { reactive, readonly } from "vue";
+import { pilotConsent, consentOwnsContext } from "./pilot-consent";
 import {
   fetchAccountState,
   fetchKeychainStatus,
@@ -76,6 +77,7 @@ export function setView(view: View): void {
 /** D4: persist the explicit operator choice and restart all network-scoped reads together. */
 export function setNetwork(network: Network): void {
   if (network === state.network) return;
+  if (consentOwnsContext(pilotConsent.state)) throw new Error("Initial consent owns the setup context.");
   // Write before changing anything. If persistence fails, keep the current network.
   localStorage.setItem("oppen.network", network);
   window.location.reload();

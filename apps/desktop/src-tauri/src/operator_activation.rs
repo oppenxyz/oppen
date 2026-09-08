@@ -9,7 +9,6 @@ use oppen_core::guardrail::{
     PolicyStatus, Refusal, Unevaluable,
 };
 use oppen_core::ledger::AuthorizedRoute;
-use oppen_hl::types::UserRole;
 use oppen_hl::{InfoClient, Network};
 use oppen_mcp::auth::Binding;
 use oppen_mcp::server::{ActivationAdmission, OperatorControl};
@@ -327,46 +326,11 @@ impl ActivationControl {
                 "activation route differs from supervised testnet identity",
             ));
         }
-        let read_started_at_ms = now_ms();
-        let account = route.binding.container;
-        let (perps, spot, orders, market, account_role, signer_role) = tokio::try_join!(
-            self.info.clearinghouse_state(account),
-            self.info.spot_clearinghouse_state(account),
-            self.info.frontend_open_orders(account),
-            self.info.meta_and_asset_ctxs(),
-            self.info.user_role(account),
-            self.info.user_role(route.binding.wallet.address),
-        )
-        .map_err(refused)?;
-        if !market.is_aligned() {
-            return Err(refused("misaligned activation market evidence"));
-        }
-        let approval_user = match (&account_role, route.binding.vault_address) {
-            (UserRole::User, None) => account,
-            (UserRole::SubAccount { master }, Some(vault)) if vault == account => *master,
-            _ => {
-                return Err(refused(
-                    "account role does not identify the reviewed approval user",
-                ));
-            }
-        };
-        let extra_agents = self
-            .info
-            .extra_agents(approval_user)
+        let evidence = crate::account_evidence::gather(&self.info, route)
             .await
             .map_err(refused)?;
         self.live()?;
-        Ok(ActivationEvidence {
-            read_started_at_ms,
-            read_completed_at_ms: now_ms(),
-            perps,
-            spot,
-            orders,
-            reference_prices: market.reference_pxs(),
-            account_role,
-            signer_role,
-            extra_agents,
-        })
+        Ok(evidence)
     }
 
     fn finish(&self, id: String, result: Result<Result<WorkResult, Refusal>, String>) {

@@ -20,6 +20,11 @@ use crate::guardrail::{AgentId, Clearance, ClearedKind, PilotMetric};
 #[path = "pilot/authority.rs"]
 mod authority;
 pub use authority::LegacyPilotReview;
+pub use authority::{
+    PilotConsentAttestation, PilotConsentCorrelation, PilotConsentCoverage, PilotConsentDisplay,
+    PilotConsentError, PilotConsentEvidence, PilotConsentObservation, PilotConsentOutcome,
+    PilotConsentReceipt, PilotConsentReview,
+};
 
 type Result<T> = std::result::Result<T, PilotError>;
 

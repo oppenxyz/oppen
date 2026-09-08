@@ -209,6 +209,42 @@ export async function fetchPilotStatus(network: "testnet" | "mainnet"): Promise<
   return invoke<PilotStatus | null>("pilot_status", { network });
 }
 
+export interface PilotConsentAttestations {
+  typed_account: string;
+  never_used_for_in_scope_trading: boolean;
+  dedicated_account_exclusive_use: boolean;
+  original_baseline_and_no_reset_confirmed: boolean;
+}
+export interface PilotConsentCorrelation { route: AuthorizedRoute; baseline: { seq: number; hash: string }; baseline_at_ms: number }
+export interface PilotConsentDisplay {
+  network: "testnet" | "mainnet"; correlation: PilotConsentCorrelation;
+  persisted_kill: KillSwitch;
+  policy_revision: number; policy: ReviewedAgentPolicy; account: AccountState;
+  wallet_approval: ActivationDisplay["wallet_approval"];
+  coverage: { network: "testnet" | "mainnet"; account: string; requested_start_ms: number; requested_end_ms: number | null;
+    pages: number; terminated_by_short_page: boolean; local_read_started_at_ms: number; local_read_completed_at_ms: number; initial_window: boolean };
+  required_attestations: { dedicated_exclusive_account: boolean; never_used_for_trading: boolean };
+  observed_at_ms: number; expires_at_ms: number;
+  order_limit_usd: string; gross_exposure_limit_usd: string; executed_limit_usd: string; realized_loss_limit_usd: string; max_leverage: number;
+}
+export interface PilotConsentReceipt { correlation: PilotConsentCorrelation; seq: number; hash: string }
+export type PilotConsentOperation = { kind: "review" } | { kind: "confirm" | "discard" | "reconcile"; review_id: string };
+export interface PilotConsentStatus {
+  owner_id: string; agent: string; account: string; operation_seq: number; last_operation: PilotConsentOperation | null;
+  phase: "idle" | "reviewing" | "review_ready" | "confirming" | "authorized" | "existing" | "refused" | "uncertain" | "recovery_required" | "closed";
+  review: { id: string; display: PilotConsentDisplay } | null; existing: PilotStatus | null; receipt: PilotConsentReceipt | null;
+  resolution: { status: "committed"; receipt: PilotConsentReceipt; current_pilot: ActivationPilotState }
+    | { status: "not_committed"; correlation: PilotConsentCorrelation } | { status: "unknown"; detail: string } | null;
+  error: { status: "refused"; detail: string } | { status: "uncertain"; correlation: PilotConsentCorrelation | null; detail: string } | null;
+}
+export function fetchPilotConsentStatus(): Promise<PilotConsentStatus | null> { return invoke("pilot_consent_status"); }
+export function reviewPilotConsent(agent: string, account: string): Promise<PilotConsentStatus> { return invoke("review_pilot_consent", { agent, account }); }
+export function confirmPilotConsent(ownerId: string, reviewId: string, attestations: PilotConsentAttestations): Promise<PilotConsentStatus> {
+  return invoke("confirm_pilot_consent", { ownerId, reviewId, attestations });
+}
+export function discardPilotConsent(ownerId: string, reviewId: string): Promise<PilotConsentStatus> { return invoke("discard_pilot_consent", { ownerId, reviewId }); }
+export function reconcilePilotConsent(ownerId: string, reviewId: string): Promise<PilotConsentStatus> { return invoke("reconcile_pilot_consent", { ownerId, reviewId }); }
+
 /** What the keychain probe answers. */
 export interface KeychainStatus {
   reachable: boolean;

@@ -703,6 +703,23 @@ pub enum GapStatus {
 }
 
 /// The report for one gap.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct FillWalkReceipt {
+    #[serde(skip)]
+    pub(crate) ledger_identity: std::sync::Arc<()>,
+    pub network: Network,
+    pub account: Address,
+    pub requested_start_ms: u64,
+    /// None is the actual open-ended request, not a measured venue end instant.
+    pub requested_end_ms: Option<u64>,
+    pub pages: usize,
+    pub terminated_by_short_page: bool,
+    pub local_read_started_at_ms: i64,
+    pub local_read_completed_at_ms: i64,
+    pub initial_window: bool,
+}
+
+/// The report for one gap.
 #[derive(Debug)]
 pub struct GapOutcome {
     pub gap_id: i64,
@@ -719,6 +736,7 @@ pub struct GapOutcome {
     /// Orders the caller believed live that the venue is not resting, settled
     /// by query. `docs/spec.md` item 19 — never resent.
     pub settled: Vec<(String, Settlement)>,
+    pub fill_walk: Option<FillWalkReceipt>,
 }
 
 /// Knobs with a defensible default each.
@@ -1051,9 +1069,24 @@ pub struct Reconciler<'a, S> {
     ledger: &'a Ledger,
     source: S,
     config: ReconcileConfig,
+    #[cfg(test)]
+    observation_clock: Option<fn() -> i64>,
 }
 
 impl<'a, S: ReconcileSource> Reconciler<'a, S> {
+    #[cfg(test)]
+    pub(crate) fn with_observation_clock(mut self, clock: fn() -> i64) -> Self {
+        self.observation_clock = Some(clock);
+        self
+    }
+
+    fn observation_time(&self) -> i64 {
+        #[cfg(test)]
+        if let Some(clock) = self.observation_clock {
+            return clock();
+        }
+        now_ms()
+    }
     /// Build a reconciler.
     ///
     /// Refuses a source that is not on the ledger's own network
@@ -1083,6 +1116,8 @@ impl<'a, S: ReconcileSource> Reconciler<'a, S> {
             ledger,
             source,
             config,
+            #[cfg(test)]
+            observation_clock: None,
         })
     }
 
@@ -1114,6 +1149,7 @@ impl<'a, S: ReconcileSource> Reconciler<'a, S> {
                     recovered: Recovered::default(),
                     resting_orders: None,
                     settled: Vec::new(),
+                    fill_walk: None,
                 },
             };
             outcomes.push(outcome);
@@ -1149,6 +1185,7 @@ impl<'a, S: ReconcileSource> Reconciler<'a, S> {
             recovered: Recovered::default(),
             resting_orders: None,
             settled: Vec::new(),
+            fill_walk: None,
         };
         let Some(account) = scope.account() else {
             return Ok(unfinished(GapStatus::NotAnAccountFeed));
@@ -1161,6 +1198,7 @@ impl<'a, S: ReconcileSource> Reconciler<'a, S> {
         };
 
         let mut recovered = Recovered::default();
+        let mut fill_walk = None;
         if matches!(scope, GapScope::UserFills(_)) {
             // The anchor is read at `gap.open_seq`, so nothing written after
             // the socket died — by a later backfill, or by the live feed once
@@ -1174,9 +1212,23 @@ impl<'a, S: ReconcileSource> Reconciler<'a, S> {
             // has succeeded. The opposite order would mark a window
             // reconciled on the strength of an order query while the fills
             // walk had not run.
-            let (fills, _) =
+            let local_read_started_at_ms = self.observation_time();
+            let (fills, pages) =
                 backfill_fills(&self.source, account, window.start_ms, self.config).await?;
+            let local_read_completed_at_ms = self.observation_time();
             recovered = self.apply_fills(account, &fills, window.recovered_from(gap.gap_id))?;
+            fill_walk = Some(FillWalkReceipt {
+                ledger_identity: self.ledger.identity().clone(),
+                network: self.ledger.network(),
+                account,
+                requested_start_ms: window.start_ms,
+                requested_end_ms: None,
+                pages,
+                terminated_by_short_page: true,
+                local_read_started_at_ms,
+                local_read_completed_at_ms,
+                initial_window: window.outage_ends_ms.is_none(),
+            });
             if window.outage_ends_ms.is_none() {
                 recovered.findings.push(Finding::FirstRunWindow {
                     account: account.to_string(),
@@ -1224,6 +1276,7 @@ impl<'a, S: ReconcileSource> Reconciler<'a, S> {
             recovered,
             resting_orders,
             settled,
+            fill_walk,
         })
     }
 

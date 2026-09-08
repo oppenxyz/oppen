@@ -1073,6 +1073,790 @@ mod tests {
         venue.shutdown().await;
     }
 
+    fn initial_consent_fixture() -> (
+        Fixture,
+        oppen_core::ledger::AuthorizedRoute,
+        serde_json::Value,
+    ) {
+        let fixture = Fixture::new(false, Some(Fixture::binding()), false);
+        let ledger = Arc::new(Ledger::open_existing(fixture.dir.path(), Network::Testnet).unwrap());
+        let registry = Arc::new(
+            RegistryJournal::open(ledger, Arc::new(HmacKey::from_bytes([11; 32]))).unwrap(),
+        );
+        let policy = PolicyJournal::new(registry.clone());
+        let current = policy.current().unwrap();
+        let mut state = current.state;
+        let config = state.guardrails.get_mut(&fixture.binding.agent).unwrap();
+        config.max_order_usd = 15.into();
+        config.max_position_usd = 25.into();
+        config.risk.max_open_exposure_usd = Some(25.into());
+        config.risk.max_leverage = 1;
+        config.symbols.insert("TEST".into());
+        let version = policy
+            .replace(current.revision, state, u64::try_from(now_ms()).unwrap())
+            .unwrap();
+        let route = registry.route_for_agent(&fixture.binding.agent).unwrap();
+        (fixture, route, serde_json::to_value(version).unwrap())
+    }
+
+    async fn consent_phase(
+        runtime: &crate::runtime::Runtime,
+        expected: crate::pilot_consent::Phase,
+    ) -> crate::pilot_consent::Status {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let status = runtime.pilot_consent_status().unwrap();
+                if status.phase == expected {
+                    return status;
+                }
+                assert!(
+                    !matches!(
+                        status.phase,
+                        crate::pilot_consent::Phase::Refused
+                            | crate::pilot_consent::Phase::Uncertain
+                            | crate::pilot_consent::Phase::RecoveryRequired
+                    ),
+                    "{status:?}"
+                );
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("consent operation did not reach expected phase")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn native_pilot_consent_creates_once_reopens_and_never_activates_or_submits() {
+        native_pilot_consent_case(true, false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn native_pilot_consent_does_not_invent_operator_attestations() {
+        native_pilot_consent_case(false, false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn native_pilot_consent_late_teardown_failure_preserves_receipt_and_requires_recovery() {
+        native_pilot_consent_case(true, true).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn native_pilot_consent_existing_authority_is_inspection_not_new_attestation_or_receipt()
+    {
+        use crate::pilot_consent::{Control, Phase};
+        let fixture = Fixture::authorized();
+        let venue = LocalVenue::start_with_pending_handshake(true).await;
+        let ledger = Ledger::open_existing(fixture.dir.path(), Network::Testnet).unwrap();
+        let original = ledger.chain_head().unwrap();
+        drop(ledger);
+        let runtime = crate::runtime::Runtime::new(fixture.dir.path().to_owned());
+        drop(runtime.read_lease(Network::Testnet).unwrap());
+        let port = venue.port;
+        runtime
+            .launch_pilot_consent(
+                fixture.binding.agent.to_string(),
+                fixture.binding.account.to_string(),
+                move |dir, agent, account, ready| {
+                    Control::launch_with(
+                        dir,
+                        agent,
+                        account,
+                        Arc::new(FixtureKeys),
+                        oppen_hl::InfoClient::loopback_fixture(port).unwrap(),
+                        FixtureSource,
+                        || panic!("existing consent must not start a bootstrap socket"),
+                        ready,
+                    )
+                },
+            )
+            .unwrap();
+        let existing = consent_phase(&runtime, Phase::Existing).await;
+        runtime.shutdown().await.unwrap();
+        let requests = venue.requests.lock().unwrap().len();
+        venue.shutdown().await;
+        assert_eq!(requests, 0);
+        assert_eq!(
+            existing.existing.unwrap().authentication,
+            oppen_core::ledger::PilotAuthentication::Verified
+        );
+        assert!(existing.review.is_none());
+        assert!(existing.receipt.is_none());
+        assert!(existing.resolution.is_none());
+        assert_eq!(
+            Ledger::open_existing(fixture.dir.path(), Network::Testnet)
+                .unwrap()
+                .chain_head()
+                .unwrap(),
+            original
+        );
+        fixture.assert_pairing_owner_released();
+    }
+
+    fn consent_prior_fill() -> oppen_hl::types::Fill {
+        serde_json::from_value(serde_json::json!({
+            "coin":"TEST", "px":"100", "sz":"0.10", "side":"B",
+            "time":u64::try_from(now_ms()).unwrap(), "startPosition":"0", "dir":"Open Long",
+            "closedPnl":"0", "hash":"synthetic-consent-history", "oid":39001,
+            "crossed":true, "fee":"0.01", "tid":39001, "feeToken":"USDC"
+        }))
+        .unwrap()
+    }
+
+    struct QuietAccountSocket {
+        port: u16,
+        frames: tokio::sync::watch::Receiver<u64>,
+        stop: CancellationToken,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl QuietAccountSocket {
+        async fn start() -> Self {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let stop = CancellationToken::new();
+            let stopped = stop.clone();
+            let (frames, observed) = tokio::sync::watch::channel(0_u64);
+            let task = tokio::spawn(async move {
+                let mut clients = tokio::task::JoinSet::new();
+                loop {
+                    tokio::select! {
+                        () = stopped.cancelled() => break,
+                        client = listener.accept() => {
+                            let (stream, _) = client.unwrap();
+                            let stream = stream.into_std().unwrap();
+                            stream.set_nonblocking(false).unwrap();
+                            stream.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
+                            stream.set_write_timeout(Some(Duration::from_secs(1))).unwrap();
+                            let stopped = stopped.clone();
+                            let frames = frames.clone();
+                            clients.spawn_blocking(move || {
+                                use tokio_tungstenite::tungstenite::{accept, Error, Message};
+                                let mut socket = accept(stream).unwrap();
+                                let mut assets = std::collections::BTreeSet::<String>::new();
+                                let mut next_frame = std::time::Instant::now();
+                                while !stopped.is_cancelled() {
+                                    match socket.read() {
+                                        Ok(Message::Text(text)) => {
+                                            let request: serde_json::Value = serde_json::from_str(&text).unwrap();
+                                            if request["method"] == "ping" {
+                                                socket.send(Message::Text(serde_json::json!({"channel":"pong"}).to_string())).unwrap();
+                                            } else {
+                                                assert!(request["method"] == "subscribe" || request["method"] == "unsubscribe");
+                                                let subscription = &request["subscription"];
+                                                if subscription["type"] == "activeAssetCtx" {
+                                                    let coin = subscription["coin"].as_str().unwrap().to_owned();
+                                                    if request["method"] == "subscribe" { assets.insert(coin); }
+                                                    else { assets.remove(&coin); }
+                                                }
+                                                socket.send(Message::Text(serde_json::json!({
+                                                    "channel":"subscriptionResponse", "data":request
+                                                }).to_string())).unwrap();
+                                            }
+                                        }
+                                        Ok(Message::Close(_)) | Err(Error::ConnectionClosed | Error::AlreadyClosed) => break,
+                                        // Pool drain guarantees task completion, not a closing handshake.
+                                        Err(Error::Protocol(tokio_tungstenite::tungstenite::error::ProtocolError::ResetWithoutClosingHandshake)) => break,
+                                        Err(Error::Io(error)) if matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {}
+                                        Err(Error::Io(error)) if matches!(error.kind(), std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::BrokenPipe) => break,
+                                        Err(error) => panic!("synthetic account socket: {error}"),
+                                        Ok(_) => {}
+                                    }
+                                    if std::time::Instant::now() >= next_frame {
+                                        for coin in &assets {
+                                            let market = LocalVenue::info(serde_json::json!({"type":"metaAndAssetCtxs"}));
+                                            socket.send(Message::Text(serde_json::json!({"channel":"activeAssetCtx",
+                                                "data":{"coin":coin,"ctx":market[1][0]}}).to_string())).unwrap();
+                                            frames.send_replace(u64::try_from(now_ms()).unwrap());
+                                        }
+                                        next_frame = std::time::Instant::now() + Duration::from_millis(100);
+                                    }
+                                }
+                            });
+                        }
+                    }
+                }
+                while let Some(done) = clients.join_next().await {
+                    done.unwrap();
+                }
+            });
+            Self {
+                port,
+                frames: observed,
+                stop,
+                task,
+            }
+        }
+
+        async fn shutdown(self) {
+            self.stop.cancel();
+            self.task.await.unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn native_pilot_consent_quiet_human_delay_uses_real_socket_frames_and_fresh_rest() {
+        use crate::pilot_consent::{Attestations, Control, Phase};
+        let (fixture, route, original_policy) = initial_consent_fixture();
+        let venue = LocalVenue::start_with_pending_handshake(true).await;
+        let mut socket = QuietAccountSocket::start().await;
+        *venue.activation_wallet.lock().unwrap() = Some((
+            fixture.binding.account,
+            route.binding.wallet.address,
+            route.binding.wallet.valid_until_ms,
+        ));
+        let runtime = crate::runtime::Runtime::new(fixture.dir.path().to_owned());
+        drop(runtime.read_lease(Network::Testnet).unwrap());
+        let port = venue.port;
+        let ws_port = socket.port;
+        runtime
+            .launch_pilot_consent(
+                fixture.binding.agent.to_string(),
+                fixture.binding.account.to_string(),
+                move |dir, agent, account, ready| {
+                    Control::launch_with(
+                        dir,
+                        agent,
+                        account,
+                        Arc::new(FixtureKeys),
+                        oppen_hl::InfoClient::loopback_fixture(port).unwrap(),
+                        FixtureSource,
+                        move || WsPool::loopback_fixture(ws_port),
+                        ready,
+                    )
+                },
+            )
+            .unwrap();
+        let reviewed = consent_phase(&runtime, Phase::ReviewReady).await;
+        let review = reviewed.review.unwrap();
+        let stale_after =
+            review.display.observed_at_ms + review.display.policy.freshness.max_account_age_ms;
+        let rest_before = venue.requests.lock().unwrap().len();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while *socket.frames.borrow_and_update() <= stale_after {
+                socket.frames.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect(
+            "actual market frames must continue beyond the account observation freshness bound",
+        );
+        assert_eq!(
+            venue.requests.lock().unwrap().len(),
+            rest_before,
+            "quiet delay does not fabricate fresh REST observations"
+        );
+        runtime
+            .confirm_pilot_consent(
+                reviewed.owner_id,
+                review.id,
+                Attestations {
+                    typed_account: fixture.binding.account.to_string(),
+                    never_used_for_in_scope_trading: true,
+                    dedicated_account_exclusive_use: true,
+                    original_baseline_and_no_reset_confirmed: true,
+                },
+            )
+            .unwrap();
+        let authorized = consent_phase(&runtime, Phase::Authorized).await;
+        runtime.shutdown().await.unwrap();
+        socket.shutdown().await;
+        let reads = venue
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .skip(rest_before)
+            .map(|request| {
+                assert_eq!(request.path, "/info");
+                serde_json::from_slice::<serde_json::Value>(&request.body).unwrap()["type"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect::<Vec<_>>();
+        venue.shutdown().await;
+        assert_eq!(reads.len(), 7);
+        for kind in [
+            "clearinghouseState",
+            "spotClearinghouseState",
+            "frontendOpenOrders",
+            "metaAndAssetCtxs",
+            "extraAgents",
+        ] {
+            assert_eq!(
+                reads.iter().filter(|read| *read == kind).count(),
+                1,
+                "{reads:?}"
+            );
+        }
+        assert_eq!(reads.iter().filter(|read| *read == "userRole").count(), 2);
+        assert_eq!(
+            authorized.receipt.unwrap().correlation,
+            review.display.correlation
+        );
+        fixture.assert_pairing_owner_released();
+        let ledger = Arc::new(Ledger::open_existing(fixture.dir.path(), Network::Testnet).unwrap());
+        let registry = Arc::new(
+            RegistryJournal::open(ledger, Arc::new(HmacKey::from_bytes([11; 32]))).unwrap(),
+        );
+        assert_eq!(
+            serde_json::to_value(PolicyJournal::new(registry).current().unwrap()).unwrap(),
+            original_policy
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn native_pilot_consent_bootstrap_preserves_prior_fill_and_refuses_zero_baseline() {
+        use crate::pilot_consent::{Control, Phase};
+        let (fixture, _, _) = initial_consent_fixture();
+        let venue = LocalVenue::start_with_pending_handshake(true).await;
+        let source = FollowupFillSource {
+            account: fixture.binding.account,
+            fill: Some(consent_prior_fill()),
+        };
+        let runtime = crate::runtime::Runtime::new(fixture.dir.path().to_owned());
+        drop(runtime.read_lease(Network::Testnet).unwrap());
+        let port = venue.port;
+        runtime
+            .launch_pilot_consent(
+                fixture.binding.agent.to_string(),
+                fixture.binding.account.to_string(),
+                move |dir, agent, account, ready| {
+                    Control::launch_with(
+                        dir,
+                        agent,
+                        account,
+                        Arc::new(FixtureKeys),
+                        oppen_hl::InfoClient::loopback_fixture(port).unwrap(),
+                        source,
+                        move || WsPool::loopback_fixture(port),
+                        ready,
+                    )
+                },
+            )
+            .unwrap();
+        let refused = consent_phase(&runtime, Phase::Refused).await;
+        runtime.shutdown().await.unwrap();
+        let no_posts = !venue
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|request| request.path == "/exchange");
+        venue.shutdown().await;
+        assert!(no_posts);
+        assert!(refused.review.is_none());
+        let ledger = Arc::new(Ledger::open_existing(fixture.dir.path(), Network::Testnet).unwrap());
+        let rows = ledger.get_events(0, 1000).unwrap().events;
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.kind == oppen_core::ledger::EventKind::Fill)
+                .count(),
+            1
+        );
+        assert!(
+            !rows
+                .iter()
+                .any(|row| row.kind == oppen_core::ledger::EventKind::PilotAuthorized)
+        );
+        fixture.assert_pairing_owner_released();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn native_pilot_consent_actual_ingress_during_fresh_confirmation_cannot_rebase() {
+        use crate::pilot_consent::{Attestations, Control, Phase};
+        let (fixture, route, _) = initial_consent_fixture();
+        let venue = LocalVenue::start_with_pending_handshake(true).await;
+        *venue.activation_wallet.lock().unwrap() = Some((
+            fixture.binding.account,
+            route.binding.wallet.address,
+            route.binding.wallet.valid_until_ms,
+        ));
+        let runtime = crate::runtime::Runtime::new(fixture.dir.path().to_owned());
+        drop(runtime.read_lease(Network::Testnet).unwrap());
+        let ingress = Arc::new(Mutex::new(None));
+        let ingress_slot = ingress.clone();
+        let port = venue.port;
+        runtime
+            .launch_pilot_consent(
+                fixture.binding.agent.to_string(),
+                fixture.binding.account.to_string(),
+                move |dir, agent, account, ready| {
+                    Control::launch_with(
+                        dir,
+                        agent,
+                        account,
+                        Arc::new(FixtureKeys),
+                        oppen_hl::InfoClient::loopback_fixture(port).unwrap(),
+                        FixtureSource,
+                        move || {
+                            let (pool, receiver, sender) =
+                                WsPool::loopback_fixture_with_ingress(port)?;
+                            *ingress_slot.lock().unwrap() = Some((sender, receiver.monitor()));
+                            Ok((pool, receiver))
+                        },
+                        ready,
+                    )
+                },
+            )
+            .unwrap();
+        let ready = consent_phase(&runtime, Phase::ReviewReady).await;
+        let review = ready.review.unwrap();
+        let (entered, entering) = oneshot::channel();
+        let (release, released) = oneshot::channel();
+        *venue.info_gate.lock().unwrap() = Some(InfoGate {
+            kind: "clearinghouseState",
+            entered,
+            released,
+        });
+        runtime
+            .confirm_pilot_consent(
+                ready.owner_id.clone(),
+                review.id.clone(),
+                Attestations {
+                    typed_account: fixture.binding.account.to_string(),
+                    never_used_for_in_scope_trading: true,
+                    dedicated_account_exclusive_use: true,
+                    original_baseline_and_no_reset_confirmed: true,
+                },
+            )
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), entering)
+            .await
+            .unwrap()
+            .unwrap();
+        let (sender, monitor) = ingress.lock().unwrap().take().unwrap();
+        let event = oppen_hl::ws::WsEvent::UserFills {
+            is_snapshot: false,
+            user: fixture.binding.account,
+            fills: vec![consent_prior_fill()],
+        };
+        sender
+            .send(event, u64::try_from(now_ms()).unwrap())
+            .await
+            .unwrap();
+        drop(sender);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while monitor.status().pending != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        release.send(()).unwrap();
+        let refused = consent_phase(&runtime, Phase::Refused).await;
+        assert_eq!(
+            refused.review.unwrap().display.correlation,
+            review.display.correlation
+        );
+        assert!(
+            runtime
+                .confirm_pilot_consent(
+                    ready.owner_id,
+                    review.id,
+                    Attestations {
+                        typed_account: fixture.binding.account.to_string(),
+                        never_used_for_in_scope_trading: true,
+                        dedicated_account_exclusive_use: true,
+                        original_baseline_and_no_reset_confirmed: true,
+                    }
+                )
+                .is_err()
+        );
+        runtime.shutdown().await.unwrap();
+        let no_posts = !venue
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|request| request.path == "/exchange");
+        venue.shutdown().await;
+        assert!(no_posts);
+        fixture.assert_pairing_owner_released();
+        let ledger = Ledger::open_existing(fixture.dir.path(), Network::Testnet).unwrap();
+        let rows = ledger.get_events(0, 1000).unwrap().events;
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.kind == oppen_core::ledger::EventKind::Fill)
+                .count(),
+            1
+        );
+        assert!(!rows.iter().any(|row| matches!(
+            row.kind,
+            oppen_core::ledger::EventKind::PilotAuthorized
+                | oppen_core::ledger::EventKind::SubmissionSigned
+                | oppen_core::ledger::EventKind::SubmissionAccepted
+        )));
+    }
+
+    async fn native_pilot_consent_case(confirm: bool, retain_sender: bool) {
+        use crate::pilot_consent::{Attestations, Control, Phase};
+        let (fixture, route, original_policy) = initial_consent_fixture();
+        let venue = LocalVenue::start_with_pending_handshake(true).await;
+        *venue.activation_wallet.lock().unwrap() = Some((
+            fixture.binding.account,
+            route.binding.wallet.address,
+            route.binding.wallet.valid_until_ms,
+        ));
+        let runtime = crate::runtime::Runtime::new(fixture.dir.path().to_owned());
+        drop(runtime.read_lease(Network::Testnet).unwrap());
+        assert!(runtime.pilot_consent_status().is_none());
+        let port = venue.port;
+        let retained_sender = Arc::new(Mutex::new(None));
+        let sender_slot = retained_sender.clone();
+        runtime
+            .launch_pilot_consent(
+                fixture.binding.agent.to_string(),
+                fixture.binding.account.to_string(),
+                move |dir, agent, account, ready| {
+                    Control::launch_with(
+                        dir,
+                        agent,
+                        account,
+                        Arc::new(FixtureKeys),
+                        oppen_hl::InfoClient::loopback_fixture(port).unwrap(),
+                        FixtureSource,
+                        move || {
+                            if retain_sender {
+                                let (pool, receiver, sender) =
+                                    WsPool::loopback_fixture_with_ingress(port)?;
+                                *sender_slot.lock().unwrap() = Some(sender);
+                                Ok((pool, receiver))
+                            } else {
+                                WsPool::loopback_fixture(port)
+                            }
+                        },
+                        ready,
+                    )
+                },
+            )
+            .unwrap();
+        let ready = consent_phase(&runtime, Phase::ReviewReady).await;
+        assert!(runtime.status().pilot_consent_owned);
+        assert!(
+            runtime
+                .launch_mcp(
+                    fixture.binding.agent.to_string(),
+                    fixture.binding.account.to_string(),
+                    |_, _, _, _| async { panic!("consent must exclude MCP construction") }
+                )
+                .is_err()
+        );
+        assert!(
+            runtime
+                .review_policy_setup(
+                    fixture.binding.agent.to_string(),
+                    fixture.binding.account.to_string(),
+                    crate::policy_setup::tests::edits(),
+                    true,
+                    true
+                )
+                .is_err()
+        );
+        assert!(
+            runtime
+                .review_pilot_consent(
+                    fixture.binding.agent.to_string(),
+                    fixture.binding.account.to_string()
+                )
+                .is_err()
+        );
+        let review = ready.review.unwrap();
+        assert_eq!(review.display.correlation.route, route);
+        assert_eq!(review.display.order_limit_usd.to_string(), "15");
+        assert_eq!(review.display.executed_limit_usd.to_string(), "150");
+        assert_eq!(review.display.realized_loss_limit_usd.to_string(), "5");
+        assert_eq!(review.display.gross_exposure_limit_usd.to_string(), "25");
+        assert_eq!(review.display.max_leverage, 1);
+        assert!(
+            runtime
+                .confirm_pilot_consent(
+                    "wrong-owner".into(),
+                    review.id.clone(),
+                    Attestations {
+                        typed_account: fixture.binding.account.to_string(),
+                        never_used_for_in_scope_trading: true,
+                        dedicated_account_exclusive_use: true,
+                        original_baseline_and_no_reset_confirmed: true,
+                    }
+                )
+                .is_err()
+        );
+        drop(
+            runtime
+                .confirm_pilot_consent(
+                    ready.owner_id.clone(),
+                    review.id.clone(),
+                    Attestations {
+                        typed_account: fixture.binding.account.to_string(),
+                        never_used_for_in_scope_trading: confirm,
+                        dedicated_account_exclusive_use: true,
+                        original_baseline_and_no_reset_confirmed: true,
+                    },
+                )
+                .unwrap(),
+        );
+        let final_status = consent_phase(
+            &runtime,
+            if retain_sender {
+                Phase::RecoveryRequired
+            } else if confirm {
+                Phase::Authorized
+            } else {
+                Phase::Refused
+            },
+        )
+        .await;
+        assert!(
+            runtime
+                .confirm_pilot_consent(
+                    ready.owner_id,
+                    review.id,
+                    Attestations {
+                        typed_account: fixture.binding.account.to_string(),
+                        never_used_for_in_scope_trading: true,
+                        dedicated_account_exclusive_use: true,
+                        original_baseline_and_no_reset_confirmed: true,
+                    }
+                )
+                .is_err()
+        );
+        if retain_sender {
+            assert!(runtime.status().pilot_consent_owned);
+            assert_eq!(final_status.operation_seq, 2);
+            assert!(matches!(
+                final_status.error,
+                Some(crate::pilot_consent::Error::Uncertain {
+                    correlation: Some(_),
+                    ..
+                })
+            ));
+            assert!(
+                runtime
+                    .reconcile_pilot_consent(final_status.owner_id.clone(), "1".into())
+                    .is_err()
+            );
+            drop(retained_sender.lock().unwrap().take());
+            assert!(runtime.shutdown().await.is_err());
+        } else {
+            runtime.shutdown().await.unwrap();
+        }
+        let posted = venue
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|request| request.path == "/exchange");
+        venue.shutdown().await;
+        assert!(!posted);
+        assert!(!runtime.status().pilot_consent_owned);
+        fixture.assert_pairing_owner_released();
+        let ledger = Arc::new(Ledger::open_existing(fixture.dir.path(), Network::Testnet).unwrap());
+        let registry = Arc::new(
+            RegistryJournal::open(ledger.clone(), Arc::new(HmacKey::from_bytes([11; 32]))).unwrap(),
+        );
+        assert_eq!(
+            serde_json::to_value(PolicyJournal::new(registry.clone()).current().unwrap()).unwrap(),
+            original_policy
+        );
+        let pilot = PilotJournal::new(registry)
+            .state(fixture.binding.account)
+            .unwrap();
+        let rows = ledger.get_events(0, 1000).unwrap().events;
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.kind == oppen_core::ledger::EventKind::PilotAuthorized)
+                .count(),
+            usize::from(confirm)
+        );
+        if confirm {
+            let receipt = final_status.receipt.unwrap();
+            assert_eq!(receipt.correlation, review.display.correlation);
+            let pilot = pilot.unwrap();
+            assert_eq!(pilot.executed_usd.to_string(), "0");
+            assert_eq!(pilot.reserved_usd.to_string(), "0");
+            assert_eq!(pilot.net_realized_pnl_usd.to_string(), "0");
+        } else {
+            assert!(pilot.is_none());
+        }
+        assert!(!rows.iter().any(|row| matches!(
+            row.kind,
+            oppen_core::ledger::EventKind::SubmissionSigned
+                | oppen_core::ledger::EventKind::SubmissionAccepted
+        )));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn native_pilot_consent_shutdown_retains_blocked_bootstrap_and_actual_pairing_owner() {
+        use crate::pilot_consent::Control;
+        let (fixture, _, _) = initial_consent_fixture();
+        let venue = LocalVenue::start_with_pending_handshake(true).await;
+        let (entered, entering) = oneshot::channel();
+        let (release, wait) = oneshot::channel();
+        let source = BlockedSource {
+            entered: Mutex::new(Some(entered)),
+            release: tokio::sync::Mutex::new(Some(wait)),
+            panic: false,
+        };
+        let runtime = crate::runtime::Runtime::new(fixture.dir.path().to_owned());
+        drop(runtime.read_lease(Network::Testnet).unwrap());
+        let port = venue.port;
+        runtime
+            .launch_pilot_consent(
+                fixture.binding.agent.to_string(),
+                fixture.binding.account.to_string(),
+                move |dir, agent, account, ready| {
+                    Control::launch_with(
+                        dir,
+                        agent,
+                        account,
+                        Arc::new(FixtureKeys),
+                        oppen_hl::InfoClient::loopback_fixture(port).unwrap(),
+                        source,
+                        move || WsPool::loopback_fixture(port),
+                        ready,
+                    )
+                },
+            )
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), entering)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), runtime.shutdown())
+                .await
+                .is_err()
+        );
+        assert!(runtime.status().pilot_consent_owned);
+        let ledger = Arc::new(Ledger::open_existing(fixture.dir.path(), Network::Testnet).unwrap());
+        assert!(
+            PairingJournal::open(ledger.clone(), Arc::new(HmacKey::from_bytes([11; 32]))).is_err()
+        );
+        release.send(()).unwrap();
+        runtime.shutdown().await.unwrap();
+        fixture.assert_pairing_owner_released();
+        assert!(!runtime.status().pilot_consent_owned);
+        assert!(
+            !venue
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|request| request.path == "/exchange")
+        );
+        venue.shutdown().await;
+        let registry = Arc::new(
+            RegistryJournal::open(ledger, Arc::new(HmacKey::from_bytes([11; 32]))).unwrap(),
+        );
+        assert!(
+            PilotJournal::new(registry)
+                .state(fixture.binding.account)
+                .unwrap()
+                .is_none()
+        );
+    }
+
     async fn rpc(
         address: &str,
         token: &str,

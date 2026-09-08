@@ -3,6 +3,14 @@
 use super::*;
 use crate::ledger::{AuthorizedRoute, RegistryJournal};
 
+#[path = "consent.rs"]
+mod consent;
+pub use consent::{
+    PilotConsentAttestation, PilotConsentCorrelation, PilotConsentCoverage, PilotConsentDisplay,
+    PilotConsentError, PilotConsentEvidence, PilotConsentObservation, PilotConsentOutcome,
+    PilotConsentReceipt, PilotConsentReview,
+};
+
 #[derive(Clone, Debug, Serialize)]
 pub struct LegacyPilotReview {
     authorization_seq: u64,
@@ -304,7 +312,21 @@ fn append(
     at_ms: u64,
     key: &str,
 ) -> Result<()> {
-    let (seq, prev_hash) = super::super::head(&tx)?;
+    let appended = append_in_tx(registry, &tx, route, operation, at_ms, key)?;
+    tx.commit()?;
+    registry.ledger().note_head(&appended)?;
+    Ok(())
+}
+
+fn append_in_tx(
+    registry: &RegistryJournal,
+    tx: &Transaction<'_>,
+    route: AuthorizedRoute,
+    operation: Operation,
+    at_ms: u64,
+    key: &str,
+) -> Result<Appended> {
+    let (seq, prev_hash) = super::super::head(tx)?;
     let route_hash = tx.query_row(
         "SELECT hash FROM events WHERE seq = ?1",
         params![route.binding_seq],
@@ -331,7 +353,7 @@ fn append(
         mac: hex::encode(mac),
     })?;
     let appended = super::super::append_keyed_in_tx(
-        &tx,
+        tx,
         &NewEvent {
             kind,
             ts_ms: at(at_ms)?,
@@ -342,9 +364,7 @@ fn append(
         key,
     )?
     .ok_or_else(|| unavailable("pilot consent key without verified transition"))?;
-    tx.commit()?;
-    registry.ledger().note_head(&appended)?;
-    Ok(())
+    Ok(appended)
 }
 
 fn publish(registry: &RegistryJournal, tx: Transaction<'_>) -> Result<()> {

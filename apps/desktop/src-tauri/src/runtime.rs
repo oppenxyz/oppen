@@ -570,6 +570,130 @@ mod tests {
             .expect("watch admission")
     }
 
+    #[tokio::test]
+    async fn pilot_consent_previous_feed_late_failure_poisons_runtime_before_releasing_slot() {
+        let runtime = runtime();
+        let (driver, mut events) = Driver::new();
+        let (release, wait) = mpsc::channel();
+        *driver.drain_gate.lock().unwrap() = Some(wait);
+        let account = oppen_hl::Address::from_bytes([7; 20]).to_string();
+        watch(&runtime, &driver, Network::Testnet, Some(&account), "BTC")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(event(&mut events).await, Event::Start(..)));
+        assert!(matches!(event(&mut events).await, Event::Watch(..)));
+        driver.fail_drain.store(true, Ordering::SeqCst);
+        runtime
+            .review_pilot_consent("fixture-agent".into(), account.clone())
+            .unwrap();
+        assert_eq!(event(&mut events).await, Event::Drain);
+        assert!(runtime.status().pilot_consent_owned);
+        assert!(
+            runtime
+                .launch_mcp(
+                    "fixture-agent".into(),
+                    account.clone(),
+                    |_, _, _, _| async { panic!("consent handoff still owns runtime") }
+                )
+                .is_err()
+        );
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while runtime.status().phase == RuntimePhase::Running {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("late feed failure must poison runtime without an explicit stop");
+        assert!(
+            runtime
+                .launch_mcp(
+                    "fixture-agent".into(),
+                    account.clone(),
+                    |_, _, _, _| async {
+                        panic!("late failure must fence admission before explicit shutdown")
+                    }
+                )
+                .is_err()
+        );
+        let result = tokio::time::timeout(Duration::from_secs(5), runtime.shutdown())
+            .await
+            .unwrap();
+        assert!(
+            matches!(result, Err(RuntimeError::Failed(ref detail)) if detail.contains("controlled consumer failure")),
+            "{result:?}"
+        );
+        assert_eq!(runtime.status().phase, RuntimePhase::StoppedWithError);
+        assert!(
+            runtime
+                .launch_mcp(
+                    "fixture-agent".into(),
+                    account.clone(),
+                    |_, _, _, _| async { panic!("failed handoff must remain closed") }
+                )
+                .is_err()
+        );
+        assert!(
+            runtime
+                .review_policy_setup(
+                    "fixture-agent".into(),
+                    account.clone(),
+                    crate::policy_setup::tests::edits(),
+                    true,
+                    true
+                )
+                .is_err()
+        );
+        assert!(
+            runtime
+                .review_pilot_consent("fixture-agent".into(), account)
+                .is_err()
+        );
+        assert!(!runtime.status().pilot_consent_owned);
+    }
+
+    #[tokio::test]
+    async fn pilot_consent_previous_setup_join_failure_remains_terminal() {
+        let runtime = setup_runtime();
+        runtime.control().setup_worker = Some(tauri::async_runtime::spawn(async {
+            panic!("synthetic prior setup worker panic");
+        }));
+        let account = oppen_hl::Address::from_bytes([7; 20]).to_string();
+        runtime
+            .review_pilot_consent("fixture-agent".into(), account.clone())
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while runtime.status().phase == RuntimePhase::Running {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            runtime
+                .launch_mcp(
+                    "fixture-agent".into(),
+                    account.clone(),
+                    |_, _, _, _| async { panic!("prior owner panic must fence MCP") }
+                )
+                .is_err()
+        );
+        let result = tokio::time::timeout(Duration::from_secs(5), runtime.shutdown())
+            .await
+            .unwrap();
+        assert!(
+            matches!(result, Err(RuntimeError::Failed(ref detail)) if detail.contains("consent prior setup worker")),
+            "{result:?}"
+        );
+        assert_eq!(runtime.status().phase, RuntimePhase::StoppedWithError);
+        assert!(
+            runtime
+                .review_pilot_consent("fixture-agent".into(), account)
+                .is_err()
+        );
+    }
+
     async fn event(events: &mut UnboundedReceiver<Event>) -> Event {
         tokio::time::timeout(Duration::from_secs(3), events.recv())
             .await
@@ -1121,6 +1245,7 @@ pub(crate) struct RuntimeStatus {
     pub phase: RuntimePhase,
     pub binding: Option<FeedBinding>,
     pub detail: Option<String>,
+    pub pilot_consent_owned: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1240,6 +1365,7 @@ struct Control {
     setup_review: Option<PreparedReview>,
     setup_worker: Option<tauri::async_runtime::JoinHandle<()>>,
     setup_serial: u64,
+    pilot_consent: Option<Arc<crate::pilot_consent::Control>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1250,6 +1376,13 @@ enum TerminalMode {
 
 impl Control {
     fn setup_busy(&self) -> bool {
+        if self
+            .pilot_consent
+            .as_ref()
+            .is_some_and(|owner| owner.owned())
+        {
+            return true;
+        }
         matches!(
             self.setup.phase,
             SetupPhase::Reviewing
@@ -1342,6 +1475,7 @@ impl Runtime {
                 setup_review: None,
                 setup_worker: None,
                 setup_serial: 0,
+                pilot_consent: None,
             }),
             feed: AsyncMutex::new(None),
             changed: Notify::new(),
@@ -1369,6 +1503,143 @@ impl Runtime {
     /// Cached only; polling never opens the ledger or loads credentials.
     pub(crate) fn policy_setup_status(&self) -> SetupStatus {
         self.control().setup.clone()
+    }
+
+    pub(crate) fn pilot_consent_status(&self) -> Option<crate::pilot_consent::Status> {
+        self.control()
+            .pilot_consent
+            .as_ref()
+            .map(|owner| owner.snapshot())
+    }
+
+    pub(crate) fn review_pilot_consent(
+        &self,
+        agent: String,
+        account: String,
+    ) -> Result<crate::pilot_consent::Status, crate::pilot_consent::Error> {
+        self.launch_pilot_consent(agent, account, crate::pilot_consent::Control::launch)
+    }
+
+    pub(crate) fn launch_pilot_consent<F>(
+        &self,
+        agent: String,
+        account: String,
+        launch: F,
+    ) -> Result<crate::pilot_consent::Status, crate::pilot_consent::Error>
+    where
+        F: FnOnce(
+            PathBuf,
+            AgentId,
+            oppen_hl::Address,
+            oneshot::Receiver<Result<(), String>>,
+        )
+            -> Result<Arc<crate::pilot_consent::Control>, crate::pilot_consent::Error>,
+    {
+        use crate::pilot_consent::Error;
+        let refused = |detail: String| Error::Refused { detail };
+        let account = account
+            .parse::<oppen_hl::Address>()
+            .map_err(|e| refused(e.to_string()))?;
+        if account == oppen_hl::Address::ZERO
+            || agent.is_empty()
+            || agent.len() > 64
+            || !agent
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+        {
+            return Err(refused(
+                "valid agent and full nonzero account required".into(),
+            ));
+        }
+        self.status();
+        let mut control = self.control();
+        Self::setup_admit(&control).map_err(|e| refused(e.detail))?;
+        if control.setup_busy() {
+            return Err(refused("another setup owner remains active".into()));
+        }
+        if control.selection.as_ref().is_some_and(|selection| {
+            selection.network != Network::Testnet
+                || selection
+                    .account
+                    .as_deref()
+                    .and_then(|value| value.parse().ok())
+                    != Some(account)
+        }) {
+            return Err(refused(
+                "consent account differs from selected context".into(),
+            ));
+        }
+        let (ready, waiting) = oneshot::channel();
+        let owner = launch(
+            self.0.data_dir.clone(),
+            AgentId::new(agent),
+            account,
+            waiting,
+        )?;
+        let status = owner.snapshot();
+        control.pilot_consent = Some(owner);
+        control.binding = None;
+        let previous = control.setup_worker.take();
+        let runtime = self.clone();
+        control.setup_worker = Some(tauri::async_runtime::spawn(async move {
+            if let Some(previous) = previous
+                && let Err(error) = previous.await
+            {
+                runtime.fail(format!("consent prior setup worker: {error}"));
+                let _ = ready.send(Err(error.to_string()));
+                return;
+            }
+            let mut feed = runtime.0.feed.lock().await;
+            let result = match feed.as_mut() {
+                Some(feed) => feed.shutdown_and_drain().await,
+                None => Ok(()),
+            };
+            *feed = None;
+            drop(feed);
+            if let Err(detail) = &result {
+                runtime.fail(format!("consent previous feed drain: {detail}"));
+            }
+            let _ = ready.send(result);
+        }));
+        Ok(status)
+    }
+
+    fn consent_owner(
+        &self,
+    ) -> Result<Arc<crate::pilot_consent::Control>, crate::pilot_consent::Error> {
+        let control = self.control();
+        Self::setup_admit(&control)
+            .map_err(|e| crate::pilot_consent::Error::Refused { detail: e.detail })?;
+        control
+            .pilot_consent
+            .clone()
+            .ok_or_else(|| crate::pilot_consent::Error::Refused {
+                detail: "no retained consent owner".into(),
+            })
+    }
+
+    pub(crate) fn confirm_pilot_consent(
+        &self,
+        owner_id: String,
+        review_id: String,
+        attestations: crate::pilot_consent::Attestations,
+    ) -> Result<crate::pilot_consent::Status, crate::pilot_consent::Error> {
+        self.consent_owner()?
+            .confirm(&owner_id, &review_id, attestations)
+    }
+    pub(crate) fn discard_pilot_consent(
+        &self,
+        owner_id: String,
+        review_id: String,
+    ) -> Result<crate::pilot_consent::Status, crate::pilot_consent::Error> {
+        self.consent_owner()?.discard(&owner_id, &review_id)
+    }
+    pub(crate) fn reconcile_pilot_consent(
+        &self,
+        owner_id: String,
+        review_id: String,
+    ) -> Result<crate::pilot_consent::Status, crate::pilot_consent::Error> {
+        self.consent_owner()?.reconcile(&owner_id, &review_id)
     }
 
     pub(crate) fn review_policy_setup(
@@ -1645,6 +1916,10 @@ impl Runtime {
             phase: control.phase,
             binding: control.binding.clone(),
             detail: control.detail.clone(),
+            pilot_consent_owned: control
+                .pilot_consent
+                .as_ref()
+                .is_some_and(|owner| owner.owned()),
         }
     }
 
@@ -2404,6 +2679,10 @@ impl Runtime {
         let mcp_worker = control.mcp_worker.take();
         let setup_worker = control.setup_worker.take();
         let setup_review = control.setup_review.take();
+        let consent = control.pilot_consent.clone();
+        if let Some(owner) = &consent {
+            owner.close();
+        }
         if !matches!(
             control.setup.phase,
             SetupPhase::Reviewing | SetupPhase::Persisting
@@ -2412,6 +2691,11 @@ impl Runtime {
         }
         let runtime = self.clone();
         control.drain = Some(tauri::async_runtime::spawn(async move {
+            if let Some(owner) = consent
+                && let Err(error) = owner.close_and_drain().await
+            {
+                runtime.fail(error);
+            }
             if let Err(error) =
                 tauri::async_runtime::spawn_blocking(move || drop(setup_review)).await
             {

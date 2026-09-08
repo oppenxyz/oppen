@@ -6,6 +6,7 @@ export { fetchPolicySetupStatus, reviewPolicySetup, persistPolicySetup, discardP
 export { fetchApprovalQueueStatus, refreshApprovalQueue, rejectApprovalProposal, prepareApprovalReview, confirmApprovalReview, discardApprovalReview } from "./approvals";
 export { fetchActivationStatus, reviewActivation, confirmActivation, discardActivation } from "./activation";
 export { fetchKillReleaseStatus, reviewKillRelease, confirmKillRelease, discardKillRelease, reconcileKillRelease } from "./release";
+export { fetchPilotConsentStatus, reviewPilotConsent, confirmPilotConsent, discardPilotConsent, reconcilePilotConsent } from "./pilot-consent";
 import { connectReleaseFixture } from "./release";
 import { connectActivationFixture } from "./activation";
 export let failedRead = false;

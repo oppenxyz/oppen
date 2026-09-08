@@ -166,6 +166,7 @@ impl<'a, S: ReconcileSource, F: FeedSubscriber> FeedPump<'a, S, F> {
     ) -> Result<Self, ReconcileError> {
         let reconciler = Reconciler::new(ledger, source)?;
         session.bind(ledger.network(), account)?;
+        session.bind_ledger(ledger)?;
         Ok(FeedPump {
             session,
             ledger,
@@ -543,6 +544,9 @@ impl<'a, S: ReconcileSource, F: FeedSubscriber> FeedPump<'a, S, F> {
 
         let mut outstanding = 0usize;
         for outcome in &outcomes {
+            if let Some(receipt) = &outcome.fill_walk {
+                self.session.record_fill_walk(&stamp, receipt.clone());
+            }
             match &outcome.status {
                 // Closed, or not this component's to close: `reconcile.rs`
                 // leaves a market-data window for whoever owns candle
@@ -746,6 +750,7 @@ mod tests {
         fills: Arc<Mutex<Vec<Fill>>>,
         refusing: Arc<AtomicBool>,
         walks: Arc<AtomicUsize>,
+        refusing_orders: Arc<AtomicBool>,
     }
 
     impl Controls {
@@ -754,6 +759,7 @@ mod tests {
                 fills: Arc::new(Mutex::new(Vec::new())),
                 refusing: Arc::new(AtomicBool::new(refusing)),
                 walks: Arc::new(AtomicUsize::new(0)),
+                refusing_orders: Arc::new(AtomicBool::new(false)),
             }
         }
 
@@ -838,7 +844,7 @@ mod tests {
             &self,
             _user: Address,
         ) -> std::result::Result<Vec<OpenOrder>, oppen_hl::Error> {
-            if self.refused() {
+            if self.refused() || self.controls.refusing_orders.load(Ordering::SeqCst) {
                 return Err(unavailable());
             }
             Ok(Vec::new())
@@ -950,6 +956,56 @@ mod tests {
             false,
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn initial_fill_receipt_survives_other_gap_retry_but_not_monitor_replacement() {
+        let dir = TempDir::new().unwrap();
+        let ledger = ledger(&dir);
+        let session = FeedSession::new();
+        let alerts = alerts();
+        let quotes = QuoteCache::new();
+        let feeds = Feeds::default();
+        let controls = Controls::new(false);
+        controls.refusing_orders.store(true, Ordering::SeqCst);
+        let pump = FeedPump::new(
+            &session,
+            &ledger,
+            account(),
+            FakeVenue::refusing(controls.clone()),
+            &alerts,
+            &quotes,
+            &feeds,
+        )
+        .unwrap();
+        let mut ingress = crate::feed::test_ingress(&session);
+        pump.catch_up().await;
+        assert!(!session.state().reconciled);
+        let receipt = session.lock().initial_fill_walk.clone().unwrap();
+        assert!(receipt.initial_window);
+        assert!(receipt.terminated_by_short_page);
+        assert_eq!(receipt.requested_end_ms, None);
+        assert_eq!(receipt.pages, 1);
+        assert_eq!(controls.walks(), 1);
+        controls.refusing_orders.store(false, Ordering::SeqCst);
+        pump.reconcile().await;
+        assert!(session.state().reconciled);
+        assert_eq!(
+            controls.walks(),
+            1,
+            "healed fills gap is no longer on retry work list"
+        );
+        assert_eq!(session.lock().initial_fill_walk.as_ref(), Some(&receipt));
+        ingress.sender.take();
+        let mut receiver = ingress.receiver.take().unwrap();
+        assert!(receiver.recv().await.is_none());
+        receiver.complete().unwrap();
+        let _replacement = crate::feed::test_ingress(&session);
+        assert!(session.lock().initial_fill_walk.is_none());
+        let stale = session.stamp();
+        session.unreconciled();
+        session.record_fill_walk(&stale, receipt);
+        assert!(session.lock().initial_fill_walk.is_none());
     }
 
     #[tokio::test]

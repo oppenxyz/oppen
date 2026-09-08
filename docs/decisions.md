@@ -1388,7 +1388,14 @@ the depth measurement problem in §14, and whether the sub-account owner rule
 | ID | Decision | Rationale |
 |---|---|---|
 | ES38 | Add an explicit, reviewed TESTNET kill-release ceremony after ES37, separate from activation and initial consent. | Bind exact scope, policy/stop generation, affected authority and pilot evidence under core coordination; preserve permanent stops and budgets, keep acknowledgment absent, and safely re-arm subsequent HALT. See [operator-kill-release.md](specs/operator-kill-release.md). Locally implemented and independently reviewed; remote CI, installed-artifact and live acceptance remain pending. |
-| ES39 | Add reviewed initial TESTNET pilot consent before MCP startup, with no reset or implicit activation. | Bind displayed identity, route, paused policy, checkpoint and fresh account evidence in the consent transaction. Existing consent is inspect-only; prior execution or incomplete accounting requires preservation, not a fresh zero baseline. Reuse the existing signed consent record and retained setup ownership. See [operator-pilot-consent.md](specs/operator-pilot-consent.md). Contract only, not implemented or live-authorized. |
+| ES39 | Add reviewed initial TESTNET pilot consent before MCP startup, with no reset or implicit activation. | Bind displayed identity, route, paused policy, checkpoint and fresh account evidence in the consent transaction. Existing consent is inspect-only; prior execution or incomplete accounting requires preservation, not a fresh zero baseline. Reuse the existing signed consent record and retained setup ownership. See [operator-pilot-consent.md](specs/operator-pilot-consent.md). Implemented locally with synthetic validation and independent working-tree review; exact-head, remote CI, installed-artifact and live gates remain separate. |
+
+ES39 native tests reuse the already-locked `tokio-tungstenite` 0.24 as a dev-only
+dependency, enabling only handshake support. A real loopback WebSocket fixture
+proves quiet-account human-delay confirmation through the actual pool and pump;
+manual frame-protocol code and manual freshness ticks were rejected because
+they would not establish that transport and admission boundary. This adds no
+production dependency or new dependency version.
 
 ### Numeric change cue
 
