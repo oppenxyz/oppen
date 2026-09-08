@@ -9,6 +9,7 @@
 mod feed;
 mod local_reads;
 mod mcp_runtime;
+mod operator_halt;
 mod runtime;
 mod updates;
 
@@ -37,6 +38,8 @@ enum ConsoleError {
     Venue(String),
     /// Local pilot evidence could not be verified. Independent of venue health.
     LocalStatus(String),
+    /// The halt was refused before any operator mutation was admitted.
+    HaltNotAdmitted(String),
 }
 
 impl std::fmt::Display for ConsoleError {
@@ -44,7 +47,8 @@ impl std::fmt::Display for ConsoleError {
         match self {
             ConsoleError::NotConfigured(detail)
             | ConsoleError::Venue(detail)
-            | ConsoleError::LocalStatus(detail) => {
+            | ConsoleError::LocalStatus(detail)
+            | ConsoleError::HaltNotAdmitted(detail) => {
                 write!(f, "{detail}")
             }
         }
@@ -404,6 +408,17 @@ async fn start_mcp(
 }
 
 #[tauri::command]
+fn halt_mcp(
+    runtime: State<'_, Runtime>,
+    agent: String,
+    account: String,
+) -> Result<mcp_runtime::McpStatus, ConsoleError> {
+    runtime
+        .halt_mcp(agent, account)
+        .map_err(|error| ConsoleError::HaltNotAdmitted(error.to_string()))
+}
+
+#[tauri::command]
 async fn stop_mcp(runtime: State<'_, Runtime>) -> Result<RuntimeStatus, ConsoleError> {
     runtime.shutdown().await?;
     Ok(runtime.status())
@@ -439,6 +454,7 @@ pub fn run() {
             mcp_status,
             start_mcp,
             stop_mcp,
+            halt_mcp,
             updates::check_update,
             updates::download_update,
             updates::install_update
@@ -466,6 +482,47 @@ pub fn run() {
                 }
             }
         });
+}
+
+#[cfg(test)]
+mod halt_command_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn halt_admission_errors_are_typed_and_never_request_a_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = Runtime::new(dir.path().to_owned());
+        let app = tauri::test::mock_app();
+        app.manage(runtime.clone());
+        for account in ["invalid", "0x1111111111111111111111111111111111111111"] {
+            let error = halt_mcp(app.state(), "fixture-agent".into(), account.into()).unwrap_err();
+            assert!(matches!(error, ConsoleError::HaltNotAdmitted(_)));
+            let detail = error.to_string();
+            assert_eq!(
+                serde_json::to_value(error).unwrap(),
+                serde_json::json!({
+                    "kind": "halt_not_admitted", "detail": detail,
+                })
+            );
+            let halt = runtime.mcp_status().halt;
+            assert_eq!(halt.phase, operator_halt::HaltPhase::Idle);
+            assert_eq!(halt.requested_at_ms, None);
+        }
+        runtime.shutdown().await.unwrap();
+        let error = halt_mcp(
+            app.state(),
+            "fixture-agent".into(),
+            "0x1111111111111111111111111111111111111111".into(),
+        )
+        .unwrap_err();
+        assert!(matches!(error, ConsoleError::HaltNotAdmitted(_)));
+        assert_eq!(runtime.mcp_status().halt.requested_at_ms, None);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        assert!(matches!(
+            ConsoleError::from(RuntimeError::Busy),
+            ConsoleError::LocalStatus(_)
+        ));
+    }
 }
 
 #[cfg(test)]

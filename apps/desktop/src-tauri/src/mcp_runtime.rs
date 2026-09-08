@@ -24,6 +24,8 @@ use serde::Serialize;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
+use crate::operator_halt::{HaltControl, HaltStatus};
+
 const PORT: u16 = 7433;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -50,6 +52,7 @@ pub(crate) struct McpStatus {
     pub supervision_in_progress: bool,
     pub supervision_error: Option<String>,
     pub orders_inhibited: bool,
+    pub halt: HaltStatus,
     pub detail: Option<String>,
 }
 
@@ -67,6 +70,7 @@ impl McpStatus {
             supervision_in_progress: false,
             supervision_error: None,
             orders_inhibited: true,
+            halt: HaltStatus::default(),
             detail: None,
         }
     }
@@ -95,7 +99,6 @@ struct Prepared {
     feed: Arc<FeedSession>,
     alerts: Arc<AlertStore>,
     quotes: Arc<QuoteCache>,
-    #[cfg(test)]
     engine: Arc<GuardrailEngine>,
 }
 
@@ -180,7 +183,6 @@ impl Prepared {
             feed,
             alerts,
             quotes,
-            #[cfg(test)]
             engine,
         })
     }
@@ -191,6 +193,7 @@ pub(crate) struct OwnedMcp {
     stop: CancellationToken,
     task: Option<tauri::async_runtime::JoinHandle<Result<(), String>>>,
     completed: Option<Result<(), String>>,
+    halt: Option<Arc<HaltControl>>,
 }
 
 impl Drop for OwnedMcp {
@@ -222,6 +225,7 @@ impl OwnedMcp {
                 stop,
                 task: None,
                 completed: Some(Ok(())),
+                halt: None,
             });
         }
         let source = VenueSource::new(Network::Testnet).map_err(|error| error.to_string())?;
@@ -287,11 +291,20 @@ impl OwnedMcp {
             stop,
             task: Some(task),
             completed: None,
+            halt: None,
         };
-        if observing.await.is_err() {
-            owned.shutdown_and_drain().await?;
+        match observing.await {
+            Ok(halt) => owned.halt = Some(halt),
+            Err(_) => owned.shutdown_and_drain().await?,
         }
         Ok(owned)
+    }
+
+    pub(crate) fn request_halt(&self, binding: &Binding) -> Result<(), String> {
+        self.halt
+            .as_ref()
+            .ok_or("MCP supervisor is not available")?
+            .request(binding)
     }
 
     pub(crate) async fn shutdown_and_drain(&mut self) -> Result<(), String> {
@@ -307,6 +320,7 @@ impl OwnedMcp {
             None => Ok(()),
         };
         self.task = None;
+        self.halt = None;
         self.completed = Some(result.clone());
         result
     }
@@ -319,7 +333,7 @@ async fn run<S, F>(
     pool: F,
     status: SharedStatus,
     stop: CancellationToken,
-    ready: oneshot::Sender<()>,
+    ready: oneshot::Sender<Arc<HaltControl>>,
 ) -> Result<(), String>
 where
     S: ReconcileSource + Send + 'static,
@@ -336,6 +350,13 @@ where
     }
     let address = bound.local_addr();
     let supervision = bound.supervision_status();
+    let halt = HaltControl::new(
+        prepared.engine.clone(),
+        prepared.binding.clone(),
+        prepared.pairings.clone(),
+        bound.supervision_control(),
+        status.clone(),
+    );
     let (pool, mut events) = pool().map_err(|error| error.to_string())?;
     let pool = Arc::new(pool);
     let (pump_stop, stopping) = oneshot::channel();
@@ -404,6 +425,7 @@ where
         let observed_feed = prepared.feed.clone();
         let observed_pool = pool.clone();
         let observed_status = status.clone();
+        let observed_halt = halt.clone();
         // Monitoring can fail independently. The parent keeps every actual
         // task handle and still drains them if this observer panics.
         let monitor = tauri::async_runtime::spawn(async move {
@@ -414,6 +436,7 @@ where
                     () = stop.cancelled() => return None,
                     _ = refresh.tick() => {
                         let sweep = supervision.borrow().clone();
+                        observed_halt.observe(&sweep);
                         let feed = observed_feed.state();
                         let fresh = observed_pool.stale_feeds(&[
                             Subscription::UserFills { user: account },
@@ -435,13 +458,18 @@ where
                 }
             }
         });
-        let _ = ready.send(());
+        let _ = ready.send(halt.clone());
         failure = match monitor.await {
             Ok(failure) => failure,
             Err(error) => Some(format!("MCP monitor task: {error}")),
         };
     }
     status_lock(&status).phase = McpPhase::Stopping;
+    // Keep the existing cancellation supervisor alive through every admitted
+    // mutation and its first subsequent sweep attempt, even after IPC drop.
+    if let Err(error) = halt.close_and_drain().await {
+        failure.get_or_insert(error);
+    }
     server_stop.cancel();
     if let Some(server) = server {
         match server.await {
@@ -454,6 +482,7 @@ where
             }
         }
     }
+    halt.supervision_ended();
     let (acknowledge, acknowledged) = oneshot::channel();
     if quiesce.send(acknowledge).is_err() {
         failure.get_or_insert("MCP pump ended before quiescence".into());
@@ -482,6 +511,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::operator_halt::{CancellationPhase, HaltPhase};
     use oppen_core::guardrail::{AgentGuardrails, AgentId, LegacyPolicyReview, PersistedState};
     use oppen_core::keys::{AgentWallet, EntryName, HmacKey, KeyStoreError, SecretText};
     use oppen_core::ledger::{RegistryBinding, now_ms};
@@ -744,17 +774,54 @@ mod tests {
             socket.read_line(&mut line).await.unwrap();
             let status = line.split_whitespace().nth(1).unwrap().parse::<u16>().unwrap();
             let mut session = None;
+            let mut chunked = false;
             loop {
                 line.clear();
                 assert!(socket.read_line(&mut line).await.unwrap() > 0);
                 if line == "\r\n" { break; }
                 let (name, value) = line.split_once(':').unwrap();
                 if name.eq_ignore_ascii_case("mcp-session-id") { session = Some(value.trim().to_owned()); }
+                if name.eq_ignore_ascii_case("transfer-encoding") {
+                    chunked = value.split(',').any(|encoding| encoding.trim().eq_ignore_ascii_case("chunked"));
+                }
             }
-            let mut body = String::new();
-            socket.read_to_string(&mut body).await.unwrap();
-            (status, session, body)
+            let mut body = Vec::new();
+            socket.read_to_end(&mut body).await.unwrap();
+            (status, session, decode_rpc_body(&body, chunked))
         }).await.expect("bounded loopback MCP response")
+    }
+
+    fn decode_rpc_body(mut bytes: &[u8], chunked: bool) -> String {
+        if !chunked {
+            return String::from_utf8(bytes.to_vec()).unwrap();
+        }
+        let mut body = Vec::new();
+        loop {
+            let end = bytes.windows(2).position(|pair| pair == b"\r\n").unwrap();
+            let header = std::str::from_utf8(&bytes[..end]).unwrap();
+            let size = usize::from_str_radix(header.split(';').next().unwrap(), 16).unwrap();
+            bytes = &bytes[end + 2..];
+            if size == 0 {
+                return String::from_utf8(body).unwrap();
+            }
+            body.extend_from_slice(&bytes[..size]);
+            assert_eq!(&bytes[size..size + 2], b"\r\n");
+            bytes = &bytes[size + 2..];
+        }
+    }
+
+    #[test]
+    fn rpc_body_decodes_chunks_inside_an_sse_json_line() {
+        let body = b"data: {\"result\":true}\n\n";
+        let mut wire = Vec::new();
+        for chunk in body.chunks(3) {
+            wire.extend_from_slice(format!("{:x}\r\n", chunk.len()).as_bytes());
+            wire.extend_from_slice(chunk);
+            wire.extend_from_slice(b"\r\n");
+        }
+        wire.extend_from_slice(b"0\r\n\r\n");
+        assert_eq!(rpc_reply(&decode_rpc_body(&wire, true))["result"], true);
+        assert_eq!(decode_rpc_body(body, false).as_bytes(), body);
     }
 
     fn rpc_reply(bytes: &str) -> serde_json::Value {
@@ -1089,6 +1156,49 @@ mod tests {
         })
         .await
         .unwrap();
+        // Admission is independent of the command observer. The same running
+        // engine must persist the exact scope before the real MCP refusal.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match runtime.halt_mcp(
+                    fixture.binding.agent.to_string(),
+                    fixture.binding.account.to_string(),
+                ) {
+                    Ok(admitted) => {
+                        assert!(matches!(
+                            admitted.halt.phase,
+                            HaltPhase::Persisting | HaltPhase::Persisted
+                        ));
+                        break;
+                    }
+                    Err(crate::runtime::RuntimeError::Busy) => tokio::task::yield_now().await,
+                    Err(error) => panic!("halt admission: {error}"),
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let halted = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let status = runtime.mcp_status();
+                if status.halt.cancellation == CancellationPhase::Acknowledged {
+                    break status;
+                }
+                assert_ne!(status.halt.phase, HaltPhase::Uncertain, "{status:?}");
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(halted.halt.phase, HaltPhase::Persisted);
+        assert_eq!(halted.halt.durable_revision, None);
+        let duplicate = runtime
+            .halt_mcp(
+                fixture.binding.agent.to_string(),
+                fixture.binding.account.to_string(),
+            )
+            .unwrap();
+        assert_eq!(duplicate.halt.requested_at_ms, halted.halt.requested_at_ms);
         let token = fixture.token.as_deref().unwrap();
         let (code, session, body) = rpc(&address, token, None, serde_json::json!({
             "jsonrpc":"2.0", "id":1, "method":"initialize",
@@ -1189,8 +1299,478 @@ mod tests {
         assert_eq!(runtime.mcp_status().phase, McpPhase::Stopped);
         assert!(TcpStream::connect(&address).await.is_err());
         drop(evidence);
-        fixture.prepare().unwrap();
+        let reopened = fixture.prepare().unwrap();
+        let kill = serde_json::to_value(reopened.engine.kill_switch()).unwrap();
+        assert_eq!(
+            kill["agents"][fixture.binding.agent.as_str()]["reason"]["reason"],
+            "operator"
+        );
+        assert_eq!(
+            kill["agents"][fixture.binding.agent.as_str()]["engaged_at_ms"],
+            halted.halt.requested_at_ms.unwrap()
+        );
+        assert!(reopened.engine.cancellation_needed(&fixture.binding.agent));
+        drop(reopened);
         venue.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn halt_stop_retains_blocked_mutation_and_rejects_foreign_scope() {
+        let fixture = Fixture::authorized();
+        let runtime = crate::runtime::Runtime::new(fixture.dir.path().to_owned());
+        assert!(
+            runtime
+                .halt_mcp(
+                    fixture.binding.agent.to_string(),
+                    fixture.binding.account.to_string()
+                )
+                .is_err()
+        );
+        let venue = LocalVenue::start().await;
+        let mut prepared = fixture.prepare().unwrap();
+        let engine = prepared.engine.clone();
+        prepared.gateway = prepared.gateway.with_loopback_fixture(venue.port).unwrap();
+        let port = venue.port;
+        runtime
+            .launch_mcp(
+                fixture.binding.agent.to_string(),
+                fixture.binding.account.to_string(),
+                move |_, _, status, stop| async move {
+                    OwnedMcp::launch(
+                        prepared,
+                        0,
+                        FixtureSource,
+                        move || WsPool::loopback_fixture(port),
+                        status,
+                        stop,
+                    )
+                    .await
+                },
+            )
+            .unwrap()
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            runtime
+                .halt_mcp("foreign-agent".into(), fixture.binding.account.to_string())
+                .is_err()
+        );
+        assert!(
+            runtime
+                .halt_mcp(
+                    fixture.binding.agent.to_string(),
+                    Address::from_bytes([8; 20]).to_string()
+                )
+                .is_err()
+        );
+        assert_eq!(runtime.mcp_status().halt.phase, HaltPhase::Idle);
+        let mut path = fixture
+            .dir
+            .path()
+            .join(oppen_core::db_file_name(Network::Testnet))
+            .into_os_string();
+        path.push(".lock");
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        lock.lock().unwrap();
+        let admitted = runtime
+            .halt_mcp(
+                fixture.binding.agent.to_string(),
+                fixture.binding.account.to_string(),
+            )
+            .unwrap();
+        assert_eq!(admitted.halt.phase, HaltPhase::Persisting);
+        drop(admitted);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let kill = serde_json::to_value(engine.kill_switch()).unwrap();
+                if kill["agents"].get(fixture.binding.agent.as_str()).is_some() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), runtime.shutdown())
+                .await
+                .is_err()
+        );
+        assert_eq!(runtime.mcp_status().halt.phase, HaltPhase::Persisting);
+        assert!(
+            runtime
+                .halt_mcp(
+                    fixture.binding.agent.to_string(),
+                    fixture.binding.account.to_string()
+                )
+                .is_err()
+        );
+        lock.unlock().unwrap();
+        tokio::time::timeout(Duration::from_secs(10), runtime.shutdown())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            runtime.mcp_status().halt.cancellation,
+            CancellationPhase::Acknowledged
+        );
+        assert_eq!(runtime.mcp_status().phase, McpPhase::Stopped);
+        // Refresh cannot erase the per-agent emergency overlay.
+        engine.policy_observation().unwrap();
+        let kill = serde_json::to_value(engine.kill_switch()).unwrap();
+        assert!(kill["agents"].get(fixture.binding.agent.as_str()).is_some());
+        drop(engine);
+        fixture.assert_pairing_owner_released();
+        venue.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn halt_failed_sweep_retries_on_existing_supervisor_without_another_mutation() {
+        let fixture = Fixture::authorized();
+        let venue = LocalVenue::start().await;
+        let mut prepared = fixture.prepare().unwrap();
+        let pairings = prepared.pairings.clone();
+        let engine = prepared.engine.clone();
+        prepared.gateway = prepared.gateway.with_loopback_fixture(venue.port).unwrap();
+        let runtime = crate::runtime::Runtime::new(fixture.dir.path().to_owned());
+        let port = venue.port;
+        runtime
+            .launch_mcp(
+                fixture.binding.agent.to_string(),
+                fixture.binding.account.to_string(),
+                move |_, _, status, stop| async move {
+                    OwnedMcp::launch(
+                        prepared,
+                        0,
+                        FixtureSource,
+                        move || WsPool::loopback_fixture(port),
+                        status,
+                        stop,
+                    )
+                    .await
+                },
+            )
+            .unwrap()
+            .await
+            .unwrap()
+            .unwrap();
+        // The real sweep cannot acquire a binding snapshot. Its completed error
+        // must not be mistaken for target cancellation acknowledgments.
+        let (holding, held) = oneshot::channel();
+        let (release, releasing) = std::sync::mpsc::channel();
+        let locked_pairings = pairings.clone();
+        let holder = tokio::task::spawn_blocking(move || {
+            let _held = locked_pairings.write().unwrap();
+            holding.send(()).unwrap();
+            let _ = releasing.recv();
+        });
+        held.await.unwrap();
+        runtime
+            .halt_mcp(
+                fixture.binding.agent.to_string(),
+                fixture.binding.account.to_string(),
+            )
+            .unwrap();
+        let retrying = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let status = runtime.mcp_status();
+                assert_ne!(status.halt.cancellation, CancellationPhase::Acknowledged);
+                if status.halt.cancellation == CancellationPhase::Retrying {
+                    break status;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(retrying.halt.phase, HaltPhase::Persisted);
+        assert!(retrying.halt.cancellation_error.is_some());
+        let revision = engine.policy_status().cached_revision;
+        release.send(()).unwrap();
+        holder.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if runtime.mcp_status().halt.cancellation == CancellationPhase::Acknowledged {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(engine.policy_status().cached_revision, revision);
+        assert_eq!(
+            runtime.mcp_status().halt.requested_at_ms,
+            retrying.halt.requested_at_ms
+        );
+        runtime.shutdown().await.unwrap();
+        drop(engine);
+        drop(pairings);
+        fixture.assert_pairing_owner_released();
+        venue.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn halt_after_registry_regrant_persists_agent_stop_without_canceling_replacement() {
+        let fixture = Fixture::authorized();
+        let venue = LocalVenue::start().await;
+        let mut prepared = fixture.prepare().unwrap();
+        let ledger = prepared.ledger.clone();
+        let engine = prepared.engine.clone();
+        prepared.gateway = prepared.gateway.with_loopback_fixture(venue.port).unwrap();
+        let runtime = crate::runtime::Runtime::new(fixture.dir.path().to_owned());
+        let port = venue.port;
+        runtime
+            .launch_mcp(
+                fixture.binding.agent.to_string(),
+                fixture.binding.account.to_string(),
+                move |_, _, status, stop| async move {
+                    OwnedMcp::launch(
+                        prepared,
+                        0,
+                        FixtureSource,
+                        move || WsPool::loopback_fixture(port),
+                        status,
+                        stop,
+                    )
+                    .await
+                },
+            )
+            .unwrap()
+            .await
+            .unwrap()
+            .unwrap();
+        let registry = Arc::new(
+            RegistryJournal::open(ledger.clone(), Arc::new(HmacKey::from_bytes([11; 32]))).unwrap(),
+        );
+        let old = registry.route_for_agent(&fixture.binding.agent).unwrap();
+        let at = u64::try_from(now_ms()).unwrap();
+        assert!(registry.retire(&old, at).unwrap());
+        let replacement_account = Address::from_bytes([8; 20]);
+        let mut replacement = old.binding.clone();
+        replacement.container = replacement_account;
+        replacement.vault_address = None;
+        replacement.wallet = AgentWallet {
+            generation: 1,
+            address: Address::from_bytes([10; 20]),
+            approved_at_ms: at,
+            valid_until_ms: at + 86_400_000,
+        };
+        let replacement = registry.grant(replacement, at).unwrap();
+        assert_eq!(
+            engine.route_for_agent(&fixture.binding.agent).unwrap(),
+            replacement
+        );
+
+        runtime
+            .halt_mcp(
+                fixture.binding.agent.to_string(),
+                fixture.binding.account.to_string(),
+            )
+            .unwrap();
+        let halted = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let observed = runtime.mcp_status();
+                assert_ne!(observed.halt.cancellation, CancellationPhase::Acknowledged);
+                if observed.halt.cancellation == CancellationPhase::Retrying {
+                    break observed.halt;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(halted.phase, HaltPhase::Persisted);
+        assert!(halted.cancellation_error.is_some());
+        assert!(engine.cancellation_needed(&fixture.binding.agent));
+        let policy = PolicyJournal::new(registry.clone()).current().unwrap();
+        let kill = serde_json::to_value(policy.state.kill).unwrap();
+        assert_eq!(
+            kill["agents"][fixture.binding.agent.as_str()]["reason"]["reason"],
+            "operator"
+        );
+        assert_eq!(
+            kill["agents"][fixture.binding.agent.as_str()]["engaged_at_ms"],
+            halted.requested_at_ms.unwrap()
+        );
+        assert_eq!(
+            registry
+                .route_for_agent(&fixture.binding.agent)
+                .unwrap()
+                .binding
+                .container,
+            replacement_account
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_secs(10), runtime.shutdown())
+                .await
+                .unwrap()
+                .is_err()
+        );
+        assert_ne!(
+            runtime.mcp_status().halt.cancellation,
+            CancellationPhase::Acknowledged
+        );
+        assert!(
+            venue
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|request| request.path != "/exchange")
+        );
+        ledger.verify().unwrap();
+        drop(engine);
+        drop(registry);
+        drop(ledger);
+        fixture.assert_pairing_owner_released();
+        let reopened = Arc::new(
+            Ledger::open_at(
+                &fixture
+                    .dir
+                    .path()
+                    .join(oppen_core::db_file_name(Network::Testnet)),
+                Network::Testnet,
+            )
+            .unwrap(),
+        );
+        let registry = Arc::new(
+            RegistryJournal::open(reopened, Arc::new(HmacKey::from_bytes([11; 32]))).unwrap(),
+        );
+        assert_eq!(
+            registry.route_for_agent(&fixture.binding.agent).unwrap(),
+            replacement
+        );
+        let persisted = PolicyJournal::new(registry).current().unwrap();
+        assert_eq!(serde_json::to_value(persisted.state.kill).unwrap(), kill);
+        venue.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn halt_dropped_drain_waiter_retains_actual_mutation() {
+        let fixture = Fixture::authorized();
+        let prepared = fixture.prepare().unwrap();
+        let bound = BoundServer::bind(0, &prepared.gateway, &prepared.pairings)
+            .await
+            .unwrap();
+        let status = Arc::new(Mutex::new(McpStatus::starting(&fixture.binding)));
+        let halt = HaltControl::new(
+            prepared.engine.clone(),
+            fixture.binding.clone(),
+            prepared.pairings.clone(),
+            bound.supervision_control(),
+            status.clone(),
+        );
+        let mut path = fixture
+            .dir
+            .path()
+            .join(oppen_core::db_file_name(Network::Testnet))
+            .into_os_string();
+        path.push(".lock");
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        lock.lock().unwrap();
+        halt.request(&fixture.binding).unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), halt.close_and_drain())
+                .await
+                .is_err()
+        );
+        // A second waiter must still await the same retained blocking worker.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), halt.close_and_drain())
+                .await
+                .is_err()
+        );
+        assert_eq!(status_lock(&status).halt.phase, HaltPhase::Persisting);
+        assert!(halt.request(&fixture.binding).is_err());
+        lock.unlock().unwrap();
+        drop(bound);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(10), halt.close_and_drain())
+                .await
+                .unwrap()
+                .is_err()
+        );
+        assert_eq!(status_lock(&status).halt.phase, HaltPhase::Persisted);
+        assert_eq!(
+            status_lock(&status).halt.cancellation,
+            CancellationPhase::Unavailable
+        );
+        drop(halt);
+        drop(prepared);
+        fixture.assert_pairing_owner_released();
+    }
+
+    #[tokio::test]
+    async fn halt_without_live_sweep_is_unavailable_even_with_startup_inhibition() {
+        for fail_persistence in [false, true] {
+            let fixture = Fixture::authorized();
+            let prepared = fixture.prepare().unwrap();
+            let bound = BoundServer::bind(0, &prepared.gateway, &prepared.pairings)
+                .await
+                .unwrap();
+            let status = Arc::new(Mutex::new(McpStatus::starting(&fixture.binding)));
+            let halt = HaltControl::new(
+                prepared.engine.clone(),
+                fixture.binding.clone(),
+                prepared.pairings.clone(),
+                bound.supervision_control(),
+                status.clone(),
+            );
+            // This is an actual filesystem failure, not a substituted engine:
+            // a directory cannot be opened as the ledger coordination file.
+            let mut lock_path = fixture
+                .dir
+                .path()
+                .join(oppen_core::db_file_name(Network::Testnet))
+                .into_os_string();
+            lock_path.push(".lock");
+            let lock_path = PathBuf::from(lock_path);
+            if fail_persistence {
+                std::fs::remove_file(&lock_path).unwrap();
+                std::fs::create_dir(&lock_path).unwrap();
+            }
+            halt.request(&fixture.binding).unwrap();
+            drop(bound);
+            assert!(
+                tokio::time::timeout(Duration::from_secs(5), halt.close_and_drain())
+                    .await
+                    .unwrap()
+                    .is_err()
+            );
+            let observed = status_lock(&status).halt.clone();
+            assert_eq!(
+                observed.phase,
+                if fail_persistence {
+                    HaltPhase::Uncertain
+                } else {
+                    HaltPhase::Persisted
+                }
+            );
+            assert_eq!(observed.cancellation, CancellationPhase::Unavailable);
+            assert!(observed.cancellation_error.is_some());
+            assert_eq!(observed.error.is_some(), fail_persistence);
+            let kill = serde_json::to_value(prepared.engine.kill_switch()).unwrap();
+            assert_eq!(
+                kill["agents"][fixture.binding.agent.as_str()]["reason"]["reason"],
+                "operator"
+            );
+            if fail_persistence {
+                std::fs::remove_dir(&lock_path).unwrap();
+                prepared.engine.policy_observation().unwrap();
+                let refreshed = serde_json::to_value(prepared.engine.kill_switch()).unwrap();
+                assert_eq!(refreshed["agents"], kill["agents"]);
+            }
+        }
     }
 
     #[test]

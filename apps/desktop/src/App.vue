@@ -5,6 +5,8 @@ import AppStatusBar from "./components/shell/AppStatusBar.vue";
 import { isOpen as tourOpen } from "./stores/tour";
 import PilotStatusBanner from "./components/shell/PilotStatusBanner.vue";
 import DesktopRuntimeBanner from "./components/shell/DesktopRuntimeBanner.vue";
+import AgentHaltBanner from "./components/shell/AgentHaltBanner.vue";
+import { supervision } from "./stores/supervision";
 import TourSpotlight from "./components/tour/TourSpotlight.vue";
 import {
   refreshKeychain,
@@ -40,6 +42,7 @@ onMounted(() => {
   startOperatorPolling();
   startPilotPolling();
   startRuntimePolling();
+  supervision.startPolling();
   // The socket, the rail poll and the staleness clock (items 31, 34). Started
   // here rather than in TradeView: the status bar reads the feed from every
   // view, so it must not stop when the operator opens Agents.
@@ -52,6 +55,7 @@ onUnmounted(() => {
   stopOperatorPolling();
   stopPilotPolling();
   stopRuntimePolling();
+  supervision.stopPolling();
   stopMarketFeed();
 });
 </script>
@@ -59,6 +63,7 @@ onUnmounted(() => {
 <template>
   <div class="app">
     <AppHeader :inert="tourOpen" />
+    <AgentHaltBanner :inert="tourOpen" />
     <PilotStatusBanner :inert="tourOpen" />
     <DesktopRuntimeBanner :inert="tourOpen" />
     <main class="app__main" :inert="tourOpen">

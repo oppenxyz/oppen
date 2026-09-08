@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, onUnmounted, ref } from "vue";
+import { computed, nextTick, ref } from "vue";
 import EmptyState from "../components/housing/EmptyState.vue";
 import PanelHousing from "../components/housing/PanelHousing.vue";
 import ReadoutRows from "../components/housing/ReadoutRows.vue";
@@ -31,8 +31,6 @@ const mcpRows = computed(() => [
   { k: "Last completed pause sweep", v: mcp.status?.supervision_last_completed_ms != null ? new Date(mcp.status.supervision_last_completed_ms).toLocaleString() : "Never observed" },
   { k: "Orders inhibited", v: mcp.status ? (mcp.status.orders_inhibited ? "Yes" : "No - not an authorization to trade") : "Unknown" },
 ]);
-onMounted(() => supervision.startPolling());
-onUnmounted(() => supervision.stopPolling());
 async function stopRuntime(): Promise<void> {
   confirmStop.value = false;
   await supervision.stop();
@@ -158,9 +156,9 @@ const local = computed(() => [
       </PanelHousing>
       <PanelHousing v-if="section === 'Permissions & limits'" inset label="Kill switch · stored state" data-tour="kill">
         <p class="copy">Stored global halt: {{ storedPolicy ? (storedPolicy.kill.global ? 'engaged' : 'not engaged') : 'not read' }}. Agent-specific stored halts: {{ storedPolicy ? Object.keys(storedPolicy.kill.agents).length : 'unknown' }}. A stored state does not prove cancel completion.</p>
-        <p class="copy">A halt pauses new orders and cancels resting orders; it does not close positions. The console has no connection to the gateway's halt control yet.</p>
+        <p class="copy">HALT AGENT targets only the listening runtime's bound TESTNET agent and account. It requests an order pause and resting-order cancellation; positions may remain open. The persistent halt banner reports durability and cancellation separately.</p>
         <p class="copy">Dead-man protection must be verified per container. This interface has no arming or coverage reading.</p>
-        <UiButton variant="hazard" disabled>Halt control unavailable</UiButton>
+        <p class="copy">No global halt or resume control is provided here. Stored policy is not proof of the live halt outcome.</p>
       </PanelHousing>
       <PanelHousing v-if="section === 'Keys & venues'" inset label="Local machine" :brackets="['br']">
         <pre class="machine" aria-hidden="true">+-----------------------------+
