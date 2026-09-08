@@ -136,6 +136,10 @@ before expanding features:
    Exact-head review and CI remain PR gates; no activation or live gate is
    claimed. See
    [paused-policy-setup.md](docs/specs/paused-policy-setup.md).
+   PR #62 now has green exact-head CI and separate automated review at
+   `a8ae379`; publication was skipped and the merge hold remains. A follow-up
+   on `fix/mcp-existing-authority` applies its existing-only ledger opener to
+   MCP startup too: the prior startup path could adopt a missing anchor.
    No dedicated-account activity has been performed during this development.
 4. **Recovery:** PR #44 merged as `06fc0e3` after green CI and separate automated
    review. The durable submission journal has SQLite reopen, independent
