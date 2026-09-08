@@ -22,6 +22,7 @@ pub mod guardrail;
 pub mod journal;
 pub mod keys;
 pub mod ledger;
+pub mod live_chart;
 pub mod market;
 pub mod operator;
 pub mod reconcile;

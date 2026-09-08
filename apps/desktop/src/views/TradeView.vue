@@ -14,6 +14,7 @@ import StatBlock from "../components/housing/StatBlock.vue";
 import {
   INTERVALS,
   market,
+  chartObservation,
   quotes,
   quoteSpread,
   refreshSnapshot,
@@ -45,10 +46,10 @@ const DASH = "—";
  * short history from a narrow panel.
  */
 const chartMeta = computed(() => {
-  const chart = market.chart;
+  const chart = chartObservation.data;
   if (chart === null) return "No bars.";
   const forming = chart.forming === null ? "" : " · 1 forming";
-  return `${chart.closed.length} closed${forming}`;
+  return `${chart.closed.length} elapsed${forming}`;
 });
 
 
@@ -117,7 +118,8 @@ const quoteLabel = computed(() => !quotes.touch ? "Touch unavailable"
   : quotes.touch.source === "rest" ? "REST touch snapshot"
   : quotes.touch.live ? `Latest observed ${quotes.touch.source.toUpperCase()} touch` : "Retained touch · not live");
 const observationNow = ref(Date.now());
-watch([() => quotes.touch?.observedMs, () => quotes.depth?.observedMs], () => {
+watch([() => quotes.touch?.observedMs, () => quotes.depth?.observedMs,
+  () => chartObservation.projection?.last_observation_received_at_ms], () => {
   observationNow.value = Date.now();
 }, { flush: "sync" });
 let observationTimer: ReturnType<typeof globalThis.setInterval> | null = null;
@@ -138,6 +140,36 @@ function quoteTime(time: number | null | undefined): string {
   const date = new Date(time);
   return Number.isFinite(date.getTime()) ? date.toISOString() : "Unavailable";
 }
+
+const chartBars = computed(() => {
+  const projection = chartObservation.projection;
+  return projection ? [...projection.closed, ...(projection.forming ? [projection.forming] : [])] : [];
+});
+const chartSource = computed(() => {
+  const bars = chartBars.value;
+  const venue = bars.filter(bar => bar.source === "venue").length;
+  const partial = bars.filter(bar => bar.partial).length;
+  const ambiguous = bars.filter(bar => bar.open_close_ambiguous).length;
+  return `Venue ${venue} · Observed tape ${bars.length - venue} · Partial ${partial} · Ambiguous O/C ${ambiguous}`;
+});
+const tapeLabel = computed(() => {
+  if (chartObservation.failure) return "Chart consumer stopped";
+  switch (chartObservation.projection?.tape_status) {
+    case "observing": return "Tape observing · incomplete coverage";
+    case "interrupted": return "Tape interrupted";
+    case "capacity_exceeded": return "Tape frozen · identity capacity exceeded";
+    case "invalid_observation": return "Tape frozen · invalid observation";
+    default: return "Tape not observed";
+  }
+});
+const markerLabel = computed(() => {
+  const projection = chartObservation.projection;
+  const marker = projection?.latest_trade;
+  if (!marker) return "Latest observed trade unavailable.";
+  const unverified = chartObservation.retained || projection?.tape_status !== "observing";
+  return `Latest observed trade ${marker.price} · ${quoteTime(marker.time_ms)}${marker.price_ambiguous ? ' · Ambiguous' : ''}${unverified ? ' · Unverified' : ''}`;
+});
+const chartSummary = computed(() => `${chartSource.value}. Volume follows each bar's source; venue and observed-trade volume are never combined. ${tapeLabel.value}. ${markerLabel.value}. The trade marker is independent of candle OHLCV and is not asserted newer than the venue candle. ${chartObservation.retained ? 'Retained chart; not live.' : ''} ${chartObservation.failure?.detail ?? ''}`);
 
 const maxBookSize = computed(() => Math.max(0, ...bids.value.concat(asks.value).map(level => Number(level.sz))));
 const ledger = ref<Ledger>("positions");
@@ -222,19 +254,22 @@ const ledger = ref<Ledger>("positions");
           </button>
         </template>
         <template #meta>{{ chartMeta }}</template>
-        <EmptyState
-          v-if="market.chartError !== null"
-          matrix
-          mode="sweep"
-          size="md"
-          :line="market.chartError"
-        />
-        <div v-else class="chart__surface">
-          <p v-if="shell.feeds.wsMarket !== 'ok'" class="chart__status" role="status">
-            Market feed {{ shell.feeds.wsMarket === 'unknown' ? 'not connected' : shell.feeds.wsMarket }}.
-            {{ shell.lastMarketTickMs ? `Last tick ${new Date(shell.lastMarketTickMs).toLocaleTimeString()}.` : 'No live tick received.' }}
-          </p>
-          <CandleChart :data="market.chart" />
+        <div class="chart__surface">
+          <p class="chart-observation" data-chart="status">{{ chartObservation.retained ? 'Retained chart · not live' : 'Latest chart observation' }} · {{ tapeLabel }}<br />{{ chartSource }}</p>
+          <p class="chart-observation" data-chart="age">Host observed {{ quoteTime(chartObservation.projection?.last_observation_received_at_ms) }} · {{ observationAge(chartObservation.projection?.last_observation_received_at_ms) }}</p>
+          <p class="chart-observation" data-chart="latest-trade">{{ markerLabel }}</p>
+          <p v-if="chartObservation.data?.priceDecimals == null" class="chart-observation" data-chart="precision">Asset precision unavailable · display fallback: 6 decimals.</p>
+          <p v-if="chartObservation.error" class="chart-observation chart-observation--error" data-chart="history-error" role="status">History read: {{ chartObservation.error }}</p>
+          <p v-if="chartObservation.projection?.observation_error" class="chart-observation chart-observation--error" data-chart="observation-error" role="status">{{ chartObservation.projection.observation_error }}</p>
+          <p v-if="chartObservation.failure" class="chart-observation chart-observation--error" data-chart="consumer-error" role="status">{{ chartObservation.failure.detail }}</p>
+          <div class="chart__plot"><CandleChart :data="chartObservation.data" :observation-summary="chartSummary" /></div>
+          <details v-if="chartBars.length" class="chart-details">
+            <summary>Bar observations · exact readings</summary>
+            <div class="chart-details__rows"><p v-for="bar in chartBars" :key="bar.time_ms">
+              {{ quoteTime(bar.time_ms) }} · {{ bar.source === 'venue' ? 'Venue-reported' : 'Observed trades only' }} · {{ bar.partial ? 'Partial coverage' : 'Venue bar' }}{{ bar.open_close_ambiguous ? ' · Open/close ambiguous' : '' }}<br />
+              O {{ bar.open }} · H {{ bar.high }} · L {{ bar.low }} · C {{ bar.close }} · Volume {{ bar.volume }} {{ market.selected }}<br />Received by native host {{ quoteTime(bar.received_at_ms) }}
+            </p></div>
+          </details>
         </div>
       </PanelHousing>
 
@@ -321,8 +356,13 @@ const ledger = ref<Ledger>("positions");
 .orders th, .orders td { padding: var(--s-2); text-align: right; font-weight: 400; border-bottom: 1px solid var(--rule); }
 .orders th:first-child { text-align: left; }
 .orders thead { color: var(--bracket); }
-.chart__surface { position: relative; flex: 1; min-height: 0; }
-.chart__status { position: absolute; z-index: 2; inset: var(--s-2) auto auto var(--s-2); max-width: calc(100% - 24px); padding: var(--s-2); background: var(--void); border: 1px solid var(--uranium); color: var(--signal); font-size: var(--fs-body); }
+.chart__surface { display: flex; flex-direction: column; flex: 1; min-height: 0; overflow: auto; }
+.chart__plot { flex: 1; min-height: 180px; }
+.chart-observation, .chart-details { font-size: var(--fs-body-sm); padding: 2px var(--s-2); color: var(--body); line-height: 1.3; overflow-wrap: anywhere; }
+.chart-observation--error { color: var(--down); }
+.chart-details summary { cursor: pointer; }
+.chart-details__rows { max-height: 140px; overflow: auto; }
+.chart-details__rows p { margin-block: var(--s-2); }
 
 .features-time { font-size: var(--fs-body-sm); color: var(--bracket); margin-bottom: var(--s-2); line-height: 1.4; }
 
@@ -464,7 +504,7 @@ const ledger = ref<Ledger>("positions");
 }
 
 .trade__col--center {
-  grid-template-rows: auto minmax(180px, 1fr) minmax(130px, 25vh);
+  grid-template-rows: auto minmax(340px, 1fr) minmax(110px, 18vh);
   overflow: auto;
 }
 

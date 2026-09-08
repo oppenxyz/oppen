@@ -1,7 +1,8 @@
 import { createSSRApp, toRaw } from "vue";
 import { renderToString } from "vue/server-renderer";
-import type { RuntimeStatus } from "../lib/bridge";
+import type { ChartBinding, ChartProjection, RuntimeStatus } from "../lib/bridge";
 import { createRuntimeMonitor, runtimeNotice } from "./runtime";
+import { createChartObservations } from "./market";
 
 interface Assertions {
   toBe(expected: unknown): void;
@@ -12,10 +13,11 @@ declare const describe: (name: string, body: () => void) => void;
 declare const it: (name: string, body: () => void | Promise<void>) => void;
 declare const expect: (actual: unknown) => Assertions & { not: Assertions };
 
-const RUNNING: RuntimeStatus = { phase: "running", binding: null, detail: null };
+const RUNNING: RuntimeStatus = { phase: "running", binding: null, detail: null, chart_failure: null };
 const STOPPING: RuntimeStatus = {
   phase: "stopping", binding: { network: "testnet", generation: "9007199254740993" },
   detail: "Waiting for retained desktop work to drain.",
+  chart_failure: null,
 };
 
 function deferred<T>() {
@@ -29,7 +31,7 @@ async function settle(): Promise<void> {
   for (let step = 0; step < 8; step += 1) await Promise.resolve();
 }
 
-function fixture() {
+function fixture(observe: (status: RuntimeStatus) => void = () => {}) {
   const requests: Array<ReturnType<typeof deferred<RuntimeStatus>>> = [];
   const timers: Array<{ callback: () => void; delayMs: number; active: boolean }> = [];
   const monitor = createRuntimeMonitor(
@@ -43,6 +45,7 @@ function fixture() {
       timers.push(timer);
       return () => { timer.active = false; };
     },
+    observe,
   );
   function fire(delayMs: number): void {
     const timer = timers.find(candidate => candidate.active && candidate.delayMs === delayMs);
@@ -54,6 +57,63 @@ function fixture() {
 }
 
 describe("desktop runtime polling", () => {
+  it("delivers exact-bound chart failure during ordinary polling and latches it against later projections", async () => {
+    const binding: ChartBinding = { network: "testnet", generation: "1", selection_id: "10", symbol: "BTC", interval: "1h" };
+    const projection = (owner: ChartBinding, revision: string): ChartProjection => ({
+      selection_id: owner.selection_id, revision, symbol: owner.symbol, interval: owner.interval,
+      interval_ms: 3600000, price_decimals: null, closed: [],
+      forming: { time_ms: 0, open: "100", high: "101", low: "99", close: "100.5", volume: "1",
+        source: "venue", partial: false, open_close_ambiguous: false, received_at_ms: 1000 },
+      latest_trade: null, history_error: null, observation_error: null,
+      last_observation_received_at_ms: 1000, tape_status: "observing",
+    });
+    const chart = createChartObservations(async () => projection(binding, "1"));
+    chart.bind(binding); chart.accept(projection(binding, "1"));
+    const f = fixture(status => { if (status.chart_failure) chart.fail(status.chart_failure); });
+    try {
+      f.monitor.start();
+      const replacement = { ...binding, selection_id: "11" };
+      chart.invalidate(true); chart.bind(replacement); chart.accept(projection(replacement, "1"));
+      f.requests[0]!.resolve({ ...RUNNING, chart_failure: { binding, detail: "Old consumer failed" } });
+      await settle();
+      expect(chart.state.failure).toBe(null);
+      expect(chart.state.retained).toBe(false);
+      f.fire(1000);
+      f.requests[1]!.resolve({ ...RUNNING, chart_failure: { binding: replacement, detail: "Consumer terminated" } });
+      await settle();
+      expect(chart.state.failure?.detail).toBe("Consumer terminated");
+      expect(chart.state.retained).toBe(true);
+      expect(chart.state.data?.forming?.close).toBe(100.5);
+      expect(chart.accept(projection(replacement, "99"))).toBe(false);
+      f.fire(1000); f.requests[2]!.resolve(RUNNING); await settle();
+      expect(chart.state.failure?.detail).toBe("Consumer terminated");
+      expect(chart.state.projection?.revision).toBe("1");
+      f.fire(1000); f.fire(5000);
+      expect(chart.state.failure?.detail).toBe("Consumer terminated");
+      chart.invalidate(); chart.bind(replacement);
+      expect(chart.accept(projection(replacement, "100"))).toBe(false);
+      const next = { ...replacement, selection_id: "12" };
+      chart.invalidate(true); chart.bind(next);
+      expect(chart.state.failure).toBe(null);
+      expect(chart.accept(projection(next, "1"))).toBe(true);
+    } finally { f.monitor.stop(); }
+  });
+
+  it("does not deliver a chart failure from a stopped runtime read after remount", async () => {
+    const delivered: RuntimeStatus[] = [];
+    const f = fixture(status => delivered.push(status));
+    try {
+      f.monitor.start(); f.monitor.stop(); f.monitor.start();
+      f.requests[0]!.resolve({ ...RUNNING, chart_failure: {
+        binding: { network: "testnet", generation: "1", selection_id: "1", symbol: "BTC", interval: "1h" }, detail: "Retired read",
+      } });
+      await settle();
+      expect(delivered.length).toBe(0);
+      f.requests[1]!.resolve(RUNNING); await settle();
+      expect(delivered).toEqual([RUNNING]);
+    } finally { f.monitor.stop(); }
+  });
+
   it("polls cached typed status once a second and hides ordinary running without a readiness claim", async () => {
     const f = fixture();
     try {

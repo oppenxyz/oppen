@@ -7,6 +7,7 @@
 //! the operator and the agent cannot be shown different accounts (A3).
 
 mod account_evidence;
+mod chart_transport;
 mod feed;
 mod local_reads;
 mod mcp_runtime;
@@ -21,14 +22,16 @@ mod updates;
 
 use std::sync::Arc;
 
+use chart_transport::{ChartBinding, Projection};
 use local_reads::ReadKind;
 use oppen_core::candles::Interval;
 use oppen_core::keys::{KeyStore, KeychainKeyStore};
 use oppen_core::ledger::{EventViews, Ledger, PilotStatus};
-use oppen_core::market::{ChartSeries, MarketRow, MarketSnapshot, chart, rows, snapshot};
+use oppen_core::live_chart::HistorySnapshot;
+use oppen_core::market::{MarketRow, MarketSnapshot, rows, snapshot};
 use oppen_core::state::{AccountState, VenueReadings, assemble};
 use oppen_hl::{Address, InfoClient, Network};
-use runtime::{FeedBinding, Runtime, RuntimeError, RuntimeStatus};
+use runtime::{Runtime, RuntimeError, RuntimeStatus, WatchBinding};
 use tauri::{Manager, State};
 
 /// Why the console has nothing to show.
@@ -373,39 +376,38 @@ const CHART_BARS: u64 = 600;
 #[tauri::command]
 async fn chart_series(
     runtime: State<'_, Runtime>,
-    network: String,
-    coin: String,
-    interval: String,
-) -> Result<ChartSeries, ConsoleError> {
-    let _read = runtime.read_lease(network_of(&network))?;
-    let parsed = Interval::parse(&interval)
-        .map_err(|e| ConsoleError::Venue(format!("{interval} is not an interval: {e}")))?;
-    let info =
-        InfoClient::new(network_of(&network)).map_err(|e| ConsoleError::Venue(e.to_string()))?;
+    binding: ChartBinding,
+) -> Result<Projection, ConsoleError> {
+    let _read = runtime.read_lease(binding.network)?;
+    let owner = runtime.chart_owner(&binding)?;
+    let ticket = owner.begin_history().map_err(ConsoleError::Conflict)?;
+    let outcome = read_chart_history(&binding).await;
+    owner
+        .finish_history(ticket, outcome)
+        .map_err(ConsoleError::Conflict)
+}
 
-    // The universe, for `max_price_decimals`. The axis is labelled to the
-    // asset's own precision rather than to whatever the prices happen to
-    // carry, so a quiet market does not relabel itself.
-    let meta = info
-        .meta()
-        .await
-        .map_err(|e| ConsoleError::Venue(format!("universe: {e}")))?;
-    let universe = oppen_hl::Universe::from_meta(&meta)
-        .map_err(|e| ConsoleError::Venue(format!("universe: {e}")))?;
+async fn read_chart_history(binding: &ChartBinding) -> Result<HistorySnapshot, String> {
+    let parsed = Interval::parse(&binding.interval).map_err(|error| error.to_string())?;
+    let info = InfoClient::new(binding.network).map_err(|error| error.to_string())?;
+    let at = now_ms();
+    let width = parsed.millis().unsigned_abs();
+    // Include the current bucket in the reducer's 600-bar bound, rather than
+    // requesting 600 preceding buckets plus an extra forming bucket.
+    let from = (at / width * width).saturating_sub((CHART_BARS - 1).saturating_mul(width));
+    let (meta, candles) = tokio::try_join!(
+        info.meta(),
+        info.candles(&binding.symbol, &binding.interval, from, at)
+    )
+    .map_err(|error| error.to_string())?;
+    let universe = oppen_hl::Universe::from_meta(&meta).map_err(|error| error.to_string())?;
     let asset = universe
-        .get(&coin)
-        .map_err(|e| ConsoleError::Venue(e.to_string()))?;
-
-    let now_ms = now_ms();
-    let width_ms = parsed.millis().unsigned_abs();
-    let from_ms = now_ms.saturating_sub(CHART_BARS.saturating_mul(width_ms));
-    let candles = info
-        .candles(&coin, &parsed.to_string(), from_ms, now_ms)
-        .await
-        .map_err(|e| ConsoleError::Venue(format!("candles: {e}")))?;
-
-    chart(&coin, parsed, &candles, asset.max_price_decimals(), now_ms)
-        .map_err(|e| ConsoleError::Venue(format!("the venue's bars are not a partition: {e}")))
+        .get(&binding.symbol)
+        .map_err(|error| error.to_string())?;
+    Ok(HistorySnapshot {
+        candles,
+        price_decimals: asset.max_price_decimals(),
+    })
 }
 
 /// The account as it stands now: equity, margin, positions, resting orders.
@@ -468,7 +470,7 @@ async fn watch_market(
     network: String,
     coin: String,
     interval: String,
-) -> Result<FeedBinding, ConsoleError> {
+) -> Result<WatchBinding, ConsoleError> {
     let interval = Interval::parse(&interval)
         .map_err(|error| ConsoleError::Venue(format!("{interval} is not an interval: {error}")))?
         .to_string();

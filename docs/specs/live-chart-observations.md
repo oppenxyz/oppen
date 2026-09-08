@@ -1,7 +1,8 @@
 # Live Chart Observations
 
-Status: independent automated design review found no blocking gaps. Cleared for
-local implementation, not implementation acceptance or live approval.
+Status: implemented and verified locally; independent automated working-tree
+review found no remaining blockers. Remote CI, installed-artifact and public-feed
+acceptance remain pending. This is not live trading approval.
 Trace: spec 30, 31, 34; charts section 2.4; owner-requested TRADE feed audit.
 This follows the local quote correction `55657ad` and changes no execution,
 accounting, wallet, permission or trading authority.
@@ -72,7 +73,8 @@ execution reference-price source in this remediation.
 The native envelope binds network and feed generation; its chart projection
 additionally carries `selection_id`, monotonically increasing `revision`, symbol,
 canonical interval, `interval_ms`, nullable `price_decimals`, `closed`, `forming`,
-`latest_trade`, `history_error`, `last_observation_received_at_ms` and `tape_status`.
+`latest_trade`, `history_error`, `observation_error`,
+`last_observation_received_at_ms` and `tape_status`.
 Identifiers and revisions cross IPC as strings. Decimal OHLCV values remain
 strings. Missing precision uses an explicit display fallback, not invented asset
 metadata. Tape status is observing, interrupted or capacity-exceeded; observing
@@ -96,6 +98,18 @@ precedence, explicitly not exchange revision ordering. Identical repeats need
 not rebuild bars but may advance receipt age. Neither candle end nor trade count
 establishes a cross-channel inclusion watermark.
 
+Classification of elapsed buckets uses a monotonic local watermark. Host-clock
+rollback cannot reopen or hide previously elapsed bars; expose clock uncertainty
+until the clock catches up. A clock-only projection changes classification, not
+the last observation receipt or shared market health. Chart/history projections
+must never synthesize a general market tick.
+
+For display trade ingestion only, allow up to five seconds of forward venue/host clock
+disagreement with explicit uncertainty and an unverified marker. Larger forward
+disagreement is refused recoverably without advancing retention or permanently
+freezing the tape. This bound is not an exchange timing guarantee or execution
+freshness tolerance. It changes no signing guard.
+
 ## Bounded Ownership
 
 Use the existing chart-history bar bound and at most 65,536 retained trade
@@ -116,9 +130,11 @@ capacity states stay latched; marker updates cannot clear them or erase known
 equal-time price ambiguity.
 
 The retained native owner selects before subscription/history work, returning
-the selection binding. A history ticket captures selection, request serial and
-observation revision under the owner's short lock; all REST awaits occur outside
-locks. Only the current selection's latest history request may finish. Fill
+the selection binding. A history ticket captures unforgeable local owner and
+request incarnations under the owner's short lock; all REST awaits occur outside
+locks. Only the current selection's latest history request may finish. WS-owned
+buckets are protected regardless of whether they arrived before or after the
+request began, rather than inventing an ordering from REST completion time. Fill
 missing venue history but preserve WS-owned bucket observations, independent
 tape aggregates and marker. A matching error updates only history status.
 
@@ -154,5 +170,37 @@ resolves that binding before beginning history, rather than trusting caller
 symbol equality. The independent chart socket buys wire-incarnation isolation;
 it is bounded and read-only, not an additional account or execution feed.
 
-W2 must be amended on implementation to replace optimistic venue/tape blending
-with this source-separated observation policy. No dependency is required.
+The existing runtime poll carries exact-binding chart-consumer failures to idle
+views. A matching failure is sticky: later projections and null polls cannot
+restore a live label, and an old binding's failure cannot poison its replacement.
+Core transport diagnostics preserve earlier observation and clock warnings,
+freeze tape/marker without advancing freshness, and do not churn revisions when
+the same failure is reported again.
+
+Once chart producers and consumer have actually joined, chart-only failure is a
+recoverable chart refusal, not termination of unchanged account supervision.
+Surface the diagnostic and allow a later selection retry. Pending shutdown takes
+precedence over that recoverable result; no late chart error may reset stopping
+to running or discard retained drain ownership.
+
+W2 is amended to replace optimistic venue/tape blending with this source-separated
+observation policy. No dependency was added.
+
+## Local Evidence
+
+The combined Rust workspace passed 1,282 tests with zero failures and 15 ignored
+tests. This includes 15 core chart regressions and all 119 native library tests.
+Real loopback frames exercise cross-selection retirement, retained consumer
+drain, quiet clock rollover, emission failure and consumer panic. A deterministic
+shutdown-race test failed with Running while account drain was held, then passed
+after terminal state was given precedence over recoverable chart failure.
+
+All 233 frontend tests passed, including unchanged renderer golden frames,
+binding/revision fences, independent market health and sticky consumer failure.
+Production build, QA typecheck, strict all-target workspace Clippy and formatting
+passed. Mock-only browser replay proved REST
+failure bootstrap, separate marker/volume, retained errors, A-B-A rejection,
+independent age and escaped consumer diagnostics. Screenshots were inspected at
+1440px and the supported 1280px minimum, including an 800px-high failure state.
+These checks use synthetic data; they do not prove native-to-installed-app venue
+delivery or any account activity. No new dependency or execution path was added.

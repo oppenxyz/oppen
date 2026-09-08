@@ -26,6 +26,9 @@ import {
   watchMarket,
   type BookLevel,
   type ChartBar,
+  type ChartBinding,
+  type ChartFailure,
+  type ChartProjection,
   type FeedBinding,
   type FeedUpdate,
   type MarketRow,
@@ -42,7 +45,8 @@ export interface ChartData {
   closed: readonly Readonly<Bar>[];
   forming: Readonly<Bar> | null;
   intervalMs: number;
-  priceDecimals: number;
+  priceDecimals: number | null;
+  latestTrade: { timeMs: number; price: number; ambiguous: boolean } | null;
 }
 
 interface MarketState {
@@ -56,16 +60,7 @@ interface MarketState {
   error: string | null;
   /** Why the last snapshot read failed. Kept apart: the two fail separately. */
   snapshotError: string | null;
-  /** Parsed bars for the chart. `null` before the first read of a symbol. */
-  chart: ChartData | null;
   interval: ChartInterval;
-  /**
-   * Why the chart is empty. A third error channel rather than a shared one,
-   * because a broken partition costs the chart and nothing else — the book
-   * beside it is still good, and collapsing the two would make the panel
-   * claim an outage it is not having.
-   */
-  chartError: string | null;
 }
 
 const state = reactive<MarketState>({
@@ -75,9 +70,7 @@ const state = reactive<MarketState>({
   featuresReadMs: null,
   error: null,
   snapshotError: null,
-  chart: null,
   interval: "1h",
-  chartError: null,
 });
 
 /**
@@ -126,6 +119,78 @@ function num(raw: string): number | null {
 }
 
 export const market = readonly(state);
+
+function sameChartBinding(a: ChartBinding, b: ChartBinding): boolean {
+  return a.network === b.network && a.generation === b.generation && a.selection_id === b.selection_id
+    && a.symbol === b.symbol && a.interval === b.interval;
+}
+
+/** One acceptance path for retained native projections, whether read replies or events. */
+export function createChartObservations(read: typeof fetchChartSeries) {
+  const chart = reactive<{
+    binding: ChartBinding | null; projection: ChartProjection | null; data: ChartData | null;
+    error: string | null; retained: boolean; failure: ChartFailure | null;
+  }>({ binding: null, projection: null, data: null, error: null, retained: true, failure: null });
+  let epoch = 0, request = 0;
+  let projectionBinding: ChartBinding | null = null;
+  function invalidate(clear = false) {
+    epoch++; request++; chart.binding = null; chart.retained = true;
+    if (clear) { chart.projection = null; chart.data = null; chart.error = null; projectionBinding = null; chart.failure = null; }
+  }
+  function retain() { chart.retained = true; }
+  function bind(binding: ChartBinding) {
+    if (!projectionBinding || !sameChartBinding(projectionBinding, binding)) {
+      chart.projection = null; chart.data = null; chart.error = null;
+    }
+    if (chart.failure && !sameChartBinding(chart.failure.binding, binding)) chart.failure = null;
+    chart.binding = { ...binding };
+  }
+  function fail(failure: ChartFailure): void {
+    if (!chart.binding || !sameChartBinding(chart.binding, failure.binding)) return;
+    chart.failure ??= { binding: { ...failure.binding }, detail: failure.detail };
+    chart.retained = true;
+  }
+  function accept(projection: ChartProjection, binding = chart.binding): boolean {
+    if (chart.failure || !binding || !chart.binding || !sameChartBinding(binding, chart.binding)
+      || projection.selection_id !== binding.selection_id || projection.symbol !== binding.symbol
+      || projection.interval !== binding.interval || !/^\d+$/.test(projection.revision)) return false;
+    if (chart.projection && BigInt(projection.revision) <= BigInt(chart.projection.revision)) return false;
+    const closed = projection.closed.map(parseBar);
+    const forming = projection.forming ? parseBar(projection.forming) : null;
+    const latest = projection.latest_trade;
+    const price = latest ? num(latest.price) : null;
+    if (closed.some(bar => bar === null) || (projection.forming && !forming)
+      || (latest && (price === null || price <= 0)) || !Number.isSafeInteger(projection.interval_ms)
+      || projection.interval_ms <= 0) {
+      chart.error = "Chart projection contains unreadable observations.";
+      return false;
+    }
+    chart.data = { closed: closed as Bar[], forming, intervalMs: projection.interval_ms,
+      priceDecimals: projection.price_decimals,
+      latestTrade: latest && price !== null ? { timeMs: latest.time_ms, price, ambiguous: latest.price_ambiguous } : null };
+    chart.projection = projection;
+    projectionBinding = { ...binding };
+    chart.retained = false;
+    chart.error = projection.history_error;
+    return true;
+  }
+  async function refresh() {
+    const binding = chart.binding;
+    if (!binding) return;
+    const owner = epoch, serial = ++request, revision = chart.projection?.revision;
+    try {
+      const projection = await read({ ...binding });
+      if (owner === epoch && serial === request) accept(projection, binding);
+    } catch (error) {
+      if (owner === epoch && serial === request && chart.projection?.revision === revision) chart.error = reason(error);
+    }
+  }
+  return { state: readonly(chart), invalidate, retain, bind, accept, refresh, fail };
+}
+
+const chartState = createChartObservations(fetchChartSeries);
+export const chartObservation = chartState.state;
+export function reportChartFailure(failure: ChartFailure): void { chartState.fail(failure); }
 
 interface QuoteClock {
   source: "bbo" | "book" | "rest";
@@ -269,8 +334,7 @@ export async function select(symbol: string): Promise<void> {
   state.snapshot = null;
   state.featuresReadMs = null;
   state.snapshotError = null;
-  state.chart = null;
-  state.chartError = null;
+  chartState.invalidate(true);
   snapshotRequest += 1;
   const selection = snapshotRequest;
   if (!inTauri()) return;
@@ -292,33 +356,14 @@ export async function refreshSnapshot(): Promise<void> {
  * rail's tick would spend a venue read a minute redrawing an identical frame.
  */
 export async function refreshChart(): Promise<void> {
-  if (state.selected === null || !inTauri()) return;
-  const symbol = state.selected;
-  const interval = state.interval;
-  const network = shell.network;
-  try {
-    const series = await fetchChartSeries(network, symbol, interval);
-    // The selection may have moved while three venue reads were in flight.
-    // Landing stale bars under a different symbol's header would be the worst
-    // kind of wrong: it looks right.
-    if (state.selected !== symbol || state.interval !== interval || shell.network !== network) return;
-    state.chart = {
-      closed: series.closed.map(parseBar).filter((bar): bar is Bar => bar !== null),
-      forming: series.forming ? parseBar(series.forming) : null,
-      intervalMs: series.interval_ms,
-      priceDecimals: series.price_decimals,
-    };
-    state.chartError = null;
-  } catch (error) {
-    if (state.selected === symbol && state.interval === interval && shell.network === network) state.chartError = reason(error);
-  }
+  if (inTauri()) await chartState.refresh();
 }
 
 /** Switches the chart's interval and re-reads. */
 export async function setInterval(interval: ChartInterval): Promise<void> {
   if (state.interval === interval) return;
   state.interval = interval;
-  state.chart = null;
+  chartState.invalidate(true);
   // The candle subscription names its interval, so switching timeframes has
   // to move the socket too or the chart would stream the old bucket width.
   await watchSelected();
@@ -364,114 +409,15 @@ export function applyFeed(update: FeedUpdate): void {
       quoteState.update(update, Date.now());
       return;
     }
-    case "candle": {
-      if (update.coin !== state.selected || update.interval !== state.interval) return;
-      if (state.chart === null) return;
-      const bar = parseBar({
-        time_ms: update.time_ms,
-        open: update.open,
-        high: update.high,
-        low: update.low,
-        close: update.close,
-        volume: update.volume,
-      });
-      if (bar === null) return;
-      state.chart = foldForming(state.chart, bar);
+    case "chart":
+      chartState.accept(update.projection);
       return;
-    }
-    case "trade": {
-      if (update.coin !== state.selected || state.chart === null) return;
-      const px = num(update.px);
-      const sz = num(update.sz);
-      const high = num(update.high);
-      const low = num(update.low);
-      if (px === null || sz === null || high === null || low === null) return;
-      state.chart = foldTrade(state.chart, { px, high, low, sz }, update.at_ms);
-      return;
-    }
     case "status":
-      if (!update.connected) quoteState.invalidate();
+      if (!update.connected) { quoteState.invalidate(); chartState.retain(); }
       return;
   }
 }
 
-/**
- * Fold a live bar into the chart.
- *
- * Exported as a test seam for the same reason. A frame whose bucket has moved
- * past the forming bar *closes* that bar and starts a new one, which is how
- * the chart grows between REST reads; a frame in the same bucket replaces it
- * in place. Getting this backwards would either duplicate every bar or freeze
- * the chart one bucket behind the market.
- */
-export function foldForming(chart: ChartData, bar: Bar): ChartData {
-  const forming = chart.forming;
-  const rolled = forming !== null && forming.time < bar.time;
-  return {
-    ...chart,
-    closed: rolled ? [...chart.closed, forming] : chart.closed,
-    forming: bar,
-  };
-}
-
-/**
- * Fold one print into the bar that is forming.
- *
- * **This is what makes the chart move.** The venue's own `candle` channel is
- * the reconcile, not the drive: measured on testnet BTC it delivered eight
- * frames in a minute with a seventeen-second tail carrying none, so a chart
- * waiting on it sits still through prints the operator can watch on the tape.
- * Each print extends the bar optimistically here, and `foldForming` overwrites
- * that bar with the venue's own OHLCV when the venue gets round to sending it.
- *
- * A print past the bucket boundary closes the bar and opens the next one at
- * the print's own price, so a chart left open across a boundary does not draw
- * one bar twice as wide as the rest.
- */
-export function foldTrade(chart: ChartData, frame: TradeFrame, atMs: number): ChartData {
-  const bucket = Math.floor(atMs / chart.intervalMs) * chart.intervalMs;
-  const forming = chart.forming;
-  if (forming === null || bucket > forming.time) {
-    return {
-      ...chart,
-      closed: forming !== null ? [...chart.closed, forming] : chart.closed,
-      // The frame's own extremes, not its close: a batch carrying a spike
-      // opens a bar that already reaches it.
-      forming: {
-        time: bucket,
-        open: frame.px,
-        high: frame.high,
-        low: frame.low,
-        close: frame.px,
-        volume: frame.sz,
-      },
-    };
-  }
-  // A print older than the bar being drawn is dropped rather than folded
-  // backwards: the venue batches the tape, and a late frame must not reopen a
-  // bar the chart has already moved past.
-  if (bucket < forming.time) return chart;
-  return {
-    ...chart,
-    forming: {
-      ...forming,
-      high: Math.max(forming.high, frame.high),
-      low: Math.min(forming.low, frame.low),
-      close: frame.px,
-      volume: forming.volume + frame.sz,
-    },
-  };
-}
-
-/** One batch off the tape, as the bar consumes it. */
-export interface TradeFrame {
-  /** The last print: the close. */
-  px: number;
-  high: number;
-  low: number;
-  /** Every print in the batch, summed. */
-  sz: number;
-}
 
 /**
  * Point the socket at the selected symbol.
@@ -495,12 +441,13 @@ export function createMarketFeed(
     invalidate: () => void;
     failure: (detail: string) => void;
     error: (detail: string | null) => void;
+    chartBinding: (binding: ChartBinding) => void;
   },
 ) {
   let active = false;
   let lifecycle = 0;
   let desired: FeedScope | null = null;
-  let accepted: { binding: FeedBinding; request: FeedScope } | null = null;
+  let accepted: { binding: FeedBinding; chart: ChartBinding; request: FeedScope } | null = null;
   let failedOwner: (FeedBinding & { failure: string }) | null = null;
   let running: Promise<void> | null = null;
   let completed: FeedScope | null = null;
@@ -517,12 +464,20 @@ export function createMarketFeed(
     while (active && desired !== null) {
       const request = desired;
       try {
-        const binding = await transport.watch(request.network, request.coin!, request.interval);
+        const reply = await transport.watch(request.network, request.coin!, request.interval);
+        const binding = reply?.feed;
         if (active && desired === request) {
           if (binding?.network !== request.network || typeof binding.generation !== "string" || binding.generation.length === 0) {
             throw new Error("Market feed acknowledgment does not match the requested scope.");
           }
-          accepted = { binding, request };
+          if (reply.chart.network !== request.network || reply.chart.generation !== binding.generation
+            || reply.chart.symbol !== request.coin || reply.chart.interval !== request.interval
+            || !/^\d+$/.test(reply.chart.selection_id)) {
+            accepted = null;
+            throw new Error("Chart acknowledgment does not match the requested scope.");
+          }
+          accepted = { binding, chart: reply.chart, request };
+          callbacks.chartBinding(reply.chart);
           if (failedOwner?.network !== binding.network || failedOwner.generation !== binding.generation) failedOwner = null;
           callbacks.error(null);
         }
@@ -567,7 +522,8 @@ export function createMarketFeed(
         }
         if (update.kind === "ctx" && update.row.symbol !== desired?.coin) return;
         if ("coin" in update && update.coin !== desired?.coin) return;
-        if (update.kind === "candle" && update.interval !== desired?.interval) return;
+        if (update.kind === "chart" && (update.projection.symbol !== desired?.coin || update.projection.interval !== desired?.interval
+          || update.projection.selection_id !== accepted.chart.selection_id)) return;
         callbacks.update(update, failedOwner?.failure);
       });
       if (!active || owner !== lifecycle) cleanup();
@@ -591,23 +547,27 @@ export function createMarketFeed(
   return { start, stop, request };
 }
 
+/** Selected-owner delivery. Chart projections have their own observation clock. */
+export function receiveSelectedFeed(update: FeedUpdate, failure?: string): void {
+  applyFeed(update);
+  if (failure !== undefined) { quoteState.invalidate(); chartState.retain(); feedStatus(false, failure); }
+  else if (update.kind === "status") feedStatus(update.connected, update.detail);
+  else if (update.kind !== "chart") feedTick(update.at_ms);
+}
+
 let watchError: string | null = null;
 const liveFeed = createMarketFeed(
   () => ({ network: shell.network, coin: state.selected, interval: state.interval }),
   { watch: watchMarket, listen: onFeedUpdate },
   {
-    invalidate: () => { quoteState.invalidate(); feedStatus(false, "Awaiting selected market feed."); },
-    failure: (detail) => { quoteState.invalidate(); feedStatus(false, detail); },
+    invalidate: () => { quoteState.invalidate(); chartState.invalidate(); feedStatus(false, "Awaiting selected market feed."); },
+    failure: (detail) => { quoteState.invalidate(); chartState.retain(); feedStatus(false, detail); },
+    chartBinding: (binding) => { chartState.bind(binding); },
     error: (detail) => {
       if (detail !== null || state.error === watchError) state.error = detail;
       watchError = detail;
     },
-    update: (update, failure) => {
-      applyFeed(update);
-      if (failure !== undefined) { quoteState.invalidate(); feedStatus(false, failure); }
-      else if (update.kind === "status") feedStatus(update.connected, update.detail);
-      else feedTick("at_ms" in update ? update.at_ms : Date.now());
-    },
+    update: receiveSelectedFeed,
   },
 );
 

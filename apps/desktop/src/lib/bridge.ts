@@ -349,23 +349,47 @@ export interface ChartBar {
 }
 
 /** A symbol's bars at one interval. */
-export interface ChartSeries {
-  symbol: string;
-  /** Canonical, so `120s` comes back `2m`. The axis is labelled from this. */
-  interval: string;
-  interval_ms: number;
-  price_decimals: number;
-  closed: ChartBar[];
-  /** The bucket in progress, drawn with the forming glyph. Absent between buckets. */
-  forming?: ChartBar;
+export interface ObservedChartBar extends ChartBar {
+  source: "venue" | "observed_trades";
+  partial: boolean;
+  open_close_ambiguous: boolean;
+  received_at_ms: number;
 }
 
-export async function fetchChartSeries(
-  network: "testnet" | "mainnet",
-  coin: string,
-  interval: string,
-): Promise<ChartSeries> {
-  return invoke<ChartSeries>("chart_series", { network, coin, interval });
+export interface ChartBinding extends FeedBinding {
+  selection_id: string;
+  symbol: string;
+  interval: string;
+}
+
+export interface ChartFailure {
+  binding: ChartBinding;
+  detail: string;
+}
+
+export interface WatchMarketReply {
+  feed: FeedBinding;
+  chart: ChartBinding;
+}
+
+export interface ChartProjection {
+  selection_id: string;
+  revision: string;
+  symbol: string;
+  interval: string;
+  interval_ms: number;
+  price_decimals: number | null;
+  closed: ObservedChartBar[];
+  forming: ObservedChartBar | null;
+  latest_trade: { time_ms: number; price: string; price_ambiguous: boolean } | null;
+  history_error: string | null;
+  observation_error: string | null;
+  last_observation_received_at_ms: number | null;
+  tape_status: "observing" | "interrupted" | "capacity_exceeded" | "invalid_observation";
+}
+
+export async function fetchChartSeries(binding: ChartBinding): Promise<ChartProjection> {
+  return invoke<ChartProjection>("chart_series", { binding });
 }
 
 export async function fetchMarketSnapshot(
@@ -392,29 +416,7 @@ export type FeedUpdate =
   | { kind: "ctx"; at_ms: number; row: MarketRow }
   | { kind: "bbo"; coin: string; at_ms: number; bid?: BookLevel; ask?: BookLevel }
   | { kind: "book"; coin: string; at_ms: number; bids: BookLevel[]; asks: BookLevel[] }
-  | {
-      kind: "candle";
-      coin: string;
-      interval: string;
-      time_ms: number;
-      open: string;
-      high: string;
-      low: string;
-      close: string;
-      volume: string;
-    }
-  | {
-      kind: "trade";
-      coin: string;
-      at_ms: number;
-      /** The last print in the frame: the bar's close. */
-      px: string;
-      /** The frame's own extremes. A batch can carry a spike `px` does not show. */
-      high: string;
-      low: string;
-      /** Every print in the frame, summed. */
-      sz: string;
-    }
+  | { kind: "chart"; projection: ChartProjection }
   | { kind: "status"; last_tick_ms?: number; connected: boolean; detail?: string };
 
 export interface FeedBinding {
@@ -429,6 +431,7 @@ export interface FeedEnvelope extends FeedBinding {
 
 /** Cached desktop task lifecycle only; not execution or reconciliation readiness. */
 export interface RuntimeStatus {
+  chart_failure: ChartFailure | null;
   phase: "running" | "replacing" | "stopping" | "stopped" | "stopped_with_error";
   binding: FeedBinding | null;
   detail: string | null;
@@ -698,8 +701,8 @@ export async function watchMarket(
   network: "testnet" | "mainnet",
   coin: string,
   interval: string,
-): Promise<FeedBinding> {
-  return invoke<FeedBinding>("watch_market", { network, coin, interval });
+): Promise<WatchMarketReply> {
+  return invoke<WatchMarketReply>("watch_market", { network, coin, interval });
 }
 
 /**
