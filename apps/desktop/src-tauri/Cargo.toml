@@ -30,8 +30,12 @@ serde_json.workspace = true
 tauri-plugin-updater = { version = "2", default-features = false }
 
 tokio = { workspace = true, features = ["process"] }
+tokio-util = "0.7"
 
 [dev-dependencies]
+oppen-mcp = { path = "../../../crates/oppen-mcp", features = ["test-support"] }
+oppen-hl = { path = "../../../crates/oppen-hl", features = ["test-support"] }
+tempfile = "3"
 tauri = { version = "2", features = ["test"] }
 # The live feed test drives a real socket, so it needs a runtime of its own.
 # Tauri's `async_runtime` is tokio; this is the same one, not a second choice.

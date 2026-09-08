@@ -150,6 +150,18 @@ impl TokenStore {
         self.journal.network()
     }
 
+    /// Whether a single-account desktop pump covers every retained binding.
+    /// Revoked records still count because supervision may need their cleanup.
+    /// An empty store has no cancellation target, so it cannot supervise one.
+    pub fn supports_binding(&self, binding: &Binding) -> bool {
+        !self.closed
+            && !self.records.is_empty()
+            && self
+                .records
+                .values()
+                .all(|record| record.binding == *binding)
+    }
+
     /// Owned bindings for pause enforcement, including revoked pairings whose
     /// resting orders still need cancellation. No credentials leave the store.
     pub(crate) fn bindings(&self) -> Vec<Binding> {
@@ -670,6 +682,21 @@ mod tests {
                 .parse()
                 .expect("address"),
         }
+    }
+
+    #[test]
+    fn single_account_support_checks_revoked_bindings_and_closed_authority() {
+        let (_dir, mut store) = fixture();
+        let expected = binding("alpha");
+        assert!(!store.supports_binding(&expected));
+        store.issue(expected.clone()).unwrap();
+        assert!(store.supports_binding(&expected));
+        let other = store.issue(binding("beta")).unwrap();
+        store.revoke(other.id).unwrap();
+        assert!(!store.supports_binding(&expected));
+        let (_dir, mut store) = fixture();
+        store.closed = true;
+        assert!(!store.supports_binding(&expected));
     }
 
     #[test]

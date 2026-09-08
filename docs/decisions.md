@@ -305,6 +305,29 @@ generation tags prevent queued old feed events from changing the new context.
 See [desktop-runtime-ownership.md](specs/desktop-runtime-ownership.md) for the
 implementation and evidence contract. This is not a completed lifecycle gate.
 
+### Desktop-owned MCP supervision (ES20)
+
+Spec items 9, 14, 15, 26, 27 and 34 require the real MCP gateway and execution
+feed pump to belong to the ES19 desktop owner. Start is an explicit testnet
+operator action requiring existing registry, policy, pairing scope and pilot
+authority; it never creates authority or acknowledges orders. Bind the loopback
+listener before venue startup, retain partial startup and actual execution,
+and close/drain the pump receiver after socket producers finish. Do not copy
+the development example's detached pump or infer execution health from console
+ticks. See [desktop-mcp-runtime.md](specs/desktop-mcp-runtime.md).
+
+The desktop adds direct dependencies on the already-used `tokio-util` 0.7 for
+the existing server cancellation contract and `tempfile` 3 in tests for isolated
+durable authority fixtures. No new version or runtime is introduced. A bespoke
+cancellation adapter and hand-managed temporary paths would duplicate existing
+workspace mechanisms without improving ownership or test isolation.
+Cross-crate desktop fixtures enable dev-only `test-support` features: reuse
+existing loopback Info/Exchange clients and restrict the WS fixture override
+to `127.0.0.1` plus a port. Production dependencies do not enable those
+features. This changes transport only, retaining the real gateway guards,
+pairing authority, pump and desktop owner; no live endpoint is used to prove
+local lifecycle behavior.
+
 ## 2026-09-07 · The console's own socket
 
 Item 34 asks for per-feed status, last-tick timestamps and a stale overlay. The

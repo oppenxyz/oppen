@@ -41,8 +41,8 @@ use serde_json::json;
 
 use crate::ledger::{Ledger, NewFill};
 
-/// The two facts `oppen_core::state` and the guardrail engine need.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Cached freshness, completeness and lifetime failure evidence.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FeedState {
     /// Newest message across every subscription, ms. `None` means nothing has
     /// ever arrived — which item 34 distinguishes from having gone quiet,
@@ -52,6 +52,9 @@ pub struct FeedState {
     /// last outage. False until a reconcile returns, and false again the
     /// moment a socket drops.
     pub reconciled: bool,
+    /// First persistent pump failure. Only a new session starts without it;
+    /// later ticks or successful gap walks cannot prove the lost work recovered.
+    pub failure: Option<String>,
 }
 
 /// What [`FeedSession::apply`] wants done that it cannot do itself.
@@ -76,6 +79,7 @@ pub enum Action {
 struct Inner {
     last_tick_ms: Option<u64>,
     reconciled: bool,
+    failure: Option<String>,
 }
 
 /// The live view of one network's feeds.
@@ -95,6 +99,7 @@ impl FeedSession {
             inner: Mutex::new(Inner {
                 last_tick_ms: None,
                 reconciled: false,
+                failure: None,
             }),
         }
     }
@@ -104,6 +109,7 @@ impl FeedSession {
         FeedState {
             last_tick_ms: inner.last_tick_ms,
             reconciled: inner.reconciled,
+            failure: inner.failure.clone(),
         }
     }
 
@@ -117,7 +123,7 @@ impl FeedSession {
     /// and nothing outside oppen-core drives the flag.
     pub(crate) fn reconciled(&self, at_ms: u64) {
         let mut inner = self.lock();
-        inner.reconciled = true;
+        inner.reconciled = inner.failure.is_none();
         // A reconcile is itself evidence the venue answered, so it counts as a
         // tick. Without this, an account that reconnects into a quiet market
         // would read as stale until the next trade prints.
@@ -135,6 +141,14 @@ impl FeedSession {
     /// questions, and this answers only the second.
     pub(crate) fn unreconciled(&self) {
         self.lock().reconciled = false;
+    }
+
+    /// Latch the first persistent failure without changing the freshness clock.
+    /// There is deliberately no reset within this session's lifetime.
+    pub(crate) fn record_failure(&self, detail: String) {
+        let mut inner = self.lock();
+        inner.failure.get_or_insert(detail);
+        inner.reconciled = false;
     }
 
     /// Fold one event into the session, recording any fills it carried.
@@ -486,7 +500,8 @@ mod tests {
             session.state(),
             FeedState {
                 last_tick_ms: None,
-                reconciled: false
+                reconciled: false,
+                failure: None,
             }
         );
     }
@@ -574,5 +589,35 @@ mod tests {
         let session = FeedSession::new();
         session.reconciled(NOW);
         assert_eq!(session.state().last_tick_ms, Some(NOW));
+    }
+
+    #[test]
+    fn failure_survives_reconciliation_and_ticks_without_affecting_a_new_session() {
+        let dir = TempDir::new().expect("tempdir");
+        let ledger = ledger(&dir);
+        let session = FeedSession::new();
+        session.reconciled(NOW);
+        session.record_failure("fill was not persisted".into());
+        assert_eq!(session.state().last_tick_ms, Some(NOW));
+        assert!(!session.state().reconciled);
+
+        session.record_failure("later failure".into());
+        session.reconciled(NOW + 1);
+        assert_eq!(session.state().last_tick_ms, Some(NOW + 1));
+        session
+            .apply(&ledger, account(), &bbo(NOW + 2), NOW + 2)
+            .expect("tick");
+        session.reconciled(NOW);
+        let failed = session.state();
+        assert!(!failed.reconciled);
+        assert_eq!(failed.failure.as_deref(), Some("fill was not persisted"));
+        assert_eq!(failed.last_tick_ms, Some(NOW + 2));
+
+        let fresh = FeedSession::new();
+        assert_eq!(fresh.state().failure, None);
+        assert_eq!(fresh.state().last_tick_ms, None);
+        fresh.reconciled(NOW + 3);
+        assert!(fresh.state().reconciled);
+        assert_eq!(session.state(), failed);
     }
 }

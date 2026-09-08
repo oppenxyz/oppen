@@ -341,6 +341,27 @@ export function fetchRuntimeStatus(): Promise<RuntimeStatus> {
   return invoke<RuntimeStatus>("runtime_status");
 }
 
+export interface McpStatus {
+  phase: "idle" | "starting" | "listening" | "stopping" | "stopped" | "failed";
+  network: "testnet" | "mainnet";
+  agent: string | null;
+  account: string | null;
+  listener: string | null;
+  reconciled: boolean | null;
+  account_feeds_ready: boolean | null;
+  supervision_last_completed_ms: number | null;
+  supervision_in_progress: boolean;
+  supervision_error: string | null;
+  orders_inhibited: boolean;
+  detail: string | null;
+}
+
+export function fetchMcpStatus(): Promise<McpStatus> { return invoke<McpStatus>("mcp_status"); }
+export function startMcp(agent: string, account: string): Promise<McpStatus> {
+  return invoke<McpStatus>("start_mcp", { agent, account });
+}
+export function stopMcp(): Promise<RuntimeStatus> { return invoke<RuntimeStatus>("stop_mcp"); }
+
 /**
  * Point the socket at one symbol and interval.
  *

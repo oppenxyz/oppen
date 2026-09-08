@@ -1,16 +1,42 @@
 <script setup lang="ts">
-import { computed, nextTick, ref } from "vue";
+import { computed, nextTick, onMounted, onUnmounted, ref } from "vue";
 import EmptyState from "../components/housing/EmptyState.vue";
 import PanelHousing from "../components/housing/PanelHousing.vue";
 import ReadoutRows from "../components/housing/ReadoutRows.vue";
 import UiButton from "../components/ui/UiButton.vue";
 import { setNetwork, shell, refreshKeychain, type Network } from "../stores/shell";
 import { decimal } from "../lib/display";
-import { operator, storedPolicy, policySourceLabel, refreshOperator } from "../stores/operator";
+import { operator, recordedAgents, storedPolicy, policySourceLabel, refreshOperator } from "../stores/operator";
+import { inTauri } from "../lib/bridge";
+import { MCP_PHASES, pauseSweepLabel, supervision, supervisionInputError } from "../stores/supervision";
+import { SETTINGS_SECTIONS as SECTIONS, settingsSection as section } from "../stores/settings";
 import { motionPaused, motionReduced, setMotionPaused } from "../lib/clock";
 
-const SECTIONS = ["Permissions & limits", "Keys & venues", "Models & API keys", "Local data", "MCP server", "Display"] as const;
-const section = ref<(typeof SECTIONS)[number]>("Permissions & limits");
+const supervisionAgent = ref("");
+const supervisionAccount = ref("");
+const confirmStop = ref(false);
+const mcp = supervision.state;
+const inputError = computed(() => supervisionInputError(shell.network, supervisionAgent.value, supervisionAccount.value));
+const canStart = computed(() => inTauri() && inputError.value === null && mcp.command === null && !mcp.stopRequested
+  && mcp.error === null && mcp.status?.phase === 'idle');
+const mcpRows = computed(() => [
+  { k: "Supervision", v: mcp.status ? MCP_PHASES[mcp.status.phase] : "Not read" },
+  { k: "Network", v: mcp.status?.network.toUpperCase() ?? "Unknown" },
+  { k: "Agent", v: mcp.status?.agent ?? "Not selected" },
+  { k: "Account", v: mcp.status?.account ?? "Not selected" },
+  { k: "Listener", v: mcp.status?.listener ?? "Not listening" },
+  { k: "Account reconciled", v: mcp.status?.reconciled === true ? "Yes" : mcp.status?.reconciled === false ? "No" : "Unknown" },
+  { k: "Account feeds ready", v: mcp.status?.account_feeds_ready === true ? "Yes" : mcp.status?.account_feeds_ready === false ? "No" : "Unknown" },
+  { k: "Pause enforcement", v: pauseSweepLabel(mcp.status) },
+  { k: "Last completed pause sweep", v: mcp.status?.supervision_last_completed_ms != null ? new Date(mcp.status.supervision_last_completed_ms).toLocaleString() : "Never observed" },
+  { k: "Orders inhibited", v: mcp.status ? (mcp.status.orders_inhibited ? "Yes" : "No - not an authorization to trade") : "Unknown" },
+]);
+onMounted(() => supervision.startPolling());
+onUnmounted(() => supervision.stopPolling());
+async function stopRuntime(): Promise<void> {
+  confirmStop.value = false;
+  await supervision.stop();
+}
 const pendingNetwork = ref<Network | null>(null);
 const networkError = ref("");
 const networkChoices = ref<HTMLElement | null>(null);
@@ -91,9 +117,38 @@ const local = computed(() => [
           <p class="copy">Display and network preferences are stored locally. No telemetry is configured.</p>
         </template>
         <template v-else-if="section === 'MCP server'">
-          <p class="copy">The gateway uses streamable HTTP on localhost. A token binds an external agent to one account/container. Its live pairing registry is not connected to this console.</p>
-          <ReadoutRows size="md" :rows="[{ k: 'Gateway status', v: 'Not read' }, { k: 'Pairings', v: 'Unknown' }, { k: 'Default endpoint', v: '127.0.0.1:7433/mcp' }]" />
-          <p class="copy">Use Builder for the current testnet development setup steps.</p>
+          <h2 class="supervision-title">TESTNET supervision</h2>
+          <ReadoutRows size="md" :rows="mcpRows" />
+          <p v-if="mcp.status?.detail" class="copy supervision-warning" role="status">{{ mcp.status.detail }}</p>
+          <p v-if="mcp.status?.phase === 'failed'" class="copy supervision-warning" role="status">Startup failure closed runtime admission. Resolve the reported blocker and restart the app; supervision cannot be retried in this runtime.</p>
+          <p v-if="mcp.status?.supervision_error" class="copy supervision-warning" role="status">Pause enforcement error: {{ mcp.status.supervision_error }}</p>
+          <p v-if="mcp.error" class="copy supervision-warning" role="status">Status unavailable: {{ mcp.error }} {{ mcp.checkedAt ? `Last observed ${new Date(mcp.checkedAt).toLocaleTimeString()}.` : '' }}</p>
+          <p class="copy">Start supervision reads the existing authority key in Rust and may enforce existing pauses and cancel resting orders under the existing authorized pilot. Positions may remain open. A listening connection is not trading activation.</p>
+          <p class="copy">Uses existing TESTNET pilot authorization, registry, policy and pairing records. The account must exactly match the configured TESTNET account. This action does not create setup, authorize a pilot, acknowledge policy or switch networks.</p>
+          <form class="supervision-form" @submit.prevent="supervision.start(shell.network, supervisionAgent, supervisionAccount)">
+            <label>Agent ID
+              <input v-model="supervisionAgent" list="supervision-agents" autocomplete="off" :disabled="mcp.command !== null || mcp.stopRequested" />
+            </label>
+            <datalist id="supervision-agents"><option v-for="agent in recordedAgents" :key="agent" :value="agent" /></datalist>
+            <label>Authorized TESTNET account
+              <input v-model="supervisionAccount" placeholder="0x..." autocomplete="off" spellcheck="false" :disabled="mcp.command !== null || mcp.stopRequested" />
+            </label>
+            <p class="copy">Recorded agent suggestions are unverified. Use the identity already confirmed in the durable pilot authorization.</p>
+            <p v-if="shell.network !== 'testnet' || (supervisionAgent && supervisionAccount && inputError)" class="supervision-warning" role="status">{{ inputError }}</p>
+            <div class="supervision-actions">
+              <UiButton type="submit" variant="primary" :disabled="!canStart">{{ mcp.command === 'start' ? 'Starting supervision' : 'Start supervision' }}</UiButton>
+              <UiButton :disabled="mcp.reading" @click="supervision.refresh">Refresh status</UiButton>
+              <UiButton variant="hazard" :disabled="!inTauri() || mcp.command === 'stop' || mcp.stopRequested" @click="confirmStop = true">Stop runtime</UiButton>
+            </div>
+          </form>
+          <p v-if="mcp.commandError" class="copy supervision-warning" role="alert">{{ mcp.commandError }}</p>
+          <div v-if="confirmStop" class="confirmation" role="group" aria-label="Confirm terminal runtime shutdown" @keydown.esc.stop.prevent="confirmStop = false">
+            <p>Stop the entire desktop runtime, including MCP and feed tasks? Shutdown is terminal: restarting the app is required. This does not close positions or prove cancellation completion.</p>
+            <UiButton @click="confirmStop = false">Keep runtime</UiButton>
+            <UiButton variant="hazard" @click="stopRuntime">Stop runtime</UiButton>
+          </div>
+          <p v-if="mcp.stopRequested" class="copy supervision-warning" role="status">Runtime shutdown requested. {{ mcp.runtime?.phase === 'stopped' ? 'Desktop tasks stopped.' : mcp.runtime?.phase === 'stopped_with_error' ? 'Desktop tasks stopped with errors.' : 'Completion is not confirmed here.' }} Restarting the app is required; this panel cannot reopen it.</p>
+          <p v-if="mcp.runtime?.detail" class="copy supervision-warning">{{ mcp.runtime.detail }}</p>
         </template>
         <template v-else>
           <p class="copy">Dark theme · Space Mono + Archivo. Bright values carry facts; subdued rules define the housings.</p>
@@ -140,4 +195,10 @@ const local = computed(() => [
 .confirmation button + button { margin-left: var(--s-3); }
 .motion { display: flex; align-items: center; gap: var(--s-3); margin-block: var(--s-4); color: var(--signal); font-size: var(--fs-copy); }
 .machine { margin: 0 auto var(--s-4); font: 12px/1.4 Menlo, Consolas, monospace; color: var(--bracket); }
+.supervision-title { margin-bottom: var(--s-4); font: 700 var(--fs-copy) / 1.5 var(--font-mono); letter-spacing: 0; }
+.supervision-form { display: grid; gap: var(--s-3); margin-block: var(--s-4); min-width: 0; }
+.supervision-form label { display: grid; gap: var(--s-2); color: var(--body); }
+.supervision-form input { box-sizing: border-box; width: 100%; min-width: 0; max-width: 64ch; padding: var(--s-3); border: 1px solid var(--rule-strong); background: var(--void); color: var(--signal); font: inherit; letter-spacing: 0; }
+.supervision-actions { display: flex; flex-wrap: wrap; gap: var(--s-3); }
+.supervision-warning { color: var(--hazard); overflow-wrap: anywhere; }
 </style>

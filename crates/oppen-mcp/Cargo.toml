@@ -8,6 +8,9 @@ repository.workspace = true
 rust-version.workspace = true
 publish = false
 
+[features]
+test-support = ["oppen-hl/test-support"]
+
 [dependencies]
 oppen-core = { path = "../oppen-core" }
 oppen-hl = { path = "../oppen-hl" }
