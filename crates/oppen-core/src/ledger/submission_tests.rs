@@ -520,7 +520,7 @@ fn prior_pending_survives_upgrade_without(missing: &str) {
             .unwrap()
             .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
             .unwrap(),
-        9
+        10
     );
     let journal = SubmissionJournal::new(ledger.clone());
     // A stricter typed reader may refuse this legacy intent. Neither reader
@@ -716,7 +716,7 @@ fn v2_upgrade_preserves_existing_events_hashes_and_head() {
             .unwrap()
             .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0),)
             .unwrap(),
-        9
+        10
     );
     let index_count: i64 = upgraded.lock().unwrap().query_row(
         "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'index' AND name = 'events_submission_account'",

@@ -372,6 +372,8 @@ impl From<OrderError> for VenueRule {
 #[serde(tag = "unevaluable", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum Unevaluable {
+    #[error("original request evidence does not match the normalized order")]
+    OriginalRequestMismatch,
     #[error("approval authority unavailable: {detail}")]
     ApprovalAuthority { detail: String },
     #[error("policy authority unavailable or unacknowledged: {detail}")]

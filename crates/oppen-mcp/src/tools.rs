@@ -22,7 +22,10 @@ use oppen_core::features::{
     BPS_PER_UNIT, book_features, funding_features, margin_runway_h, position_risk, vol_features,
 };
 use oppen_core::feed::FeedSession;
-use oppen_core::guardrail::{Cleared, FeedQuality, GuardrailEngine, MarketRef, OrderIntent};
+use oppen_core::guardrail::{
+    Cleared, FeedQuality, GuardrailEngine, MarketRef, OrderIntent, OriginalRequest,
+    RequestedOrderKind,
+};
 use oppen_core::journal::Journal;
 use oppen_core::ledger::{
     EventViews, PilotAccounting, PilotStatus, PilotStop, SubmissionError, SubmissionJournal,
@@ -881,48 +884,10 @@ impl Gateway {
         // The price and the order type together: a market order has no price
         // of its own, and a stop takes the book when it triggers, so both are
         // priced from the operator's slippage bound rather than the caller's.
-        let (px, kind) = match &params.order {
-            PlaceKind::Limit { limit_px, tif } => (
-                limit_px
-                    .parse::<Decimal>()
-                    .map_err(|e| ToolError::invalid("limit_px", e))?,
-                OrderKind::Limit { tif: (*tif).into() },
-            ),
-            PlaceKind::Market => {
-                // A missing mid is a refusal, not a guess: this is the gateway
-                // failing to build an order rather than a guardrail verdict.
-                let mid = context
-                    .market
-                    .reference_px
-                    .ok_or_else(|| ToolError::Unavailable {
-                        what: "reference price",
-                        detail: format!(
-                            "no mid for {}; refusing to price a market order",
-                            params.symbol
-                        ),
-                    })?;
-                (
-                    self.crossing_price(&bound, asset, mid, params.is_buy)?,
-                    OrderKind::Limit { tif: Tif::Ioc },
-                )
-            }
-            PlaceKind::StopMarket { trigger_px, tpsl } => {
-                let trigger_px = trigger_px
-                    .parse::<Decimal>()
-                    .map_err(|e| ToolError::invalid("trigger_px", e))?;
-                // Priced from the *trigger*, not today's mid: that is where
-                // the book will be when this fills, and it is the reference
-                // the engine measures the slippage cap against.
-                (
-                    self.crossing_price(&bound, asset, trigger_px, params.is_buy)?,
-                    OrderKind::Trigger {
-                        is_market: true,
-                        trigger_px,
-                        tpsl: (*tpsl).into(),
-                    },
-                )
-            }
-        };
+        let (px, kind, original) =
+            normalize_place_order(&params.order, params.is_buy, asset, &context.market, || {
+                self.operator_slippage_bps(&bound)
+            })?;
 
         let intent = OrderIntent {
             symbol: params.symbol.clone(),
@@ -936,6 +901,7 @@ impl Gateway {
             builder: None,
             max_slippage_bps: None,
             reason: params.reason,
+            original: Some(original),
         };
 
         // The gate. There is no branch around it.
@@ -1268,6 +1234,7 @@ impl Gateway {
             &params.reason,
             position.size,
             reference_px,
+            context.market.as_of_ms,
             // The operator's bound, shared with `place`'s market order.
             self.operator_slippage_bps(&bound)?,
             asset,
@@ -1366,6 +1333,7 @@ impl Gateway {
             // engine still checks one, so a fixed non-empty marker keeps the
             // predicate honest without inviting a placeholder from the agent.
             reason: "preflight".to_owned(),
+            original: None,
         };
         let agent = bound.agent.clone();
         let decision_asset = asset.clone();
@@ -2066,7 +2034,7 @@ impl Gateway {
     /// make slippage operator-set, and an agent that could widen it to cross
     /// the book could widen it to cross a worse one. In bps because that is
     /// what the guardrail config stores and what every refusal reports — the
-    /// one conversion to a fraction lives in [`Gateway::crossing_price`].
+    /// conversions to fractions live in the normalization helpers.
     fn operator_slippage_bps(&self, bound: &Binding) -> Result<Decimal, ToolError> {
         let guardrails =
             self.inner
@@ -2080,21 +2048,6 @@ impl Gateway {
                     ),
                 })?;
         Ok(guardrails.max_slippage_bps)
-    }
-
-    /// A price that crosses the book from `reference_px`, within that bound.
-    ///
-    /// Rounded toward the reference, so pricing *at* the operator's limit
-    /// cannot be refused *for* that limit (`docs/decisions.md` C5).
-    fn crossing_price(
-        &self,
-        bound: &Binding,
-        asset: &oppen_hl::meta::Asset,
-        reference_px: Decimal,
-        is_buy: bool,
-    ) -> Result<Decimal, ToolError> {
-        let slippage = self.operator_slippage_bps(bound)? / BPS;
-        Ok(asset.slippage_price_bounded(reference_px, is_buy, slippage))
     }
 
     /// Fill spec F's σ-unit risk fields on an assembled state.
@@ -2512,6 +2465,75 @@ fn cancel_outcome(response: ExchangeResponse, named: Vec<(Option<u64>, Option<St
     outcome::canceled(requested, failed)
 }
 
+/// Retain the requested semantics alongside the unchanged execution conversion.
+/// The operator bound is read once, only for orders that require crossing prices.
+fn normalize_place_order(
+    order: &PlaceKind,
+    is_buy: bool,
+    asset: &oppen_hl::meta::Asset,
+    market: &MarketRef,
+    slippage: impl FnOnce() -> Result<Decimal, ToolError>,
+) -> Result<(Decimal, OrderKind, OriginalRequest), ToolError> {
+    let (px, kind, requested) = match order {
+        PlaceKind::Limit { limit_px, tif } => {
+            let limit_px = limit_px
+                .parse::<Decimal>()
+                .map_err(|error| ToolError::invalid("limit_px", error))?;
+            let tif = (*tif).into();
+            (
+                limit_px,
+                OrderKind::Limit { tif },
+                RequestedOrderKind::Limit { limit_px, tif },
+            )
+        }
+        PlaceKind::Market => {
+            let mid = market.reference_px.ok_or_else(|| ToolError::Unavailable {
+                what: "reference price",
+                detail: format!(
+                    "no mid for {}; refusing to price a market order",
+                    market.symbol
+                ),
+            })?;
+            let slippage_bps = slippage()?;
+            (
+                asset.slippage_price_bounded(mid, is_buy, slippage_bps / BPS),
+                OrderKind::Limit { tif: Tif::Ioc },
+                RequestedOrderKind::Market { slippage_bps },
+            )
+        }
+        PlaceKind::StopMarket { trigger_px, tpsl } => {
+            let trigger_px = trigger_px
+                .parse::<Decimal>()
+                .map_err(|error| ToolError::invalid("trigger_px", error))?;
+            let tpsl = (*tpsl).into();
+            let slippage_bps = slippage()?;
+            // Stops cross from the trigger, not from the contemporaneous quote.
+            (
+                asset.slippage_price_bounded(trigger_px, is_buy, slippage_bps / BPS),
+                OrderKind::Trigger {
+                    is_market: true,
+                    trigger_px,
+                    tpsl,
+                },
+                RequestedOrderKind::StopMarket {
+                    trigger_px,
+                    tpsl,
+                    slippage_bps,
+                },
+            )
+        }
+    };
+    Ok((
+        px,
+        kind,
+        OriginalRequest {
+            kind: requested,
+            reference_px: market.reference_px,
+            reference_at_ms: market.as_of_ms,
+        },
+    ))
+}
+
 /// The order a close is, decided from the position and the operator's bound.
 ///
 /// Free-standing and pure, because the two things that make a close dangerous
@@ -2521,11 +2543,13 @@ fn cancel_outcome(response: ExchangeResponse, named: Vec<(Option<u64>, Option<St
 /// refusing a reversed order is a worse way to learn this is wrong than a test.
 ///
 /// `position_size` is signed as the venue reports it: negative is short.
+#[allow(clippy::too_many_arguments)]
 fn close_intent(
     symbol: &str,
     reason: &str,
     position_size: Decimal,
     reference_px: Decimal,
+    reference_at_ms: u64,
     max_slippage_bps: Decimal,
     asset: &oppen_hl::meta::Asset,
     cloid: Cloid,
@@ -2554,6 +2578,14 @@ fn close_intent(
         // would refuse the order this function just priced.
         max_slippage_bps: None,
         reason: reason.to_owned(),
+        original: Some(OriginalRequest {
+            kind: RequestedOrderKind::ClosePosition {
+                position_size,
+                slippage_bps: max_slippage_bps,
+            },
+            reference_px: Some(reference_px),
+            reference_at_ms,
+        }),
     }
 }
 
@@ -2765,6 +2797,179 @@ mod tests {
         Cloid::from_bytes([7u8; 16])
     }
 
+    fn normalization_market(as_of_ms: u64) -> MarketRef {
+        MarketRef {
+            symbol: "TEST".into(),
+            reference_px: Some(d("100")),
+            as_of_ms,
+            quality: FeedQuality::Ok,
+            mark_divergence_bps: None,
+            mark_divergent_since_ms: None,
+            snapshot: None,
+            sigma_day: None,
+            vol_ratio: None,
+        }
+    }
+
+    #[test]
+    fn market_and_explicit_ioc_keep_distinct_originals_with_identical_normalization() {
+        let asset = test_asset(4);
+        let market = normalization_market(1234);
+        for is_buy in [false, true] {
+            let reads = std::cell::Cell::new(0);
+            let (px, kind, original) =
+                normalize_place_order(&PlaceKind::Market, is_buy, &asset, &market, || {
+                    reads.set(reads.get() + 1);
+                    Ok(d("50"))
+                })
+                .unwrap();
+            assert_eq!(
+                reads.get(),
+                1,
+                "normalization and evidence share one bound read"
+            );
+            let (limit_px, limit_kind, limit_original) = normalize_place_order(
+                &PlaceKind::Limit {
+                    limit_px: px.to_string(),
+                    tif: PlaceTif::Ioc,
+                },
+                is_buy,
+                &asset,
+                &market,
+                || panic!("explicit limits must not read the operator crossing bound"),
+            )
+            .unwrap();
+            assert_eq!((px, kind), (limit_px, limit_kind));
+            assert_eq!(
+                original,
+                OriginalRequest {
+                    kind: RequestedOrderKind::Market {
+                        slippage_bps: d("50")
+                    },
+                    reference_px: Some(d("100")),
+                    reference_at_ms: 1234,
+                }
+            );
+            assert_eq!(
+                limit_original,
+                OriginalRequest {
+                    kind: RequestedOrderKind::Limit {
+                        limit_px: px,
+                        tif: Tif::Ioc
+                    },
+                    reference_px: Some(d("100")),
+                    reference_at_ms: 1234,
+                }
+            );
+            assert_ne!(original, limit_original);
+        }
+    }
+
+    #[test]
+    fn stop_market_preserves_trigger_quote_time_and_the_single_normalization_bound() {
+        let asset = test_asset(4);
+        let market = normalization_market(4321);
+        for (requested_tpsl, tpsl) in [(PlaceTpsl::Sl, Tpsl::Sl), (PlaceTpsl::Tp, Tpsl::Tp)] {
+            for is_buy in [false, true] {
+                let reads = std::cell::Cell::new(0);
+                let (px, kind, original) = normalize_place_order(
+                    &PlaceKind::StopMarket {
+                        trigger_px: "90.1234".into(),
+                        tpsl: requested_tpsl,
+                    },
+                    is_buy,
+                    &asset,
+                    &market,
+                    || {
+                        reads.set(reads.get() + 1);
+                        Ok(d("0.6"))
+                    },
+                )
+                .unwrap();
+                assert_eq!(reads.get(), 1);
+                assert_eq!(
+                    px,
+                    asset.slippage_price_bounded(d("90.1234"), is_buy, d("0.6") / BPS)
+                );
+                assert_eq!(
+                    kind,
+                    OrderKind::Trigger {
+                        is_market: true,
+                        trigger_px: d("90.1234"),
+                        tpsl
+                    }
+                );
+                assert_eq!(
+                    original,
+                    OriginalRequest {
+                        kind: RequestedOrderKind::StopMarket {
+                            trigger_px: d("90.1234"),
+                            tpsl,
+                            slippage_bps: d("0.6")
+                        },
+                        reference_px: Some(d("100")),
+                        reference_at_ms: 4321,
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn missing_market_reference_still_refuses_before_reading_slippage() {
+        let mut market = normalization_market(1234);
+        market.reference_px = None;
+        let result =
+            normalize_place_order(&PlaceKind::Market, true, &test_asset(4), &market, || {
+                panic!("a missing quote must not price an order")
+            });
+        assert!(matches!(
+            result,
+            Err(ToolError::Unavailable {
+                what: "reference price",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn close_original_preserves_signed_position_size_and_reference_evidence() {
+        let asset = test_asset(4);
+        for position_size in [d("1.2345"), d("-1.2345")] {
+            let intent = close_intent(
+                "TEST",
+                "reduce risk",
+                position_size,
+                d("100"),
+                9876,
+                d("50"),
+                &asset,
+                a_cloid(),
+            );
+            assert_eq!(
+                intent.original,
+                Some(OriginalRequest {
+                    kind: RequestedOrderKind::ClosePosition {
+                        position_size,
+                        slippage_bps: d("50")
+                    },
+                    reference_px: Some(d("100")),
+                    reference_at_ms: 9876,
+                })
+            );
+            assert_eq!(intent.sz, position_size.abs());
+            assert_eq!(intent.is_buy, position_size.is_sign_negative());
+            assert_eq!(
+                intent.px,
+                asset.slippage_price_bounded(d("100"), intent.is_buy, d("50") / BPS)
+            );
+            assert_eq!(intent.kind, OrderKind::Limit { tif: Tif::Ioc });
+            assert!(intent.reduce_only);
+            assert_eq!(intent.cloid, Some(a_cloid()));
+            assert_eq!(intent.max_slippage_bps, None);
+        }
+    }
+
     /// The one that doubles a position if it is backwards.
     #[test]
     fn closing_a_long_sells_and_closing_a_short_buys() {
@@ -2774,6 +2979,7 @@ mod tests {
             "flat",
             d("1.5"),
             d("100"),
+            0,
             d("50"),
             &asset,
             a_cloid(),
@@ -2786,6 +2992,7 @@ mod tests {
             "flat",
             d("-1.5"),
             d("100"),
+            0,
             d("50"),
             &asset,
             a_cloid(),
@@ -2800,7 +3007,16 @@ mod tests {
     #[test]
     fn a_close_is_a_reduce_only_ioc() {
         let asset = test_asset(4);
-        let intent = close_intent("BTC", "flat", d("2"), d("100"), d("50"), &asset, a_cloid());
+        let intent = close_intent(
+            "BTC",
+            "flat",
+            d("2"),
+            d("100"),
+            0,
+            d("50"),
+            &asset,
+            a_cloid(),
+        );
         assert!(intent.reduce_only);
         assert_eq!(intent.kind, OrderKind::Limit { tif: Tif::Ioc });
         assert!(intent.cloid.is_some(), "a close must be reconcilable too");
@@ -2814,7 +3030,16 @@ mod tests {
         let asset = test_asset(4);
         // 0.6 bp on a 100 mid is the case where rounding to nearest lands on
         // 100.01 — 1 bp — and would be refused for exceeding 0.6 bp.
-        let buy = close_intent("T", "flat", d("-1"), d("100"), d("0.6"), &asset, a_cloid());
+        let buy = close_intent(
+            "T",
+            "flat",
+            d("-1"),
+            d("100"),
+            0,
+            d("0.6"),
+            &asset,
+            a_cloid(),
+        );
         assert!(buy.is_buy);
         assert!(
             buy.px <= d("100.006"),
@@ -2822,7 +3047,16 @@ mod tests {
             buy.px
         );
 
-        let sell = close_intent("T", "flat", d("1"), d("100"), d("0.6"), &asset, a_cloid());
+        let sell = close_intent(
+            "T",
+            "flat",
+            d("1"),
+            d("100"),
+            0,
+            d("0.6"),
+            &asset,
+            a_cloid(),
+        );
         assert!(!sell.is_buy);
         assert!(
             sell.px >= d("99.994"),
@@ -2837,7 +3071,16 @@ mod tests {
     #[test]
     fn a_close_does_not_set_its_own_slippage_limit() {
         let asset = test_asset(4);
-        let intent = close_intent("BTC", "flat", d("1"), d("100"), d("50"), &asset, a_cloid());
+        let intent = close_intent(
+            "BTC",
+            "flat",
+            d("1"),
+            d("100"),
+            0,
+            d("50"),
+            &asset,
+            a_cloid(),
+        );
         assert_eq!(intent.max_slippage_bps, None);
     }
 
@@ -2851,6 +3094,7 @@ mod tests {
             "risk off",
             d("1"),
             d("100"),
+            0,
             d("50"),
             &asset,
             a_cloid(),
@@ -3110,6 +3354,7 @@ mod tests {
             builder: None,
             max_slippage_bps: None,
             reason: "durable submission fixture".into(),
+            original: None,
         };
         let market = MarketRef {
             symbol: "TEST".into(),
