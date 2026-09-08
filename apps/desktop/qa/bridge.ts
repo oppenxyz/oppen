@@ -3,6 +3,7 @@ import type { AccountState, ChartSeries, FeedBinding, MarketSnapshot, McpStatus,
 export type * from "../src/lib/bridge";
 export { isConsoleError } from "../src/lib/bridge";
 export { fetchPolicySetupStatus, reviewPolicySetup, persistPolicySetup, discardPolicySetup } from "./policy-setup";
+export { fetchApprovalQueueStatus, refreshApprovalQueue, rejectApprovalProposal } from "./approvals";
 export let failedRead = false;
 export function failNextReads(): void { failedRead = true; }
 const scenario = new URLSearchParams(location.search).get("state") ?? "positions";

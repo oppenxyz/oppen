@@ -15,4 +15,5 @@ window.addEventListener("message", event => {
 });
 if (new URLSearchParams(location.search).get("state") === "loading") setView("agents");
 if (new URLSearchParams(location.search).has("policy")) setView("settings");
+if (new URLSearchParams(location.search).has("approvals")) setView("agents");
 createApp(App).mount("#app");

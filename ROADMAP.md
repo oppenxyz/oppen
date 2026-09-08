@@ -174,6 +174,19 @@ before expanding features:
    issues; exact-head review and CI remain gates;
    original-request repricing and native approval UI remain open. This is not a
    completed live gate.
+   ES28 is implemented locally on `feat/native-approval-queue`: desktop-owned
+   scoped pending reads and durable rejection, retained single-flight work,
+   shutdown drain even after parent failure, and row-local confirmation.
+   Cached decisions cannot replace another proposal's unresolved rejection;
+   explicit retry requires a successful fresh queue observation. Workspace
+   Rust tests, 168 frontend tests, production build, formatting and all-target
+   Clippy pass; independent automated diff review found no blocking issues.
+   Browser fixtures verified row-local confirmation, rejection, uncertainty and
+   explicit refresh at wide and 1280x800 desktop sizes. The separate QA project
+   typecheck fails on missing `bun:test`/`node:url` types in existing test files;
+   it is not a passing gate. Exact-head review and CI remain pending.
+   Native pricing review, approval execution, exact-head CI and live gates remain
+   open. This queue/rejection work does not enable order submission.
    No dedicated-account activity has been performed during this development.
 4. **Recovery:** PR #44 merged as `06fc0e3` after green CI and separate automated
    review. The durable submission journal has SQLite reopen, independent

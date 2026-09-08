@@ -126,6 +126,11 @@ impl Proposal {
         &self.agent
     }
 
+    /// The original authorized account, not a lookup through today's registry.
+    pub fn account(&self) -> Address {
+        self.route.binding.container
+    }
+
     /// What the agent asked for. Item 28 re-prices at approval time, so the
     /// operator console shows this against the current market to display the
     /// drift.

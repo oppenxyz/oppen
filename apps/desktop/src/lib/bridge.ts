@@ -434,6 +434,60 @@ export function haltMcp(agent: string, account: string): Promise<McpStatus> {
   return invoke<McpStatus>("halt_mcp", { agent, account });
 }
 
+export type RequestedOrderKind =
+  | { kind: "limit"; limit_px: string; tif: "Alo" | "Ioc" | "Gtc" }
+  | { kind: "market"; slippage_bps: string }
+  | { kind: "stop_market"; trigger_px: string; tpsl: "tp" | "sl"; slippage_bps: string }
+  | { kind: "close_position"; position_size: string; slippage_bps: string };
+
+export interface OriginalRequest {
+  kind: RequestedOrderKind;
+  reference_px: string | null;
+  reference_at_ms: number;
+}
+
+export interface PendingApprovalView {
+  id: string;
+  agent: string;
+  account: string;
+  symbol: string;
+  is_buy: boolean;
+  px: string;
+  sz: string;
+  reduce_only: boolean;
+  reason: string;
+  expires_at_ms: number;
+  original: OriginalRequest | null;
+}
+
+export interface ApprovalDecision {
+  proposal_id: string;
+  outcome: "rejected" | "not_pending" | "uncertain";
+  at_ms: number;
+  error: string | null;
+}
+
+export interface ApprovalQueueStatus {
+  owner_id: string;
+  agent: string;
+  account: string;
+  phase: "idle" | "refreshing" | "rejecting" | "ready" | "unavailable" | "recovery_required" | "closed";
+  observed_at_ms: number | null;
+  pending: PendingApprovalView[];
+  decision: ApprovalDecision | null;
+  error: string | null;
+}
+
+export function fetchApprovalQueueStatus(agent: string, account: string): Promise<ApprovalQueueStatus> {
+  return invoke<ApprovalQueueStatus>("approval_queue_status", { agent, account });
+}
+export function refreshApprovalQueue(agent: string, account: string): Promise<ApprovalQueueStatus> {
+  return invoke<ApprovalQueueStatus>("refresh_approval_queue", { agent, account });
+}
+export function rejectApprovalProposal(agent: string, account: string, ownerId: string, proposalId: string): Promise<ApprovalQueueStatus> {
+  return invoke<ApprovalQueueStatus>("reject_approval_proposal", { agent, account, ownerId, proposalId });
+}
+
 /**
  * Point the socket at one symbol and interval.
  *

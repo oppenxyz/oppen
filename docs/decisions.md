@@ -399,6 +399,24 @@ operator-only gateway execution and recovery acceptance are tracked in
 [operator-approvals.md](specs/operator-approvals.md). No dependency or live
 authorization is introduced.
 
+### Native approval queue and rejection (ES28)
+
+Spec items 18/28/32: connect the durable pending queue and rejection to the
+existing desktop-owned engine before exposing approval execution. A concrete
+native controller retains one bounded read/reject worker and cached observation;
+lost IPC does not cancel admitted work. Bind commands to the exact supervised
+account/agent and rejection to an owner-generation ID. Fresh durable lookup must
+verify proposal scope before rejection, not trust an ID from a cached UI list.
+Report rejected, no-longer-pending and uncertain outcomes separately. Retain stale
+evidence on read failure with explicit status; never report an empty verified
+queue from a failed read. Close admission and drain actual workers before
+releasing the MCP/feed owner, including dropped shutdown waiters.
+
+No MCP approval/rejection tool, signing, policy activation or new dependency.
+Rejection is permitted for retained proposals even if pairing was revoked; it
+does not authorize execution. Future approval requires the separate retained
+pricing commitment and live pairing lease described in operator-approvals.md.
+
 ### Approval deadline at signing (ES27)
 
 Spec item 28's exclusive proposal expiry must survive operator approval. Carry

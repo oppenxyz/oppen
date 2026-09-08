@@ -9,6 +9,7 @@
 mod feed;
 mod local_reads;
 mod mcp_runtime;
+mod operator_approvals;
 mod operator_halt;
 mod policy_setup;
 mod runtime;
@@ -488,6 +489,41 @@ async fn stop_mcp(runtime: State<'_, Runtime>) -> Result<RuntimeStatus, ConsoleE
     runtime.shutdown().await?;
     Ok(runtime.status())
 }
+
+#[tauri::command]
+fn approval_queue_status(
+    runtime: State<'_, Runtime>,
+    agent: String,
+    account: String,
+) -> Result<operator_approvals::ApprovalQueueStatus, ConsoleError> {
+    runtime
+        .approval_queue_status(agent, account)
+        .map_err(ConsoleError::from)
+}
+
+#[tauri::command]
+fn refresh_approval_queue(
+    runtime: State<'_, Runtime>,
+    agent: String,
+    account: String,
+) -> Result<operator_approvals::ApprovalQueueStatus, ConsoleError> {
+    runtime
+        .refresh_approval_queue(agent, account)
+        .map_err(ConsoleError::from)
+}
+
+#[tauri::command]
+fn reject_approval_proposal(
+    runtime: State<'_, Runtime>,
+    agent: String,
+    account: String,
+    owner_id: String,
+    proposal_id: String,
+) -> Result<operator_approvals::ApprovalQueueStatus, ConsoleError> {
+    runtime
+        .reject_approval_proposal(agent, account, owner_id, proposal_id)
+        .map_err(ConsoleError::from)
+}
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -524,6 +560,9 @@ pub fn run() {
             start_mcp,
             stop_mcp,
             halt_mcp,
+            approval_queue_status,
+            refresh_approval_queue,
+            reject_approval_proposal,
             updates::check_update,
             updates::download_update,
             updates::install_update
