@@ -137,6 +137,7 @@ pub(crate) struct ConsoleFeed {
     failure: Arc<Mutex<Option<String>>>,
     drained: Option<Result<(), String>>,
     chart: Option<ChartTransport>,
+    diagnostics: Arc<crate::channel_health::Diagnostics>,
     /// What the operator is looking at. Swapped whole on every selection, so
     /// the console never holds a feed for a symbol it stopped drawing.
     watching: Mutex<Vec<Subscription>>,
@@ -196,9 +197,16 @@ impl ConsoleFeed {
         let loop_session = Arc::clone(&session);
         let loop_account = account.unwrap_or_default();
         let failure = Arc::new(Mutex::new(None));
+        let diagnostics = Arc::new(crate::channel_health::Diagnostics::default());
+        let loop_diagnostics = diagnostics.clone();
         let loop_failure = failure.clone();
         let event_task =
             spawn_event_consumer(events, failure.clone(), move |event, received_at_ms| {
+                loop_diagnostics.record(
+                    crate::channel_health::Owner::Console,
+                    event,
+                    received_at_ms,
+                );
                 // One blocking consumer preserves application order and owns every
                 // ledger write through completion, without occupying an async worker.
                 let apply_error = loop_session
@@ -268,6 +276,7 @@ impl ConsoleFeed {
             failure,
             drained: None,
             chart: None,
+            diagnostics,
             watching: Mutex::new(Vec::new()),
         })
     }
@@ -339,6 +348,7 @@ impl ConsoleFeed {
             Subscription::Bbo { coin: coin.into() },
             Subscription::L2Book { coin: coin.into() },
         ];
+        self.diagnostics.select(&wanted);
         let mut held = self.watching.lock().map_err(|_| "feed lock poisoned")?;
         // Recorded as each one is taken, never assumed. Returning early on a
         // refusal without writing down what already succeeded would leak those
@@ -403,6 +413,39 @@ impl ConsoleFeed {
 
     pub(crate) fn chart_failure(&self) -> Option<crate::chart_transport::ChartFailure> {
         self.chart.as_ref().and_then(ChartTransport::failure)
+    }
+
+    pub(crate) fn channel_health(
+        &self,
+        binding: &ChartBinding,
+        at: u64,
+    ) -> Option<(
+        crate::channel_health::PoolObservation,
+        crate::channel_health::PoolObservation,
+    )> {
+        let health = match &self.pool {
+            Some(pool) => pool.try_health()?,
+            None => Vec::new(),
+        };
+        let failure = self.failure.try_lock().ok()?.clone().or_else(|| {
+            (self.drained.is_none()
+                && self
+                    .event_task
+                    .as_ref()
+                    .is_some_and(JoinHandle::is_finished))
+            .then(|| "console consumer terminated before shutdown".into())
+        });
+        let console = self.diagnostics.sample(
+            health,
+            crate::channel_health::Owner::Console,
+            failure.as_deref(),
+            at,
+        )?;
+        let chart = match &self.chart {
+            Some(chart) => chart.channel_health(binding, at)?,
+            None => crate::channel_health::PoolObservation::missing(),
+        };
+        Some((console, chart))
     }
 }
 
@@ -539,6 +582,7 @@ mod tests {
             failure,
             drained: None,
             chart: None,
+            diagnostics: Arc::new(crate::channel_health::Diagnostics::default()),
             watching: Mutex::new(Vec::new()),
         }
     }

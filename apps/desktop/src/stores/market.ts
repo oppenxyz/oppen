@@ -34,7 +34,8 @@ import {
   type MarketRow,
   type MarketSnapshot,
 } from "../lib/bridge";
-import { ageFeeds, feedStatus, feedTick, shell } from "./shell";
+import { shell } from "./shell";
+import { marketHealth } from "./market-health";
 
 /** Bar intervals the chart offers. Native on the venue, so nothing resamples. */
 export const INTERVALS = ["1m", "5m", "15m", "1h", "4h", "1d"] as const;
@@ -271,6 +272,11 @@ export function quoteSpread(bid: string | null | undefined, ask: string | null |
   const spread = ((a - b) / (a / 2 + b / 2)) * 10_000;
   return Number.isFinite(spread) ? spread : null;
 }
+
+export const quoteValidity = computed(() => {
+  if (!quotes.touch?.bid || !quotes.touch.ask) return "Unavailable";
+  return quoteSpread(quotes.touch.bid.px, quotes.touch.ask.px) === null ? "Invalid / crossed" : "Two-sided";
+});
 
 /** The selected row, for the strip above the chart. */
 export const selectedRow = computed<MarketRow | null>(
@@ -550,9 +556,7 @@ export function createMarketFeed(
 /** Selected-owner delivery. Chart projections have their own observation clock. */
 export function receiveSelectedFeed(update: FeedUpdate, failure?: string): void {
   applyFeed(update);
-  if (failure !== undefined) { quoteState.invalidate(); chartState.retain(); feedStatus(false, failure); }
-  else if (update.kind === "status") feedStatus(update.connected, update.detail);
-  else if (update.kind !== "chart") feedTick(update.at_ms);
+  if (failure !== undefined) { quoteState.invalidate(); chartState.retain(); }
 }
 
 let watchError: string | null = null;
@@ -560,9 +564,9 @@ const liveFeed = createMarketFeed(
   () => ({ network: shell.network, coin: state.selected, interval: state.interval }),
   { watch: watchMarket, listen: onFeedUpdate },
   {
-    invalidate: () => { quoteState.invalidate(); chartState.invalidate(); feedStatus(false, "Awaiting selected market feed."); },
-    failure: (detail) => { quoteState.invalidate(); chartState.retain(); feedStatus(false, detail); },
-    chartBinding: (binding) => { chartState.bind(binding); },
+    invalidate: () => { quoteState.invalidate(); chartState.invalidate(); marketHealth.invalidate(); },
+    failure: () => { quoteState.invalidate(); chartState.retain(); },
+    chartBinding: (binding) => { chartState.bind(binding); marketHealth.bind(binding); },
     error: (detail) => {
       if (detail !== null || state.error === watchError) state.error = detail;
       watchError = detail;
@@ -586,33 +590,24 @@ export async function watchSelected(): Promise<void> {
  */
 const RAIL_REFRESH_MS = 10_000;
 
-/** How often the staleness overlay re-reads the clock (item 34). */
-const AGE_TICK_MS = 1_000;
-
 let rail: ReturnType<typeof globalThis.setInterval> | null = null;
-let age: ReturnType<typeof globalThis.setInterval> | null = null;
 
 /**
  * Start the console's live data (`docs/spec.md` items 31, 34).
  *
- * Three clocks, deliberately not one: the socket for the selected symbol, a
- * poll for the rail that no socket can serve, and a timer that ages the
- * staleness overlay because a feed going quiet announces nothing. Idempotent,
- * so a remount does not stack listeners or timers.
+ * The selected symbol streams independently of the rail poll. Channel health
+ * is observed by the runtime monitor. Remounts do not stack listeners or timers.
  */
 export async function startMarketFeed(): Promise<void> {
   if (rail !== null) return;
   void refreshMarkets();
   rail = globalThis.setInterval(() => void refreshMarkets(), RAIL_REFRESH_MS);
-  age = globalThis.setInterval(() => ageFeeds(Date.now()), AGE_TICK_MS);
   if (inTauri()) await liveFeed.start();
 }
 
 /** Stop everything `startMarketFeed` started. */
 export function stopMarketFeed(): void {
   if (rail !== null) globalThis.clearInterval(rail);
-  if (age !== null) globalThis.clearInterval(age);
   liveFeed.stop();
   rail = null;
-  age = null;
 }

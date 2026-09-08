@@ -1,13 +1,13 @@
 <script setup lang="ts">
 import { computed, nextTick, ref } from "vue";
-import { formatLatency, formatUsd, NAV, setView, shell, feedLabel } from "../../stores/shell";
+import { formatLatency, formatUsd, NAV, setView, shell } from "../../stores/shell";
+import { marketTransport, marketChannels } from "../../stores/market-health";
 import { progress } from "../../stores/tour";
 import UiButton from "../ui/UiButton.vue";
 import ApertureMark from "./ApertureMark.vue";
 import WordMark from "./WordMark.vue";
 import { supervision } from "../../stores/supervision";
 
-const venue = computed(() => feedLabel(shell.feeds.wsMarket));
 const latency = computed(() => formatLatency(shell.latencyMs));
 const equity = computed(() => formatUsd(shell.equityUsd));
 const network = computed(() => shell.network.toUpperCase());
@@ -53,7 +53,7 @@ async function submitHalt(): Promise<void> {
 
     <div class="hdr__status">
       <span>LOCAL · <span class="hdr__v">CONSOLE OPEN</span></span>
-      <span>HYPERLIQUID MKT · <span class="hdr__v">{{ venue }}</span></span>
+      <span data-health="summary">WS · <span class="hdr__v">{{ marketTransport }}</span> · Channels · <span class="hdr__v">{{ marketChannels }}</span></span>
       <span class="hdr__chip" :class="`hdr__chip--${shell.network}`" data-tour="network">{{ network }}</span>
       <span>LAT · <span class="hdr__v">{{ latency }}</span></span>
       <span>EQUITY · <span class="hdr__v hdr__v--signal">{{ equity }}</span></span>

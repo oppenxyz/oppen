@@ -1,7 +1,6 @@
 import type { ChartBinding, ChartProjection, ObservedChartBar } from "../lib/bridge";
-import { toRaw } from "vue";
 import { createChartObservations, receiveSelectedFeed } from "./market";
-import { ageFeeds, feedStatus, feedTick, shell } from "./shell";
+import { shell } from "./shell";
 
 declare const test: (name: string, body: () => void | Promise<void>) => void;
 declare const expect: (actual: unknown) => { toBe(expected: unknown): void; toEqual(expected: unknown): void };
@@ -27,34 +26,11 @@ function fixture() {
   return { owner, reads };
 }
 
-test("history, clock-only and interrupted or frozen chart projections never freshen the shared market feed", () => {
-  const prior = { lastMarketTickMs: shell.lastMarketTickMs, feeds: { ...shell.feeds }, feedDetail: shell.feedDetail };
-  try {
-    feedTick(Date.now() - 100000);
-    const tick = shell.lastMarketTickMs!;
-    const updates: ChartProjection[] = [
-      { ...projection("1"), last_observation_received_at_ms: null, forming: null },
-      { ...projection("2"), history_error: "History read failed" },
-      { ...projection("3"), forming: null, closed: [venue] },
-      { ...projection("4"), tape_status: "interrupted" },
-      { ...projection("5"), tape_status: "capacity_exceeded" },
-      { ...projection("6"), tape_status: "invalid_observation" },
-    ];
-    for (const status of ["down", "stale"] as const) {
-      feedStatus(status !== "down", "Retained market status");
-      if (status === "stale") ageFeeds(tick + 100000);
-      expect(shell.feeds.wsMarket).toBe(status);
-      for (const projection of updates) {
-        receiveSelectedFeed({ kind: "chart", projection });
-        expect(shell.feeds.wsMarket).toBe(status);
-        expect(shell.lastMarketTickMs).toBe(tick);
-        expect(shell.feedDetail).toBe("Retained market status");
-      }
-    }
-    receiveSelectedFeed({ kind: "book", coin: "BTC", at_ms: tick + 1, bids: [], asks: [] });
-    expect(shell.feeds.wsMarket).toBe("ok");
-    expect(shell.lastMarketTickMs).toBe(tick + 1);
-  } finally { Object.assign(toRaw(shell), prior); }
+test("chart and book payloads never promote the market summary", () => {
+  const prior = { ...shell.feeds };
+  receiveSelectedFeed({ kind: "chart", projection: projection("1") });
+  receiveSelectedFeed({ kind: "book", coin: "BTC", at_ms: 1000, bids: [], asks: [] });
+  expect(shell.feeds).toEqual(prior);
 });
 
 test("only acknowledged exact chart owners bootstrap projections without REST", () => {

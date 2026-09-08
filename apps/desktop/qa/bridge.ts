@@ -9,6 +9,7 @@ export { fetchKillReleaseStatus, reviewKillRelease, confirmKillRelease, discardK
 export { fetchPilotConsentStatus, reviewPilotConsent, confirmPilotConsent, discardPilotConsent, reconcilePilotConsent } from "./pilot-consent";
 import { connectReleaseFixture } from "./release";
 import { connectActivationFixture } from "./activation";
+import { channelHealthFixture } from "./channel-health";
 export let failedRead = false;
 export function failNextReads(): void { failedRead = true; }
 const scenario = new URLSearchParams(location.search).get("state") ?? "positions";
@@ -44,9 +45,12 @@ export async function fetchMarkets() { return []; }
 export async function fetchChartSeries(_binding: ChartBinding): Promise<ChartProjection> { throw new Error("UI fixture: chart history not supplied."); }
 export async function fetchMarketSnapshot(): Promise<MarketSnapshot> { throw new Error("UI fixture: market snapshot not supplied."); }
 let chartSelection = 0;
+let healthBinding: ChartBinding | null = null;
+let healthRevision = 0;
 export async function watchMarket(network: FeedBinding["network"], symbol: string, interval: string): Promise<WatchMarketReply> {
   const feed = { network, generation: "1" };
-  return { feed, chart: { ...feed, selection_id: String(++chartSelection), symbol, interval } };
+  healthBinding = { ...feed, selection_id: String(++chartSelection), symbol, interval };
+  return { feed, chart: healthBinding };
 }
 export async function onFeedUpdate() { return () => {}; }
 
@@ -60,6 +64,8 @@ export async function fetchRuntimeStatus(): Promise<RuntimeStatus> {
     : "UI fixture: waiting for retained desktop work to finish before shutdown or replacement. Update installation has not started. Diagnostic=";
   return {
     phase,
+    channel_health: phase === "running" && healthBinding && new URLSearchParams(location.search).get("health") !== "null"
+      ? channelHealthFixture(healthBinding, String(++healthRevision), new URLSearchParams(location.search).get("health") ?? "connected") : null,
     chart_failure: null,
     binding: phase === "running" ? { network: "testnet", generation: "1" } : null,
     detail: phase === "running" || phase === "stopped" ? null : detail + "retained-task-context/".repeat(24),
@@ -95,7 +101,7 @@ export async function startMcp(agent: string, requestedAccount: string): Promise
 }
 export async function stopMcp(): Promise<RuntimeStatus> {
   mcpStatus = { ...mcpStatus, phase: "stopped", listener: null, reconciled: null, account_feeds_ready: null, supervision_in_progress: false };
-  stoppedRuntime = { phase: "stopped", binding: null, chart_failure: null, detail: "UI fixture: desktop tasks stopped. Restart required." };
+  stoppedRuntime = { phase: "stopped", binding: null, channel_health: null, chart_failure: null, detail: "UI fixture: desktop tasks stopped. Restart required." };
   return { ...stoppedRuntime };
 }
 

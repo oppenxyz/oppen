@@ -7,6 +7,7 @@
 //! the operator and the agent cannot be shown different accounts (A3).
 
 mod account_evidence;
+mod channel_health;
 mod chart_transport;
 mod feed;
 mod local_reads;
