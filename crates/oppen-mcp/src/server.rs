@@ -26,7 +26,8 @@ use rmcp::model::{
 };
 use rmcp::service::RequestContext;
 use rmcp::transport::streamable_http_server::{
-    StreamableHttpService, session::local::LocalSessionManager,
+    StreamableHttpService,
+    session::{SessionManager, local::LocalSessionManager},
 };
 use rmcp::{ErrorData, RoleServer, ServerHandler};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -159,6 +160,7 @@ pub fn router(gateway: Gateway, pairings: Pairings) -> axum::Router {
         pairings,
         CancellationToken::new(),
         watch::channel(()).0,
+        Arc::new(LocalSessionManager::default()),
     )
 }
 
@@ -167,17 +169,22 @@ fn router_with_lifecycle(
     pairings: Pairings,
     shutdown: CancellationToken,
     execution: watch::Sender<()>,
+    sessions: Arc<LocalSessionManager>,
 ) -> axum::Router {
     let network = gateway.gateway().network();
-    let handler = ShutdownHandler {
-        inner: gateway,
-        pairings: Arc::downgrade(&pairings),
-        shutdown: shutdown.clone(),
-        execution,
-    };
+    let handler_pairings = Arc::downgrade(&pairings);
+    let handler_shutdown = shutdown.clone();
     let service = StreamableHttpService::new(
-        move || Ok(handler.clone()),
-        LocalSessionManager::default().into(),
+        move || {
+            Ok(ShutdownHandler {
+                inner: gateway.clone(),
+                pairings: handler_pairings.clone(),
+                shutdown: handler_shutdown.clone(),
+                execution: execution.clone(),
+                _session_owner: execution.subscribe(),
+            })
+        },
+        sessions,
         rmcp::transport::streamable_http_server::StreamableHttpServerConfig::default()
             .with_cancellation_token(shutdown.clone()),
     );
@@ -198,6 +205,8 @@ struct ShutdownHandler<H> {
     pairings: Weak<RwLock<TokenStore>>,
     shutdown: CancellationToken,
     execution: watch::Sender<()>,
+    // Last field: observing session drain also proves the inner handler dropped.
+    _session_owner: watch::Receiver<()>,
 }
 
 impl<H: ServerHandler> ServerHandler for ShutdownHandler<H> {
@@ -495,13 +504,37 @@ async fn serve_bound(
     };
     // Await Axum's spawned connection tasks, not just its accept loop. Closing
     // their IO also handles idle SSE, partial requests, and blocked writers.
+    let sessions = Arc::new(LocalSessionManager::default());
     let server = axum::serve(
         listener,
-        router_with_lifecycle(gateway, pairings, shutdown.clone(), execution.clone()),
+        router_with_lifecycle(
+            gateway,
+            pairings,
+            shutdown.clone(),
+            execution.clone(),
+            sessions.clone(),
+        ),
     )
     .with_graceful_shutdown(shutdown.clone().cancelled_owned());
+    let server_shutdown = shutdown.clone();
     supervise_and_drain(
-        async move { server.await },
+        async move {
+            let result = server.await;
+            server_shutdown.cancel();
+            // rmcp's legacy session workers outlive HTTP connections and are
+            // not closed by the HTTP cancellation token. Close only after
+            // connection tasks stop, so no new session can enter this snapshot.
+            let ids: Vec<_> = sessions.sessions.read().await.keys().cloned().collect();
+            let mut close_error = None;
+            for id in ids {
+                if let Err(error) = sessions.close_session(&id).await {
+                    close_error.get_or_insert_with(|| std::io::Error::other(error));
+                }
+            }
+            // Closing enqueues a message; execution drain separately waits for
+            // actual handler destruction and retained blocking work.
+            result.and(close_error.map_or(Ok(()), Err))
+        },
         enforcement,
         shutdown,
         execution,
@@ -1063,11 +1096,13 @@ mod authority_tests {
         let authority = store.authenticate(token.reveal()).unwrap().authority();
         store.revoke(token.id).unwrap();
         let pairings = Arc::new(RwLock::new(store));
+        let execution = watch::channel(()).0;
         let handler = ShutdownHandler {
             inner: MustNotRun,
             pairings: Arc::downgrade(&pairings),
             shutdown: CancellationToken::new(),
-            execution: watch::channel(()).0,
+            execution: execution.clone(),
+            _session_owner: execution.subscribe(),
         };
         for mode in 0..3 {
             let mut context = RequestContext::new(
@@ -1092,7 +1127,7 @@ mod authority_tests {
                 "unavailable"
             };
             assert_eq!(error.data.unwrap()["code"], expected);
-            assert_eq!(handler.execution.receiver_count(), 0);
+            assert_eq!(handler.execution.receiver_count(), 1);
         }
         drop(pairings);
         assert!(
@@ -1111,7 +1146,7 @@ mod authority_tests {
             .await
             .unwrap_err();
         assert_eq!(error.data.unwrap()["code"], "unavailable");
-        assert_eq!(handler.execution.receiver_count(), 0);
+        assert_eq!(handler.execution.receiver_count(), 1);
         service.cancel().await.unwrap();
     }
 
@@ -1168,6 +1203,7 @@ mod authority_tests {
                 pairings: Arc::downgrade(&pairings),
                 shutdown: shutdown.clone(),
                 execution: execution.clone(),
+                _session_owner: execution.subscribe(),
             };
             let mut context = RequestContext::new(
                 rmcp::model::NumberOrString::Number(1),

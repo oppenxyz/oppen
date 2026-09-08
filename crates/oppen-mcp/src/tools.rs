@@ -149,6 +149,30 @@ struct ExecutionPermit {
     revision: u64,
 }
 
+enum SubmissionOwnership {
+    Order(ExecutionPermit),
+    Cancellation {
+        account: Address,
+        _queue: tokio::sync::OwnedMutexGuard<()>,
+    },
+}
+
+impl SubmissionOwnership {
+    fn account(&self) -> Address {
+        match self {
+            Self::Order(permit) => permit.account,
+            Self::Cancellation { account, .. } => *account,
+        }
+    }
+
+    fn order(&self) -> Option<&ExecutionPermit> {
+        match self {
+            Self::Order(permit) => Some(permit),
+            Self::Cancellation { .. } => None,
+        }
+    }
+}
+
 struct CancelAllResult {
     reply: Reply,
     complete: bool,
@@ -994,7 +1018,7 @@ impl Gateway {
 
     /// `cancel` — one resting order (`docs/spec.md` item 19).
     #[tool(
-        description = "Cancel one resting order by oid or by the cloid place returned. Requires \
+        description = "Cancel one proven own resting order by oid or by the cloid place returned. Requires \
                        a reason. Approval mode retains the exact target for operator review; \
                        runtime emergency cleanup remains independent."
     )]
@@ -1007,7 +1031,7 @@ impl Gateway {
         let tracker = ExecutionTracker::from_context(&ctx)?;
         let bound = Self::bound(&ctx)?;
         let queue = self.execution_queue(bound.account);
-        let _execution = queue.lock().await;
+        let execution = queue.lock_owned().await;
         self.require_route(&bound).await?;
 
         // Which resting order this names, and on which asset. The asset id is
@@ -1067,18 +1091,21 @@ impl Gateway {
             targets: context.targets.clone(),
             reason: params.reason,
         };
-        let cleared = match self
-            .decision(tracker, move |engine| {
-                engine.evaluate_cancel(&agent, &intent, &context, self::now_ms())
+        let (decision, execution) = self
+            .decision(tracker.clone(), move |engine| {
+                (
+                    engine.evaluate_cancel(&agent, &intent, &context, self::now_ms()),
+                    execution,
+                )
             })
-            .await?
-        {
+            .await?;
+        let cleared = match decision {
             Ok(cleared) => cleared,
             Err(refusal) => return Ok(outcome::refused(refusal).into_result()),
         };
 
         let response = self
-            .submit(cleared, order.cloid.as_ref(), &bound, None, None)
+            .submit_cancellation(cleared, &bound, execution, None, tracker)
             .await?;
         Ok(cancel_outcome(
             response,
@@ -1093,7 +1120,8 @@ impl Gateway {
     /// `cancel_all` — every resting order, or every one on a symbol
     /// (`docs/spec.md` item 19).
     #[tool(
-        description = "Cancel every resting order, or every one on a symbol. Requires a reason. \
+        description = "Cancel every resting order, or every one on a symbol, only when all targets \
+                       have authenticated own-order evidence. Requires a reason. \
                        Partial success is normal — an order that filled a moment ago cannot be \
                        cancelled — so the result itemises what the venue would not take. \
                        Approval mode retains a frozen target set, never future orders."
@@ -1133,7 +1161,9 @@ impl Gateway {
                     .map_err(|e| ToolError::unavailable("orders", e))?;
                 Ok((orders, self.universe().await?))
             },
-            |cleared| self.submit(cleared, None, bound, None, None),
+            |cleared, execution, tracker| {
+                self.submit_cancellation(cleared, bound, execution, None, tracker)
+            },
         )
         .await
     }
@@ -1149,11 +1179,11 @@ impl Gateway {
     ) -> Result<CancelAllResult, ToolError>
     where
         Read: Future<Output = Result<(Vec<oppen_hl::types::OpenOrder>, Universe), ToolError>>,
-        Submit: FnOnce(Cleared) -> Posted,
+        Submit: FnOnce(Cleared, tokio::sync::OwnedMutexGuard<()>, ExecutionTracker) -> Posted,
         Posted: Future<Output = Result<ExchangeResponse, ToolError>>,
     {
         let queue = self.execution_queue(bound.account);
-        let _execution = queue.lock().await;
+        let execution = queue.lock_owned().await;
         self.require_route(bound).await?;
         let cancellation_needed = || async {
             if paused_only {
@@ -1217,15 +1247,18 @@ impl Gateway {
 
         let agent = bound.agent.clone();
         let reason = params.reason.clone();
-        let cleared = match self
-            .decision(tracker, move |engine| match discretionary {
-                Some((intent, context)) => {
-                    engine.evaluate_cancel(&agent, &intent, &context, self::now_ms())
-                }
-                None => engine.clear_cancel(&agent, wires, &reason, now_ms),
+        let (decision, execution) = self
+            .decision(tracker.clone(), move |engine| {
+                let decision = match discretionary {
+                    Some((intent, context)) => {
+                        engine.evaluate_cancel(&agent, &intent, &context, self::now_ms())
+                    }
+                    None => engine.clear_cancel(&agent, wires, &reason, now_ms),
+                };
+                (decision, execution)
             })
-            .await?
-        {
+            .await?;
+        let cleared = match decision {
             Ok(cleared) => cleared,
             Err(refusal) => {
                 return Ok(CancelAllResult {
@@ -1240,7 +1273,7 @@ impl Gateway {
         if !cancellation_needed().await? {
             return Ok(skipped());
         }
-        let response = submit(cleared).await?;
+        let response = submit(cleared, execution, tracker).await?;
         let complete = response.statuses.len() == named.len()
             && response
                 .statuses
@@ -1957,6 +1990,38 @@ impl Gateway {
             .await
     }
 
+    async fn submit_cancellation(
+        &self,
+        cleared: Cleared,
+        bound: &Binding,
+        execution: tokio::sync::OwnedMutexGuard<()>,
+        operator: Option<&crate::server::OperatorWork>,
+        tracker: ExecutionTracker,
+    ) -> Result<ExchangeResponse, ToolError> {
+        if matches!(
+            cleared.clearance().kind,
+            oppen_core::guardrail::ClearedKind::DiscretionaryCancel { .. }
+        ) {
+            return self
+                .submit_retained(
+                    cleared,
+                    None,
+                    bound,
+                    SubmissionOwnership::Cancellation {
+                        account: bound.account,
+                        _queue: execution,
+                    },
+                    operator,
+                    Some(tracker),
+                )
+                .await;
+        }
+        // Runtime cleanup retains its separate admission and capacity.
+        let _execution = execution;
+        self.submit_authorized(cleared, None, bound, None, operator, Some(tracker))
+            .await
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn submit_authorized(
         &self,
@@ -1982,45 +2047,84 @@ impl Gateway {
             let submission = submission.ok_or_else(|| {
                 ToolError::unavailable("submission ledger", "order has no account reservation")
             })?;
-            if submission.account != bound.account {
-                return Err(ToolError::unavailable(
-                    "submission ledger",
-                    "reservation and bound account differ",
-                ));
-            }
-            let tracker = operator
-                .map(|work| work.tracker.clone())
-                .or(tracker)
-                .ok_or_else(|| {
-                    ToolError::unavailable("submission owner", "order has no execution tracker")
-                })?;
-            let slot = self
-                .inner
-                .submission_worker
-                .clone()
-                .try_acquire_owned()
-                .map_err(|error| ToolError::unavailable("submission worker busy", error))?;
-            let gateway = self.clone();
-            let bound = bound.clone();
-            let cloid = cloid.cloned();
-            let operator = operator.cloned();
-            let runtime = tokio::runtime::Handle::current();
-            return tokio::task::spawn_blocking(move || {
-                let _slot = slot;
-                runtime.block_on(gateway.submit_inline(
+            return self
+                .submit_retained(
                     cleared,
-                    cloid.as_ref(),
-                    &bound,
-                    Some(&submission),
-                    operator.as_ref(),
-                    Some(&tracker),
-                ))
-            })
-            .await
-            .map_err(|error| ToolError::worker_failed("submission worker", error))?;
+                    cloid,
+                    bound,
+                    SubmissionOwnership::Order(submission),
+                    operator,
+                    tracker,
+                )
+                .await;
+        }
+        if matches!(
+            cleared.clearance().kind,
+            oppen_core::guardrail::ClearedKind::DiscretionaryCancel { .. }
+        ) {
+            return Err(ToolError::unavailable(
+                "submission owner",
+                "discretionary cancellation requires retained account authority",
+            ));
         }
         self.submit_inline(cleared, cloid, bound, None, operator, None)
             .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn submit_retained(
+        &self,
+        cleared: Cleared,
+        cloid: Option<&Cloid>,
+        bound: &Binding,
+        ownership: SubmissionOwnership,
+        operator: Option<&crate::server::OperatorWork>,
+        tracker: Option<ExecutionTracker>,
+    ) -> Result<ExchangeResponse, ToolError> {
+        if cleared.clearance().agent != bound.agent
+            || cleared.clearance().route.binding.container != bound.account
+        {
+            return Err(ToolError::unavailable(
+                "submission route",
+                "clearance, execution owner and pairing identity differ",
+            ));
+        }
+        if ownership.account() != bound.account {
+            return Err(ToolError::unavailable(
+                "submission ledger",
+                "reservation and bound account differ",
+            ));
+        }
+        let tracker = operator
+            .map(|work| work.tracker.clone())
+            .or(tracker)
+            .ok_or_else(|| {
+                ToolError::unavailable("submission owner", "submission has no execution tracker")
+            })?;
+        let slot = self
+            .inner
+            .submission_worker
+            .clone()
+            .try_acquire_owned()
+            .map_err(|error| ToolError::unavailable("submission worker busy", error))?;
+        let gateway = self.clone();
+        let bound = bound.clone();
+        let cloid = cloid.cloned();
+        let operator = operator.cloned();
+        let runtime = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || {
+            let _slot = slot;
+            runtime.block_on(gateway.submit_inline(
+                cleared,
+                cloid.as_ref(),
+                &bound,
+                ownership.order(),
+                operator.as_ref(),
+                Some(&tracker),
+            ))
+        })
+        .await
+        .map_err(|error| ToolError::worker_failed("submission worker", error))?
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2117,6 +2221,34 @@ impl Gateway {
                 std::future::ready(result),
             )
             .await;
+        }
+        let discretionary = matches!(
+            cleared.clearance().kind,
+            oppen_core::guardrail::ClearedKind::DiscretionaryCancel { .. }
+        );
+        if discretionary {
+            let signed = inner
+                .engine
+                .sign_discretionary_cancel_authorized(cleared, nonce, None, self::now_ms, authorize)
+                .map_err(|error| signing_submission_error(&inner.submissions, None, error))?;
+            let response = match inner
+                .engine
+                .post_cancellation_authorized(signed, &inner.exchange, self::now_ms, authorize)
+                .await
+            {
+                Ok(response) => Ok(response),
+                Err(oppen_core::guardrail::SubmissionPostError::Transport(error)) => Err(error),
+                Err(oppen_core::guardrail::SubmissionPostError::NotSent(refusal)) => {
+                    return Err(ToolError::GuardrailRefused { refusal });
+                }
+                Err(oppen_core::guardrail::SubmissionPostError::JournalUncertain(error)) => {
+                    return Err(ToolError::TimeoutUnknownOutcome {
+                        cloid: cloid.map(|cloid| cloid.as_str().to_owned()),
+                        detail: error.to_string(),
+                    });
+                }
+            };
+            return track_submission(cloid, None, std::future::ready(response)).await;
         }
         let signed =
             inner
@@ -2517,6 +2649,7 @@ fn cancellation_context(
                 orig_sz: order.orig_sz,
                 timestamp: order.timestamp,
                 order_type: order.order_type.clone(),
+                tif: order.tif,
                 reduce_only: order.reduce_only,
                 is_trigger: order.is_trigger,
                 trigger_px: order.trigger_px,
@@ -4711,8 +4844,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn busy_pilot_reader_reports_failure_but_does_not_block_paused_accounts_or_agent_cancels()
-    {
+    async fn busy_pilot_reader_does_not_hide_cleanup_or_ownership_refusal() {
         let gateway = activated_gateway();
         let alpha = binding_for("alpha");
         grant_test_route(&gateway, &alpha);
@@ -4764,18 +4896,23 @@ mod tests {
                 false,
                 test_tracker(&gateway),
                 async { Ok(cancel_fixture()) },
-                |_| async { Ok(cancel_response(vec![Status::Success])) },
+                |_, _, _| async { panic!("unowned target must not submit") },
             )
             .await
             .unwrap();
-        assert!(result.complete);
+        assert!(!result.complete);
+        assert_eq!(
+            serde_json::to_value(&result.reply).unwrap()["refusal"]["unevaluable"],
+            "submission_authority"
+        );
     }
 
     fn cancel_fixture() -> (Vec<oppen_hl::types::OpenOrder>, Universe) {
         let orders = serde_json::from_value(serde_json::json!([{
             "coin": "BTC", "side": "B", "limitPx": "100", "sz": "1",
             "origSz": "1", "oid": 42, "timestamp": 1, "orderType": "Limit",
-            "reduceOnly": false, "isTrigger": false, "isPositionTpsl": false
+            "reduceOnly": false, "isTrigger": false, "isPositionTpsl": false,
+            "tif": "Gtc", "triggerPx": "0", "triggerCondition": "N/A"
         }]))
         .expect("orders");
         let meta = serde_json::from_value(serde_json::json!({
@@ -4829,7 +4966,7 @@ mod tests {
             true,
             test_tracker(&gateway),
             async { panic!("resumed account must not even read cancellation targets") },
-            |_| async { panic!("resumed account must not submit a cancel") },
+            |_, _, _| async { panic!("resumed account must not submit a cancel") },
         ));
         assert!(matches!(
             std::future::poll_fn(|cx| std::task::Poll::Ready(cancel.as_mut().poll(cx))).await,
@@ -4843,7 +4980,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_resume_during_target_reads_skips_submission_but_agent_cancel_still_works() {
+    async fn a_resume_skips_cleanup_but_does_not_authorize_an_unowned_agent_target() {
         let gateway = activated_gateway();
         let bound = binding_for("alpha");
         pause(&gateway, &bound);
@@ -4868,12 +5005,11 @@ mod tests {
                     resume(&gateway, &bound);
                     Ok(cancel_fixture())
                 },
-                |_| async { panic!("resume during reads must prevent cancellation") },
+                |_, _, _| async { panic!("resume during reads must prevent cancellation") },
             )
             .await
             .expect("skip after resume");
         assert!(result.complete);
-        let mut submitted = false;
         let result = gateway
             .cancel_all_with(
                 &bound,
@@ -4881,18 +5017,15 @@ mod tests {
                 false,
                 test_tracker(&gateway),
                 async { Ok(cancel_fixture()) },
-                |cleared| {
-                    submitted = true;
-                    assert!(matches!(
-                        cleared.clearance().kind,
-                        oppen_core::guardrail::ClearedKind::DiscretionaryCancel { ref targets, .. } if targets.len() == 1
-                    ));
-                    async { Ok(cancel_response(vec![Status::Success])) }
-                },
+                |_, _, _| async { panic!("unowned target must not submit") },
             )
             .await
-            .expect("agent cancel while unpaused");
-        assert!(submitted && result.complete);
+            .expect("unowned target refusal while unpaused");
+        assert!(!result.complete);
+        assert_eq!(
+            serde_json::to_value(&result.reply).unwrap()["refusal"]["unevaluable"],
+            "submission_authority"
+        );
         assert!(!gateway.inner.engine.paused_agents().contains(&bound.agent));
     }
 
@@ -4913,7 +5046,7 @@ mod tests {
                 true,
                 test_tracker(&gateway),
                 async { Ok(cancel_fixture()) },
-                |cleared| {
+                |cleared, _execution, _tracker| {
                     assert!(
                         queue.try_lock().is_err(),
                         "cancel must keep the execution lock"

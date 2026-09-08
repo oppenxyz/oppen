@@ -93,6 +93,40 @@ impl Venue {
         self.state.lock().unwrap().reverse_open_orders = true;
     }
 
+    /// Venue-only manual activity: deliberately creates no Oppen evidence.
+    pub(super) fn manual_copy(&self, source_oid: u64, cloid: oppen_hl::wire::Cloid) -> u64 {
+        let mut book = self.state.lock().unwrap();
+        let source = &book.orders[&source_oid];
+        let mut wire = source.wire.clone();
+        wire.c = Some(cloid);
+        let oid = book.orders.len() as u64 + 1;
+        let order = Order {
+            wire,
+            grouping: source.grouping,
+            oid,
+            original: source.original,
+            remaining: source.remaining,
+            created: now_ms(),
+            updated: now_ms(),
+            status: "open",
+        };
+        book.orders.insert(oid, order);
+        oid
+    }
+
+    pub(super) fn alter_order(&self, oid: u64, change: impl FnOnce(&mut OrderWire)) {
+        change(
+            &mut self
+                .state
+                .lock()
+                .unwrap()
+                .orders
+                .get_mut(&oid)
+                .unwrap()
+                .wire,
+        );
+    }
+
     /// `size` is the incremental fill quantity, not cumulative filled size.
     pub(super) fn fill(&self, cloid: &str, size: Decimal) {
         self.fill_with_fee(cloid, size, Decimal::new(1, 2));
@@ -177,8 +211,8 @@ struct Order {
 
 impl Order {
     fn view(&self) -> Value {
-        let (kind, trigger_px, condition) = match &self.wire.t {
-            OrderType::Limit { .. } => ("Limit", None, None),
+        let (kind, trigger_px, condition, tif, is_trigger) = match &self.wire.t {
+            OrderType::Limit { tif } => ("Limit", "0.0", "N/A".to_owned(), Some(*tif), false),
             OrderType::Trigger {
                 is_market,
                 trigger_px,
@@ -193,8 +227,14 @@ impl Order {
                 let above = self.wire.b == (*tpsl == Tpsl::Sl);
                 (
                     kind,
-                    Some(trigger_px.as_str()),
-                    Some(if above { "Price above" } else { "Price below" }),
+                    trigger_px.as_str(),
+                    format!(
+                        "Price {} {}",
+                        if above { "above" } else { "below" },
+                        trigger_px.as_str()
+                    ),
+                    None,
+                    true,
                 )
             }
         };
@@ -203,8 +243,8 @@ impl Order {
             "limitPx": self.wire.p.as_str(), "sz": self.remaining.to_string(),
             "origSz": self.original.to_string(), "oid": self.oid,
             "timestamp": self.created, "cloid": self.wire.c,
-            "orderType": kind, "reduceOnly": self.wire.r,
-            "isTrigger": trigger_px.is_some(), "triggerPx": trigger_px, "triggerCondition": condition,
+            "orderType": kind, "tif": tif, "reduceOnly": self.wire.r,
+            "isTrigger": is_trigger, "triggerPx": trigger_px, "triggerCondition": condition,
             "isPositionTpsl": self.grouping == Grouping::PositionTpsl
         })
     }

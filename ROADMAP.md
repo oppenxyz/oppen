@@ -253,6 +253,21 @@ before expanding features:
    Discretionary cancellation provenance enforcement and sufficient lost-response
    ownership recovery remain open. Stop older writers before upgrading; rollback
    must preserve V13 history and cumulative accounting without schema downgrade.
+   ES31c on `feat/cancellation-ownership` implements the discretionary
+   cancellation gate: authenticated per-target links across proposal, retained
+   review, final signing and consuming dispatch; immutable order identity with
+   observed TIF/protective metadata; and partial-fill size decreases without
+   target substitution. Unknown/manual targets refuse the whole request, while
+   runtime HALT cleanup remains independent. Operator review displays observed
+   TIF without historical defaults. A reproduced legacy MCP session-retention
+   bug is fixed by explicit session closure plus actual handler/worker drain.
+   Workspace tests pass (1,139 Rust, 15 live/keychain-gated ignored), along with
+   175 frontend tests, build, QA typecheck, three release-script fixtures,
+   all-target Clippy, formatting and dependency policy. Separate automated
+   working-diff review found no blocking issues; exact-head review and green CI
+   remain required. V14 preserves absent historical metadata without granting
+   ownership; stop older writers and preserve all history on rollback. Lost-response
+   ownership recovery and dedicated-account live acceptance remain open.
    No dedicated-account activity has been performed during this development.
 4. **Recovery:** PR #44 merged as `06fc0e3` after green CI and separate automated
    review. The durable submission journal has SQLite reopen, independent

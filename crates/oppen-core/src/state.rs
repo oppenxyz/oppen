@@ -565,6 +565,7 @@ mod tests {
             oid: 1,
             timestamp: 0,
             order_type: "Limit".into(),
+            tif: Some(oppen_hl::wire::Tif::Gtc),
             reduce_only: false,
             is_trigger: false,
             trigger_px: None,

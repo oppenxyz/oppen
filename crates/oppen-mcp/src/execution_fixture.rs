@@ -743,23 +743,22 @@ async fn wrong_exchange_identity_or_extra_status_remains_unknown_over_real_http(
             .call("get_order_status", json!({"cloid":cloid.as_str()}))
             .await;
         assert_eq!(observed["status"], "open", "{observed}");
-        venue.next_response(Behavior::WrongKind);
         let canceled = runtime
             .call(
                 "cancel",
                 json!({"cloid":cloid.as_str(),"reason":"identity regression"}),
             )
             .await;
+        assert_eq!(canceled["status"], "rejected", "{canceled}");
         assert_eq!(
-            canceled["protocol_error"]["data"]["code"], "timeout_unknown_outcome",
+            canceled["refusal"]["unevaluable"], "submission_authority",
             "{canceled}"
         );
-        assert_eq!(canceled["protocol_error"]["data"]["retryable"], false);
-        assert_eq!(venue.submissions().len(), 2);
+        assert_eq!(venue.submissions().len(), 1);
         let observed = runtime
             .call("get_order_status", json!({"cloid":cloid.as_str()}))
             .await;
-        assert_eq!(observed["status"], "canceled", "{observed}");
+        assert_eq!(observed["status"], "open", "{observed}");
         runtime.shutdown().await;
         venue.shutdown().await;
     }

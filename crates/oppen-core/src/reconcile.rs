@@ -1647,6 +1647,7 @@ mod tests {
             oid,
             timestamp: 1,
             order_type: "Limit".to_owned(),
+            tif: Some(oppen_hl::wire::Tif::Gtc),
             reduce_only: false,
             is_trigger: false,
             trigger_px: None,

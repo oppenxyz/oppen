@@ -207,7 +207,7 @@ impl Gateway {
         let permit = self.execution_queue(binding.account).lock_owned().await;
         let context = self.operator_cancel_context(work, &targets).await?;
         // Retain the account queue in the actual decision worker, not its observer.
-        let (decision, _permit) = self
+        let (decision, permit) = self
             .operator_decision(work, move |engine| {
                 let decision = engine.operator_confirm_cancel_review(review, &context, now_ms());
                 (decision, permit)
@@ -218,7 +218,7 @@ impl Gateway {
             Err(refusal) => return Ok(outcome::refused(refusal)),
         };
         let response = match self
-            .submit_authorized(cleared, None, binding, None, Some(work), None)
+            .submit_cancellation(cleared, binding, permit, Some(work), work.tracker.clone())
             .await
         {
             Ok(response) => response,

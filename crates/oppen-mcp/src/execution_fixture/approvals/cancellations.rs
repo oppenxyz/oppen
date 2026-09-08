@@ -143,15 +143,15 @@ async fn cancel_all_review_never_expands_to_a_later_order() {
 }
 
 #[tokio::test]
-async fn missing_or_partially_filled_review_target_refuses_without_subset_submission() {
+async fn missing_target_refuses_but_partial_fill_preserves_the_frozen_cancel_set() {
     for fill in [Decimal::new(5, 2), Decimal::new(10, 2)] {
         let dir = tempfile::tempdir().unwrap();
         let venue = Venue::start().await;
         let keys = Arc::new(FixtureKeys::default());
         let runtime = Runtime::open(dir.path(), venue.port(), keys.clone()).await;
         runtime.activate_orders().await;
-        seed(&runtime, 143).await;
-        seed(&runtime, 144).await;
+        let first = seed(&runtime, 143).await;
+        let second = seed(&runtime, 144).await;
         enable_approval(&runtime).await;
         let serving = Serving::start(&runtime).await;
         let id = propose(
@@ -165,16 +165,59 @@ async fn missing_or_partially_filled_review_target_refuses_without_subset_submis
             .prepare(&binding(&runtime), &id)
             .await
             .unwrap();
+        let targets = &review.display().cancel().unwrap().targets;
+        assert_eq!(
+            targets.iter().map(|target| target.oid).collect::<Vec<_>>(),
+            vec![first, second]
+        );
+        assert!(
+            targets
+                .iter()
+                .all(|target| target.orig_sz == Decimal::new(10, 2))
+        );
+        let later = venue.manual_copy(second, Cloid::from_bytes([179; 16]));
         venue.fill(Cloid::from_bytes([143; 16]).as_str(), fill);
         let reads = keys.read_heads.lock().unwrap().len();
         let result = serving.control.confirm(review).await.unwrap();
-        assert_eq!(result["status"], "rejected", "{result}");
+        if fill == Decimal::new(10, 2) {
+            assert_eq!(result["status"], "rejected", "{result}");
+            assert_eq!(
+                result["refusal"]["unevaluable"], "approval_review_changed",
+                "{result}"
+            );
+            assert_eq!(venue.submissions().len(), 2);
+            assert_eq!(keys.read_heads.lock().unwrap().len(), reads);
+            assert_eq!(
+                runtime
+                    .call("get_order_status", json!({"oid":second}))
+                    .await["status"],
+                "open"
+            );
+        } else {
+            assert_eq!(result["status"], "canceled", "{result}");
+            assert_eq!(result["requested"], 2);
+            assert_eq!(result["canceled"], 2);
+            assert_eq!(venue.submissions().len(), 3);
+            assert_eq!(
+                venue.submissions()[2]["action"],
+                json!({"type":"cancel","cancels":[{"a":0,"o":first},{"a":0,"o":second}]})
+            );
+            let observed = runtime.call("get_order_status", json!({"oid":first})).await;
+            assert_eq!(observed["status"], "canceled", "{observed}");
+            assert_eq!(
+                observed["sz_original"]
+                    .as_str()
+                    .unwrap()
+                    .parse::<Decimal>()
+                    .unwrap(),
+                Decimal::new(10, 2)
+            );
+        }
         assert_eq!(
-            result["refusal"]["unevaluable"], "approval_review_changed",
-            "{result}"
+            runtime.call("get_order_status", json!({"oid":later})).await["status"],
+            "open",
+            "a later order must never expand the frozen cancel set"
         );
-        assert_eq!(venue.submissions().len(), 2);
-        assert_eq!(keys.read_heads.lock().unwrap().len(), reads);
         serving.finish().await;
         runtime.shutdown().await;
         venue.shutdown().await;

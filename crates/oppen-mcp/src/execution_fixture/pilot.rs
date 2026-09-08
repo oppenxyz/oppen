@@ -339,11 +339,11 @@ async fn ordinary_resume_during_cancel_reads_cannot_clear_a_pilot_stop() {
                     Universe::from_meta(&runtime.gateway.inner.info.meta().await.unwrap()).unwrap(),
                 ))
             },
-            |cleared| async {
+            |cleared, execution, tracker| async {
                 assert!(queue.try_lock().is_err());
                 runtime
                     .gateway
-                    .submit(cleared, None, &bound, None, None)
+                    .submit_cancellation(cleared, &bound, execution, None, tracker)
                     .await
             },
         ));

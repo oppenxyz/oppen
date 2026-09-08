@@ -97,7 +97,8 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 pub use breaker::{BudgetScope, LossBudget, LossKind};
-pub use cancellation::{CancelContext, CancelIntent, CancelTarget};
+pub(crate) use cancellation::CancelOwnershipLink;
+pub use cancellation::{CancelContext, CancelIntent, CancelProvenance, CancelTarget};
 pub use config::{
     AgentGuardrails, Freshness, GlobalRateBudget, LossLimits, MarginMode, OrderRate, RiskSettings,
 };
@@ -107,7 +108,7 @@ pub use engine::{
     CancelApprovalReviewDisplay, Clearance, Cleared, ClearedKind, GuardedSignature,
     GuardrailEngine, GuardrailError, OperatorAction, OrderApprovalReviewDisplay, OrderIntent,
     PolicyAcknowledgment, PolicyStatus, Proposal, ProposalIntent, SignClearedError,
-    SignedSubmission, SigningPermit, SubmissionPostError, Utilization, Verdict,
+    SignedCancellation, SignedSubmission, SigningPermit, SubmissionPostError, Utilization, Verdict,
 };
 pub use kill::{Engagement, KillEffect, KillReason, KillScope, KillSwitch};
 pub use refusal::{PilotMetric, ReduceOnlyBreach, Refusal, Unevaluable, VenueRule};

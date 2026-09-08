@@ -171,7 +171,8 @@ CREATE INDEX events_submission_account
 // V11: reviewed candidate commitments and their actual receipt binding.
 // V12: typed discretionary cancellation proposals and reviewed action receipts.
 // V13: authenticated guarded-signature digests and direct acceptance receipts.
-const MIGRATIONS: &[&str] = &[V1, V2, V3, "", "", "", "", "", "", "", "", "", ""];
+// V14: discretionary cancellation ownership receipts and observed TIF evidence.
+const MIGRATIONS: &[&str] = &[V1, V2, V3, "", "", "", "", "", "", "", "", "", "", ""];
 
 pub(super) const CURRENT_VERSION: usize = MIGRATIONS.len();
 
