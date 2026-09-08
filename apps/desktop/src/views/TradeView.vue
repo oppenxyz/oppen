@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref } from "vue";
+import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { operator, recordedAgents } from "../stores/operator";
 import DecisionStream from "../components/DecisionStream.vue";
 import AsciiGauge from "../components/ascii/AsciiGauge.vue";
@@ -14,6 +14,8 @@ import StatBlock from "../components/housing/StatBlock.vue";
 import {
   INTERVALS,
   market,
+  quotes,
+  quoteSpread,
   refreshSnapshot,
   select,
   selectedRow,
@@ -92,7 +94,7 @@ const FEATURES_EMPTY: readonly ReadoutRow[] = [
 const strip = computed(() => {
   const row = selectedRow.value;
   return {
-    symbol: row?.symbol ?? DASH,
+    symbol: row?.symbol ?? market.selected ?? DASH,
     mark: row?.mark_px ?? DASH,
     // A market the venue has stopped quoting has no mid, and no substitute.
     mid: row?.mid_px ?? DASH,
@@ -105,8 +107,37 @@ const strip = computed(() => {
 /** Book rows, deepest-first on the bid so the two sides mirror at the touch. */
 const search = ref("");
 const filteredMarkets = computed(() => market.rows.filter(row => row.symbol.toLowerCase().includes(search.value.trim().toLowerCase())));
-const bids = computed(() => market.snapshot?.bids.slice(0, 8) ?? []);
-const asks = computed(() => market.snapshot?.asks.slice(0, 8) ?? []);
+const bids = computed(() => quotes.depth?.bids.slice(0, 8) ?? []);
+const asks = computed(() => quotes.depth?.asks.slice(0, 8) ?? []);
+const spread = computed(() => {
+  const value = quoteSpread(quotes.touch?.bid?.px, quotes.touch?.ask?.px);
+  return value === null ? "Unavailable" : `${value.toFixed(2)} bp`;
+});
+const quoteLabel = computed(() => !quotes.touch ? "Touch unavailable"
+  : quotes.touch.source === "rest" ? "REST touch snapshot"
+  : quotes.touch.live ? `Latest observed ${quotes.touch.source.toUpperCase()} touch` : "Retained touch · not live");
+const observationNow = ref(Date.now());
+watch([() => quotes.touch?.observedMs, () => quotes.depth?.observedMs], () => {
+  observationNow.value = Date.now();
+}, { flush: "sync" });
+let observationTimer: ReturnType<typeof globalThis.setInterval> | null = null;
+onMounted(() => {
+  observationNow.value = Date.now();
+  observationTimer = globalThis.setInterval(() => { observationNow.value = Date.now(); }, 1000);
+});
+onUnmounted(() => {
+  if (observationTimer !== null) globalThis.clearInterval(observationTimer);
+});
+function observationAge(time: number | null | undefined): string {
+  if (time == null) return "Unavailable";
+  const elapsed = observationNow.value - time;
+  return elapsed < 0 ? "UI clock moved backward" : `${Math.floor(elapsed / 1000)}s ago`;
+}
+function quoteTime(time: number | null | undefined): string {
+  if (time == null) return "Unavailable";
+  const date = new Date(time);
+  return Number.isFinite(date.getTime()) ? date.toISOString() : "Unavailable";
+}
 
 const maxBookSize = computed(() => Math.max(0, ...bids.value.concat(asks.value).map(level => Number(level.sz))));
 const ledger = ref<Ledger>("positions");
@@ -168,9 +199,12 @@ const ledger = ref<Ledger>("positions");
             <StatBlock label="Mark" :value="strip.mark" />
             <StatBlock label="Funding" :value="strip.funding" />
             <StatBlock label="OI" :value="strip.oi" />
-            <StatBlock label="Spread" :value="FEATURES[1]?.v ?? '—'" />
+            <StatBlock data-quote="bid" label="Best bid" :value="quotes.touch?.bid?.px ?? 'Unavailable'" />
+            <StatBlock data-quote="ask" label="Best ask" :value="quotes.touch?.ask?.px ?? 'Unavailable'" />
+            <StatBlock data-quote="spread" :label="quotes.touch?.live ? 'Latest observed approx. spread' : 'Retained approx. spread'" :value="spread" />
           </div>
         </div>
+        <p class="quote-time" data-quote="touch-clock">{{ quoteLabel }} · Venue {{ quoteTime(quotes.touch?.venueMs) }} · Observed by UI {{ quoteTime(quotes.touch?.observedMs) }} · {{ observationAge(quotes.touch?.observedMs) }}</p>
       </PanelHousing>
 
       <PanelHousing :brackets="['tl', 'br']" data-tour="chart">
@@ -237,10 +271,11 @@ const ledger = ref<Ledger>("positions");
     </div>
 
     <div class="trade__col trade__col--right">
-      <PanelHousing label="Book · Hyperliquid" meta="L2">
+      <PanelHousing label="Book · Hyperliquid" :meta="quotes.depth?.source === 'rest' ? 'REST snapshot' : 'L2 depth'">
+        <p class="quote-time" data-quote="depth-clock">{{ !quotes.depth ? 'Depth unavailable' : quotes.depth.live ? 'Latest observed depth' : 'Retained depth · not live' }}<br />Venue {{ quoteTime(quotes.depth?.venueMs) }}<br />Observed by UI {{ quoteTime(quotes.depth?.observedMs) }} · {{ observationAge(quotes.depth?.observedMs) }}</p>
         <EmptyState
           v-if="bids.length === 0 && asks.length === 0"
-          :line="market.snapshotError ?? 'No book subscribed.'"
+          line="Depth unavailable."
         />
         <div v-else class="book">
           <div class="book__row book__head"><span>Price · USD</span><span>Size · {{ market.selected }}</span><span>Orders</span><span>Depth</span></div>
@@ -249,7 +284,7 @@ const ledger = ref<Ledger>("positions");
           <div v-for="lvl in [...asks].reverse()" :key="`a${lvl.px}`" class="book__row book__row--ask">
             <span>{{ lvl.px }}</span><span>{{ lvl.sz }}</span><span class="book__n">{{ lvl.n }}</span><AsciiGauge :value="maxBookSize > 0 ? Number(lvl.sz) / maxBookSize : null" :cells="8" :label="`${lvl.sz} ${market.selected}; relative to largest visible level`" />
           </div>
-          <div class="book__mid">Snapshot spread {{ decimal(market.snapshot?.book.spread_bps, 2, " bp") }}</div>
+          <div class="book__mid">{{ quoteLabel }} · Approx. spread {{ spread }}</div>
           <div v-for="lvl in bids" :key="`b${lvl.px}`" class="book__row book__row--bid">
             <span>{{ lvl.px }}</span><span>{{ lvl.sz }}</span><span class="book__n">{{ lvl.n }}</span><AsciiGauge :value="maxBookSize > 0 ? Number(lvl.sz) / maxBookSize : null" :cells="8" :label="`${lvl.sz} ${market.selected}; relative to largest visible level`" />
           </div>
@@ -259,7 +294,7 @@ const ledger = ref<Ledger>("positions");
         <template #meta>
           <button type="button" class="refresh" @click="refreshSnapshot">Re-read</button>
         </template>
-        <p class="features-time">Derived snapshot · {{ market.featuresReadMs ? new Date(market.featuresReadMs).toLocaleTimeString() : 'Not read' }}</p>
+        <p class="features-time">Derived REST snapshot · Host request started {{ market.featuresReadMs === null ? 'Not read' : quoteTime(market.featuresReadMs) }}</p>
         <p v-if="market.snapshotError" class="features-time" role="status">{{ market.snapshotError }}</p>
         <ReadoutRows :rows="FEATURES" />
         <details class="feature-details">
@@ -275,6 +310,7 @@ const ledger = ref<Ledger>("positions");
 </template>
 
 <style scoped>
+.quote-time { padding: var(--s-2) var(--s-3); font-size: var(--fs-body-sm); color: var(--bracket); overflow-wrap: anywhere; line-height: 1.5; }
 .feature-details { padding-top: var(--s-3); font-size: var(--fs-body-sm); line-height: 1.6; }
 .feature-details summary { cursor: pointer; color: var(--body); }
 .feature-details dt { margin-top: var(--s-3); color: var(--signal); }
@@ -443,7 +479,7 @@ const ledger = ref<Ledger>("positions");
   align-items: center;
   gap: var(--s-4);
   min-width: 0;
-  overflow: hidden;
+  flex-wrap: wrap;
 }
 
 .strip__price {
@@ -459,6 +495,9 @@ const ledger = ref<Ledger>("positions");
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: var(--s-2) var(--s-4);
+  min-width: 0;
+  flex: 1;
+  overflow-wrap: anywhere;
 }
 
 .chart__tf {
