@@ -127,6 +127,86 @@ function num(raw: string): number | null {
 
 export const market = readonly(state);
 
+interface QuoteClock {
+  source: "bbo" | "book" | "rest";
+  venueMs: number | null;
+  observedMs: number;
+  live: boolean;
+}
+
+/** Separate observations: a touch never invents a depth snapshot. */
+export function createQuotes() {
+  const quotes = reactive<{
+    touch: (QuoteClock & { bid: BookLevel | null; ask: BookLevel | null }) | null;
+    depth: (QuoteClock & { bids: BookLevel[]; asks: BookLevel[] }) | null;
+  }>({ touch: null, depth: null });
+  let revision = 0;
+  let liveOwned = false;
+  let depthObservation: { bids: BookLevel[]; asks: BookLevel[] } | null = null;
+  function invalidate() {
+    revision++;
+    if (quotes.touch) quotes.touch.live = false;
+    if (quotes.depth) quotes.depth.live = false;
+  }
+  function reset() { invalidate(); quotes.touch = null; quotes.depth = null; depthObservation = null; liveOwned = false; }
+  function seed(snapshot: MarketSnapshot, requestedRevision: number, observedMs: number) {
+    if (liveOwned || revision !== requestedRevision) return;
+    const clock = { source: "rest" as const, venueMs: null, observedMs, live: false };
+    quotes.touch = { ...clock, bid: snapshot.bids[0] ?? null, ask: snapshot.asks[0] ?? null };
+    quotes.depth = { ...clock, bids: snapshot.bids, asks: snapshot.asks };
+  }
+  function update(frame: Extract<FeedUpdate, { kind: "book" | "bbo" }>, observedMs: number) {
+    if (!Number.isSafeInteger(frame.at_ms) || frame.at_ms < 0) return;
+    liveOwned = true;
+    revision++;
+    const clock = { source: frame.kind, venueMs: frame.at_ms, observedMs, live: true };
+    const old = quotes.touch;
+    const bid = (frame.kind === "bbo" ? frame.bid : frame.bids[0]) ?? null;
+    const ask = (frame.kind === "bbo" ? frame.ask : frame.asks[0]) ?? null;
+    const sameLevel = (a: BookLevel | null, b: BookLevel | null) => a === null || b === null
+      ? a === b : a.px === b.px && a.sz === b.sz && a.n === b.n;
+    const repeatTouch = old?.source === frame.kind && old.venueMs === frame.at_ms
+      && sameLevel(old.bid, bid) && sameLevel(old.ask, ask);
+    if (old?.venueMs == null || frame.at_ms > old.venueMs
+      || repeatTouch || (frame.at_ms === old.venueMs && frame.kind === "bbo" && old.source !== "bbo")) {
+      quotes.touch = { ...clock, bid, ask };
+      if (frame.kind === "bbo" && quotes.depth) {
+        quotes.depth.live = false;
+        if (!frame.bid) quotes.depth.bids = [];
+        if (!frame.ask) quotes.depth.asks = [];
+      }
+    }
+    if (frame.kind === "book") {
+      const newerTouch = quotes.touch?.source === "bbo" && (quotes.touch.venueMs ?? 0) >= frame.at_ms;
+      const bids = newerTouch && !quotes.touch?.bid ? [] : frame.bids;
+      const asks = newerTouch && !quotes.touch?.ask ? [] : frame.asks;
+      const sameLevels = (a: BookLevel[], b: BookLevel[]) => a.length === b.length
+        && a.every((level, i) => sameLevel(level, b[i]!));
+      const depth = quotes.depth;
+      if (depth?.venueMs == null || frame.at_ms > depth.venueMs
+        || (frame.at_ms === depth.venueMs && depthObservation !== null
+          && sameLevels(depthObservation.bids, frame.bids) && sameLevels(depthObservation.asks, frame.asks))) {
+        quotes.depth = { ...clock, live: !newerTouch, bids, asks };
+        depthObservation = { bids: frame.bids, asks: frame.asks };
+      }
+    }
+  }
+  return { quotes: readonly(quotes), invalidate, reset, seed, update, get revision() { return revision; } };
+}
+
+const quoteState = createQuotes();
+export const quotes = quoteState.quotes;
+
+/** Approximation for display only; exact wire prices remain untouched. */
+export function quoteSpread(bid: string | null | undefined, ask: string | null | undefined): number | null {
+  const valid = (px: string | null | undefined) => px != null && /^\d+(\.\d+)?$/.test(px) && Number.isFinite(Number(px)) && Number(px) > 0;
+  if (!valid(bid) || !valid(ask)) return null;
+  const b = Number(bid), a = Number(ask);
+  if (b > a) return null;
+  const spread = ((a - b) / (a / 2 + b / 2)) * 10_000;
+  return Number.isFinite(spread) ? spread : null;
+}
+
 /** The selected row, for the strip above the chart. */
 export const selectedRow = computed<MarketRow | null>(
   () => state.rows.find((row) => row.symbol === state.selected) ?? null,
@@ -170,10 +250,12 @@ let snapshotRequest = 0;
 async function readSnapshot(symbol: string): Promise<void> {
   const request = ++snapshotRequest;
   const network = shell.network;
+  const quoteRevision = quoteState.revision;
   try {
     const snapshot = await fetchMarketSnapshot(network, symbol);
     if (request !== snapshotRequest || state.selected !== symbol || shell.network !== network) return;
     state.snapshot = snapshot;
+    quoteState.seed(snapshot, quoteRevision, Date.now());
     state.featuresReadMs = snapshot.as_of_ms;
     state.snapshotError = null;
   } catch (error) {
@@ -183,15 +265,17 @@ async function readSnapshot(symbol: string): Promise<void> {
 
 export async function select(symbol: string): Promise<void> {
   state.selected = symbol;
+  quoteState.reset();
   state.snapshot = null;
   state.featuresReadMs = null;
   state.snapshotError = null;
   state.chart = null;
   state.chartError = null;
   snapshotRequest += 1;
+  const selection = snapshotRequest;
   if (!inTauri()) return;
   await watchSelected();
-  if (state.selected !== symbol) return;
+  if (state.selected !== symbol || selection !== snapshotRequest) return;
   await Promise.all([readSnapshot(symbol), refreshChart()]);
 }
 
@@ -271,30 +355,13 @@ export function applyFeed(update: FeedUpdate): void {
       return;
     }
     case "bbo": {
-      if (update.coin !== state.selected || state.snapshot === null) return;
-      // Top of book only. An absent side stays absent — §5.2 makes an empty
-      // side stale, and splicing a zero in would quote a spread the venue
-      // never showed.
-      state.snapshot = {
-        ...state.snapshot,
-        bids: mergeTop(state.snapshot.bids, update.bid, "bid"),
-        asks: mergeTop(state.snapshot.asks, update.ask, "ask"),
-        as_of_ms: update.at_ms,
-      };
+      if (update.coin !== state.selected) return;
+      quoteState.update(update, Date.now());
       return;
     }
     case "book": {
-      if (update.coin !== state.selected || state.snapshot === null) return;
-      // The ladder is replaced whole. `book`, `funding` and `vol` are left as
-      // the snapshot read them: they are derived packs, and recomputing them
-      // from a depth frame here would be a second implementation of
-      // `oppen_core::market::snapshot` living in TypeScript.
-      state.snapshot = {
-        ...state.snapshot,
-        bids: update.bids,
-        asks: update.asks,
-        as_of_ms: update.at_ms,
-      };
+      if (update.coin !== state.selected) return;
+      quoteState.update(update, Date.now());
       return;
     }
     case "candle": {
@@ -323,25 +390,9 @@ export function applyFeed(update: FeedUpdate): void {
       return;
     }
     case "status":
+      if (!update.connected) quoteState.invalidate();
       return;
   }
-}
-
-/**
- * Replace the touch of one side, or leave it exactly as it was.
- *
- * Exported as a test seam (`AGENTS.md` leanness rule 2). The absent case is
- * the whole point: `docs/specs/fair-value.md` §5.2 makes an empty side stale,
- * never zero, so a `bbo` frame with no ask must leave the ask ladder alone
- * rather than splice a hole into it — a spread computed off that hole is a
- * number the venue never quoted.
- */
-export function mergeTop(levels: BookLevel[], top: BookLevel | undefined, side: "bid" | "ask"): BookLevel[] {
-  if (top === undefined) return levels;
-  // A worsened touch invalidates deeper cached levels that now outrank it.
-  // Keep exact wire strings; numeric comparison only orders the displayed ladder.
-  const price = Number(top.px);
-  return [top, ...levels.slice(1).filter(level => side === "bid" ? Number(level.px) < price : Number(level.px) > price)];
 }
 
 /**
@@ -545,15 +596,15 @@ const liveFeed = createMarketFeed(
   () => ({ network: shell.network, coin: state.selected, interval: state.interval }),
   { watch: watchMarket, listen: onFeedUpdate },
   {
-    invalidate: () => { feedStatus(false, "Awaiting selected market feed."); },
-    failure: (detail) => { feedStatus(false, detail); },
+    invalidate: () => { quoteState.invalidate(); feedStatus(false, "Awaiting selected market feed."); },
+    failure: (detail) => { quoteState.invalidate(); feedStatus(false, detail); },
     error: (detail) => {
       if (detail !== null || state.error === watchError) state.error = detail;
       watchError = detail;
     },
     update: (update, failure) => {
       applyFeed(update);
-      if (failure !== undefined) feedStatus(false, failure);
+      if (failure !== undefined) { quoteState.invalidate(); feedStatus(false, failure); }
       else if (update.kind === "status") feedStatus(update.connected, update.detail);
       else feedTick("at_ms" in update ? update.at_ms : Date.now());
     },

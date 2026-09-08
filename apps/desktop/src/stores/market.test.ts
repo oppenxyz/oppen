@@ -13,8 +13,8 @@
  */
 
 import { reactive } from "vue";
-import type { FeedBinding, FeedEnvelope, FeedUpdate } from "../lib/bridge";
-import { createMarketFeed, foldForming, foldTrade, mergeTop, parseBar } from "./market";
+import type { FeedBinding, FeedEnvelope, FeedUpdate, MarketSnapshot } from "../lib/bridge";
+import { createMarketFeed, createQuotes, quoteSpread, foldForming, foldTrade, parseBar } from "./market";
 
 interface Assertions {
   toBe(expected: unknown): void;
@@ -324,32 +324,129 @@ describe("parseBar", () => {
  * frame can be folded *wrong* rather than merely dropped, so they are the two
  * the socket path pins.
  */
-describe("mergeTop", () => {
-  it("removes duplicate and outranked cached levels when the touch worsens", () => {
-    const bids = [{ px: "100", sz: "1", n: 1 }, { px: "99", sz: "2", n: 1 }, { px: "98", sz: "3", n: 1 }];
-    expect(mergeTop(bids, { px: "99", sz: "4", n: 1 }, "bid")).toEqual([
-      { px: "99", sz: "4", n: 1 }, { px: "98", sz: "3", n: 1 },
-    ]);
-    const asks = [{ px: "100", sz: "1", n: 1 }, { px: "101", sz: "2", n: 1 }, { px: "102", sz: "3", n: 1 }];
-    expect(mergeTop(asks, { px: "102", sz: "4", n: 1 }, "ask")).toEqual([{ px: "102", sz: "4", n: 1 }]);
+describe("independent quote observations", () => {
+  const level = (px: string) => ({ px, sz: "1.000", n: 1 });
+  const book = (at_ms: number): Extract<FeedUpdate, { kind: "book" }> => ({ kind: "book", coin: "BTC", at_ms,
+    bids: [level("100"), level("99")], asks: [level("102"), level("103")] });
+  const bbo = (at_ms: number): Extract<FeedUpdate, { kind: "bbo" }> => ({ kind: "bbo", coin: "BTC", at_ms,
+    bid: level("100.5000"), ask: level("101.5000") });
+  const snapshot = { bids: [level("10")], asks: [level("12")], as_of_ms: 99999999 } as MarketSnapshot;
+
+  it("bootstraps BBO without REST or invented depth and preserves exact strings and separate clocks", () => {
+    const q = createQuotes();
+    q.update(bbo(100), 900);
+    expect(q.quotes.touch?.bid?.px).toBe("100.5000");
+    expect(q.quotes.touch?.venueMs).toBe(100);
+    expect(q.quotes.touch?.observedMs).toBe(900);
+    expect(q.quotes.depth).toBe(null);
+    expect(q.quotes.touch?.live).toBe(true);
+    q.invalidate();
+    expect(q.quotes.touch?.live).toBe(false);
+    expect(q.quotes.touch?.bid?.px).toBe("100.5000");
   });
 
-  const LEVELS = [
-    { px: "100", sz: "1", n: 1 },
-    { px: "99", sz: "2", n: 2 },
-  ];
-
-  it("replaces the touch and leaves the depth behind it", () => {
-    expect(mergeTop(LEVELS, { px: "100.5", sz: "3", n: 1 }, "bid")).toEqual([
-      { px: "100.5", sz: "3", n: 1 },
-      { px: "99", sz: "2", n: 2 },
-    ]);
+  it("orders both channels by venue time with BBO winning equal timestamps in either arrival order", () => {
+    for (const firstBbo of [false, true]) {
+      const q = createQuotes();
+      q.update(firstBbo ? bbo(100) : book(100), 900);
+      q.update(firstBbo ? book(100) : bbo(100), 901);
+      expect(q.quotes.touch?.source).toBe("bbo");
+      expect(q.quotes.touch?.bid?.px).toBe("100.5000");
+      expect(q.quotes.depth?.bids[0]?.px).toBe("100");
+      expect(q.quotes.depth?.live).toBe(false);
+      q.update(book(99), 999);
+      q.update(bbo(99), 1000);
+      expect(q.quotes.touch?.venueMs).toBe(100);
+      expect(q.quotes.depth?.venueMs).toBe(100);
+      q.update(book(101), 1001);
+      expect(q.quotes.touch?.source).toBe("book");
+      expect(q.quotes.depth?.live).toBe(true);
+    }
   });
 
-  it("leaves an empty side exactly as it was rather than zeroing it", () => {
-    // §5.2: an absent side is stale, never zero. Splicing a hole in here would
-    // let the strip quote a spread against a price the venue never showed.
-    expect(mergeTop(LEVELS, undefined, "bid")).toEqual(LEVELS);
+  it("authoritative missing sides clear liquidity and cannot be resurrected by older or tied L2", () => {
+    const q = createQuotes();
+    q.update(book(100), 900);
+    q.update({ kind: "bbo", coin: "BTC", at_ms: 101, bid: level("101") }, 901);
+    expect(q.quotes.touch?.ask).toBe(null);
+    expect(q.quotes.depth?.asks).toEqual([]);
+    q.update(book(100), 902);
+    q.update(book(101), 903);
+    expect(q.quotes.touch?.ask).toBe(null);
+    expect(q.quotes.depth?.asks).toEqual([]);
+    expect(quoteSpread(q.quotes.touch?.bid?.px, q.quotes.touch?.ask?.px)).toBe(null);
+    q.update({ kind: "bbo", coin: "BTC", at_ms: 102 }, 904);
+    expect(q.quotes.touch?.bid).toBe(null);
+    expect(q.quotes.depth?.bids).toEqual([]);
+    q.update(book(103), 905);
+    expect(q.quotes.touch?.ask?.px).toBe("102");
+  });
+
+  it("identical observations refresh UI receipt and liveness after invalidation, but equal-time conflicts do not", () => {
+    for (const frame of [bbo(100), book(100)]) {
+      const q = createQuotes();
+      q.update(frame, 900);
+      q.invalidate();
+      const conflict = frame.kind === "bbo" ? { ...frame, bid: level("98") }
+        : { ...frame, bids: [level("98")] };
+      q.update(conflict, 901);
+      expect(q.quotes.touch?.observedMs).toBe(900);
+      expect(q.quotes.touch?.live).toBe(false);
+      q.update(frame, 902);
+      expect(q.quotes.touch?.observedMs).toBe(902);
+      expect(q.quotes.touch?.live).toBe(true);
+      if (frame.kind === "book") {
+        expect(q.quotes.depth?.observedMs).toBe(902);
+        expect(q.quotes.depth?.live).toBe(true);
+      }
+    }
+  });
+
+  it("newer depth advances on its own clock behind a newer BBO without reviving a cleared side", () => {
+    const q = createQuotes();
+    q.update(book(100), 900);
+    q.update({ ...bbo(110), ask: undefined }, 901);
+    q.update({ ...book(105), bids: [level("99.5")] }, 902);
+    expect(q.quotes.touch?.venueMs).toBe(110);
+    expect(q.quotes.touch?.observedMs).toBe(901);
+    expect(q.quotes.touch?.bid?.px).toBe("100.5000");
+    expect(q.quotes.touch?.ask).toBe(null);
+    expect(q.quotes.depth?.venueMs).toBe(105);
+    expect(q.quotes.depth?.observedMs).toBe(902);
+    expect(q.quotes.depth?.bids[0]?.px).toBe("99.5");
+    expect(q.quotes.depth?.asks).toEqual([]);
+    expect(q.quotes.depth?.live).toBe(false);
+  });
+
+  it("REST seeds only absent live ownership, never comparing host time with venue time", () => {
+    const q = createQuotes();
+    q.seed(snapshot, q.revision, 800);
+    expect(q.quotes.touch?.venueMs).toBe(null);
+    expect(q.quotes.touch?.observedMs).toBe(800);
+    expect(q.quotes.touch?.live).toBe(false);
+    const pending = q.revision;
+    q.update(bbo(1), 900);
+    q.seed(snapshot, pending, 901);
+    expect(q.quotes.touch?.bid?.px).toBe("100.5000");
+    q.invalidate();
+    q.seed(snapshot, q.revision, 902);
+    expect(q.quotes.touch?.bid?.px).toBe("100.5000");
+    const oldScope = q.revision;
+    q.reset();
+    q.seed(snapshot, oldScope, 903);
+    expect(q.quotes.touch).toBe(null);
+    q.seed(snapshot, q.revision, 904);
+    expect(q.quotes.touch?.source).toBe("rest");
+  });
+
+  it("does not compute spreads from missing, invalid, nonpositive or crossed prices", () => {
+    for (const bad of [undefined, null, "", " ", "Infinity", "NaN", "-1", "0", "0x64", "1e2"]) {
+      expect(quoteSpread(bad, "102")).toBe(null);
+      expect(quoteSpread("100", bad)).toBe(null);
+    }
+    expect(quoteSpread("103", "102")).toBe(null);
+    expect(quoteSpread("100", "100")).toBe(0);
+    expect(quoteSpread("99", "101")).toBe(200);
   });
 });
 

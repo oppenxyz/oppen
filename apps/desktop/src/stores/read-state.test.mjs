@@ -3,6 +3,7 @@ import * as bridge from '../lib/bridge';
 let accountRead;
 let operatorRead;
 const pendingSnapshots = new Map();
+const failedSnapshots = new Map();
 const account = {
   contract_version: 1, network: 'testnet', address: '0x0000000000000000000000000000000000000001',
   as_of_ms: 1000, feed_age_ms: 0, feed: 'live',
@@ -11,12 +12,12 @@ const account = {
 };
 mock.module('../lib/bridge', () => ({
   ...bridge, inTauri: () => true, fetchOperatorState: () => operatorRead(), fetchAccountState: () => accountRead(), watchMarket: async () => {},
-  fetchMarketSnapshot: (_network, symbol) => new Promise(resolve => pendingSnapshots.set(symbol, resolve)),
+  fetchMarketSnapshot: (_network, symbol) => new Promise((resolve, reject) => { pendingSnapshots.set(symbol, resolve); failedSnapshots.set(symbol, reject); }),
   fetchChartSeries: async (_network, symbol, interval) => ({ symbol, interval, interval_ms: 3600000, price_decimals: 2, closed: [] }),
 }));
 const { operator, refreshOperator, recordedAgents, storedPolicy, policySourceLabel } = await import('./operator');
 const { shell, refreshAccount, setNetwork } = await import('./shell');
-const { market, select, refreshSnapshot, applyFeed } = await import('./market');
+const { market, quotes, select, refreshSnapshot, applyFeed } = await import('./market');
 const snapshot = (symbol, at) => ({ symbol, as_of_ms: at, bids: [], asks: [], book: { depth: [] }, funding: {}, vol: {} });
 it('persists an explicit network choice before reload and leaves the session intact if saving fails', () => {
   const previousWindow = globalThis.window;
@@ -78,16 +79,61 @@ describe('market selection and derived freshness', () => {
   });
   it('book ticks do not freshen derived packs and refresh preserves the chart', async () => {
     applyFeed({ kind: 'book', coin: 'ETH', at_ms: 3000, bids: [], asks: [] });
-    expect(market.snapshot.as_of_ms).toBe(3000);
+    expect(market.snapshot.as_of_ms).toBe(2000);
+    expect(quotes.touch.venueMs).toBe(3000);
     expect(market.featuresReadMs).toBe(2000);
     const chart = market.chart;
     pendingSnapshots.delete('ETH');
     const reading = refreshSnapshot(); await untilSnapshot('ETH');
     expect(market.chart).toBe(chart);
-    expect(market.snapshot.as_of_ms).toBe(3000);
+    expect(market.snapshot.as_of_ms).toBe(2000);
     pendingSnapshots.get('ETH')(snapshot('ETH', 4000)); await reading;
     expect(market.chart).toBe(chart);
     expect(market.featuresReadMs).toBe(4000);
+    expect(quotes.touch.venueMs).toBe(3000);
+  });
+  it('live quotes bootstrap despite failed REST and a delayed refresh cannot replace them', async () => {
+    pendingSnapshots.delete('BTC');
+    const reading = select('BTC'); await untilSnapshot('BTC');
+    const bid = { px: '78575.000', sz: '1', n: 1 }, ask = { px: '78581', sz: '2', n: 1 };
+    applyFeed({ kind: 'bbo', coin: 'BTC', at_ms: 10, bid, ask });
+    failedSnapshots.get('BTC')(new Error('REST unavailable')); await reading;
+    expect(market.snapshot).toBe(null);
+    expect(market.featuresReadMs).toBe(null);
+    expect(market.snapshotError).toContain('REST unavailable');
+    expect(quotes.touch.bid.px).toBe('78575.000');
+    expect(quotes.depth).toBe(null);
+    pendingSnapshots.delete('BTC');
+    const refresh = refreshSnapshot(); await untilSnapshot('BTC');
+    applyFeed({ kind: 'book', coin: 'BTC', at_ms: 11, bids: [bid], asks: [ask] });
+    pendingSnapshots.get('BTC')({ ...snapshot('BTC', 99999999), bids: [{ ...bid, px: '1' }], asks: [] }); await refresh;
+    expect(quotes.touch.bid.px).toBe('78575.000');
+    expect(quotes.depth.bids[0].px).toBe('78575.000');
+    expect(market.featuresReadMs).toBe(99999999);
+    applyFeed({ kind: 'status', connected: false });
+    expect(quotes.touch.live).toBe(false);
+    expect(quotes.depth.live).toBe(false);
+    applyFeed({ kind: 'status', connected: true });
+    expect(quotes.touch.live).toBe(false);
+  });
+  it('REST A-B-A selection revisions reject an old A result and off-selection live quotes', async () => {
+    pendingSnapshots.delete('BTC');
+    const first = select('BTC'); await untilSnapshot('BTC');
+    const oldA = pendingSnapshots.get('BTC');
+    pendingSnapshots.delete('ETH');
+    const middle = select('ETH'); await untilSnapshot('ETH');
+    const oldB = pendingSnapshots.get('ETH');
+    pendingSnapshots.delete('BTC');
+    const last = select('BTC'); await untilSnapshot('BTC');
+    const newA = pendingSnapshots.get('BTC');
+    applyFeed({ kind: 'bbo', coin: 'ETH', at_ms: 100, bid: { px: '1', sz: '1', n: 1 } });
+    expect(quotes.touch).toBe(null);
+    oldA(snapshot('BTC', 100)); oldB(snapshot('ETH', 200)); await Promise.all([first, middle]);
+    expect(market.snapshot).toBe(null);
+    expect(quotes.touch).toBe(null);
+    newA(snapshot('BTC', 300)); await last;
+    expect(market.featuresReadMs).toBe(300);
+    expect(quotes.touch.source).toBe('rest');
   });
 });
 
