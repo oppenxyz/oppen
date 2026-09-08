@@ -78,6 +78,7 @@
 
 mod breaker;
 mod bucket;
+mod cancellation;
 mod config;
 pub(crate) use config::{APPROVAL_TTL_MS, MAX_REASON_BYTES};
 mod deadman;
@@ -96,15 +97,16 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 pub use breaker::{BudgetScope, LossBudget, LossKind};
+pub use cancellation::{CancelContext, CancelIntent, CancelTarget};
 pub use config::{
     AgentGuardrails, Freshness, GlobalRateBudget, LossLimits, MarginMode, OrderRate, RiskSettings,
 };
 pub use deadman::DeadManIntent;
 pub use engine::{
     ApprovalReview, ApprovalReviewDisplay, AuditEntry, AuditError, AuditOutcome, AuditSink,
-    Clearance, Cleared, ClearedKind, GuardrailEngine, GuardrailError, OperatorAction, OrderIntent,
-    PolicyAcknowledgment, PolicyStatus, Proposal, SignClearedError, SigningPermit, Utilization,
-    Verdict,
+    CancelApprovalReviewDisplay, Clearance, Cleared, ClearedKind, GuardrailEngine, GuardrailError,
+    OperatorAction, OrderApprovalReviewDisplay, OrderIntent, PolicyAcknowledgment, PolicyStatus,
+    Proposal, ProposalIntent, SignClearedError, SigningPermit, Utilization, Verdict,
 };
 pub use kill::{Engagement, KillEffect, KillReason, KillScope, KillSwitch};
 pub use refusal::{PilotMetric, ReduceOnlyBreach, Refusal, Unevaluable, VenueRule};

@@ -127,7 +127,14 @@ impl OperatorControl {
         &self,
         retained: OperatorReview,
     ) -> Result<serde_json::Value, rmcp::ErrorData> {
-        let cloid = retained.review.display().cloid.as_str().to_owned();
+        let correlation = match retained.review.display() {
+            oppen_core::guardrail::ApprovalReviewDisplay::Order(display) => serde_json::json!({
+                "cloid": display.cloid.as_str(), "proposal_id": display.proposal_id,
+            }),
+            oppen_core::guardrail::ApprovalReviewDisplay::Cancel(display) => serde_json::json!({
+                "action": "cancel", "targets": display.targets, "proposal_id": display.proposal_id,
+            }),
+        };
         let failure = |error: ToolError| {
             let mut error: rmcp::ErrorData = error.into();
             if let Some(data) = error
@@ -135,7 +142,9 @@ impl OperatorControl {
                 .as_mut()
                 .and_then(serde_json::Value::as_object_mut)
             {
-                data.insert("cloid".into(), serde_json::Value::String(cloid.clone()));
+                if let Some(correlation) = correlation.as_object() {
+                    data.extend(correlation.clone());
+                }
                 data.insert("retryable".into(), serde_json::Value::Bool(false));
             }
             error

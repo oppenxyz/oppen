@@ -10,7 +10,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
 use oppen_hl::Action;
-use oppen_hl::wire::{OrderType, OrderWire, Tif};
+use oppen_hl::wire::{Grouping, OrderType, OrderWire, Tif, Tpsl};
 use rust_decimal::Decimal;
 use serde_json::{Value, json};
 use tokio::task::JoinHandle;
@@ -85,6 +85,10 @@ impl Venue {
             .push_back(behavior);
     }
 
+    pub(super) fn reverse_open_orders(&self) {
+        self.state.lock().unwrap().reverse_open_orders = true;
+    }
+
     /// `size` is the incremental fill quantity, not cumulative filled size.
     pub(super) fn fill(&self, cloid: &str, size: Decimal) {
         self.fill_with_fee(cloid, size, Decimal::new(1, 2));
@@ -137,6 +141,7 @@ impl Drop for Venue {
 
 #[derive(Default)]
 struct Book {
+    reverse_open_orders: bool,
     info_count: usize,
     info_gate: Option<(String, Arc<InfoGate>)>,
     orders: BTreeMap<u64, Order>,
@@ -157,6 +162,7 @@ pub(super) struct InfoGate {
 
 struct Order {
     wire: OrderWire,
+    grouping: Grouping,
     oid: u64,
     original: Decimal,
     remaining: Decimal,
@@ -167,14 +173,35 @@ struct Order {
 
 impl Order {
     fn view(&self) -> Value {
+        let (kind, trigger_px, condition) = match &self.wire.t {
+            OrderType::Limit { .. } => ("Limit", None, None),
+            OrderType::Trigger {
+                is_market,
+                trigger_px,
+                tpsl,
+            } => {
+                let kind = match (tpsl, is_market) {
+                    (Tpsl::Sl, true) => "Stop Market",
+                    (Tpsl::Sl, false) => "Stop Limit",
+                    (Tpsl::Tp, true) => "Take Profit Market",
+                    (Tpsl::Tp, false) => "Take Profit Limit",
+                };
+                let above = self.wire.b == (*tpsl == Tpsl::Sl);
+                (
+                    kind,
+                    Some(trigger_px.as_str()),
+                    Some(if above { "Price above" } else { "Price below" }),
+                )
+            }
+        };
         json!({
             "coin": "TEST", "side": if self.wire.b { "B" } else { "A" },
             "limitPx": self.wire.p.as_str(), "sz": self.remaining.to_string(),
             "origSz": self.original.to_string(), "oid": self.oid,
             "timestamp": self.created, "cloid": self.wire.c,
-            "orderType": "Limit", "reduceOnly": self.wire.r,
-            "isTrigger": false, "triggerPx": null, "triggerCondition": null,
-            "isPositionTpsl": false
+            "orderType": kind, "reduceOnly": self.wire.r,
+            "isTrigger": trigger_px.is_some(), "triggerPx": trigger_px, "triggerCondition": condition,
+            "isPositionTpsl": self.grouping == Grouping::PositionTpsl
         })
     }
 
@@ -259,13 +286,18 @@ impl Book {
                 )
             }
             "spotClearinghouseState" => Ok(json!({ "balances": [] })),
-            "frontendOpenOrders" => Ok(Value::Array(
-                self.orders
+            "frontendOpenOrders" => {
+                let mut orders: Vec<_> = self
+                    .orders
                     .values()
                     .filter(|order| order.status == "open")
                     .map(Order::view)
-                    .collect(),
-            )),
+                    .collect();
+                if self.reverse_open_orders {
+                    orders.reverse();
+                }
+                Ok(Value::Array(orders))
+            }
             "userFillsByTime" => {
                 let start = request["startTime"].as_u64().ok_or("missing startTime")?;
                 let end = match request.get("endTime") {
@@ -387,15 +419,15 @@ impl Book {
             ));
         }
         let (kind, statuses) = match action {
-            Action::Order { orders, .. } => {
+            Action::Order {
+                orders, grouping, ..
+            } => {
                 let mut statuses = Vec::new();
                 for wire in orders {
                     if wire.a != 0 {
                         return Err("fixture asset must be TEST (0)".into());
                     }
-                    let OrderType::Limit { tif } = wire.t else {
-                        return Err("fixture supports limit/IOC orders only".into());
-                    };
+                    let immediate = matches!(wire.t, OrderType::Limit { tif: Tif::Ioc });
                     let size: Decimal =
                         wire.s.as_str().parse().map_err(|e| format!("size: {e}"))?;
                     let px: Decimal = wire.p.as_str().parse().map_err(|e| format!("price: {e}"))?;
@@ -416,6 +448,7 @@ impl Book {
                         oid,
                         Order {
                             wire,
+                            grouping,
                             oid,
                             original: size,
                             remaining: size,
@@ -424,7 +457,7 @@ impl Book {
                             status: "open",
                         },
                     );
-                    if tif == Tif::Ioc {
+                    if immediate {
                         let buy = self.orders[&oid].wire.b;
                         if (buy && px < Decimal::from(100)) || (!buy && px > Decimal::from(100)) {
                             self.cancel(oid);

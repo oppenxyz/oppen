@@ -3,7 +3,9 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use oppen_core::guardrail::{ApprovalReviewDisplay, GuardrailEngine, OriginalRequest, Proposal};
+use oppen_core::guardrail::{
+    ApprovalReviewDisplay, CancelTarget, GuardrailEngine, OriginalRequest, Proposal, ProposalIntent,
+};
 use oppen_core::ledger::PairingId;
 use oppen_mcp::auth::Binding;
 use oppen_mcp::server::{OperatorControl, OperatorReview};
@@ -31,14 +33,26 @@ pub(crate) struct PendingApprovalView {
     pub id: String,
     pub agent: String,
     pub account: String,
-    pub symbol: String,
-    pub is_buy: bool,
-    pub px: String,
-    pub sz: String,
-    pub reduce_only: bool,
     pub reason: String,
     pub expires_at_ms: u64,
-    pub original: Option<OriginalRequest>,
+    #[serde(flatten)]
+    pub intent: PendingIntentView,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum PendingIntentView {
+    Order {
+        symbol: String,
+        is_buy: bool,
+        px: String,
+        sz: String,
+        reduce_only: bool,
+        original: Option<OriginalRequest>,
+    },
+    Cancel {
+        targets: Vec<CancelTarget>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -125,19 +139,32 @@ fn views(proposals: Vec<Proposal>, binding: &Binding) -> Vec<PendingApprovalView
         .into_iter()
         .filter(|proposal| scoped(proposal, binding))
         .map(|proposal| {
-            let intent = proposal.intent();
+            let (reason, intent) = match proposal.intent() {
+                ProposalIntent::Order(intent) => (
+                    intent.reason.clone(),
+                    PendingIntentView::Order {
+                        symbol: intent.symbol.clone(),
+                        is_buy: intent.is_buy,
+                        px: intent.px.to_string(),
+                        sz: intent.sz.to_string(),
+                        reduce_only: intent.reduce_only,
+                        original: intent.original.clone(),
+                    },
+                ),
+                ProposalIntent::Cancel(intent) => (
+                    intent.reason.clone(),
+                    PendingIntentView::Cancel {
+                        targets: intent.targets.clone(),
+                    },
+                ),
+            };
             PendingApprovalView {
                 id: proposal.id().to_owned(),
                 agent: binding.agent.to_string(),
                 account: binding.account.to_string(),
-                symbol: intent.symbol.clone(),
-                is_buy: intent.is_buy,
-                px: intent.px.to_string(),
-                sz: intent.sz.to_string(),
-                reduce_only: intent.reduce_only,
-                reason: intent.reason.clone(),
+                reason,
                 expires_at_ms: proposal.expires_at_ms(),
-                original: intent.original.clone(),
+                intent,
             }
         })
         .collect()
@@ -521,12 +548,12 @@ impl ApprovalQueueControl {
                 .review
                 .as_ref()
                 .ok_or("pricing review is missing")?;
-            if view.id != id || view.owner_id != owner_id || view.display.expires_at_ms <= at_ms {
+            if view.id != id || view.owner_id != owner_id || view.display.expires_at_ms() <= at_ms {
                 return Err("pricing review changed or expired".into());
             }
             let ids = (
                 view.id.clone(),
-                view.display.proposal_id.clone(),
+                view.display.proposal_id().to_owned(),
                 view.reason.clone(),
             );
             let retained = admission
@@ -603,10 +630,10 @@ impl ApprovalQueueControl {
             match result {
                 Ok(Ok((Some(review), None))) if !confirming => {
                     let display = review.display();
-                    if display.agent != owner.binding.agent
-                        || display.account != owner.binding.account
-                        || display.proposal_id != proposal_id
-                        || display.expires_at_ms <= completed_at
+                    if display.agent() != &owner.binding.agent
+                        || display.account() != owner.binding.account
+                        || display.proposal_id() != proposal_id
+                        || display.expires_at_ms() <= completed_at
                     {
                         admission.status.phase = QueuePhase::Unavailable;
                         admission.status.error =
@@ -1046,7 +1073,9 @@ mod tests {
         assert_eq!(status.pending[0].agent, "alpha");
         assert_eq!(status.pending[0].account, f.alpha.account.to_string());
         assert_eq!(status.pending[0].reason, "<script>inert claim</script>");
-        assert_eq!(status.pending[0].px, "100");
+        assert!(
+            matches!(&status.pending[0].intent, PendingIntentView::Order { px, .. } if px == "100")
+        );
         assert_eq!(f.engine.policy_status().acknowledgment, acknowledgment);
         assert_eq!(f.ledger.chain_head().unwrap(), head);
         queue.close_and_drain().await.unwrap();

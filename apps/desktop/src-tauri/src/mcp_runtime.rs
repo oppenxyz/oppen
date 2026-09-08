@@ -672,6 +672,7 @@ mod tests {
         stop: CancellationToken,
         task: Option<tokio::task::JoinHandle<()>>,
         info_gate: Arc<Mutex<Option<InfoGate>>>,
+        orders: Arc<Mutex<Vec<serde_json::Value>>>,
     }
 
     struct InfoGate {
@@ -701,6 +702,8 @@ mod tests {
             let recorded = requests.clone();
             let info_gate = Arc::new(Mutex::new(None::<InfoGate>));
             let gates = info_gate.clone();
+            let orders = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+            let open_orders = orders.clone();
             let task = tokio::spawn(async move {
                 let mut clients = tokio::task::JoinSet::new();
                 loop {
@@ -712,6 +715,7 @@ mod tests {
                             let recorded = recorded.clone();
                             let gates = gates.clone();
                             let stopped = stopping.clone();
+                            let open_orders = open_orders.clone();
                             clients.spawn(async move {
                                 let mut socket = BufReader::new(socket);
                                 let mut line = String::new();
@@ -751,7 +755,10 @@ mod tests {
                                         let _ = gate.entered.send(());
                                         let _ = gate.released.await;
                                     }
-                                    ("200 OK", Self::info(request).to_string())
+                                    let response = if request["type"] == "frontendOpenOrders" {
+                                        serde_json::json!(*open_orders.lock().unwrap())
+                                    } else { Self::info(request) };
+                                    ("200 OK", response.to_string())
                                 };
                                 let response = format!("HTTP/1.1 {code}\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{response}", response.len());
                                 let _ = socket.write_all(response.as_bytes()).await;
@@ -772,6 +779,7 @@ mod tests {
                 stop,
                 task: Some(task),
                 info_gate,
+                orders,
             }
         }
 
@@ -1433,7 +1441,7 @@ mod tests {
         let reviewed = controller_settled(&queue, &fixture.binding).await;
         assert_eq!(reviewed.phase, QueuePhase::ReviewReady, "{reviewed:?}");
         let review = reviewed.review.unwrap();
-        assert_eq!(review.display.proposal_id, id);
+        assert_eq!(review.display.proposal_id(), id);
         assert!(
             queue
                 .confirm(&fixture.binding, &review.owner_id, "wrong-review".into())
@@ -1606,6 +1614,147 @@ mod tests {
             );
             venue.shutdown().await;
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn native_controller_cancellation_exact_targets_changed_snapshot_refuses_without_retry() {
+        use crate::operator_approvals::QueuePhase;
+        use oppen_core::guardrail::{CancelContext, CancelIntent, CancelTarget, Refusal};
+        let fixture = Fixture::authorized();
+        let venue = LocalVenue::start_with_pending_handshake(true).await;
+        let mut prepared = fixture.prepare().unwrap();
+        let order_id = controller_proposal(&prepared);
+        let at = u64::try_from(now_ms()).unwrap();
+        let target = CancelTarget {
+            symbol: "TEST".into(),
+            asset_index: 0,
+            oid: 501,
+            cloid: Some(oppen_hl::wire::Cloid::from_bytes([122; 16])),
+            is_buy: false,
+            limit_px: 100.into(),
+            sz: "0.12".parse().unwrap(),
+            orig_sz: "0.15".parse().unwrap(),
+            timestamp: at,
+            order_type: "Stop Market".into(),
+            reduce_only: true,
+            is_trigger: true,
+            trigger_px: Some(101.into()),
+            trigger_condition: Some("<script>display only</script>".into()),
+            is_position_tpsl: true,
+        };
+        *venue.orders.lock().unwrap() = vec![serde_json::json!({
+            "coin":target.symbol, "oid":target.oid,"cloid":target.cloid,"side":"A","limitPx":"100","sz":"0.12","origSz":"0.15",
+            "timestamp":at,"orderType":target.order_type,"reduceOnly":true,"isTrigger":true,"triggerPx":"101",
+            "triggerCondition":target.trigger_condition,"isPositionTpsl":true,
+        })];
+        let intent = CancelIntent {
+            targets: vec![target.clone()],
+            reason: "Remove exact protective order <img src=x>".into(),
+        };
+        let context = CancelContext {
+            account: fixture.binding.account,
+            observed_at_ms: at,
+            targets: vec![target.clone()],
+        };
+        let id =
+            match prepared
+                .engine
+                .evaluate_cancel(&fixture.binding.agent, &intent, &context, at)
+            {
+                Err(Refusal::CancellationApprovalRequired { approval_id, .. }) => approval_id,
+                other => panic!("expected durable cancellation proposal: {other:?}"),
+            };
+        let ledger = prepared.ledger.clone();
+        let feed = prepared.feed.clone();
+        let port = venue.port;
+        prepared.gateway = prepared.gateway.with_loopback_fixture(port).unwrap();
+        let mut owned = OwnedMcp::launch(
+            prepared,
+            0,
+            FixtureSource,
+            move || WsPool::loopback_fixture(port),
+            Arc::new(Mutex::new(McpStatus::starting(&fixture.binding))),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        controller_reconciled(&feed).await;
+        let queue = owned.approvals().unwrap().clone();
+        drop(queue.refresh(&fixture.binding).unwrap());
+        let refreshed = controller_settled(&queue, &fixture.binding).await;
+        assert_eq!(refreshed.pending.len(), 2);
+        let pending = serde_json::to_value(&refreshed.pending).unwrap();
+        let cancel = pending
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == id)
+            .unwrap();
+        assert_eq!(cancel["kind"], "cancel");
+        assert_eq!(cancel["targets"][0], serde_json::to_value(&target).unwrap());
+        assert!(
+            pending
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| row["id"] == order_id && row["kind"] == "order")
+        );
+        drop(
+            queue
+                .prepare(&fixture.binding, &refreshed.owner_id, id.clone())
+                .unwrap(),
+        );
+        let reviewed = controller_settled(&queue, &fixture.binding).await;
+        assert_eq!(reviewed.phase, QueuePhase::ReviewReady, "{reviewed:?}");
+        let review = reviewed.review.unwrap();
+        assert_eq!(review.display.cancel().unwrap().targets, vec![target]);
+        assert!(
+            queue
+                .confirm(&fixture.binding, &review.owner_id, "wrong-review".into())
+                .is_err()
+        );
+        assert_eq!(
+            queue.status(&fixture.binding).unwrap().review.unwrap().id,
+            review.id
+        );
+        // A disappeared target is not silently treated as cancellation success.
+        venue.orders.lock().unwrap().clear();
+        drop(
+            queue
+                .confirm(&fixture.binding, &review.owner_id, review.id.clone())
+                .unwrap(),
+        );
+        let completed = controller_settled(&queue, &fixture.binding).await;
+        assert!(completed.observed_at_ms.is_none());
+        let result = completed.confirmation.unwrap();
+        assert_eq!(result.review_id, review.id);
+        assert_eq!(result.result.unwrap()["status"], "rejected");
+        assert!(
+            queue
+                .confirm(&fixture.binding, &review.owner_id, review.id)
+                .is_err()
+        );
+        assert!(
+            !ledger
+                .get_events(0, 1000)
+                .unwrap()
+                .events
+                .iter()
+                .any(|row| row.kind == oppen_core::ledger::EventKind::SubmissionStarted)
+        );
+        assert!(
+            venue
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|request| request.path != "/exchange")
+        );
+        tokio::time::timeout(Duration::from_secs(5), owned.shutdown_and_drain())
+            .await
+            .unwrap()
+            .unwrap();
+        venue.shutdown().await;
     }
 
     #[derive(Debug)]

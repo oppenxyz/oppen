@@ -49,6 +49,12 @@ pub enum PilotMetric {
 #[serde(tag = "refusal", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum Refusal {
+    #[error("cancellation requires operator approval ({approval_id}, expires at {expires_at_ms})")]
+    CancellationApprovalRequired {
+        approval_id: String,
+        expires_at_ms: u64,
+        targets: Vec<super::CancelTarget>,
+    },
     #[error("pilot {metric:?} budget stopped execution: ${observed_usd} against ${limit_usd}")]
     PilotBudget {
         metric: PilotMetric,

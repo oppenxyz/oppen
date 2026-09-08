@@ -3,6 +3,9 @@ use super::*;
 #[path = "approval_review_tests.rs"]
 mod approval_review_tests;
 
+#[path = "cancellation_approval_tests.rs"]
+mod cancellation_approval_tests;
+
 use std::path::Path;
 use std::sync::atomic::AtomicU64;
 
@@ -164,7 +167,7 @@ impl DurableFixture {
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].id(), approval_id);
         assert_eq!(pending[0].expires_at_ms(), expires_at_ms);
-        assert_eq!(pending[0].intent(), &order);
+        assert_eq!(pending[0].order_intent().unwrap(), &order);
         pending[0].clone()
     }
 
@@ -285,10 +288,10 @@ fn production_approval_consumes_once_and_records_claim_intent_and_disposition() 
     assert!(claims[0].seq < intents[0].seq && intents[0].seq < disposed[0].seq);
     assert_eq!(intents[0].agent_id.as_deref(), Some("alpha"));
     let mut expected = serde_json::to_value(cleared.clearance()).unwrap();
-    expected
-        .as_object_mut()
-        .unwrap()
-        .insert("reason".into(), proposal.intent().reason.clone().into());
+    expected.as_object_mut().unwrap().insert(
+        "reason".into(),
+        proposal.order_intent().unwrap().reason.clone().into(),
+    );
     assert_eq!(intents[0].payload.as_ref().unwrap(), &expected);
     let proposed = f.events(EventKind::ApprovalProposed);
     let root = serde_json::json!({ "seq": proposed[0].seq, "hash": proposed[0].hash });
@@ -539,7 +542,7 @@ fn production_mint_publication_failure_has_no_followon_refusal_and_retry_recover
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].id(), original_id);
     assert_eq!(pending[0].expires_at_ms(), original_expiry);
-    assert_eq!(pending[0].intent(), &order);
+    assert_eq!(pending[0].order_intent().unwrap(), &order);
     assert!(f.events(EventKind::OrderIntent).is_empty());
 }
 

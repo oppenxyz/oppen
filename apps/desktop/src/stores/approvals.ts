@@ -156,9 +156,11 @@ export function createApprovals(
         : transport.reject(binding.agent, binding.account, owner!, proposalId!));
       if (!current() || expired) return;
       if (!sameBinding(status, binding) || !status.owner_id
-        || status.pending.some(p => !sameBinding(p, binding))
+        || status.pending.some(p => !sameBinding(p, binding) || (p.kind !== "order" && p.kind !== "cancel"))
         || (status.review != null && (status.review.owner_id !== status.owner_id
-          || !sameBinding(status.review.display, binding) || status.review.pairing_id.network !== "testnet"))) {
+          || !sameBinding(status.review.display, binding) || status.review.pairing_id.network !== "testnet"
+          || (status.review.display.kind !== "order" && status.review.display.kind !== "cancel")
+          || status.pending.some(p => p.id === status.review!.display.proposal_id && p.kind !== status.review!.display.kind)))) {
         state.status = null;
         refreshProof = null;
         uncertain("Approval queue identity did not match the current runtime binding.");

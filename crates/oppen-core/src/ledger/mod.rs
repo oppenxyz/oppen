@@ -2532,7 +2532,11 @@ impl crate::guardrail::AuditSink for LedgerAuditSink {
                     detail: error.to_string(),
                 })
             })?;
-        if matches!(clearance.kind, crate::guardrail::ClearedKind::Order { .. }) {
+        if matches!(
+            clearance.kind,
+            crate::guardrail::ClearedKind::Order { .. }
+                | crate::guardrail::ClearedKind::DiscretionaryCancel { .. }
+        ) {
             let policy = self.policy.current_in(&permit).map_err(|error| {
                 crate::guardrail::Refusal::from(crate::guardrail::Unevaluable::PolicyAuthority {
                     detail: error.to_string(),
@@ -2547,7 +2551,9 @@ impl crate::guardrail::AuditSink for LedgerAuditSink {
                 }
                 .into());
             }
-            if let Some((scope, engagement)) = policy.state.kill.blocking(&clearance.agent) {
+            if matches!(clearance.kind, crate::guardrail::ClearedKind::Order { .. })
+                && let Some((scope, engagement)) = policy.state.kill.blocking(&clearance.agent)
+            {
                 return Err(crate::guardrail::Refusal::TradingPaused {
                     scope,
                     since_ms: engagement.engaged_at_ms,
@@ -2577,9 +2583,9 @@ impl crate::guardrail::AuditSink for LedgerAuditSink {
             AuditOutcome::Cleared(clearance) => (
                 match clearance.kind {
                     ClearedKind::Order { .. } => EventKind::OrderIntent,
-                    ClearedKind::Cancel { .. } | ClearedKind::ScheduleCancel { .. } => {
-                        EventKind::AgentDecision
-                    }
+                    ClearedKind::Cancel { .. }
+                    | ClearedKind::DiscretionaryCancel { .. }
+                    | ClearedKind::ScheduleCancel { .. } => EventKind::AgentDecision,
                 },
                 serde_json::to_value(clearance).map_err(|e| crate::guardrail::AuditError {
                     detail: e.to_string(),
