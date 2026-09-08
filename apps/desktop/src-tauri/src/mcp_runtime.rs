@@ -622,7 +622,10 @@ mod tests {
                             clients.spawn(async move {
                                 let mut socket = BufReader::new(socket);
                                 let mut line = String::new();
-                                socket.read_line(&mut line).await.unwrap();
+                                if socket.read_line(&mut line).await.unwrap() == 0 {
+                                    // A canceled client may close before sending a request.
+                                    return;
+                                }
                                 let websocket = line.starts_with("GET /");
                                 let path = line.split_whitespace().nth(1).unwrap().to_owned();
                                 let mut length = 0;
@@ -705,6 +708,23 @@ mod tests {
                 task.abort();
             }
         }
+    }
+
+    #[tokio::test]
+    async fn local_venue_accepts_connection_closed_before_request() {
+        let venue = LocalVenue::start().await;
+        let mut socket = TcpStream::connect(("127.0.0.1", venue.port)).await.unwrap();
+        socket.shutdown().await.unwrap();
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), socket.read_to_end(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(response.is_empty());
+        assert!(venue.requests.lock().unwrap().is_empty());
+        // Joining also observes any handler panic, rather than aborting the
+        // handler before it has consumed the connection's EOF.
+        venue.shutdown().await;
     }
 
     async fn rpc(
