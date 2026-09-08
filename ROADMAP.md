@@ -268,6 +268,13 @@ before expanding features:
    remain required. V14 preserves absent historical metadata without granting
    ownership; stop older writers and preserve all history on rollback. Lost-response
    ownership recovery and dedicated-account live acceptance remain open.
+   Recovery acquisition investigation now identifies a concrete provider
+   action/response association, but no authenticated testnet capture has been
+   obtained. An operator-controlled official node is a candidate, not an enabled
+   dependency. Source trust, real testnet evidence and exact signed-digest
+   reconstruction are prerequisites to implementing recovery; see the
+   [acquisition gate](docs/specs/order-provenance.md#acquisition-gate).
+   No node provisioning, subscription or paid archive download is authorized.
    No dedicated-account activity has been performed during this development.
 4. **Recovery:** PR #44 merged as `06fc0e3` after green CI and separate automated
    review. The durable submission journal has SQLite reopen, independent
