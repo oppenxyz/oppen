@@ -1387,7 +1387,8 @@ the depth measurement problem in §14, and whether the sub-account owner rule
 
 | ID | Decision | Rationale |
 |---|---|---|
-| ES38 | Add an explicit, reviewed TESTNET kill-release ceremony after ES37, separate from activation and initial consent. | The desktop currently cannot release the global pause created by policy setup, and its HALT owner is lifetime-latched. Bind exact scope, policy/stop generation, affected authority and pilot evidence under core coordination; preserve permanent stops and budgets, keep acknowledgment absent, and safely re-arm subsequent HALT. See [operator-kill-release.md](specs/operator-kill-release.md). Planned, not implemented or live-authorized. |
+| ES38 | Add an explicit, reviewed TESTNET kill-release ceremony after ES37, separate from activation and initial consent. | Bind exact scope, policy/stop generation, affected authority and pilot evidence under core coordination; preserve permanent stops and budgets, keep acknowledgment absent, and safely re-arm subsequent HALT. See [operator-kill-release.md](specs/operator-kill-release.md). Locally implemented and independently reviewed; remote CI, installed-artifact and live acceptance remain pending. |
+| ES39 | Add reviewed initial TESTNET pilot consent before MCP startup, with no reset or implicit activation. | Bind displayed identity, route, paused policy, checkpoint and fresh account evidence in the consent transaction. Existing consent is inspect-only; prior execution or incomplete accounting requires preservation, not a fresh zero baseline. Reuse the existing signed consent record and retained setup ownership. See [operator-pilot-consent.md](specs/operator-pilot-consent.md). Contract only, not implemented or live-authorized. |
 
 ### Numeric change cue
 
