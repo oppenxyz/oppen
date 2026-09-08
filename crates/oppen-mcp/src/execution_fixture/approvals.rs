@@ -494,6 +494,98 @@ async fn signing_admission_wins_close_without_hiding_actual_submission_or_drain(
 }
 
 #[tokio::test]
+async fn native_route_timeout_retains_actual_worker_until_parent_drain() {
+    let dir = tempfile::tempdir().unwrap();
+    let venue = Venue::start().await;
+    let keys = Arc::new(FixtureKeys::default());
+    let anchor = Arc::new(HeldAnchor::default());
+    let runtime = Runtime::open_with_anchor(
+        dir.path(),
+        venue.port(),
+        keys.clone(),
+        Some(Box::new(AnchorHandle(anchor.clone()))),
+    )
+    .await;
+    enable_approval(&runtime).await;
+    // Wait for the initial sweep before arming the native route read.
+    let mut serving = Serving::start(&runtime).await;
+    let id = mint(&runtime, 135).await;
+    let info_before = venue.info_count();
+    assert_eq!(runtime.gateway.inner.decision_worker.available_permits(), 1);
+    assert_eq!(runtime.gateway.inner.route_reader.available_permits(), 1);
+    let (release, wait) = std::sync::mpsc::channel();
+    *anchor.wait.lock().unwrap() = Some(wait);
+    let control = serving.control.clone();
+    let bound = binding(&runtime);
+    let proposal = id.clone();
+    let started = tokio::time::Instant::now();
+    let prepare = tokio::spawn(async move { control.prepare(&bound, &proposal).await });
+    timeout(Duration::from_secs(2), anchor.entered.notified())
+        .await
+        .unwrap();
+    assert_eq!(runtime.gateway.inner.route_reader.available_permits(), 0);
+    assert_eq!(
+        runtime.gateway.inner.decision_worker.available_permits(),
+        1,
+        "a supervisor/decision worker must not be the stalled read"
+    );
+
+    serving.control.close();
+    unavailable(
+        serving
+            .control
+            .prepare(&binding(&runtime), &id)
+            .await
+            .err()
+            .expect("closed native admission"),
+    );
+    // Stop periodic supervision before its next tick. Only the native route
+    // closure is stalled, not an independently admitted supervisor worker.
+    serving.stop.cancel();
+    assert!(
+        timeout(Duration::from_millis(100), serving.task.as_mut().unwrap())
+            .await
+            .is_err()
+    );
+    // The timeout above drops a drain observer, not the retained server task.
+    let error = timeout(Duration::from_secs(6), prepare)
+        .await
+        .expect("native route deadline did not fire")
+        .unwrap()
+        .err()
+        .expect("blocked route returned a review");
+    assert!(started.elapsed() >= Duration::from_secs(5));
+    assert!(error.message.contains("registry read timeout"), "{error:?}");
+    unavailable(error);
+    assert_eq!(runtime.gateway.inner.route_reader.available_permits(), 0);
+    assert_eq!(runtime.gateway.inner.decision_worker.available_permits(), 1);
+    assert_eq!(
+        venue.info_count(),
+        info_before,
+        "timed-out prepare continued into venue reads"
+    );
+    assert!(
+        timeout(Duration::from_millis(200), serving.task.as_mut().unwrap())
+            .await
+            .is_err(),
+        "server drained after caller timeout while native route worker was still alive"
+    );
+    assert!(keys.read_heads.lock().unwrap().is_empty());
+    assert!(venue.submissions().is_empty());
+
+    release.send(()).unwrap();
+    serving.finish().await;
+    assert_eq!(runtime.gateway.inner.route_reader.available_permits(), 1);
+    assert_eq!(count(&runtime, EventKind::ApprovalClaimed), 0);
+    assert_eq!(count(&runtime, EventKind::SubmissionStarted), 0);
+    assert_eq!(venue.info_count(), info_before);
+    assert!(keys.read_heads.lock().unwrap().is_empty());
+    assert!(venue.submissions().is_empty());
+    runtime.shutdown().await;
+    venue.shutdown().await;
+}
+
+#[tokio::test]
 async fn parent_stop_closes_operator_admission_and_drains_abandoned_prepare_worker() {
     let dir = tempfile::tempdir().unwrap();
     let venue = Venue::start().await;
