@@ -2059,8 +2059,10 @@ async fn session(
                 None => return SessionEnd::Dropped("stream ended".to_owned()),
                 Some(Err(e)) => return SessionEnd::Dropped(e.to_string()),
                 Some(Ok(Message::Text(text))) => {
-                    if !handle_text(id, &text, inner, events).await {
-                        return SessionEnd::Shutdown;
+                    match handle_text(id, &text, inner, events, idle_ms).await {
+                        Ok(true) => {},
+                        Ok(false) => return SessionEnd::Shutdown,
+                        Err(reason) => return SessionEnd::Dropped(reason),
                     }
                 }
                 Some(Ok(Message::Ping(payload))) => {
@@ -2106,24 +2108,33 @@ async fn session(
     }
 }
 
-/// Returns false when the consumer's receiver is gone, which ends the task.
+/// Returns false when the consumer is gone, or an error when silence requires
+/// reconnecting without accepting the frame as evidence of continuity.
 async fn handle_text(
     id: ConnectionId,
     text: &str,
     inner: &Arc<Mutex<PoolInner>>,
     events: &mpsc::Sender<WsEvent>,
-) -> bool {
-    let now = now_ms();
-    let order_updates_user = {
+    idle_ms: u64,
+) -> Result<bool, String> {
+    let (now, order_updates_user) = {
         let mut guard = lock(inner);
+        // Check after select resumes and under the same lock as the touch:
+        // buffered text (including pong/unknown channels) cannot erase a gap.
+        let now = now_ms();
+        if let Some(last) = guard.registry.connection_last_message(id)
+            && now.saturating_sub(last) > idle_ms
+        {
+            return Err(format!("idle for more than {idle_ms} ms"));
+        }
         guard.registry.touch_connection(id, now);
-        guard.registry.order_updates_user(id)
+        (now, guard.registry.order_updates_user(id))
     };
     let ctx = ParseContext {
         now_ms: now,
         order_updates_user,
     };
-    match parse_message(text, &ctx) {
+    Ok(match parse_message(text, &ctx) {
         Ok(Incoming::Event(event)) => {
             if let Some(key) = event.subscription_key() {
                 lock(inner).registry.touch(id, &key, now);
@@ -2166,7 +2177,7 @@ async fn handle_text(
                 .await
                 .is_ok()
         }
-    }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -3791,16 +3802,24 @@ mod tests {
         let mut registry = SubscriptionRegistry::new(1, 10);
         let bbo = Subscription::Bbo { coin: "BTC".into() };
         registry.place(bbo.clone()).expect("place");
-        registry.set_connected(ConnectionId(0), true, 0);
+        registry.set_connected(ConnectionId(0), true, now_ms());
         let inner = test_inner(registry);
         let (tx, mut rx) = mpsc::channel(8);
         let thresholds = StalenessThresholds::default();
 
-        assert!(handle_text(ConnectionId(0), fixtures::ACK_BBO, &inner, &tx).await);
+        assert!(
+            handle_text(ConnectionId(0), fixtures::ACK_BBO, &inner, &tx, 75_000)
+                .await
+                .unwrap()
+        );
         assert!(rx.try_recv().is_err(), "an ack is not a consumer event");
         assert!(lock(&inner).registry.health(0, &thresholds)[0].acked);
 
-        assert!(handle_text(ConnectionId(0), fixtures::BBO, &inner, &tx).await);
+        assert!(
+            handle_text(ConnectionId(0), fixtures::BBO, &inner, &tx, 75_000)
+                .await
+                .unwrap()
+        );
         assert!(matches!(rx.recv().await, Some(WsEvent::Bbo { .. })));
         let anchor = lock(&inner)
             .registry
@@ -3813,7 +3832,11 @@ mod tests {
         );
 
         // A pong proves the socket is alive without being an event.
-        assert!(handle_text(ConnectionId(0), fixtures::PONG, &inner, &tx).await);
+        assert!(
+            handle_text(ConnectionId(0), fixtures::PONG, &inner, &tx, 75_000)
+                .await
+                .unwrap()
+        );
         assert!(rx.try_recv().is_err());
 
         assert!(
@@ -3821,9 +3844,11 @@ mod tests {
                 ConnectionId(0),
                 r#"{"channel":"bbo","data":{}}"#,
                 &inner,
-                &tx
+                &tx,
+                75_000
             )
             .await
+            .unwrap()
         );
         let Some(WsEvent::MessageDropped { channel, .. }) = rx.recv().await else {
             panic!("a frame that cannot be understood must be reported, not swallowed");
@@ -3919,6 +3944,75 @@ mod tests {
                 .is_some(),
             "the frame moved the gap anchor"
         );
+    }
+
+    #[tokio::test]
+    async fn session_rejects_buffered_text_after_expired_silence() {
+        for text in [
+            fixtures::BBO,
+            fixtures::PONG,
+            r#"{"channel":"unknown","data":{}}"#,
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let (release, released) = tokio::sync::oneshot::channel();
+            let server = tokio::spawn(async move {
+                let (tcp, _) = listener.accept().await.unwrap();
+                let mut socket = tokio_tungstenite::accept_async(tcp).await.unwrap();
+                released.await.unwrap();
+                socket.send(Message::Text(text.to_owned())).await.unwrap();
+                socket.send(Message::Close(None)).await.unwrap();
+            });
+            let (mut stream, _) = connect_async(format!("ws://{addr}")).await.unwrap();
+            let inner = connected_registry(&Subscription::Bbo { coin: "BTC".into() });
+            let (tx, mut rx) = mpsc::channel(8);
+            let (_cmd_tx, mut cmds) = mpsc::unbounded_channel();
+            let cfg = WsPoolConfig {
+                ping_interval: Duration::from_secs(60),
+                idle_timeout: Duration::from_millis(100),
+                ..WsPoolConfig::default()
+            };
+            let pending = session(ConnectionId(0), &mut stream, &mut cmds, &tx, &inner, &cfg);
+            tokio::pin!(pending);
+            // First enter select with a fresh clock and no frame. Then seed
+            // expired silence while suspended, before queuing the late text.
+            assert!(
+                tokio::time::timeout(Duration::from_millis(10), &mut pending)
+                    .await
+                    .is_err()
+            );
+            let last = now_ms() - 1_000;
+            lock(&inner)
+                .registry
+                .touch_connection(ConnectionId(0), last);
+            release.send(()).unwrap();
+            tokio::time::timeout(Duration::from_secs(2), server)
+                .await
+                .unwrap()
+                .unwrap();
+            let end = tokio::time::timeout(Duration::from_secs(2), &mut pending)
+                .await
+                .unwrap();
+            assert!(
+                rx.try_recv().is_err(),
+                "expired buffered text must not reach the consumer"
+            );
+            assert_eq!(
+                lock(&inner)
+                    .registry
+                    .connection_last_message(ConnectionId(0)),
+                Some(last)
+            );
+            let SessionEnd::Dropped(reason) = end else {
+                panic!("expired silence must reconnect")
+            };
+            assert_eq!(reason, "idle for more than 100 ms");
+            assert!(report_disconnect(ConnectionId(0), &cfg, &inner, &tx, reason, false).await);
+            let WsEvent::Disconnected(disconnected) = rx.recv().await.unwrap() else {
+                panic!("the first event must report the gap");
+            };
+            assert_eq!(disconnected.last_message_ms, Some(last));
+        }
     }
 
     /// A TCP connection can black-hole without erroring. The client ping is
