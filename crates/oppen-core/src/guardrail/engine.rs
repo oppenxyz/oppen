@@ -39,6 +39,7 @@ use oppen_hl::wire::{BuilderInfo, CancelByCloidWire, CancelWire, Cloid, Grouping
 use oppen_hl::{Action, Address, AgentKey, ExchangeRequest, Network};
 
 use crate::keys::{AgentWallet, KeyStore, KeyStoreError};
+use crate::ledger::approval::{ApprovalJournal, Candidate};
 use crate::ledger::{AuthorizedRoute, LedgerAuditSink, PolicyJournal};
 
 use super::AgentId;
@@ -105,11 +106,11 @@ pub struct OrderIntent {
 /// charge entirely.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Proposal {
-    id: String,
-    agent: AgentId,
-    intent: OrderIntent,
-    route: AuthorizedRoute,
-    expires_at_ms: u64,
+    pub(crate) id: String,
+    pub(crate) agent: AgentId,
+    pub(crate) intent: OrderIntent,
+    pub(crate) route: AuthorizedRoute,
+    pub(crate) expires_at_ms: u64,
 }
 
 impl Proposal {
@@ -421,6 +422,14 @@ impl SigningPermit for () {}
 /// the only honest way to test it is to make a write fail.
 pub trait AuditSink: Send + Sync {
     fn record(&self, entry: &AuditEntry<'_>) -> Result<(), AuditError>;
+    /// Production approval dispositions require the actual committed intent receipt.
+    fn record_with_receipt(
+        &self,
+        entry: &AuditEntry<'_>,
+    ) -> Result<Option<crate::ledger::Appended>, AuditError> {
+        self.record(entry)?;
+        Ok(None)
+    }
     /// Revalidate durable execution authority inside the final signing gate.
     fn route_for_agent(&self, agent: &AgentId) -> Result<AuthorizedRoute, Refusal>;
     fn before_sign(
@@ -441,6 +450,8 @@ pub enum GuardrailError {
     InvalidConfig { field: String, detail: String },
     #[error("policy requires operator reconciliation: {detail}")]
     Policy { detail: String },
+    #[error("approval authority unavailable: {detail}")]
+    Approval { detail: String },
 }
 
 /// The exact verified policy and local stop evidence reviewed by the operator.
@@ -602,6 +613,7 @@ impl EngineState {
 /// parameter would leak into every one of their signatures.
 pub struct GuardrailEngine {
     submissions: Option<crate::ledger::SubmissionJournal>,
+    approvals: Option<ApprovalJournal>,
     store: Arc<dyn GuardrailStore>,
     sink: Arc<dyn AuditSink>,
     /// Where the agent wallets live. Held by the engine rather than passed to
@@ -636,6 +648,7 @@ impl GuardrailEngine {
     ) -> Result<Self, GuardrailError> {
         let network = authority.network();
         let submissions = authority.submissions(false);
+        let approvals = ApprovalJournal::new(authority.clone());
         let mut engine = Self::build(
             Arc::new(SqliteGuardrailStore::new(authority.clone())),
             Arc::new(LedgerAuditSink::new(authority)),
@@ -643,6 +656,7 @@ impl GuardrailEngine {
             network,
         )?;
         engine.submissions = Some(submissions);
+        engine.approvals = Some(approvals);
         Ok(engine)
     }
 
@@ -660,6 +674,7 @@ impl GuardrailEngine {
             });
         }
         let submissions = authority.submissions(true);
+        let approvals = ApprovalJournal::new(authority.clone());
         let mut engine = Self::build(
             Arc::new(SqliteGuardrailStore::new(authority.clone())),
             Arc::new(LedgerAuditSink::supervised(authority)),
@@ -667,6 +682,7 @@ impl GuardrailEngine {
             network,
         )?;
         engine.submissions = Some(submissions);
+        engine.approvals = Some(approvals);
         Ok(engine)
     }
 
@@ -729,6 +745,7 @@ impl GuardrailEngine {
         }
         Ok(Self {
             submissions: None,
+            approvals: None,
             store,
             sink,
             keys,
@@ -1192,10 +1209,17 @@ impl GuardrailEngine {
 
     /// Proposals still waiting on an operator, for item 16's `get_state`.
     /// Expired ones are swept first, so nothing here is stale.
-    pub fn pending_proposals(&self, now_ms: u64) -> Vec<Proposal> {
+    pub fn pending_proposals(&self, now_ms: u64) -> Result<Vec<Proposal>, GuardrailError> {
+        if let Some(journal) = &self.approvals {
+            return journal
+                .pending(now_ms)
+                .map_err(|error| GuardrailError::Approval {
+                    detail: error.to_string(),
+                });
+        }
         let mut state = self.state();
         state.sweep_proposals(now_ms);
-        state.proposals.values().cloned().collect()
+        Ok(state.proposals.values().cloned().collect())
     }
 
     /// Approves a proposal and re-evaluates it in full against fresh market
@@ -1227,7 +1251,21 @@ impl GuardrailEngine {
         // re-queued: a proposal is a snapshot of an intent, and re-clicking it
         // against a market that has moved is what item 28's re-pricing exists
         // to prevent.
-        let proposal = {
+        let claim = self
+            .approvals
+            .as_ref()
+            .map(|journal| journal.claim(approval_id, now_ms))
+            .transpose()
+            .map_err(approval_refusal)?;
+        let proposal = if let Some(claim) = &claim {
+            claim
+                .as_ref()
+                .ok_or_else(|| Unevaluable::UnknownProposal {
+                    approval_id: approval_id.to_owned(),
+                })?
+                .proposal()
+                .clone()
+        } else {
             let mut state = self.state();
             state.sweep_proposals(now_ms);
             state
@@ -1246,29 +1284,55 @@ impl GuardrailEngine {
             now_ms,
             Mode::Approved(&proposal.route),
         );
-        self.record(
+        let receipt = self.record(
             Some(&proposal.agent),
             now_ms,
             &proposal.intent.reason,
             &outcome,
         )?;
+        if let (Some(journal), Some(Some(claim))) = (&self.approvals, claim) {
+            if receipt.is_none() {
+                return Err(approval_refusal(
+                    "approval evaluation audit receipt unavailable",
+                ));
+            }
+            journal
+                .finish(claim, &outcome, receipt.as_ref(), now_ms)
+                .map_err(approval_refusal)?;
+        }
         outcome
     }
 
     /// Rejects a proposal. Item 18 makes approval decisions ledger events, so
     /// this is recorded even though nothing is signed.
-    pub fn operator_reject_proposal(&self, approval_id: &str, now_ms: u64) -> bool {
+    pub fn operator_reject_proposal(
+        &self,
+        approval_id: &str,
+        now_ms: u64,
+    ) -> Result<bool, GuardrailError> {
+        if let Some(journal) = &self.approvals {
+            return journal
+                .reject(approval_id, now_ms)
+                .map_err(|error| GuardrailError::Approval {
+                    detail: error.to_string(),
+                });
+        }
         let removed = self.state().proposals.remove(approval_id).is_some();
         if removed {
-            self.record_operator(
-                None,
-                now_ms,
-                &OperatorAction::ProposalRejected {
-                    approval_id: approval_id.to_owned(),
-                },
-            );
+            self.sink
+                .record(&AuditEntry {
+                    agent: None,
+                    at_ms: now_ms,
+                    reason: "operator",
+                    outcome: AuditOutcome::Operator(&OperatorAction::ProposalRejected {
+                        approval_id: approval_id.to_owned(),
+                    }),
+                })
+                .map_err(|error| GuardrailError::Approval {
+                    detail: error.to_string(),
+                })?;
         }
-        removed
+        Ok(removed)
     }
 
     /// Marks an agent as connected or gone, which is what the dead-man's
@@ -1331,6 +1395,14 @@ impl GuardrailEngine {
         now_ms: u64,
     ) -> Result<Cleared, Refusal> {
         let outcome = self.decide(agent, intent, asset, market, exposure, now_ms, Mode::Fresh);
+        // A journal error may follow COMMIT with an unpublished head. Do not
+        // extend that uncertain tail with a best-effort refusal audit.
+        if matches!(
+            &outcome,
+            Err(Refusal::Unevaluable(Unevaluable::ApprovalAuthority { .. }))
+        ) {
+            return outcome;
+        }
         self.record(Some(agent), now_ms, &intent.reason, &outcome)?;
         outcome
     }
@@ -1418,7 +1490,7 @@ impl GuardrailEngine {
         now_ms: u64,
         reason: &str,
         outcome: &Result<Cleared, Refusal>,
-    ) -> Result<(), Refusal> {
+    ) -> Result<Option<crate::ledger::Appended>, Refusal> {
         let entry = AuditEntry {
             agent,
             at_ms: now_ms,
@@ -1428,8 +1500,9 @@ impl GuardrailEngine {
                 Err(refusal) => AuditOutcome::Refused(refusal),
             },
         };
-        let Err(e) = self.sink.record(&entry) else {
-            return Ok(());
+        let e = match self.sink.record_with_receipt(&entry) {
+            Ok(receipt) => return Ok(receipt),
+            Err(error) => error,
         };
         let blocks = match outcome {
             Ok(cleared) => matches!(cleared.clearance().kind, ClearedKind::Order { .. }),
@@ -1447,7 +1520,7 @@ impl GuardrailEngine {
             "a guardrail outcome was not recorded in the ledger; \
              it was a refusal or a risk-reducing action, so it still stands"
         );
-        Ok(())
+        Ok(None)
     }
 
     /// Records an operator mutation. Never refuses: the change has already
@@ -1899,6 +1972,25 @@ impl GuardrailEngine {
             });
         }
         if config.approval_required && mode == Mode::Fresh {
+            if let Some(journal) = &self.approvals {
+                let policy_revision = state.policy_revision;
+                drop(state);
+                let proposal = journal
+                    .mint(Candidate {
+                        agent: agent.clone(),
+                        intent: intent.clone(),
+                        route,
+                        policy_revision,
+                        at_ms: now_ms,
+                    })
+                    .map_err(approval_refusal)?;
+                return Err(Refusal::ApprovalRequired {
+                    symbol: intent.symbol.clone(),
+                    notional_usd,
+                    approval_id: proposal.id,
+                    expires_at_ms: proposal.expires_at_ms,
+                });
+            }
             let approval_id = state.mint_proposal(agent, intent, &route, now_ms);
             let expires_at_ms = now_ms.saturating_add(APPROVAL_TTL_MS);
             return Err(Refusal::ApprovalRequired {
@@ -2583,6 +2675,13 @@ fn check_reason(reason: &str) -> Result<(), Refusal> {
 fn route_refusal(detail: &str) -> Refusal {
     Unevaluable::RouteAuthority {
         detail: detail.to_owned(),
+    }
+    .into()
+}
+
+fn approval_refusal(error: impl std::fmt::Display) -> Refusal {
+    Unevaluable::ApprovalAuthority {
+        detail: error.to_string(),
     }
     .into()
 }

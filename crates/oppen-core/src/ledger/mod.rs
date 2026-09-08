@@ -51,6 +51,7 @@
 //!   itself is operator-only.
 
 mod anchor;
+pub(crate) mod approval;
 mod export;
 mod hash;
 mod pairing;
@@ -221,6 +222,8 @@ pub enum LedgerError {
     UseRegistryJournal,
     #[error("policy authority events must use PolicyJournal")]
     UsePolicyJournal,
+    #[error("approval authority events must use ApprovalJournal")]
+    UseApprovalJournal,
     #[error("ledger has an unfinished transaction; reopen required")]
     UnfinishedTransaction,
     #[error("pilot accounting failed: {detail}")]
@@ -337,6 +340,12 @@ pub enum EventKind {
     PolicyInitialized,
     /// Authenticated replacement of the complete policy snapshot.
     PolicyReplaced,
+    /// Authenticated normalized request awaiting an operator disposition.
+    ApprovalProposed,
+    /// One-shot approval claim; replay never recreates an execution permit.
+    ApprovalClaimed,
+    /// Authenticated terminal disposition linked to its proposal and claim.
+    ApprovalDisposed,
     /// Something the human did: a manual ticket, a flatten, a setting change.
     OperatorAction,
     /// An approval-mode proposal was approved, rejected or expired
@@ -382,6 +391,9 @@ impl EventKind {
             EventKind::RegistryRetired => "registry_retired",
             EventKind::PolicyInitialized => "policy_initialized",
             EventKind::PolicyReplaced => "policy_replaced",
+            EventKind::ApprovalProposed => "approval_proposed",
+            EventKind::ApprovalClaimed => "approval_claimed",
+            EventKind::ApprovalDisposed => "approval_disposed",
             EventKind::OperatorAction => "operator_action",
             EventKind::ApprovalDecision => "approval_decision",
             EventKind::KillSwitchChanged => "kill_switch_changed",
@@ -416,6 +428,9 @@ impl std::str::FromStr for EventKind {
             "registry_retired" => Ok(EventKind::RegistryRetired),
             "policy_initialized" => Ok(EventKind::PolicyInitialized),
             "policy_replaced" => Ok(EventKind::PolicyReplaced),
+            "approval_proposed" => Ok(EventKind::ApprovalProposed),
+            "approval_claimed" => Ok(EventKind::ApprovalClaimed),
+            "approval_disposed" => Ok(EventKind::ApprovalDisposed),
             "operator_action" => Ok(EventKind::OperatorAction),
             "approval_decision" => Ok(EventKind::ApprovalDecision),
             "kill_switch_changed" => Ok(EventKind::KillSwitchChanged),
@@ -994,6 +1009,9 @@ impl Ledger {
             EventKind::PolicyInitialized | EventKind::PolicyReplaced => {
                 Err(LedgerError::UsePolicyJournal)
             }
+            EventKind::ApprovalProposed
+            | EventKind::ApprovalClaimed
+            | EventKind::ApprovalDisposed => Err(LedgerError::UseApprovalJournal),
             _ => Ok(()),
         }
     }
@@ -1348,7 +1366,7 @@ impl Ledger {
         let mut statement = guard.prepare(&format!(
             "SELECT {SELECT_EVENT_COLUMNS} FROM events WHERE seq > ?1{} ORDER BY seq ASC LIMIT ?2",
             match scope {
-                Some(_) => " AND (agent_id = ?3 OR agent_id IS NULL) AND kind NOT IN ('pairing_issued', 'pairing_revoked', 'registry_granted', 'registry_retired', 'policy_initialized', 'policy_replaced')",
+                Some(_) => " AND (agent_id = ?3 OR agent_id IS NULL) AND kind NOT IN ('pairing_issued', 'pairing_revoked', 'registry_granted', 'registry_retired', 'policy_initialized', 'policy_replaced', 'approval_proposed', 'approval_claimed', 'approval_disposed')",
                 None => "",
             }
         ))?;
@@ -1977,6 +1995,9 @@ impl AgentView {
                     | EventKind::RegistryRetired
                     | EventKind::PolicyInitialized
                     | EventKind::PolicyReplaced
+                    | EventKind::ApprovalProposed
+                    | EventKind::ApprovalClaimed
+                    | EventKind::ApprovalDisposed
             ) && event
                 .agent_id
                 .as_ref()
@@ -2543,6 +2564,13 @@ impl crate::guardrail::AuditSink for LedgerAuditSink {
         &self,
         entry: &crate::guardrail::AuditEntry<'_>,
     ) -> std::result::Result<(), crate::guardrail::AuditError> {
+        self.record_with_receipt(entry).map(|_| ())
+    }
+
+    fn record_with_receipt(
+        &self,
+        entry: &crate::guardrail::AuditEntry<'_>,
+    ) -> std::result::Result<Option<Appended>, crate::guardrail::AuditError> {
         use crate::guardrail::{AuditOutcome, ClearedKind};
 
         let (kind, mut payload) = match &entry.outcome {
@@ -2594,7 +2622,12 @@ impl crate::guardrail::AuditSink for LedgerAuditSink {
                     payload: &payload,
                     snapshot: None,
                 })
-                .map(|_| ())
+                .map(|intent| {
+                    Some(Appended {
+                        seq: intent.seq(),
+                        hash: intent.hash().to_owned(),
+                    })
+                })
                 .map_err(|e| crate::guardrail::AuditError {
                     detail: e.to_string(),
                 });
@@ -2610,7 +2643,7 @@ impl crate::guardrail::AuditSink for LedgerAuditSink {
                 payload: &payload,
                 snapshot: None,
             })
-            .map(|_| ())
+            .map(Some)
             .map_err(|e| crate::guardrail::AuditError {
                 detail: e.to_string(),
             })

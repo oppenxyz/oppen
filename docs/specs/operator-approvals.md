@@ -78,6 +78,42 @@ No activation, consent adoption, registry grant, pairing, key access, funding or
 publication is implied by this plan. Compatible and verified MCP clients must
 share these same server-side safeguards.
 
+## Durable Lifecycle Evidence
+
+ES25 installs authenticated proposal/claim/disposition authority in both
+production engine constructors. Approval persistence runs outside engine-state
+locks. A published claim is one-shot; restarting or republishing evidence cannot
+recreate its execution permit. Approved dispositions reference actual intent
+receipts, not a guessed latest row. Queue/rejection failures are typed errors.
+
+Before each approval append, verify the existing head under coordination and
+publish any tolerated one-row lag; stop if that publication fails. A mint error
+does not trigger a second best-effort refusal append. This bounds the approval
+writer's own failure path, not every independent writer in the system. During
+sustained anchor failure, preserving additional fills may exceed the verification
+window: authority must fail closed and require reconciliation, not discard fills
+or blindly adopt a new head. No automatic global recovery or unconditional
+lossless-ingestion claim follows from this change.
+
+V9 excludes older readers without rewriting prior events. Operator authority
+records are withheld from raw agent event views; scoped pending/status and
+client-visible decision projections remain integration work, not a completed
+item-28 surface. Local verification passes 34 focused approval tests and the full
+workspace (1,008 Rust tests passed, 15 live-gated ignored), plus formatting,
+all-target Clippy, 152 frontend tests and the desktop frontend build. Fixtures
+exercise production constructors without live account activity or signing keys.
+Independent automated diff review found no blocking issues; committed-head review
+and CI remain pending. Native approval execution/UI and original-request
+repricing remain integration work.
+
+Upgrade requires stopping older writers first: an open-time version check cannot
+evict a process that already holds an older connection. Keep the ledger and its
+anchor together. Recovery/rollback must use V9-capable code preserving every
+committed event; never lower `user_version`, discard new decisions or restore an
+old budget snapshot to make an older binary run. A verified backup is evidence,
+not authorization to erase later execution or reset cumulative limits. No local
+operator ledger is migrated by the synthetic development checks.
+
 ## Route-Binding Evidence
 
 On `fix/approval-route-binding`, the replacement-account regression produced a

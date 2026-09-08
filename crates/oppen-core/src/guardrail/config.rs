@@ -35,13 +35,13 @@ pub(super) const DEFAULT_MARK_DIVERGENCE_WINDOW_MS: u64 = 30_000;
 /// about roughly the current market rather than about a stale one. The order
 /// is re-evaluated in full against fresh data at approval time anyway, so an
 /// expiry is a convenience for the operator, not the safety property.
-pub(super) const APPROVAL_TTL_MS: u64 = 120_000;
+pub(crate) const APPROVAL_TTL_MS: u64 = 120_000;
 /// Longest agent `reason` string accepted, in bytes.
 ///
 /// Refusal rows are kept forever (D-e) and a refusal costs no rate token, so
 /// an unbounded reason is unlimited free writes into an append-only
 /// hash-chained store. 2 KiB is far more than a sentence explaining a trade.
-pub(super) const MAX_REASON_BYTES: usize = 2_048;
+pub(crate) const MAX_REASON_BYTES: usize = 2_048;
 
 /// Token-bucket shape for spec item 24's order-rate cap: `count` orders per
 /// `per_ms` milliseconds. `docs/specs/workflows.md` §7 writes it as

@@ -150,6 +150,14 @@ before expanding features:
    replacement-account clearance reproduced before the fix now refuses, and
    the full workspace passes 981 Rust tests (15 live-gated ignored). Durable
    lifecycle, original-request repricing and operator UI remain open.
+   PR #64 has green exact-head CI and independent automated review at
+   `a35fa08`; publication was skipped. ES25 durable approval lifecycle is in
+   implemented on `feat/durable-approval-lifecycle`, with journal/engine integration
+   and production-constructor failure/restart tests. Local verification passes
+   1,008 Rust tests (15 live-gated ignored), 152 frontend tests, build, formatting
+   and workspace all-target Clippy. Exact-head review and CI remain pending;
+   original-request repricing and native approval UI remain open. This is not a
+   completed live gate.
    No dedicated-account activity has been performed during this development.
 4. **Recovery:** PR #44 merged as `06fc0e3` after green CI and separate automated
    review. The durable submission journal has SQLite reopen, independent
