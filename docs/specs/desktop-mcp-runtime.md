@@ -58,9 +58,9 @@ does not authorize actual account cleanup.
 
 The real Gateway, execution FeedSession, FeedPump and WsPool belong to the
 desktop runtime. They are not simulated by console market freshness. Orders
-remain inhibited until a separate future operator review/reconciliation and
-acknowledgment path. Starting supervision can enforce existing pauses and cancel
-resting orders, so it is not a read-only connection test.
+remain inhibited until the planned [operator activation](operator-activation.md)
+review/reconciliation and acknowledgment path. Starting supervision can enforce
+existing pauses and cancel resting orders, so it is not a read-only connection test.
 
 Quit, update installation and context replacement cannot pass the retained MCP
 startup/server/pump drain. Close MCP admission and await actual execution;
