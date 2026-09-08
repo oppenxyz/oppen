@@ -83,6 +83,11 @@ before expanding features:
    The lifecycle banner wraps at 390px while the console remains desktop-only.
    Real native installer/restart and MCP activation remain unverified. See
    [desktop-runtime-ownership.md](docs/specs/desktop-runtime-ownership.md).
+   PR #56 now has green exact-head CI at `5bc94379` and separate automated
+   review; the publication approval hold still prevents merging. A follow-up
+   on `fix/mcp-supervisor-failure` closes MCP admission when pause supervision
+   terminates, retains actual execution drain, and reports failure instead of
+   successful shutdown. This is a prerequisite, not desktop MCP activation.
    Neither branch activates a trading account.
 4. **Recovery:** PR #44 merged as `06fc0e3` after green CI and separate automated
    review. The durable submission journal has SQLite reopen, independent
