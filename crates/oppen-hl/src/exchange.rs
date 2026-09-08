@@ -224,7 +224,16 @@ enum RawResponse {
 /// (leverage, sub-account, scheduleCancel) yield an empty list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExchangeResponse {
+    pub kind: ExchangeResponseKind,
     pub statuses: Vec<Status>,
+}
+
+/// The response envelope identity, independent of its per-action statuses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExchangeResponseKind {
+    Order,
+    Cancel,
+    Default,
 }
 
 impl ExchangeResponse {
@@ -233,12 +242,16 @@ impl ExchangeResponse {
             .map_err(|e| Error::InvalidExchangeResponse(format!("{e}; body: {json}")))?;
         match raw {
             RawResponse::Err(message) => Err(Error::ExchangeRejected { message }),
-            RawResponse::Ok(ResponseBody::Order { data } | ResponseBody::Cancel { data }) => {
-                Ok(ExchangeResponse {
-                    statuses: data.statuses,
-                })
-            }
+            RawResponse::Ok(ResponseBody::Order { data }) => Ok(ExchangeResponse {
+                kind: ExchangeResponseKind::Order,
+                statuses: data.statuses,
+            }),
+            RawResponse::Ok(ResponseBody::Cancel { data }) => Ok(ExchangeResponse {
+                kind: ExchangeResponseKind::Cancel,
+                statuses: data.statuses,
+            }),
             RawResponse::Ok(ResponseBody::Default) => Ok(ExchangeResponse {
+                kind: ExchangeResponseKind::Default,
                 statuses: Vec::new(),
             }),
         }
@@ -435,6 +448,27 @@ mod tests {
             ExchangeResponse::parse(rejected),
             Err(Error::ExchangeRejected { .. })
         ));
+    }
+
+    #[test]
+    fn response_kind_is_preserved_independently_of_status_shape() {
+        for (kind, expected) in [
+            ("order", ExchangeResponseKind::Order),
+            ("cancel", ExchangeResponseKind::Cancel),
+            ("default", ExchangeResponseKind::Default),
+        ] {
+            let response = ExchangeResponse::parse(
+                &serde_json::json!({
+                    "status":"ok", "response":{"type":kind,"data":{"statuses":["success"]}}
+                })
+                .to_string(),
+            )
+            .unwrap();
+            assert_eq!(response.kind, expected);
+            if expected != ExchangeResponseKind::Default {
+                assert_eq!(response.statuses, vec![Status::Success]);
+            }
+        }
     }
 
     #[test]

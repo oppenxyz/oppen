@@ -22,6 +22,9 @@ pub(super) enum Behavior {
     Resting,
     Rejected,
     AppliedMalformed,
+    WrongKind,
+    WrongKindError,
+    ExtraStatus,
 }
 
 pub(super) struct Venue {
@@ -418,7 +421,7 @@ impl Book {
                 false,
             ));
         }
-        let (kind, statuses) = match action {
+        let (mut kind, mut statuses) = match action {
             Action::Order {
                 orders, grouping, ..
             } => {
@@ -504,6 +507,16 @@ impl Book {
             }
             _ => return Err("unsupported fixture action".into()),
         };
+        match behavior {
+            Behavior::WrongKind | Behavior::WrongKindError => {
+                kind = if kind == "order" { "cancel" } else { "order" };
+                if matches!(behavior, Behavior::WrongKindError) {
+                    statuses = vec![json!({"error":"wrong request identity"})];
+                }
+            }
+            Behavior::ExtraStatus => statuses.push(json!({"error":"extra status"})),
+            _ => {}
+        }
         Ok((
             json!({"status": "ok", "response": {"type": kind, "data": {"statuses": statuses}}}),
             matches!(behavior, Behavior::AppliedMalformed),

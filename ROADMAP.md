@@ -228,6 +228,14 @@ before expanding features:
    inspected reservation/signing gap, required authenticated evidence and
    recovery acceptance tests. Signer publication ordering and sufficient venue
    identity evidence remain design gates; no ownership implementation is claimed.
+   ES31a on `fix/exchange-response-identity` preserves the exchange envelope
+   discriminator and rejects wrong response types or single-order cardinality.
+   Wrong-kind errors retain pending reservations. Synthetic real-HTTP tests
+   apply requests despite mismatched replies and verify non-retryable uncertainty;
+   removing the reservation kind check made the regression fail. Workspace tests
+   pass (1,093 Rust, 15 live/keychain-gated ignored). Separate automated diff
+   review found no blocking issues; exact-head CI remains required. This is a
+   response-classification fix, not completed ownership or live recovery.
    No dedicated-account activity has been performed during this development.
 4. **Recovery:** PR #44 merged as `06fc0e3` after green CI and separate automated
    review. The durable submission journal has SQLite reopen, independent

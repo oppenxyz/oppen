@@ -11,6 +11,21 @@ decisions" section until then.
 
 ---
 
+## 2026-09-08 · Exchange response identity
+
+ES31a is a prerequisite for D1 provenance and spec item 19's factual execution
+outcomes. Preserve the venue response's order/cancel/default discriminator
+through parsing. Order outcomes require an order envelope and exactly one
+status for the current single-order request; cancellation outcomes require a
+cancel envelope and exactly the frozen target count. Wrong envelopes or
+cardinality mean an unknown, non-retryable outcome, not a successful order or
+cancellation and not permission to release unresolved exposure.
+
+This corrects response classification without claiming durable ownership.
+Authenticated signing and accepted-OID evidence, including lost-response
+recovery, remain ES31 design and activation gates. No second signer, event store,
+new dependency, credential access or live activity is introduced.
+
 ## 2026-09-08 · Discretionary cancellation approval
 
 ES30 implements spec item 28 for ordinary agent `cancel` and `cancel_all`.

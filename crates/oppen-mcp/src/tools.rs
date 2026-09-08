@@ -39,7 +39,9 @@ use oppen_hl::info::OrderRef;
 use oppen_hl::types::{Candle, OrderStatusResponse, ReferencePrices};
 use oppen_hl::wire::{CancelWire, Cloid, Grouping, Tif, Tpsl};
 use oppen_hl::{Address, InfoClient, Network, Universe, meta::MIN_NOTIONAL_USD};
-use oppen_hl::{ExchangeClient, ExchangeResponse, NonceAllocator, OrderKind, Status};
+use oppen_hl::{
+    ExchangeClient, ExchangeResponse, ExchangeResponseKind, NonceAllocator, OrderKind, Status,
+};
 
 use crate::auth::Binding;
 use crate::server::ExecutionTracker;
@@ -2449,7 +2451,8 @@ async fn track_submission(
     // Only a structured rejection proves that this request cannot fill.
     // Successful submissions remain reserved until a later status read,
     // followed by fresh account reads under the same container lock.
-    if let [Status::Error(message)] = response.statuses.as_slice()
+    if response.kind == ExchangeResponseKind::Order
+        && let [Status::Error(message)] = response.statuses.as_slice()
         && let Some((journal, receipt)) = durable
     {
         journal
@@ -2532,15 +2535,22 @@ fn submission_error(error: SubmissionError) -> ToolError {
 /// was spent and the request was seen, which is a different fact about the
 /// world than a guardrail saying no.
 fn order_outcome(response: ExchangeResponse, cloid: Option<String>) -> Result<Reply, ToolError> {
-    // One order in, so one status out. A venue that answers a single order
-    // with none of them has not accepted it, and reporting that as success
-    // would invent a fill.
-    let Some(status) = response.statuses.into_iter().next() else {
-        return Err(ToolError::venue(
-            200,
-            "the venue accepted the request but reported no order status".to_owned(),
-        ));
-    };
+    // A different envelope or extra status cannot be attributed to this order.
+    let [status]: [Status; 1] =
+        response
+            .statuses
+            .try_into()
+            .map_err(|_| ToolError::TimeoutUnknownOutcome {
+                cloid: cloid.clone(),
+                detail: "order response did not contain exactly one status; reconcile by cloid"
+                    .into(),
+            })?;
+    if response.kind != ExchangeResponseKind::Order {
+        return Err(ToolError::TimeoutUnknownOutcome {
+            cloid,
+            detail: "exchange response was not an order response; reconcile by cloid".into(),
+        });
+    }
     match status {
         Status::Resting { oid } => Ok(outcome::resting(oid, cloid)),
         Status::Filled {
@@ -2570,7 +2580,8 @@ fn cancel_outcome(
     named: Vec<(Option<u64>, Option<String>)>,
 ) -> Result<Reply, ToolError> {
     let requested = named.len();
-    if response.statuses.len() != requested
+    if response.kind != ExchangeResponseKind::Cancel
+        || response.statuses.len() != requested
         || response
             .statuses
             .iter()
@@ -2797,7 +2808,17 @@ mod tests {
     }
 
     fn response(statuses: Vec<Status>) -> ExchangeResponse {
-        ExchangeResponse { statuses }
+        ExchangeResponse {
+            kind: ExchangeResponseKind::Order,
+            statuses,
+        }
+    }
+
+    fn cancel_response(statuses: Vec<Status>) -> ExchangeResponse {
+        ExchangeResponse {
+            kind: ExchangeResponseKind::Cancel,
+            statuses,
+        }
     }
 
     fn body(result: CallToolResult) -> String {
@@ -2863,7 +2884,10 @@ mod tests {
     #[test]
     fn an_empty_status_list_is_never_reported_as_a_fill() {
         let err = order_outcome(response(vec![]), None).expect_err("no status is not a success");
-        assert!(matches!(err, ToolError::VenueError { .. }), "{err:?}");
+        assert!(
+            matches!(err, ToolError::TimeoutUnknownOutcome { .. }),
+            "{err:?}"
+        );
     }
 
     /// A trigger order rests off-book with no oid. The agent must reconcile
@@ -2887,7 +2911,7 @@ mod tests {
     #[test]
     fn cancel_failures_are_paired_with_the_order_each_one_answers_for() {
         let reply = cancel_outcome(
-            response(vec![
+            cancel_response(vec![
                 Status::Success,
                 Status::Error("Order was never placed, already canceled, or filled.".into()),
                 Status::Success,
@@ -2908,7 +2932,7 @@ mod tests {
     #[test]
     fn a_cancel_the_venue_took_in_full_reports_no_failures() {
         let reply = cancel_outcome(
-            response(vec![Status::Success, Status::Success]),
+            cancel_response(vec![Status::Success, Status::Success]),
             vec![(Some(1), None), (Some(2), None)],
         );
         assert_eq!(
@@ -2924,8 +2948,68 @@ mod tests {
             vec![Status::Success, Status::Success],
             vec![Status::Resting { oid: 7 }],
         ] {
-            let error = cancel_outcome(response(statuses), vec![(Some(7), Some("0xcc".into()))])
-                .unwrap_err();
+            let error = cancel_outcome(
+                cancel_response(statuses),
+                vec![(Some(7), Some("0xcc".into()))],
+            )
+            .unwrap_err();
+            assert!(
+                matches!(&error, ToolError::TimeoutUnknownOutcome { cloid, .. }
+                if cloid.as_deref() == Some("0xcc"))
+            );
+            let error: ErrorData = error.into();
+            assert_eq!(error.data.unwrap()["retryable"], false);
+        }
+    }
+
+    #[test]
+    fn wrong_envelopes_and_extra_order_statuses_are_nonretryable_unknown() {
+        for (kind, statuses) in [
+            ("cancel", serde_json::json!([{"resting":{"oid":7}}])),
+            (
+                "cancel",
+                serde_json::json!([{"error":"not an order rejection"}]),
+            ),
+            ("default", serde_json::json!([])),
+            ("order", serde_json::json!([])),
+            (
+                "order",
+                serde_json::json!([{"resting":{"oid":7}},{"error":"extra"}]),
+            ),
+            (
+                "order",
+                serde_json::json!([{"filled":{"oid":7,"totalSz":"1","avgPx":"100"}},"success"]),
+            ),
+            (
+                "order",
+                serde_json::json!([{"error":"first"},{"resting":{"oid":8}}]),
+            ),
+        ] {
+            let parsed = ExchangeResponse::parse(
+                &serde_json::json!({
+                    "status":"ok", "response":{"type":kind,"data":{"statuses":statuses}}
+                })
+                .to_string(),
+            )
+            .unwrap();
+            let error = order_outcome(parsed, Some("0xcc".into())).unwrap_err();
+            assert!(
+                matches!(&error, ToolError::TimeoutUnknownOutcome { cloid, .. }
+                if cloid.as_deref() == Some("0xcc")),
+                "{kind}: {error:?}"
+            );
+            let error: ErrorData = error.into();
+            assert_eq!(error.data.unwrap()["retryable"], false);
+        }
+        for kind in ["order", "default"] {
+            let parsed = ExchangeResponse::parse(
+                &serde_json::json!({
+                    "status":"ok", "response":{"type":kind,"data":{"statuses":["success"]}}
+                })
+                .to_string(),
+            )
+            .unwrap();
+            let error = cancel_outcome(parsed, vec![(Some(7), Some("0xcc".into()))]).unwrap_err();
             assert!(
                 matches!(&error, ToolError::TimeoutUnknownOutcome { cloid, .. }
                 if cloid.as_deref() == Some("0xcc"))
@@ -4009,6 +4093,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_cancel_envelope_error_cannot_release_an_order_reservation() {
+        let (gateway, bound, receipt) = pending_fixture();
+        let parsed = ExchangeResponse::parse(r#"{"status":"ok","response":{"type":"cancel","data":{"statuses":[{"error":"wrong request identity"}]}}}"#).unwrap();
+        let response = track_submission(
+            Some(receipt.cloid()),
+            Some((&gateway.inner.submissions, &receipt)),
+            async { Ok(parsed) },
+        )
+        .await
+        .unwrap();
+        let error = order_outcome(response, Some(receipt.cloid().as_str().to_owned())).unwrap_err();
+        assert!(
+            matches!(&error, ToolError::TimeoutUnknownOutcome { cloid, .. }
+            if cloid.as_deref() == Some(receipt.cloid().as_str()))
+        );
+        let error: ErrorData = error.into();
+        assert_eq!(error.data.unwrap()["retryable"], false);
+        assert_eq!(
+            gateway
+                .inner
+                .submissions
+                .state(bound.account)
+                .unwrap()
+                .pending,
+            Some(receipt)
+        );
+    }
+
+    #[tokio::test]
     async fn a_top_level_exchange_rejection_releases_the_next_submission() {
         let (gateway, bound, receipt) = pending_fixture();
         let queue = gateway.execution_queue(bound.account);
@@ -4441,7 +4554,7 @@ mod tests {
                 false,
                 test_tracker(&gateway),
                 async { Ok(cancel_fixture()) },
-                |_| async { Ok(response(vec![Status::Success])) },
+                |_| async { Ok(cancel_response(vec![Status::Success])) },
             )
             .await
             .unwrap();
@@ -4564,7 +4677,7 @@ mod tests {
                         cleared.clearance().kind,
                         oppen_core::guardrail::ClearedKind::DiscretionaryCancel { ref targets, .. } if targets.len() == 1
                     ));
-                    async { Ok(response(vec![Status::Success])) }
+                    async { Ok(cancel_response(vec![Status::Success])) }
                 },
             )
             .await
@@ -4600,7 +4713,7 @@ mod tests {
                         oppen_core::guardrail::ClearedKind::Cancel { count: 1 }
                     ));
                     submitted = true;
-                    async { Ok(response(vec![Status::Success])) }
+                    async { Ok(cancel_response(vec![Status::Success])) }
                 },
             )
             .await
