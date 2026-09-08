@@ -42,15 +42,15 @@ test("native age budgets, clock uncertainty and transport remain independent", (
   expect(channelStatus(channelHealthFixture(binding, "3", "reconnect").rows[0]!)).toBe("Awaiting ACK");
   expect(channelStatus(channelHealthFixture(binding, "4", "quarantine").rows[1]!)).toBe("Quarantined");
 });
-test("loss is exact-selection scoped while terminal console failure survives symbol replacement", () => {
+test("loss and terminal public failure stay scoped to their exact selection", () => {
   const f = fixture(); const sample = channelHealthFixture(binding);
   sample.rows[0]!.consumer_failure = "Console terminated";
-  sample.rows[0]!.last_loss = { subscription_key: "activeAssetCtx:BTC", owner: "console", channel: "context", connection_id: "1", kind: "parse_loss", received_at_ms: 10, detail: "BTC loss" };
+  sample.rows[0]!.last_loss = { subscription_key: "activeAssetCtx:BTC", owner: "selected", channel: "context", connection_id: "1", kind: "parse_loss", received_at_ms: 10, detail: "BTC loss" };
   f.health.accept(sample); f.health.accept(channelHealthFixture(binding, "2"));
   expect(f.health.state.snapshot?.rows[0]!.last_loss?.detail).toBe("BTC loss");
   const eth = { ...binding, symbol: "ETH", selection_id: "2" }; f.health.bind(eth); f.health.accept(channelHealthFixture(eth, "3"));
   expect(f.health.state.snapshot?.rows[0]!.last_loss).toBe(null);
-  expect(f.health.state.snapshot?.rows[0]!.consumer_failure).toBe("Console terminated");
+  expect(f.health.state.snapshot?.rows[0]!.consumer_failure).toBe(null);
 });
 test("context, ready status and malformed books cannot restore health or valid quotes", () => {
   void select("BTC");

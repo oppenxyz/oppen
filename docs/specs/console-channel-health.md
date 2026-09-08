@@ -1,7 +1,10 @@
 # Console Channel Health
 
-Status: independent automated design review found no blocking gaps. Cleared for
-local implementation, not implemented or accepted for live use.
+Status: locally implemented and independently reviewed at `4b23774`; remote CI,
+installed and live acceptance remain pending. The subsequent
+[selected-market incarnation contract](selected-market-incarnation.md) revises
+pool ownership and account-observation semantics without relaxing this health
+projection's freshness or diagnostic requirements.
 Trace: spec 30, 31, 34; owner-requested TRADE subscription audit.
 Baseline: quote correction `55657ad`, chart correction `4742184`.
 
@@ -24,9 +27,12 @@ connection IDs are not global identities or unique reconnect incarnations.
 
 Read existing pool owners; do not add sockets, subscriptions or a second pool
 health implementation. Expose five expected public channels: context, BBO, depth,
-trades and candles. Include expected-but-absent rows explicitly. The console pool
-owns the first three; the selected chart pool owns the last two. Keep configured
-account subscriptions, reconciliation and execution health outside this change.
+trades and candles. Include expected-but-absent rows explicitly. At `4b23774`, the
+console pool owned the first three and the selected chart pool owned the last
+two. The selected-market incarnation follow-up moves all five to the existing
+selected pool, with owner `selected`; it preserves the separate account consumer.
+Its explicit desktop account-observation change is defined in that follow-up
+contract. Reconciliation and execution health remain outside both changes.
 
 Keep four facts distinct:
 
@@ -58,7 +64,7 @@ Each row contains owner kind, channel, nullable pool-local connection ID,
 `subscribed`, `connected`, `acked`, `quarantined`, nullable
 `last_received_at_ms`, `age_ms`, `threshold_ms`, and `age_budget_exceeded`.
 Connection identity is scoped by network, feed generation and pool owner;
-chart-pool identity additionally includes its immutable selection incarnation.
+selected-pool identity additionally includes its immutable selection incarnation.
 The projection is read-only and carries no account address.
 
 Native revisions advance monotonically for emitted health observations, not by
@@ -80,10 +86,11 @@ of connection state. In particular, an unchanged BBO can be connected and
 acknowledged while exceeding the existing reference-age limit. This is not a
 claim that the venue missed a periodic update, nor a reason to loosen a guard.
 
-Reused console subscriptions do not gain chart-style A-B-A wire isolation from
-the projection's selection label. That unresolved quote transport boundary must
-remain explicit; this snapshot describes the current registry, not the origin
-of every buffered venue frame. Do not claim that a new ACK refreshed old prices.
+The original reused console subscriptions did not gain A-B-A wire isolation from
+the projection's selection label. The selected-market incarnation follow-up
+addresses that boundary at the producer, not by relabeling health observations.
+This snapshot still describes the current registry, not the origin of every
+buffered venue frame. Do not claim that a new ACK refreshed old prices.
 
 ## Diagnostics And UI
 

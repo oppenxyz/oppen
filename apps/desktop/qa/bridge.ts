@@ -1,5 +1,5 @@
 // UI fixture transport only. Every read is local; no invoke, venue, key or signer call.
-import type { AccountState, ChartBinding, ChartProjection, FeedBinding, WatchMarketReply, MarketSnapshot, McpStatus, OperatorRead, RuntimeStatus } from "../src/lib/bridge";
+import type { AccountState, ChartBinding, ChartProjection, FeedBinding, FeedEnvelope, WatchMarketReply, MarketSnapshot, McpStatus, OperatorRead, RuntimeStatus } from "../src/lib/bridge";
 export type * from "../src/lib/bridge";
 export { isConsoleError } from "../src/lib/bridge";
 export { fetchPolicySetupStatus, reviewPolicySetup, persistPolicySetup, discardPolicySetup } from "./policy-setup";
@@ -41,7 +41,11 @@ export async function fetchOperatorState(): Promise<OperatorRead> {
   return { network: "testnet", policy: { status: "unavailable", detail: "UI fixture: no live operator connection." },
     ledger: { status: "ready", value: { events: [], head_seq: 0, next_cursor: 0, resync_required: false } } };
 }
-export async function fetchMarkets() { return []; }
+export async function fetchMarkets(): Promise<import("../src/lib/bridge").MarketRow[]> {
+  return new URLSearchParams(location.search).get("markets") === "fixture" ? ["BTC", "ETH"].map(symbol => ({
+    symbol, mark_px: symbol === "BTC" ? "100" : "50", funding_1h_bps: "0", open_interest: "10", day_volume_usd: "1000", has_book: true,
+  })) : [];
+}
 export async function fetchChartSeries(_binding: ChartBinding): Promise<ChartProjection> { throw new Error("UI fixture: chart history not supplied."); }
 export async function fetchMarketSnapshot(): Promise<MarketSnapshot> { throw new Error("UI fixture: market snapshot not supplied."); }
 let chartSelection = 0;
@@ -52,7 +56,13 @@ export async function watchMarket(network: FeedBinding["network"], symbol: strin
   healthBinding = { ...feed, selection_id: String(++chartSelection), symbol, interval };
   return { feed, chart: healthBinding };
 }
-export async function onFeedUpdate() { return () => {}; }
+const feedListeners = new Set<(envelope: FeedEnvelope) => void>();
+export async function onFeedUpdate(callback: (envelope: FeedEnvelope) => void) {
+  feedListeners.add(callback); return () => { feedListeners.delete(callback); };
+}
+export function emitFeedFixture(envelope: FeedEnvelope): void {
+  for (const listener of feedListeners) listener(envelope);
+}
 
 let stoppedRuntime: RuntimeStatus | null = null;
 export async function fetchRuntimeStatus(): Promise<RuntimeStatus> {
@@ -66,7 +76,7 @@ export async function fetchRuntimeStatus(): Promise<RuntimeStatus> {
     phase,
     channel_health: phase === "running" && healthBinding && new URLSearchParams(location.search).get("health") !== "null"
       ? channelHealthFixture(healthBinding, String(++healthRevision), new URLSearchParams(location.search).get("health") ?? "connected") : null,
-    chart_failure: null,
+    account_failure: null, selected_failure: null,
     binding: phase === "running" ? { network: "testnet", generation: "1" } : null,
     detail: phase === "running" || phase === "stopped" ? null : detail + "retained-task-context/".repeat(24),
   };
@@ -101,7 +111,7 @@ export async function startMcp(agent: string, requestedAccount: string): Promise
 }
 export async function stopMcp(): Promise<RuntimeStatus> {
   mcpStatus = { ...mcpStatus, phase: "stopped", listener: null, reconciled: null, account_feeds_ready: null, supervision_in_progress: false };
-  stoppedRuntime = { phase: "stopped", binding: null, channel_health: null, chart_failure: null, detail: "UI fixture: desktop tasks stopped. Restart required." };
+  stoppedRuntime = { phase: "stopped", binding: null, channel_health: null, account_failure: null, selected_failure: null, detail: "UI fixture: desktop tasks stopped. Restart required." };
   return { ...stoppedRuntime };
 }
 

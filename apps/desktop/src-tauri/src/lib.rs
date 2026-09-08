@@ -446,20 +446,19 @@ async fn account_state(
         .map_err(|e| ConsoleError::Venue(format!("marks: {e}")))?
         .reference_pxs();
 
+    let (observed, as_of_ms) = runtime.account_observation_at(network, account, now_ms);
     Ok(assemble(
         network,
         account,
-        now_ms(),
+        as_of_ms,
         &VenueReadings {
             perps: &perps,
             spot: &spot,
             orders: &orders,
             mids: &mids,
-            // The live socket's own clock (item 34). Still `None` before the
-            // first `watch_market` builds the feed, which is the honest answer
-            // then: nothing has connected, so there is no last-good value
-            // behind the overlay.
-            last_tick_ms: runtime.last_tick_ms(network),
+            // Last successfully applied matching-account observation, captured
+            // before as-of. Connections and public traffic do not advance it.
+            last_tick_ms: observed,
         },
     ))
 }

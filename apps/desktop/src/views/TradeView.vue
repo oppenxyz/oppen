@@ -155,7 +155,7 @@ const chartSource = computed(() => {
   return `Venue ${venue} · Observed tape ${bars.length - venue} · Partial ${partial} · Ambiguous O/C ${ambiguous}`;
 });
 const tapeLabel = computed(() => {
-  if (chartObservation.failure) return "Chart consumer stopped";
+  if (chartObservation.failure) return "Selected market consumer stopped";
   switch (chartObservation.projection?.tape_status) {
     case "observing": return "Tape observing · incomplete coverage";
     case "interrupted": return "Tape interrupted";
@@ -508,8 +508,14 @@ const ledger = ref<Ledger>("positions");
 }
 
 .trade__col--center {
-  grid-template-rows: auto minmax(340px, 1fr) minmax(110px, 18vh);
+  grid-template-rows: max-content minmax(340px, 1fr) minmax(190px, 22vh);
   overflow: auto;
+}
+
+@media (max-height: 850px) {
+  .trade__col--center {
+    grid-template-rows: max-content minmax(280px, 1fr) minmax(190px, 22vh);
+  }
 }
 
 .trade__col--right {
