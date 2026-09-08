@@ -43,6 +43,12 @@ The later execution owner must attach the real gateway/feed pump and retain its
 existing session, supervision and execution drain guarantees. This prerequisite
 does not complete that activation gate or the position-aware quit ceremony.
 
+The MCP transport must stop if its pause-supervision task terminates unexpectedly.
+Its completion must await transport teardown, supervision and tracked decisions,
+and return supervisor join failures rather than logging them as a successful
+shutdown. A requested normal shutdown remains successful. These guarantees do
+not make a listener or console feed proof of execution reconciliation.
+
 ## Evidence
 
 Use controlled streams, local loopback fixtures and blocked closures to prove

@@ -274,20 +274,51 @@ pub async fn serve(
     };
     // Await Axum's spawned connection tasks, not just its accept loop. Closing
     // their IO also handles idle SSE, partial requests, and blocked writers.
-    let result = axum::serve(
+    let server = axum::serve(
         listener,
         router_with_lifecycle(gateway, pairings, shutdown.clone(), execution.clone()),
     )
-    .with_graceful_shutdown(shutdown.clone().cancelled_owned())
-    .await;
-    shutdown.cancel();
-    if let Err(error) = enforcement.await
-        && !error.is_cancelled()
-    {
-        tracing::warn!(%error, "pause enforcement task failed");
-    }
+    .with_graceful_shutdown(shutdown.clone().cancelled_owned());
+    supervise_and_drain(
+        async move { server.await },
+        enforcement,
+        shutdown,
+        execution,
+    )
+    .await
+}
+
+// A dead supervisor must not leave an apparently healthy transport running.
+// Cancellation closes admission, but completion still requires both task
+// teardown and every tracked blocking decision to finish.
+async fn supervise_and_drain(
+    server: impl Future<Output = std::io::Result<()>>,
+    mut enforcement: tokio::task::JoinHandle<()>,
+    shutdown: CancellationToken,
+    execution: watch::Sender<()>,
+) -> std::io::Result<()> {
+    tokio::pin!(server);
+    let (server_result, enforcement_result, unexpected_exit) = tokio::select! {
+        result = &mut enforcement => {
+            let unexpected_exit = !shutdown.is_cancelled();
+            shutdown.cancel();
+            (server.await, result, unexpected_exit)
+        }
+        result = &mut server => {
+            shutdown.cancel();
+            (result, enforcement.await, false)
+        }
+    };
     execution.closed().await;
-    result
+    enforcement_result.map_err(|error| {
+        std::io::Error::other(format!("pause enforcement task failed: {error}"))
+    })?;
+    if unexpected_exit {
+        return Err(std::io::Error::other(
+            "pause enforcement task exited unexpectedly",
+        ));
+    }
+    server_result
 }
 
 struct ShutdownListener {
@@ -497,6 +528,101 @@ mod authority_tests {
     use oppen_core::guardrail::AgentId;
     use oppen_core::keys::HmacKey;
     use oppen_core::ledger::{Ledger, PairingJournal};
+
+    #[tokio::test]
+    async fn supervisor_panic_closes_transport_but_waits_for_actual_work() {
+        let shutdown = CancellationToken::new();
+        let server_shutdown = shutdown.clone();
+        let (execution, worker) = watch::channel(());
+        let (transport_closed, closed) = tokio::sync::oneshot::channel();
+        let (release_transport, transport_release) = tokio::sync::oneshot::channel();
+        let enforcement = tokio::spawn(async { panic!("supervisor failure fixture") });
+        let task = tokio::spawn(supervise_and_drain(
+            async move {
+                server_shutdown.cancelled().await;
+                transport_closed.send(()).unwrap();
+                transport_release.await.unwrap();
+                Ok(())
+            },
+            enforcement,
+            shutdown.clone(),
+            execution,
+        ));
+        closed.await.unwrap();
+        assert!(shutdown.is_cancelled());
+        assert!(!task.is_finished());
+        release_transport.send(()).unwrap();
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished());
+        drop(worker);
+        let error = task.await.unwrap().unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert!(error.to_string().contains("pause enforcement task failed"));
+    }
+
+    #[tokio::test]
+    async fn unexpected_supervisor_return_is_not_success() {
+        let shutdown = CancellationToken::new();
+        let server_shutdown = shutdown.clone();
+        let (execution, unused) = watch::channel(());
+        drop(unused);
+        let result = supervise_and_drain(
+            async move {
+                server_shutdown.cancelled().await;
+                Ok(())
+            },
+            tokio::spawn(async {}),
+            shutdown,
+            execution,
+        )
+        .await;
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("exited unexpectedly")
+        );
+    }
+
+    #[tokio::test]
+    async fn transport_failure_cancels_supervisor_and_preserves_error() {
+        let shutdown = CancellationToken::new();
+        let supervisor_shutdown = shutdown.clone();
+        let (finished, completion) = tokio::sync::oneshot::channel();
+        let (execution, unused) = watch::channel(());
+        drop(unused);
+        let result = supervise_and_drain(
+            async { Err(std::io::Error::from(std::io::ErrorKind::ConnectionAborted)) },
+            tokio::spawn(async move {
+                supervisor_shutdown.cancelled().await;
+                finished.send(()).unwrap();
+            }),
+            shutdown,
+            execution,
+        )
+        .await;
+        completion.await.unwrap();
+        assert_eq!(
+            result.unwrap_err().kind(),
+            std::io::ErrorKind::ConnectionAborted
+        );
+    }
+
+    #[tokio::test]
+    async fn requested_shutdown_is_success_after_both_tasks_finish() {
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+        let (execution, unused) = watch::channel(());
+        drop(unused);
+        supervise_and_drain(
+            async { Ok(()) },
+            tokio::spawn(async {}),
+            shutdown,
+            execution,
+        )
+        .await
+        .unwrap();
+    }
 
     #[derive(Clone)]
     struct MustNotRun;
