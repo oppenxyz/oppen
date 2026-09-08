@@ -224,6 +224,10 @@ before expanding features:
    D1 own-order provenance remains a
    separate activation gate: account binding alone does not exclude manual
    orders, and operator review does not establish that the agent opened them.
+   ES31's [provenance contract](docs/specs/order-provenance.md) records the
+   inspected reservation/signing gap, required authenticated evidence and
+   recovery acceptance tests. Signer publication ordering and sufficient venue
+   identity evidence remain design gates; no ownership implementation is claimed.
    No dedicated-account activity has been performed during this development.
 4. **Recovery:** PR #44 merged as `06fc0e3` after green CI and separate automated
    review. The durable submission journal has SQLite reopen, independent
