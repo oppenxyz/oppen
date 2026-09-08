@@ -17,6 +17,10 @@ use super::{
 };
 use crate::guardrail::{AgentId, Clearance, ClearedKind, PilotMetric};
 
+#[path = "pilot/authority.rs"]
+mod authority;
+pub use authority::LegacyPilotReview;
+
 type Result<T> = std::result::Result<T, PilotError>;
 
 #[derive(Debug, thiserror::Error)]
@@ -80,7 +84,8 @@ impl PilotStop {
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PilotState {
     pub agent: AgentId,
     pub account: Address,
@@ -100,8 +105,17 @@ pub struct PilotStatus {
     pub agent: AgentId,
     pub account: Address,
     pub halt: Option<PilotStop>,
+    pub authentication: PilotAuthentication,
     #[serde(flatten)]
     pub accounting: PilotAccounting,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PilotAuthentication {
+    Unverified,
+    LegacyReviewRequired,
+    Verified,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -122,9 +136,9 @@ pub enum PilotAccounting {
 
 /// Operator capability. Never expose this constructor through an agent view.
 #[derive(Clone, Debug)]
-pub struct PilotJournal(Arc<Ledger>);
+pub struct PilotJournal(Arc<super::RegistryJournal>);
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Authorized {
     version: u64,
@@ -158,6 +172,7 @@ struct Authority {
     hash: String,
     data: Authorized,
     halt: Option<PilotStop>,
+    event: Event,
 }
 
 struct History {
@@ -165,6 +180,7 @@ struct History {
     submissions: Vec<PilotSubmission>,
     fills: Vec<Event>,
     fill_keys: HashMap<u64, Option<String>>,
+    adoption: Option<Event>,
 }
 
 fn unavailable(detail: impl Into<String>) -> PilotError {
@@ -184,64 +200,25 @@ fn exhausted(metric: PilotMetric, observed_usd: Decimal, limit: Decimal) -> Pilo
 }
 
 impl PilotJournal {
-    pub fn new(ledger: Arc<Ledger>) -> Self {
-        Self(ledger)
+    pub fn new(registry: Arc<super::RegistryJournal>) -> Self {
+        Self(registry)
     }
 
     /// Requires an operator-confirmed exclusive, flat, fully reconciled testnet
     /// account. This records that authority, not evidence of venue readiness.
     /// There is deliberately no renewal, replacement, or reset operation.
+    /// A post-commit anchor error has an uncertain durable outcome. Retry the
+    /// same identity and baseline timestamp to verify and publish that outcome.
     pub fn authorize(&self, agent: AgentId, account: Address, at_ms: u64) -> Result<PilotState> {
-        if self.0.network != Network::Testnet || agent.as_str().is_empty() {
-            return Err(unavailable(
-                "pilot authorization requires testnet and a named agent",
-            ));
-        }
-        let ts_ms =
-            i64::try_from(at_ms).map_err(|_| unavailable("baseline timestamp out of range"))?;
-        let mut guard = self.0.lock()?;
-        let tx = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let history = history(&self.0, &tx, true)?;
-        if !history.authorities.is_empty() {
-            return Err(unavailable(
-                "pilot account or agent has already been authorized",
-            ));
-        }
-        check_baseline(&history, account, &agent)?;
-        let (seq, hash) = super::head(&tx)?;
-        let data = Authorized {
-            version: 1,
-            network: Network::Testnet,
-            agent: agent.clone(),
-            account,
-            baseline_at_ms: at_ms,
-            baseline: Anchor { seq, hash },
-            order_limit_usd: Decimal::from(15),
-            executed_limit_usd: Decimal::from(150),
-            realized_loss_limit_usd: Decimal::from(5),
-        };
-        let payload = serde_json::to_value(&data)?;
-        let appended = super::append_keyed_in_tx(
-            &tx,
-            &NewEvent {
-                kind: EventKind::PilotAuthorized,
-                ts_ms,
-                agent_id: Some(agent.as_str()),
-                payload: &payload,
-                snapshot: None,
-            },
-            &format!("pilot_authorized:{account}"),
-        )?
-        .ok_or_else(|| unavailable("pilot authorization key already exists"))?;
-        tx.commit()?;
-        self.0.note_head(&appended)?;
-        Ok(initial(&data))
+        authority::authorize(&self.0, agent, account, at_ms)
     }
 
     pub fn state(&self, account: Address) -> Result<Option<PilotState>> {
-        let mut guard = self.0.lock()?;
+        let ledger = self.0.ledger();
+        let mut guard = ledger.lock()?;
         let tx = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let history = history(&self.0, &tx, true)?;
+        let history = history(ledger, &tx, true)?;
+        authority::verify(&self.0, &tx, &history)?;
         history
             .authorities
             .iter()
@@ -249,11 +226,53 @@ impl PilotJournal {
             .map(|authority| project(&history, authority))
             .transpose()
     }
+
+    pub fn status(&self, account: Address) -> Result<Option<PilotStatus>> {
+        let ledger = self.0.ledger();
+        let mut guard = ledger.lock()?;
+        let tx = guard.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let history = history(ledger, &tx, true)?;
+        authority::verify(&self.0, &tx, &history)?;
+        status_from_history(&history, account, PilotAuthentication::Verified)
+    }
+
+    pub fn review_legacy(&self, account: Address) -> Result<LegacyPilotReview> {
+        authority::review(&self.0, account)
+    }
+
+    /// Authenticate exactly the reviewed legacy history without changing its
+    /// baseline, usage, reservations or stops. A newer retry timestamp with the
+    /// identical review is an idempotent publication retry, not fresh consent:
+    /// the existing signed adoption and its original timestamp are retained.
+    /// Post-commit anchor errors may leave that adoption durable; retry must
+    /// verify and publish the current head before reporting success.
+    pub fn adopt_legacy(&self, review: &LegacyPilotReview, at_ms: u64) -> Result<PilotState> {
+        authority::adopt(&self.0, review, at_ms)
+    }
 }
 
 pub(super) fn status(ledger: &Ledger, account: Address) -> Result<Option<PilotStatus>> {
-    let guard = ledger.lock()?;
-    let history = history(ledger, &guard, true)?;
+    let mut guard = ledger.lock()?;
+    let tx = guard.transaction_with_behavior(TransactionBehavior::Deferred)?;
+    let history = history(ledger, &tx, true)?;
+    let authentication = if history
+        .authorities
+        .first()
+        .is_some_and(|a| authority::is_signed(&a.event))
+        || history.adoption.is_some()
+    {
+        PilotAuthentication::Unverified
+    } else {
+        PilotAuthentication::LegacyReviewRequired
+    };
+    status_from_history(&history, account, authentication)
+}
+
+fn status_from_history(
+    history: &History,
+    account: Address,
+    authentication: PilotAuthentication,
+) -> Result<Option<PilotStatus>> {
     let Some(authority) = history
         .authorities
         .iter()
@@ -268,7 +287,7 @@ pub(super) fn status(ledger: &Ledger, account: Address) -> Result<Option<PilotSt
     {
         return Err(unavailable("required pilot fill history redacted"));
     }
-    let (halt, accounting) = match project(&history, authority) {
+    let (halt, accounting) = match project(history, authority) {
         Ok(state) => (
             state.halt,
             PilotAccounting::Known {
@@ -288,6 +307,7 @@ pub(super) fn status(ledger: &Ledger, account: Address) -> Result<Option<PilotSt
         agent: authority.data.agent.clone(),
         account: authority.data.account,
         halt,
+        authentication,
         accounting,
     }))
 }
@@ -349,6 +369,59 @@ pub(super) fn check_admission(
     let state = project(&history, authority)?;
     let amount = order_limit(&serde_json::to_value(clearance)?, &authority.data)?;
     permitted(&state, amount, &authority.data)
+}
+
+fn authenticate_order(
+    registry: &super::RegistryJournal,
+    connection: &Connection,
+    account: Address,
+    clearance: &Clearance,
+    required: bool,
+) -> Result<()> {
+    let history = history(registry.ledger(), connection, true)?;
+    authority::verify(registry, connection, &history)?;
+    let applicable = history
+        .authorities
+        .iter()
+        .any(|a| a.data.agent == clearance.agent || a.data.account == account);
+    if !applicable {
+        return if required {
+            Err(unavailable("authenticated pilot consent required"))
+        } else {
+            Ok(())
+        };
+    }
+    authority::verify_route(registry, connection, &history, clearance)
+}
+
+pub(super) fn check_authenticated_admission(
+    registry: &super::RegistryJournal,
+    connection: &Connection,
+    account: Address,
+    clearance: &Clearance,
+    required: bool,
+) -> Result<()> {
+    authenticate_order(registry, connection, account, clearance, required)?;
+    check_admission(registry.ledger(), connection, account, clearance)
+}
+
+pub(super) fn check_authenticated_before_sign(
+    registry: &super::RegistryJournal,
+    connection: &Connection,
+    clearance: &Clearance,
+    required: bool,
+) -> Result<()> {
+    if !matches!(clearance.kind, ClearedKind::Order { .. }) {
+        return Ok(());
+    }
+    authenticate_order(
+        registry,
+        connection,
+        clearance.route.binding.container,
+        clearance,
+        required,
+    )?;
+    check_before_sign(registry.ledger(), connection, clearance)
 }
 
 /// Caller verifies the anchored chain before appending the fill. Its write
@@ -441,9 +514,10 @@ fn history(ledger: &Ledger, connection: &Connection, verify_anchor: bool) -> Res
         submissions,
         fills: Vec::new(),
         fill_keys: HashMap::new(),
+        adoption: None,
     };
     let mut statement = connection.prepare(&format!(
-        "SELECT {}, idem_key FROM events WHERE kind IN ('pilot_authorized', 'pilot_halted', 'fill') ORDER BY seq",
+        "SELECT {}, idem_key FROM events WHERE kind IN ('pilot_authorized', 'pilot_adopted', 'pilot_halted', 'fill') ORDER BY seq",
         super::SELECT_EVENT_COLUMNS))?;
     let mut rows = statement.query([])?;
     while let Some(row) = rows.next()? {
@@ -464,6 +538,8 @@ fn history(ledger: &Ledger, connection: &Connection, verify_anchor: bool) -> Res
             .ok_or_else(|| unavailable("pilot authority or halt redacted"))?;
         match event.kind {
             EventKind::PilotAuthorized => {
+                let payload =
+                    authority::authorization_payload(ledger, row.get(4)?, &event, payload)?;
                 for field in [
                     "order_limit_usd",
                     "executed_limit_usd",
@@ -480,7 +556,8 @@ fn history(ledger: &Ledger, connection: &Connection, verify_anchor: bool) -> Res
                     || data.network != Network::Testnet
                     || data.network != ledger.network
                     || event.agent_id.as_deref() != Some(data.agent.as_str())
-                    || data.agent.as_str().is_empty()
+                    || crate::keys::checked_agent_id(&data.agent).is_err()
+                    || data.account == Address::ZERO
                     || i64::try_from(data.baseline_at_ms).ok() != Some(event.ts_ms)
                     || data.baseline.seq.checked_add(1) != Some(event.seq)
                     || key.as_deref() != Some(format!("pilot_authorized:{}", data.account).as_str())
@@ -503,10 +580,18 @@ fn history(ledger: &Ledger, connection: &Connection, verify_anchor: bool) -> Res
                 }
                 out.authorities.push(Authority {
                     seq: event.seq,
-                    hash: event.hash,
+                    hash: event.hash.clone(),
                     data,
                     halt: None,
+                    event,
                 });
+            }
+            EventKind::PilotAdopted => {
+                if out.adoption.is_some() {
+                    return Err(unavailable("duplicate pilot adoption"));
+                }
+                authority::validate_adoption(ledger, row.get(4)?, &event, &out, key.as_deref())?;
+                out.adoption = Some(event);
             }
             EventKind::PilotHalted => {
                 let halted = parse_halt(&payload)?;

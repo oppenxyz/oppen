@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed } from "vue";
-import { pilot, pilotNotice } from "../../stores/pilot";
+import { pilot, pilotAuthentication, pilotNotice } from "../../stores/pilot";
 
 const notice = computed(() => pilotNotice(pilot));
 const checkedAt = computed(() => pilot.checkedAt === null ? null : new Date(pilot.checkedAt).toLocaleTimeString());
@@ -11,10 +11,11 @@ const checkedAt = computed(() => pilot.checkedAt === null ? null : new Date(pilo
     <div class="pilot-banner__summary">
       <strong class="pilot-banner__title">{{ notice.title }}</strong>
       <span class="pilot-banner__network">{{ pilot.network }}</span>
-      <span v-if="pilot.error && checkedAt" class="pilot-banner__stale">Stale / last verified {{ checkedAt }}</span>
+      <span v-if="pilot.error && checkedAt" class="pilot-banner__stale">Stale / last observed {{ checkedAt }}</span>
       <span v-if="pilot.status" class="pilot-banner__identity">{{ pilot.status.agent }} / {{ pilot.status.account }}</span>
     </div>
     <p>{{ notice.detail }} Orders and positions may remain open.</p>
+    <p v-if="pilot.status">{{ pilotAuthentication(pilot.status) }}. Authentication does not enable trading.</p>
     <dl v-if="pilot.status?.accounting === 'known'" class="pilot-banner__totals">
       <div><dt>Executed</dt><dd>{{ pilot.status.executed_usd }} USD</dd></div>
       <div><dt>Reserved</dt><dd>{{ pilot.status.reserved_usd }} USD</dd></div>

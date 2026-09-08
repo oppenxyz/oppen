@@ -136,8 +136,9 @@ export type PilotStop =
   | { reason: "exhausted"; metric: PilotMetric; observed_usd: string; limit_usd: string }
   | { reason: "unavailable"; detail: string };
 
-/** EventViews' verified identity and stop survive unavailable accounting totals. */
+/** Local pilot evidence carries consent authentication separately from accounting. */
 export type PilotStatus = {
+  authentication: "unverified" | "legacy_review_required" | "verified";
   agent: string;
   account: string;
   halt: PilotStop | null;

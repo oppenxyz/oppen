@@ -65,7 +65,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("OPPEN_TESTNET_USER differs from the authorized container; correct explicit operator setup".into());
     }
     let mut store = TokenStore::open(PairingJournal::open(ledger.clone(), hmac)?)?;
-    let engine = Arc::new(GuardrailEngine::new(
+    let engine = Arc::new(GuardrailEngine::new_supervised_alpha(
         Arc::new(PolicyJournal::new(Arc::new(registry))),
         keys,
     )?);

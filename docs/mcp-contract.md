@@ -158,6 +158,15 @@ Missing or contradictory budget evidence is `pilot_budget_unavailable` within an
 orders until reconciliation proves that link; it does not erase consumption.
 No MCP method authorizes, renews or resets a pilot.
 
+The supervised-alpha desktop and server example require HMAC-authenticated
+consent, including for reduce-only orders. Missing or legacy unsigned consent
+is not permission to trade. Explicit operator adoption records `pilot_adopted`
+in the event taxonomy and retains the original budget baseline and all prior
+usage/stops. Reservation admission and final
+signing verify against the engine's registry-backed authority; preflight checks
+the same consent and candidate budget without reserving or writing. Keyless
+local inspection distinguishes unverified consent from authenticated consent.
+
 The runtime retries cancellation of resting orders for a verified permanent
 pilot stop or unavailable accounting, using the same bounded sweep as an
 operator pause. Transient reconciliation alone does not trigger cancellation.

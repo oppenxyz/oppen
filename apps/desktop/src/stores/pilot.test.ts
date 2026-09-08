@@ -1,16 +1,18 @@
 import type { PilotStatus } from "../lib/bridge";
 import { shell } from "./shell";
-import { createPilotMonitor, pilotNotice } from "./pilot";
+import { createPilotMonitor, pilotAuthentication, pilotNotice } from "./pilot";
 
 interface Assertions {
   toBe(expected: unknown): void;
   toEqual(expected: unknown): void;
+  toContain(expected: string): void;
 }
 declare const describe: (name: string, body: () => void) => void;
 declare const it: (name: string, body: () => void | Promise<void>) => void;
-declare const expect: (actual: unknown) => Assertions;
+declare const expect: (actual: unknown) => Assertions & { not: Assertions };
 
 const STOP: PilotStatus = {
+  authentication: "unverified",
   agent: "pilot-alpha",
   account: "0x1111111111111111111111111111111111111111",
   halt: { reason: "exhausted", metric: "realized_loss", observed_usd: "5.01", limit_usd: "5" },
@@ -203,6 +205,75 @@ describe("pilot banner states", () => {
     return { monitor, notice: pilotNotice(monitor.state) };
   }
 
+  it("keeps consent authentication independent of stop and unavailable accounting priority", async () => {
+    for (const authentication of ["unverified", "legacy_review_required", "verified"] as const) {
+      const stopped = await notice({ ...STOP, authentication });
+      expect(stopped.notice?.title).toBe("Pilot stopped");
+      expect(stopped.monitor.state.status).toEqual({ ...STOP, authentication });
+      expect(pilotAuthentication(stopped.monitor.state.status)).toBe(`Consent authentication: ${authentication.split("_").join(" ")}`);
+      const unavailable = await notice({ authentication, agent: STOP.agent, account: STOP.account, halt: null, accounting: "unavailable", detail: "Missing accounting evidence" });
+      expect(unavailable.notice?.title).toBe("Pilot accounting unavailable");
+      const reconciling = await notice({ ...STOP, authentication, halt: { reason: "awaiting_reconciliation" } });
+      expect(reconciling.notice?.title).toBe("Pilot reconciling");
+    }
+  });
+
+  it("surfaces unverified or legacy consent without inventing a budget stop or enabling trading", async () => {
+    expect((await notice({ ...STOP, halt: null })).notice?.title).toBe("Pilot consent unverified");
+    expect((await notice({ ...STOP, authentication: "legacy_review_required", halt: null })).notice?.title).toBe("Pilot consent review required");
+    expect((await notice({ ...STOP, authentication: "verified", halt: null })).notice).toBe(null);
+  });
+
+  it("retains authentication and exact totals beside a stale stop and untrusted read error", async () => {
+    let fail = false;
+    const monitor = createPilotMonitor(async () => {
+      if (fail) throw { kind: "local_status", detail: "<img src=x onerror=alert(1)>" };
+      return { ...STOP, authentication: "legacy_review_required" as const };
+    });
+    monitor.setNetwork("testnet");
+    await monitor.refresh();
+    const before = monitor.state.status;
+    const checked = monitor.state.checkedAt;
+    fail = true;
+    await monitor.refresh();
+    expect(monitor.state.status).toEqual(before);
+    expect(monitor.state.checkedAt).toBe(checked);
+    expect(monitor.state.error).toBe("<img src=x onerror=alert(1)>");
+    expect(pilotNotice(monitor.state)?.title).toBe("Pilot stopped");
+    expect(pilotAuthentication(monitor.state.status)).toBe("Consent authentication: legacy review required");
+  });
+
+  it("renders authentication as subordinate evidence with escaped errors and last-observed wording", async () => {
+    const { createServer } = await import("vite");
+    const { default: vue } = await import("@vitejs/plugin-vue");
+    const { createSSRApp, toRaw } = await import("vue");
+    const { renderToString } = await import("vue/server-renderer");
+    const server = await createServer({
+      root: decodeURIComponent(new URL("../../", import.meta.url).pathname), configFile: false,
+      plugins: [vue()], server: { middlewareMode: true, hmr: false },
+    });
+    try {
+      const { pilot } = await server.ssrLoadModule("/src/stores/pilot.ts");
+      const { default: Banner } = await server.ssrLoadModule("/src/components/shell/PilotStatusBanner.vue");
+      const raw = toRaw(pilot);
+      raw.network = "testnet";
+      raw.checkedAt = 100;
+      raw.error = "<img src=x onerror=alert(1)>";
+      for (const authentication of ["unverified", "legacy_review_required", "verified"] as const) {
+        raw.status = { ...STOP, authentication };
+        const html = await renderToString(createSSRApp(Banner));
+        expect(html).toContain("Pilot stopped");
+        expect(html).toContain(pilotAuthentication(raw.status));
+        expect(html).toContain("Authentication does not enable trading");
+        expect(html).toContain("last observed");
+        expect(html).not.toContain("last verified");
+        expect(html).toContain(STOP.executed_usd);
+        expect(html).toContain("&lt;img");
+        expect(html).not.toContain("<img");
+      }
+    } finally { await server.close(); }
+  });
+
   it("shows the exhausted metric with exact observed and limit strings", async () => {
     const result = await notice(STOP);
     expect(result.notice).toEqual({ title: "Pilot stopped", detail: "Realized loss: 5.01 USD observed; 5 USD limit." });
@@ -214,7 +285,7 @@ describe("pilot banner states", () => {
   });
 
   it("keeps the verified stop when accounting is unavailable, without old totals", async () => {
-    const unavailable: PilotStatus = { agent: STOP.agent, account: STOP.account, halt: STOP.halt, accounting: "unavailable", detail: "Contradictory fill evidence" };
+    const unavailable: PilotStatus = { authentication: "unverified", agent: STOP.agent, account: STOP.account, halt: STOP.halt, accounting: "unavailable", detail: "Contradictory fill evidence" };
     let next: PilotStatus = STOP;
     const monitor = createPilotMonitor(async () => next);
     monitor.setNetwork("testnet");
@@ -227,7 +298,7 @@ describe("pilot banner states", () => {
   });
 
   it("shows unavailable accounting even without a persisted halt", async () => {
-    const result = await notice({ agent: STOP.agent, account: STOP.account, halt: null, accounting: "unavailable", detail: "Unmatched submission evidence" });
+    const result = await notice({ authentication: "unverified", agent: STOP.agent, account: STOP.account, halt: null, accounting: "unavailable", detail: "Unmatched submission evidence" });
     expect(result.notice).toEqual({ title: "Pilot accounting unavailable", detail: "Unmatched submission evidence" });
   });
 
@@ -238,6 +309,6 @@ describe("pilot banner states", () => {
 
   it("does not show a stop for no pilot or verified non-halted accounting", async () => {
     expect((await notice(null)).notice).toBe(null);
-    expect((await notice({ ...STOP, halt: null })).notice).toBe(null);
+    expect((await notice({ ...STOP, authentication: "verified", halt: null })).notice).toBe(null);
   });
 });

@@ -229,6 +229,86 @@ fn signing_snapshot_stays_stable_while_an_independent_raw_wal_writer_commits() {
 }
 
 #[test]
+fn supervised_orders_require_consent_at_reservation_and_final_signing() {
+    use crate::guardrail::{GuardrailEngine, Refusal, Unevaluable};
+    for reduce in [false, true] {
+        let (_dir, ledger, policy, mut clearance) = signing_fixture();
+        let engine = GuardrailEngine::new_supervised_alpha(
+            policy.clone(),
+            Arc::new(crate::keys::MemoryKeyStore::new(Network::Testnet)),
+        )
+        .unwrap();
+        engine
+            .operator_acknowledge_policy(engine.policy_observation().unwrap(), 100)
+            .unwrap();
+        if let ClearedKind::Order {
+            reduce_only,
+            sz,
+            notional_usd,
+            ..
+        } = &mut clearance.kind
+        {
+            *reduce_only = reduce;
+            *sz = Decimal::new(1, 1);
+            *notional_usd = Decimal::from(10);
+        }
+        let sink = LedgerAuditSink::supervised(policy);
+        sink.record(&AuditEntry {
+            agent: Some(&clearance.agent),
+            at_ms: 100,
+            reason: "required consent fixture",
+            outcome: AuditOutcome::Cleared(&clearance),
+        })
+        .unwrap();
+        let before = ledger.chain_head().unwrap();
+        let journal = engine.submissions().unwrap();
+        assert!(matches!(
+            journal.preflight(&clearance),
+            Err(PilotError::Unavailable { .. })
+        ));
+        assert!(matches!(
+            journal.begin(clearance.route.binding.container, &clearance, 0, 100),
+            Err(SubmissionError::Pilot(PilotError::Unavailable { .. }))
+        ));
+        assert!(
+            journal
+                .state(clearance.route.binding.container)
+                .unwrap()
+                .pending
+                .is_none()
+        );
+        let wallet = &clearance.route.binding.wallet;
+        assert!(matches!(
+            sink.before_sign(&clearance, wallet, wallet.address),
+            Err(Refusal::Unevaluable(
+                Unevaluable::PilotBudgetUnavailable { .. }
+            ))
+        ));
+        assert_eq!(ledger.chain_head().unwrap(), before);
+        assert!(ledger.connection.lock().unwrap().is_autocommit());
+        assert!(ledger.verify().unwrap().is_intact());
+    }
+}
+
+#[test]
+fn supervised_cleanup_does_not_require_order_consent() {
+    let (_dir, ledger, policy, mut clearance) = signing_fixture();
+    let sink = LedgerAuditSink::supervised(policy);
+    for kind in [
+        ClearedKind::Cancel { count: 1 },
+        ClearedKind::ScheduleCancel { cancel_at_ms: None },
+    ] {
+        clearance.kind = kind;
+        let wallet = &clearance.route.binding.wallet;
+        drop(
+            sink.before_sign(&clearance, wallet, wallet.address)
+                .unwrap(),
+        );
+        assert!(ledger.connection.lock().unwrap().is_autocommit());
+    }
+}
+
+#[test]
 fn combined_signing_permit_rolls_back_on_identity_registry_policy_and_pilot_errors() {
     for failure in ["identity", "registry", "policy", "pilot"] {
         let (_dir, ledger, policy, clearance) = signing_fixture();
@@ -244,13 +324,19 @@ fn combined_signing_permit_rolls_back_on_identity_registry_policy_and_pilot_erro
                     .unwrap();
             }
             "pilot" => {
-                pilot::PilotJournal::new(ledger.clone())
-                    .authorize(
-                        clearance.agent.clone(),
-                        clearance.route.binding.container,
-                        100,
+                pilot::PilotJournal::new(Arc::new(
+                    RegistryJournal::open(
+                        ledger.clone(),
+                        Arc::new(crate::keys::HmacKey::from_bytes([31; 32])),
                     )
-                    .unwrap();
+                    .unwrap(),
+                ))
+                .authorize(
+                    clearance.agent.clone(),
+                    clearance.route.binding.container,
+                    100,
+                )
+                .unwrap();
             }
             _ => unreachable!(),
         }
@@ -385,9 +471,15 @@ fn valid_route_cleanup_survives_redacted_pilot_evidence_but_still_checks_signer_
     for target in ["authorization", "submission"] {
         let (_dir, ledger, policy, mut clearance) = signing_fixture();
         let account = clearance.route.binding.container;
-        pilot::PilotJournal::new(ledger.clone())
-            .authorize(clearance.agent.clone(), account, 100)
-            .unwrap();
+        pilot::PilotJournal::new(Arc::new(
+            RegistryJournal::open(
+                ledger.clone(),
+                Arc::new(crate::keys::HmacKey::from_bytes([31; 32])),
+            )
+            .unwrap(),
+        ))
+        .authorize(clearance.agent.clone(), account, 100)
+        .unwrap();
         let authorization = ledger.chain_head().unwrap().seq;
         if let ClearedKind::Order {
             sz, notional_usd, ..

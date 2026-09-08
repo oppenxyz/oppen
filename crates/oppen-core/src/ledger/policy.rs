@@ -218,6 +218,10 @@ impl PolicyJournal {
         &self.registry
     }
 
+    pub(crate) fn submissions(&self, pilot_required: bool) -> super::SubmissionJournal {
+        super::SubmissionJournal::authenticated(self.registry.clone(), pilot_required)
+    }
+
     /// Explicit adoption of a supplied complete policy, initially globally
     /// paused. Old writers must be stopped: retaining a fresh read-only legacy
     /// transaction gives consistent evidence, not cross-database atomicity.

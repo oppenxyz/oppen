@@ -508,6 +508,14 @@ pub struct SymbolMeta {
     pub is_delisted: bool,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum GatewayInitError {
+    #[error(transparent)]
+    Transport(#[from] oppen_hl::Error),
+    #[error(transparent)]
+    Authority(#[from] oppen_core::guardrail::GuardrailError),
+}
+
 #[tool_router]
 impl Gateway {
     pub fn new(
@@ -518,14 +526,14 @@ impl Gateway {
         feed: Arc<FeedSession>,
         alerts: Arc<AlertStore>,
         quotes: Arc<QuoteCache>,
-    ) -> Result<Self, oppen_hl::Error> {
+    ) -> Result<Self, GatewayInitError> {
         Ok(Self {
             inner: Arc::new(GatewayInner {
                 execution: Mutex::new(HashMap::new()),
                 pilot_reader: Arc::new(tokio::sync::Semaphore::new(1)),
                 route_reader: Arc::new(tokio::sync::Semaphore::new(1)),
                 decision_worker: Arc::new(tokio::sync::Semaphore::new(1)),
-                submissions: events.submissions(),
+                submissions: engine.submissions()?,
                 network,
                 info: InfoClient::new(network)?,
                 engine,
@@ -3763,6 +3771,7 @@ mod tests {
         let status = PilotStatus {
             agent: bound.agent.clone(),
             account: bound.account,
+            authentication: oppen_core::ledger::PilotAuthentication::Unverified,
             halt: Some(PilotStop::AwaitingReconciliation),
             accounting: PilotAccounting::Known {
                 executed_usd: Decimal::ZERO,

@@ -358,6 +358,32 @@ fn engine_order_signing(change_policy: bool) {
         },
         fleet: None,
     };
+    if !change_policy {
+        let supervised =
+            GuardrailEngine::new_supervised_alpha(policy.clone(), keys.clone()).unwrap();
+        supervised
+            .operator_acknowledge_policy(supervised.policy_observation().unwrap(), now_ms)
+            .unwrap();
+        let before = ledger.chain_head().unwrap();
+        assert!(
+            engine
+                .preflight(&agent, &intent, &asset, &market, &exposure, now_ms)
+                .would_clear
+        );
+        let verdict = supervised.preflight(&agent, &intent, &asset, &market, &exposure, now_ms);
+        assert!(!verdict.would_clear);
+        assert!(matches!(
+            verdict.refusal,
+            Some(crate::guardrail::Refusal::Unevaluable(
+                crate::guardrail::Unevaluable::PilotBudgetUnavailable { .. }
+            ))
+        ));
+        assert_eq!(
+            ledger.chain_head().unwrap(),
+            before,
+            "preflight cannot record or reserve"
+        );
+    }
     let cleared = engine
         .evaluate(&agent, &intent, &asset, &market, &exposure, now_ms)
         .expect("policy-cleared order must reach the real ledger");
@@ -2493,7 +2519,11 @@ fn generic_writers_cannot_forge_submission_lifecycle_events() {
             Err(LedgerError::UseSubmissionJournal)
         ));
     }
-    for kind in [EventKind::PilotAuthorized, EventKind::PilotHalted] {
+    for kind in [
+        EventKind::PilotAuthorized,
+        EventKind::PilotAdopted,
+        EventKind::PilotHalted,
+    ] {
         assert!(matches!(
             ledger.append(&NewEvent {
                 kind,
@@ -2546,7 +2576,7 @@ fn generic_writers_cannot_forge_submission_lifecycle_events() {
 
 #[test]
 fn authority_reader_barriers_preserve_the_existing_chain_on_upgrade() {
-    for prior_version in [3, 4, 5, 6] {
+    for prior_version in [3, 4, 5, 6, 7] {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("testnet.db");
         let (head, original) = {
@@ -2581,7 +2611,7 @@ fn authority_reader_barriers_preserve_the_existing_chain_on_upgrade() {
             .unwrap()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
     }
 }
 
@@ -2617,14 +2647,14 @@ fn a_reader_refuses_a_newer_authority_schema_without_rewriting_history() {
         .connection
         .lock()
         .unwrap()
-        .pragma_update(None, "user_version", 8)
+        .pragma_update(None, "user_version", 9)
         .unwrap();
     drop(ledger);
     assert!(matches!(
         Ledger::open_at(&path, Network::Testnet),
         Err(LedgerError::SchemaTooNew {
-            found: 8,
-            supported: 7
+            found: 9,
+            supported: 8
         })
     ));
     let connection = rusqlite::Connection::open(&path).unwrap();
@@ -2632,7 +2662,7 @@ fn a_reader_refuses_a_newer_authority_schema_without_rewriting_history() {
         connection
             .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
             .unwrap(),
-        8
+        9
     );
     let (seq, hash) = super::head(&connection).unwrap();
     assert_eq!(Anchor { seq, hash }, head);
