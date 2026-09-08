@@ -10,6 +10,13 @@ The component checkboxes below are not production-readiness claims. The assemble
 execution path failed review despite its passing unit tests. Follow this order
 before expanding features:
 
+Next activation implementation contract: [operator-activation.md](docs/specs/operator-activation.md).
+Review and explicit confirmation must bind fresh account evidence to the existing
+runtime's authority; initial consent and kill release stay separate operations.
+PR #82 (ES36) has green exact-head CI and separate automated review at
+`7c6d43ea`; its private update job was skipped. It remains unmerged under the
+publication approval hold. This is not an account activation or live gate.
+
 1. **Baseline:** repositories moved to `oppenxyz` with private visibility and
    history preserved; local remotes updated. PR #40 merged as `df4fdbd` after
    every CI job passed and a separate automated review found no blockers.
