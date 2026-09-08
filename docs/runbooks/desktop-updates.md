@@ -1,14 +1,14 @@
-# Private desktop update channel
+# Signed desktop update channel
 
-Owner-approved decisions UP1–UP4. First target: Apple Silicon macOS, private
-`oppenxyz/oppen` releases, personal builds without Apple notarization.
+Owner-approved decisions UP1–UP4 and PUB1–PUB3. First target: Apple Silicon macOS,
+public `oppenxyz/oppen` releases, personal builds without Apple notarization.
 
 ## Everyday use
 
 Merge to main. The existing `ci` workflow must pass Rust formatting, Clippy,
 workspace tests, dependency checks and frontend checks before its release job
 runs. That job builds `aarch64-apple-darwin`, assigns version `0.1.<CI run number>`,
-signs the updater archive and publishes `desktop-v<version>` in the same private
+signs the updater archive and publishes `desktop-v<version>` in the same public
 repository. Version numbers can have gaps because pull requests also run CI.
 
 The installed app checks at launch and hourly while open. It reads the current
@@ -24,7 +24,11 @@ orders or close positions. Background checking/downloading never restarts the ap
 
 ## Signing and bootstrap
 
-`TAURI_SIGNING_PRIVATE_KEY` is an encrypted Actions repository secret. A private
+`TAURI_SIGNING_PRIVATE_KEY` belongs only to the encrypted `desktop-release`
+environment, whose branch policy permits `main` and no tags. The release job
+declares that environment; other branches cannot obtain its key. Keep no
+repository-wide duplicate after migration. See the migration and verification
+steps in [repository security](repository-security.md). A private
 local backup is kept outside the repository in `~/.oppen/release-signing/`, with
 owner-only directory/file permissions. Keep that backup secure: losing the key
 prevents delivering updates to already installed clients. The public key lives
@@ -37,9 +41,9 @@ the application bundle is replaced. Keychain entries, gateway data directories
 and WebKit preferences are not copied, deleted or migrated by the installer.
 
 macOS code signing is ad-hoc (`-`). Tauri's update signature is mandatory but is
-not an Apple Developer ID signature. General public distribution requires a
-Developer ID certificate and notarization; neither is configured for this
-personal channel. The initial downloaded bundle may need explicit macOS Open
+not an Apple Developer ID signature. Broad macOS distribution with normal
+Gatekeeper trust remains gated on Developer ID signing and notarization;
+neither is configured for this personal channel. The initial downloaded bundle may need explicit macOS Open
 approval. Never remove quarantine recursively from unrelated files.
 
 ## Failure and recovery
@@ -59,7 +63,7 @@ approval. Never remove quarantine recursively from unrelated files.
   and reinstall a verified release bundle if necessary. Tauri handles bundle
   replacement; this is not a database rollback mechanism.
 - Roll forward with a corrective main commit. Do not downgrade across ledger
-  reader barriers (currently V6). Restoring an older app does not downgrade data.
+  reader barriers (currently V14). Restoring an older app does not downgrade data.
 
 ## Validation
 

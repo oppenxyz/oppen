@@ -1,0 +1,16 @@
+# Review routing. This is not independent approval: the sole maintainer cannot
+# approve their own PR. See docs/runbooks/repository-security.md.
+* @gkssxf
+
+# Release, signing, authority and licensing changes need explicit owner attention.
+/.github/ @gkssxf
+/scripts/desktop-release.py @gkssxf
+/apps/desktop/src-tauri/ @gkssxf
+/crates/oppen-hl/src/signing/ @gkssxf
+/crates/oppen-core/src/guardrail/ @gkssxf
+/crates/oppen-core/src/ledger/ @gkssxf
+/crates/oppen-mcp/src/ @gkssxf
+/LICENSE @gkssxf
+/apps/desktop/LICENSE @gkssxf
+/CLA.md @gkssxf
+/SECURITY.md @gkssxf

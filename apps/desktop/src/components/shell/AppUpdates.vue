@@ -60,7 +60,7 @@ onUnmounted(() => clearInterval(timer));
     <p v-else-if="busy" role="status">{{ label }}</p>
     <p v-if="error" role="alert">{{ error }}</p>
     <p v-if="!inTauri()">Updates are available in the installed app.</p>
-    <p>Updates download automatically from the private Oppen release channel using your GitHub login. Installation waits for your confirmation.</p>
+    <p>Updates download automatically from the official Oppen release channel using your GitHub login. Installation waits for your confirmation.</p>
     <div v-if="confirming" class="confirm" role="group" aria-label="Confirm restart">
       <p>Restarting interrupts this console and its market feeds. It does not cancel orders or close positions. Confirm when you are ready to restart.</p>
       <button ref="keepRunning" :disabled="phase === 'installing'" @click="cancelRestart">Keep running</button>

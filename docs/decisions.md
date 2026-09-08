@@ -1356,3 +1356,11 @@ the depth measurement problem in §14, and whether the sub-account owner rule
 | ID | Decision | Rationale |
 |---|---|---|
 | UI6 | Yellow only on changed digits in live numeric readouts; brief return to underlying ink. | Owner explicitly requested digit-level change highlighting as a general UX guide. The [design guide](design/README.md#live-numeric-changes) specifies comparison, timing and initial-read behavior. U3 candle geometry/directional colors remain intact. Runtime rollout is separate from recording this rule. |
+
+### Public repository safeguards — owner requested, 8 September 2026
+
+| ID | Decision | Rationale |
+|---|---|---|
+| PUB1 | Publish `oppenxyz/oppen`; keep `oppenxyz/oppen-website` private. Preserve the Apache-2.0 core / Commercial Source desktop boundary. | Owner explicitly authorized publication to restore standard hosted Actions. Supersedes the private-repository assumption in UP1/UP3 and the Q4 source-publication timing in L6. Releases and history are public; GitHub login behavior in the current updater stays unchanged. License texts are not amended and counsel review remains open. |
+| PUB2 | Enforce main PR/check/conversation gates for administrators, full action SHA pinning and an action allowlist, and approval for all external fork workflows. | Spec #1 and owner's hardening request. Preserve the existing CI and CLA path, narrow privileged comment triggers and remove unused status writes. One maintainer cannot independently approve their own PR: CODEOWNERS routes review, while a mandatory second-person approval remains contingent on appointing another maintainer. Private vulnerability reporting and dependency/secret alerts complete the repository controls. |
+| PUB3 | Move the existing updater key from repository scope to a `desktop-release` environment allowing only main; preserve automatic releases after passing CI. | Spec #1 and UP1–UP4. Narrow credential availability without rotating client trust or adding a new service. The workflow declares the environment; remove the repository duplicate during the documented migration. No manual release approval or trading activation is introduced. |
