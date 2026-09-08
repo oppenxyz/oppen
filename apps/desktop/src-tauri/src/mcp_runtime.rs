@@ -262,10 +262,8 @@ impl OwnedMcp {
     ) -> Result<Self, String>
     where
         S: ReconcileSource + Send + 'static,
-        F: FnOnce() -> Result<
-                (WsPool, tokio::sync::mpsc::Receiver<oppen_hl::ws::WsEvent>),
-                oppen_hl::ws::PoolError,
-            > + Send
+        F: FnOnce() -> Result<(WsPool, oppen_hl::ws::EventReceiver), oppen_hl::ws::PoolError>
+            + Send
             + 'static,
     {
         let (ready, observing) = oneshot::channel();
@@ -374,10 +372,7 @@ async fn run<S, F>(
 ) -> Result<(), String>
 where
     S: ReconcileSource + Send + 'static,
-    F: FnOnce() -> Result<
-        (WsPool, tokio::sync::mpsc::Receiver<oppen_hl::ws::WsEvent>),
-        oppen_hl::ws::PoolError,
-    >,
+    F: FnOnce() -> Result<(WsPool, oppen_hl::ws::EventReceiver), oppen_hl::ws::PoolError>,
 {
     let bound = BoundServer::bind(port, &prepared.gateway, &prepared.pairings)
         .await
@@ -425,9 +420,13 @@ where
             .map_err(|error| error.to_string())?;
             pump.run_until_shutdown(&mut events, quiescing, stopping)
                 .await;
+            drop(pump);
+            drop(pump_pool);
+            let completion = events.complete().map_err(|error| error.to_string());
             if let Some(failure) = feed.state().failure {
                 return Err(failure);
             }
+            completion?;
             Ok::<(), String>(())
         })
     });
@@ -538,6 +537,7 @@ where
     if let Err(error) = pool.shutdown_and_drain().await {
         failure.get_or_insert(error.to_string());
     }
+    drop(pool);
     // No socket producer can publish after this point. Close admission to the
     // event receiver, then consume every queued event before releasing journals.
     let _ = pump_stop.send(());
@@ -1292,50 +1292,18 @@ mod tests {
         fixture.prepare().unwrap();
     }
 
-    fn reconcile_controller_feed(prepared: &Prepared) {
-        struct NoSubscriptions;
-        impl oppen_core::feed::pump::FeedSubscriber for NoSubscriptions {
-            fn subscribe(&self, _: Subscription) -> Result<(), oppen_hl::ws::PoolError> {
-                panic!("seed fixture must not subscribe");
-            }
-            fn unsubscribe(&self, _: &Subscription) -> Result<(), oppen_hl::ws::PoolError> {
-                panic!("seed fixture has no subscriptions");
-            }
-        }
+    fn reconcile_controller_feed(
+        prepared: &Prepared,
+    ) -> crate::operator_approvals::tests::LiveFeed {
         let feed = prepared.engine.feed();
         assert!(Arc::ptr_eq(&feed, &prepared.feed));
-        if feed.state().reconciled {
-            return;
-        }
-        // Run genuine startup reconciliation without nesting the test's runtime.
-        std::thread::scope(|scope| {
-            scope
-                .spawn(|| {
-                    tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .unwrap()
-                        .block_on(async {
-                            let pump = FeedPump::new(
-                                &feed,
-                                &prepared.ledger,
-                                prepared.binding.account,
-                                FixtureSource,
-                                &prepared.alerts,
-                                &prepared.quotes,
-                                &NoSubscriptions,
-                            )
-                            .unwrap();
-                            let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-                            drop(tx);
-                            pump.run(&mut rx).await;
-                        });
-                })
-                .join()
-                .unwrap();
-        });
-        assert!(feed.state().reconciled);
-        assert!(feed.state().failure.is_none());
+        crate::operator_approvals::tests::LiveFeed::start(
+            feed,
+            prepared.ledger.clone(),
+            prepared.binding.account,
+            prepared.alerts.clone(),
+            prepared.quotes.clone(),
+        )
     }
 
     fn controller_proposal(prepared: &Prepared) -> String {
@@ -1344,7 +1312,7 @@ mod tests {
             RestingExposure,
         };
         use oppen_hl::wire::{Cloid, Grouping, Tif};
-        reconcile_controller_feed(prepared);
+        let _feed = reconcile_controller_feed(prepared);
         let stamp = prepared.engine.feed().stamp();
         let at = u64::try_from(now_ms()).unwrap();
         let engine = &prepared.engine;
@@ -1767,7 +1735,6 @@ mod tests {
             PositionSnapshot, Refusal, RestingExposure,
         };
         use oppen_hl::wire::{Cloid, Grouping, Tpsl};
-        reconcile_controller_feed(prepared);
         let stamp = prepared.engine.feed().stamp();
         let at = u64::try_from(now_ms()).unwrap();
         let intent = OrderIntent {
@@ -1914,6 +1881,7 @@ mod tests {
         let mut prepared =
             Prepared::open(fixture.dir.path(), fixture.binding.clone(), keys).unwrap();
         let order_id = controller_proposal(&prepared);
+        let seed_feed = reconcile_controller_feed(&prepared);
         let target = accept_protective_order(&prepared, &venue).await;
         let at = u64::try_from(now_ms()).unwrap();
         *venue.orders.lock().unwrap() = vec![serde_json::json!({
@@ -1950,6 +1918,7 @@ mod tests {
         let feed = prepared.feed.clone();
         let port = venue.port;
         prepared.gateway = prepared.gateway.with_loopback_fixture(port).unwrap();
+        drop(seed_feed);
         let mut owned = OwnedMcp::launch(
             prepared,
             0,

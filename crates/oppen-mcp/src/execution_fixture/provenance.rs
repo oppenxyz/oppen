@@ -28,14 +28,202 @@ fn assert_pending(runtime: &Runtime, cloid: &Cloid) {
     assert!(evidence(runtime, EventKind::SubmissionResolved).is_empty());
 }
 
-/// Lifecycle events are injected here; the HL socket regression owns detection
-/// of silence before a buffered frame. This test owns the downstream recovery.
 #[tokio::test]
-async fn persistent_pump_recovers_gap_loss_before_reopening_order_admission() {
+async fn queued_account_fill_blocks_fresh_order_before_pump_applies_loss() {
     use oppen_core::guardrail::PilotMetric;
     use oppen_core::ledger::{PilotJournal, PilotStop};
-    use oppen_hl::ws::{ConnectionId, Disconnected, GapWindow, Reconnected, WsEvent};
-    use tokio::sync::{mpsc, oneshot};
+    use oppen_hl::ws::WsEvent;
+    use tokio::sync::oneshot;
+    use tokio::time::timeout;
+
+    let dir = tempfile::tempdir().unwrap();
+    let venue = Venue::start().await;
+    let keys = Arc::new(FixtureKeys::default());
+    let runtime = Arc::new(Runtime::open(dir.path(), venue.port(), keys).await);
+    let startup = venue.hold_info("userFillsByTime");
+    let (events, mut receiver) = oppen_hl::ws::event_channel(8);
+    let (quiesce, quiescing) = oneshot::channel();
+    let (producers_done, producers) = oneshot::channel();
+    let pumping = runtime.clone();
+    // Retain the actual pump future without spawning it. Polling below is
+    // explicit, so the queued account event cannot race consumer scheduling.
+    let mut pump = Box::pin(async move {
+        let inner = &pumping.gateway.inner;
+        FeedPump::new(
+            &inner.feed,
+            &pumping.ledger,
+            pumping.account,
+            HttpSource(InfoClient::loopback_fixture(pumping.port).unwrap()),
+            &inner.alerts,
+            &inner.quotes,
+            &NoSocket,
+        )
+        .unwrap()
+        .run_until_shutdown(&mut receiver, quiescing, producers)
+        .await;
+        receiver.complete().unwrap();
+    });
+    tokio::select! {
+        () = &mut pump => panic!("pump exited during startup"),
+        result = timeout(Duration::from_secs(3), async {
+            startup.entered.notified().await;
+            startup.release.notify_one();
+            while !runtime.gateway.inner.feed.state().reconciled {
+                tokio::task::yield_now().await;
+            }
+        }) => result.expect("persistent pump startup did not reconcile"),
+    }
+    runtime
+        .gateway
+        .inner
+        .engine
+        .operator_release_kill(&KillScope::Global, now_ms())
+        .unwrap();
+    runtime.acknowledge_policy();
+    PilotJournal::new(runtime.registry.clone())
+        .authorize(AgentId::new("fixture-agent"), runtime.account, now_ms())
+        .unwrap();
+    let cloid = Cloid::from_bytes([188; 16]);
+    let placed = tokio::select! {
+        () = &mut pump => panic!("pump exited during seed order"),
+        placed = runtime.call("place", place(cloid.as_str(), "0.15")) => placed,
+    };
+    assert_eq!(placed["status"], "resting", "{placed}");
+    let bound = Binding {
+        agent: AgentId::new("fixture-agent"),
+        account: runtime.account,
+    };
+    tokio::select! {
+        () = &mut pump => panic!("pump exited during seed settlement"),
+        permit = runtime.gateway.reserve_submission(&bound) => drop(permit.unwrap()),
+    }
+    assert!(
+        runtime
+            .gateway
+            .inner
+            .submissions
+            .state(runtime.account)
+            .unwrap()
+            .pending
+            .is_none()
+    );
+    let posts_before = venue.submissions();
+    let signed_before = evidence(&runtime, EventKind::SubmissionSigned);
+    let accepted_before = evidence(&runtime, EventKind::SubmissionAccepted);
+
+    // The consumer is now suspended, not disconnected. The next request has
+    // fresh REST observations and a fresh clearance, not an aged prior order.
+    venue.fill_with_fee(cloid.as_str(), Decimal::new(5, 2), Decimal::from(5));
+    let fills = runtime
+        .gateway
+        .inner
+        .info
+        .user_fills_by_time(runtime.account, 0, None)
+        .await
+        .unwrap();
+    assert_eq!(fills.len(), 1);
+    events
+        .send(
+            WsEvent::UserFills {
+                user: runtime.account,
+                is_snapshot: false,
+                fills,
+            },
+            now_ms(),
+        )
+        .await
+        .unwrap();
+    let queued_feed = runtime.gateway.inner.feed.state();
+    let durable_before = evidence(&runtime, EventKind::Fill);
+    let budget_before = PilotJournal::new(runtime.registry.clone())
+        .state(runtime.account)
+        .unwrap()
+        .unwrap();
+    let reply = runtime
+        .call(
+            "place",
+            place(Cloid::from_bytes([189; 16]).as_str(), "0.10"),
+        )
+        .await;
+    let posts_while_queued = venue.submissions();
+    let signed_while_queued = evidence(&runtime, EventKind::SubmissionSigned);
+    let accepted_while_queued = evidence(&runtime, EventKind::SubmissionAccepted);
+    let durable_while_queued = evidence(&runtime, EventKind::Fill);
+
+    // Resume this same pump only for ordered quiescence and event drain.
+    let (ack, acknowledged) = oneshot::channel();
+    quiesce.send(ack).unwrap();
+    tokio::select! {
+        () = &mut pump => panic!("pump exited before producer completion"),
+        result = timeout(Duration::from_secs(3), acknowledged) => result.unwrap().unwrap(),
+    }
+    drop(events);
+    producers_done.send(()).unwrap();
+    timeout(Duration::from_secs(3), &mut pump).await.unwrap();
+    drop(pump);
+    let drained = evidence(&runtime, EventKind::Fill);
+    let budget_after = PilotJournal::new(runtime.registry.clone())
+        .state(runtime.account)
+        .unwrap()
+        .unwrap();
+    let feed = runtime.gateway.inner.feed.state();
+    let runtime = Arc::try_unwrap(runtime)
+        .ok()
+        .expect("drained pump retains runtime");
+    runtime.shutdown().await;
+    venue.shutdown().await;
+
+    assert!(
+        !queued_feed.reconciled,
+        "queued account delivery must inhibit admission"
+    );
+    assert!(durable_before.is_empty());
+    assert!(
+        durable_while_queued.is_empty(),
+        "the consumer ran during the order probe"
+    );
+    assert!(budget_before.halt.is_none());
+    assert_eq!(drained.len(), 1);
+    assert_eq!(
+        drained[0].payload.as_ref().unwrap()["cloid"],
+        cloid.as_str()
+    );
+    assert_eq!(
+        budget_after.halt,
+        Some(PilotStop::Exhausted {
+            metric: PilotMetric::RealizedLoss,
+            observed_usd: Decimal::from(5),
+            limit_usd: Decimal::from(5),
+        })
+    );
+    assert!(feed.failure.is_none(), "{feed:?}");
+    assert_eq!(reply["status"], "rejected", "{reply}");
+    assert_eq!(reply["code"], "guardrail_reject", "{reply}");
+    assert_eq!(
+        reply["refusal"]["unevaluable"], "unreconciled_account",
+        "{reply}"
+    );
+    assert_eq!(
+        posts_while_queued, posts_before,
+        "fresh order posted before queued fill ingestion"
+    );
+    assert_eq!(signed_while_queued, signed_before);
+    assert_eq!(accepted_while_queued, accepted_before);
+}
+
+#[tokio::test]
+async fn account_delivery_ack_does_not_revive_pre_ingress_clearance() {
+    account_delivery_lifetime(false).await;
+}
+
+#[tokio::test]
+async fn abandoned_account_delivery_refuses_fresh_order() {
+    account_delivery_lifetime(true).await;
+}
+
+async fn account_delivery_lifetime(abandon: bool) {
+    use oppen_hl::ws::WsEvent;
+    use tokio::sync::oneshot;
     use tokio::time::timeout;
 
     let dir = tempfile::tempdir().unwrap();
@@ -43,7 +231,207 @@ async fn persistent_pump_recovers_gap_loss_before_reopening_order_admission() {
     let keys = Arc::new(FixtureKeys::default());
     let runtime = Arc::new(Runtime::open(dir.path(), venue.port(), keys.clone()).await);
     let startup = venue.hold_info("userFillsByTime");
-    let (events, mut receiver) = mpsc::channel(8);
+    let (events, mut receiver) = oppen_hl::ws::event_channel(8);
+    let (quiesce, quiescing) = oneshot::channel();
+    let (producers_done, producers) = oneshot::channel();
+    let pumping = runtime.clone();
+    let mut pump = Box::pin(async move {
+        let inner = &pumping.gateway.inner;
+        FeedPump::new(
+            &inner.feed,
+            &pumping.ledger,
+            pumping.account,
+            HttpSource(InfoClient::loopback_fixture(pumping.port).unwrap()),
+            &inner.alerts,
+            &inner.quotes,
+            &NoSocket,
+        )
+        .unwrap()
+        .run_until_shutdown(&mut receiver, quiescing, producers)
+        .await;
+        receiver.complete().unwrap();
+    });
+    tokio::select! {
+        () = &mut pump => panic!("pump exited during startup"),
+        result = timeout(Duration::from_secs(3), async {
+            startup.entered.notified().await;
+            startup.release.notify_one();
+            while !runtime.gateway.inner.feed.state().reconciled {
+                tokio::task::yield_now().await;
+            }
+        }) => result.expect("persistent pump startup did not reconcile"),
+    }
+    runtime
+        .gateway
+        .inner
+        .engine
+        .operator_release_kill(&KillScope::Global, now_ms())
+        .unwrap();
+    runtime.acknowledge_policy();
+    let seed = Cloid::from_bytes([190; 16]);
+    let placed = runtime.call("place", place(seed.as_str(), "0.15")).await;
+    assert_eq!(placed["status"], "resting", "{placed}");
+    let bound = Binding {
+        agent: AgentId::new("fixture-agent"),
+        account: runtime.account,
+    };
+    drop(runtime.gateway.reserve_submission(&bound).await.unwrap());
+    let signed_before = evidence(&runtime, EventKind::SubmissionSigned);
+    let accepted_before = evidence(&runtime, EventKind::SubmissionAccepted);
+    let posts_before = venue.submissions();
+    let cloid = Cloid::from_bytes([191; 16]);
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let (release, wait) = std::sync::mpsc::channel();
+    let order = if abandon {
+        drop(wait);
+        None
+    } else {
+        *keys.read_gate.lock().unwrap() = Some(KeyReadGate {
+            entered: entered.clone(),
+            release: wait,
+        });
+        let calling = runtime.clone();
+        let arguments = place(cloid.as_str(), "0.10");
+        let order = tokio::spawn(async move { calling.call("place", arguments).await });
+        timeout(Duration::from_secs(3), entered.notified())
+            .await
+            .unwrap();
+        Some(order)
+    };
+    // Zero fee: a budget stop must not mask the old-stamp rejection. The fill
+    // transfers resting size to position size without changing total exposure.
+    venue.fill(seed.as_str(), Decimal::new(5, 2));
+    let fills = runtime
+        .gateway
+        .inner
+        .info
+        .user_fills_by_time(runtime.account, 0, None)
+        .await
+        .unwrap();
+    events
+        .send(
+            WsEvent::UserFills {
+                user: runtime.account,
+                is_snapshot: false,
+                fills,
+            },
+            now_ms(),
+        )
+        .await
+        .unwrap();
+    let queued = runtime.gateway.inner.feed.state();
+    let (reply, observed) = if let Some(order) = order {
+        tokio::select! {
+            () = &mut pump => panic!("pump exited before account acknowledgment"),
+            result = timeout(Duration::from_secs(3), async {
+                while !runtime.gateway.inner.feed.state().reconciled {
+                    tokio::task::yield_now().await;
+                }
+            }) => result.expect("account delivery did not finish"),
+        }
+        let observed = runtime.gateway.inner.feed.state();
+        let recorded = evidence(&runtime, EventKind::Fill);
+        assert_eq!(
+            recorded.len(),
+            1,
+            "acknowledgment must follow durable fill application"
+        );
+        release.send(()).unwrap();
+        let reply = timeout(Duration::from_secs(5), order)
+            .await
+            .unwrap()
+            .unwrap();
+        let (ack, acknowledged) = oneshot::channel();
+        quiesce.send(ack).unwrap();
+        tokio::select! {
+            () = &mut pump => panic!("pump exited before producer completion"),
+            result = timeout(Duration::from_secs(3), acknowledged) => result.unwrap().unwrap(),
+        }
+        drop(events);
+        producers_done.send(()).unwrap();
+        timeout(Duration::from_secs(3), &mut pump).await.unwrap();
+        drop(pump);
+        (reply, observed)
+    } else {
+        // Deliberate receiver abandonment, while no pump operation is active.
+        // Unlike normal shutdown this must permanently withdraw admission.
+        drop(pump);
+        drop(events);
+        drop(quiesce);
+        drop(producers_done);
+        let observed = runtime.gateway.inner.feed.state();
+        let reply = runtime.call("place", place(cloid.as_str(), "0.10")).await;
+        (reply, observed)
+    };
+    let signed = evidence(&runtime, EventKind::SubmissionSigned);
+    let accepted = evidence(&runtime, EventKind::SubmissionAccepted);
+    let posts = venue.submissions();
+    let starts: Vec<_> = evidence(&runtime, EventKind::SubmissionStarted)
+        .into_iter()
+        .filter(|event| event.payload.as_ref().unwrap()["cloid"] == cloid.as_str())
+        .collect();
+    let resolutions = evidence(&runtime, EventKind::SubmissionResolved);
+    let pending = runtime
+        .gateway
+        .inner
+        .submissions
+        .state(runtime.account)
+        .unwrap()
+        .pending;
+    let runtime = Arc::try_unwrap(runtime)
+        .ok()
+        .expect("account delivery retains runtime");
+    runtime.shutdown().await;
+    venue.shutdown().await;
+
+    assert!(!queued.reconciled);
+    assert_eq!(reply["status"], "rejected", "{reply}");
+    if abandon {
+        assert!(!observed.reconciled);
+        assert_eq!(
+            reply["refusal"]["unevaluable"], "unreconciled_account",
+            "{reply}"
+        );
+        assert!(starts.is_empty());
+    } else {
+        assert!(observed.reconciled);
+        assert_eq!(reply["refusal"]["unevaluable"], "feed_admission", "{reply}");
+        assert_eq!(starts.len(), 1);
+        let resolved: Vec<_> = resolutions
+            .iter()
+            .filter(|event| {
+                let payload = event.payload.as_ref().unwrap();
+                payload["start_seq"] == starts[0].seq && payload["start_hash"] == starts[0].hash
+            })
+            .collect();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(
+            resolved[0].payload.as_ref().unwrap()["outcome"]["resolution"],
+            "not_sent"
+        );
+    }
+    assert_eq!(signed, signed_before);
+    assert_eq!(accepted, accepted_before);
+    assert_eq!(posts, posts_before);
+    assert!(pending.is_none());
+}
+
+/// Lifecycle events are injected here; the HL socket regression owns detection
+/// of silence before a buffered frame. This test owns the downstream recovery.
+#[tokio::test]
+async fn persistent_pump_recovers_gap_loss_before_reopening_order_admission() {
+    use oppen_core::guardrail::PilotMetric;
+    use oppen_core::ledger::{PilotJournal, PilotStop};
+    use oppen_hl::ws::{ConnectionId, Disconnected, GapWindow, Reconnected, WsEvent};
+    use tokio::sync::oneshot;
+    use tokio::time::timeout;
+
+    let dir = tempfile::tempdir().unwrap();
+    let venue = Venue::start().await;
+    let keys = Arc::new(FixtureKeys::default());
+    let runtime = Arc::new(Runtime::open(dir.path(), venue.port(), keys.clone()).await);
+    let startup = venue.hold_info("userFillsByTime");
+    let (events, mut receiver) = oppen_hl::ws::event_channel(8);
     let (quiesce, quiescing) = oneshot::channel();
     let (producers_done, producers) = oneshot::channel();
     let pumping = runtime.clone();
@@ -61,6 +449,7 @@ async fn persistent_pump_recovers_gap_loss_before_reopening_order_admission() {
         .unwrap()
         .run_until_shutdown(&mut receiver, quiescing, producers)
         .await;
+        receiver.complete().unwrap();
     });
     timeout(Duration::from_secs(3), startup.entered.notified())
         .await
@@ -103,24 +492,30 @@ async fn persistent_pump_recovers_gap_loss_before_reopening_order_admission() {
     };
     let dropped_at = now_ms();
     events
-        .send(WsEvent::Disconnected(Box::new(Disconnected {
-            connection: ConnectionId::new(0),
-            at_ms: dropped_at,
-            last_message_ms: Some(dropped_at),
-            subscriptions: vec![subscription.clone()],
-            unacked: Vec::new(),
-            reason: "synthetic buffered-frame silence".into(),
-        })))
+        .send(
+            WsEvent::Disconnected(Box::new(Disconnected {
+                connection: ConnectionId::new(0),
+                at_ms: dropped_at,
+                last_message_ms: Some(dropped_at),
+                subscriptions: vec![subscription.clone()],
+                unacked: Vec::new(),
+                reason: "synthetic buffered-frame silence".into(),
+            })),
+            dropped_at,
+        )
         .await
         .unwrap();
     let tick_at = dropped_at + 1;
     events
-        .send(WsEvent::Bbo {
-            coin: "TEST".into(),
-            venue_time_ms: tick_at,
-            bid: None,
-            ask: None,
-        })
+        .send(
+            WsEvent::Bbo {
+                coin: "TEST".into(),
+                venue_time_ms: tick_at,
+                bid: None,
+                ask: None,
+            },
+            tick_at,
+        )
         .await
         .unwrap();
     timeout(Duration::from_secs(3), async {
@@ -144,16 +539,19 @@ async fn persistent_pump_recovers_gap_loss_before_reopening_order_admission() {
     let recovery = venue.hold_info("userFillsByTime");
     let resumed_at = now_ms().max(tick_at);
     events
-        .send(WsEvent::Reconnected(Box::new(Reconnected {
-            connection: ConnectionId::new(0),
-            at_ms: resumed_at,
-            gap: GapWindow {
-                start_ms: dropped_at,
-                end_ms: resumed_at,
-            },
-            resubscribed: vec![subscription.clone()],
-            attempts: 1,
-        })))
+        .send(
+            WsEvent::Reconnected(Box::new(Reconnected {
+                connection: ConnectionId::new(0),
+                at_ms: resumed_at,
+                gap: GapWindow {
+                    start_ms: dropped_at,
+                    end_ms: resumed_at,
+                },
+                resubscribed: vec![subscription.clone()],
+                attempts: 1,
+            })),
+            resumed_at,
+        )
         .await
         .unwrap();
     timeout(Duration::from_secs(3), recovery.entered.notified())

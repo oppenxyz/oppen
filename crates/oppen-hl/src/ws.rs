@@ -69,6 +69,12 @@ use tokio::time::MissedTickBehavior;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 
+mod ingress;
+pub use ingress::{
+    EventReceiver, EventSendError, EventSender, FrameEnvelope, IngressAdmissionGuard, IngressError,
+    IngressMonitor, IngressObservation, IngressStatus, event_channel,
+};
+
 use crate::types::{AssetCtx, Candle, Fill, L2Book, Level, OrderStatusEntry, Side};
 use crate::{Address, Network};
 
@@ -1414,7 +1420,7 @@ pub struct WsPool {
     #[cfg(feature = "test-support")]
     fixture_url: Option<String>,
     inner: Arc<Mutex<PoolInner>>,
-    events: mpsc::Sender<WsEvent>,
+    events: EventSender,
     /// Captured at construction so [`WsPool::subscribe`] can stay synchronous
     /// and callable from a plain thread — a Tauri command thread, say — without
     /// `tokio::spawn`'s "no reactor running" panic.
@@ -1445,9 +1451,9 @@ impl WsPool {
     /// discovering that at the first subscribe would mean panicking on the
     /// caller's thread. Returns [`PoolError::NoRuntime`] when called from
     /// outside a runtime.
-    pub fn new(cfg: WsPoolConfig) -> Result<(Self, mpsc::Receiver<WsEvent>), PoolError> {
+    pub fn new(cfg: WsPoolConfig) -> Result<(Self, EventReceiver), PoolError> {
         let handle = tokio::runtime::Handle::try_current().map_err(|_| PoolError::NoRuntime)?;
-        let (tx, rx) = mpsc::channel(EVENT_BUFFER);
+        let (tx, rx) = event_channel(EVENT_BUFFER);
         let inner = PoolInner {
             registry: SubscriptionRegistry::new(cfg.max_connections, cfg.max_subs_per_connection),
             conns: Vec::new(),
@@ -1469,7 +1475,7 @@ impl WsPool {
 
     /// Loopback-only pool for cross-crate ownership and shutdown tests.
     #[cfg(feature = "test-support")]
-    pub fn loopback_fixture(port: u16) -> Result<(Self, mpsc::Receiver<WsEvent>), PoolError> {
+    pub fn loopback_fixture(port: u16) -> Result<(Self, EventReceiver), PoolError> {
         let (mut pool, events) = Self::new(WsPoolConfig::default())?;
         pool.fixture_url = Some(format!("ws://127.0.0.1:{port}/ws"));
         Ok((pool, events))
@@ -1846,7 +1852,7 @@ async fn run_connection(
     url: String,
     cfg: WsPoolConfig,
     inner: Arc<Mutex<PoolInner>>,
-    events: mpsc::Sender<WsEvent>,
+    events: EventSender,
     mut cmds: mpsc::UnboundedReceiver<ConnCommand>,
 ) {
     let mut jitter = Jitter::from_entropy(id.0 as u64);
@@ -1942,7 +1948,7 @@ async fn apply(
     id: ConnectionId,
     cfg: &WsPoolConfig,
     inner: &Arc<Mutex<PoolInner>>,
-    events: &mpsc::Sender<WsEvent>,
+    events: &EventSender,
     resubscribed: &[Subscription],
 ) -> bool {
     match next_step(state, turn) {
@@ -1958,7 +1964,7 @@ async fn apply(
                 resubscribed: resubscribed.to_vec(),
                 attempts,
             }));
-            events.send(event).await.is_ok()
+            events.send(event, gap.end_ms).await.is_ok()
         }
     }
 }
@@ -1973,7 +1979,7 @@ async fn report_disconnect(
     id: ConnectionId,
     cfg: &WsPoolConfig,
     inner: &Arc<Mutex<PoolInner>>,
-    events: &mpsc::Sender<WsEvent>,
+    events: &EventSender,
     reason: String,
     strike: bool,
 ) -> bool {
@@ -2005,7 +2011,7 @@ async fn report_disconnect(
         unacked,
         reason,
     }));
-    if events.send(event).await.is_err() {
+    if events.send(event, at).await.is_err() {
         return false;
     }
     if let Some((subscription, strikes)) = quarantined {
@@ -2020,7 +2026,7 @@ async fn report_disconnect(
             subscription,
             strikes,
         };
-        return events.send(event).await.is_ok();
+        return events.send(event, at).await.is_ok();
     }
     true
 }
@@ -2029,7 +2035,7 @@ async fn session(
     id: ConnectionId,
     stream: &mut WsStream,
     cmds: &mut mpsc::UnboundedReceiver<ConnCommand>,
-    events: &mpsc::Sender<WsEvent>,
+    events: &EventSender,
     inner: &Arc<Mutex<PoolInner>>,
     cfg: &WsPoolConfig,
 ) -> SessionEnd {
@@ -2114,7 +2120,7 @@ async fn handle_text(
     id: ConnectionId,
     text: &str,
     inner: &Arc<Mutex<PoolInner>>,
-    events: &mpsc::Sender<WsEvent>,
+    events: &EventSender,
     idle_ms: u64,
 ) -> Result<bool, String> {
     let (now, order_updates_user) = {
@@ -2139,7 +2145,7 @@ async fn handle_text(
             if let Some(key) = event.subscription_key() {
                 lock(inner).registry.touch(id, &key, now);
             }
-            events.send(event).await.is_ok()
+            events.send(event, now).await.is_ok()
         }
         Ok(Incoming::Ack { key, subscribed }) => {
             if let (Some(key), true) = (key, subscribed) {
@@ -2155,10 +2161,13 @@ async fn handle_text(
         Ok(Incoming::VenueError(message)) => {
             tracing::warn!(connection = %id, message, "venue ws error");
             events
-                .send(WsEvent::VenueError {
-                    connection: id,
-                    message,
-                })
+                .send(
+                    WsEvent::VenueError {
+                        connection: id,
+                        message,
+                    },
+                    now,
+                )
                 .await
                 .is_ok()
         }
@@ -2169,11 +2178,14 @@ async fn handle_text(
             };
             tracing::warn!(connection = %id, error = %e, "dropped ws message");
             events
-                .send(WsEvent::MessageDropped {
-                    connection: id,
-                    channel,
-                    reason: e.to_string(),
-                })
+                .send(
+                    WsEvent::MessageDropped {
+                        connection: id,
+                        channel,
+                        reason: e.to_string(),
+                    },
+                    now,
+                )
                 .await
                 .is_ok()
         }
@@ -2188,6 +2200,12 @@ async fn handle_text(
 mod tests {
     use super::*;
     use rust_decimal::prelude::FromStr;
+
+    fn observed_event(frame: FrameEnvelope) -> WsEvent {
+        let event = frame.event().clone();
+        frame.acknowledge();
+        event
+    }
 
     /// Frames captured verbatim from `wss://api.hyperliquid.xyz/ws` on
     /// 2026-09-03. Checked in so parsing is pinned without a socket.
@@ -3508,10 +3526,14 @@ mod tests {
         let (pool, mut rx) = WsPool::new(WsPoolConfig::default()).unwrap();
         for _ in 0..EVENT_BUFFER {
             pool.events
-                .try_send(WsEvent::VenueError {
-                    connection: ConnectionId(0),
-                    message: "queued fixture".into(),
-                })
+                .send(
+                    WsEvent::VenueError {
+                        connection: ConnectionId(0),
+                        message: "queued fixture".into(),
+                    },
+                    now_ms(),
+                )
+                .await
                 .unwrap();
         }
         pool.subscribe_to(
@@ -3532,7 +3554,10 @@ mod tests {
             .unwrap();
         assert!(pool.health().iter().all(|feed| !feed.connected));
         for _ in 0..EVENT_BUFFER {
-            assert!(matches!(rx.try_recv(), Ok(WsEvent::VenueError { .. })));
+            assert!(matches!(
+                rx.try_recv().map(observed_event),
+                Ok(WsEvent::VenueError { .. })
+            ));
         }
         assert!(rx.try_recv().is_err(), "a writer survived drain");
         pool.shutdown_and_drain().await.unwrap();
@@ -3715,7 +3740,7 @@ mod tests {
         registry.set_connected(ConnectionId(0), true, 0);
         registry.ack(ConnectionId(0), &good.key());
         let inner = test_inner(registry);
-        let (tx, mut rx) = mpsc::channel(8);
+        let (tx, mut rx) = event_channel(8);
         let cfg = WsPoolConfig {
             quarantine_after: 1,
             ..WsPoolConfig::default()
@@ -3733,7 +3758,7 @@ mod tests {
             .await
         );
 
-        let Some(WsEvent::Disconnected(d)) = rx.recv().await else {
+        let Some(WsEvent::Disconnected(d)) = rx.recv().await.map(observed_event) else {
             panic!("expected a Disconnected");
         };
         assert_eq!(
@@ -3743,7 +3768,9 @@ mod tests {
         );
         assert_eq!(d.subscriptions, vec![good.clone(), poison.clone()]);
         assert_eq!(d.reason, "closed");
-        let Some(WsEvent::SubscriptionQuarantined { subscription, .. }) = rx.recv().await else {
+        let Some(WsEvent::SubscriptionQuarantined { subscription, .. }) =
+            rx.recv().await.map(observed_event)
+        else {
             panic!("expected a SubscriptionQuarantined");
         };
         assert_eq!(
@@ -3769,7 +3796,7 @@ mod tests {
         registry.place(sub.clone()).expect("place");
         registry.set_connected(ConnectionId(0), true, 0);
         let inner = test_inner(registry);
-        let (tx, mut rx) = mpsc::channel(8);
+        let (tx, mut rx) = event_channel(8);
         let cfg = WsPoolConfig {
             quarantine_after: 1,
             ..WsPoolConfig::default()
@@ -3786,7 +3813,10 @@ mod tests {
             )
             .await
         );
-        assert!(matches!(rx.recv().await, Some(WsEvent::Disconnected(_))));
+        assert!(matches!(
+            rx.recv().await.map(observed_event),
+            Some(WsEvent::Disconnected(_))
+        ));
         assert!(rx.try_recv().is_err(), "no quarantine without evidence");
         assert_eq!(
             lock(&inner).registry.resubscribe_set(ConnectionId(0), 0),
@@ -3804,7 +3834,7 @@ mod tests {
         registry.place(bbo.clone()).expect("place");
         registry.set_connected(ConnectionId(0), true, now_ms());
         let inner = test_inner(registry);
-        let (tx, mut rx) = mpsc::channel(8);
+        let (tx, mut rx) = event_channel(8);
         let thresholds = StalenessThresholds::default();
 
         assert!(
@@ -3820,7 +3850,10 @@ mod tests {
                 .await
                 .unwrap()
         );
-        assert!(matches!(rx.recv().await, Some(WsEvent::Bbo { .. })));
+        assert!(matches!(
+            rx.recv().await.map(observed_event),
+            Some(WsEvent::Bbo { .. })
+        ));
         let anchor = lock(&inner)
             .registry
             .connection_last_message(ConnectionId(0));
@@ -3850,7 +3883,8 @@ mod tests {
             .await
             .unwrap()
         );
-        let Some(WsEvent::MessageDropped { channel, .. }) = rx.recv().await else {
+        let Some(WsEvent::MessageDropped { channel, .. }) = rx.recv().await.map(observed_event)
+        else {
             panic!("a frame that cannot be understood must be reported, not swallowed");
         };
         assert_eq!(channel, "bbo");
@@ -3927,7 +3961,7 @@ mod tests {
 
         let bbo = Subscription::Bbo { coin: "BTC".into() };
         let inner = connected_registry(&bbo);
-        let (tx, mut rx) = mpsc::channel(8);
+        let (tx, mut rx) = event_channel(8);
         let (_cmd_tx, mut cmds) = mpsc::unbounded_channel();
         let cfg = WsPoolConfig::default();
 
@@ -3936,7 +3970,10 @@ mod tests {
             panic!("a server close is a drop, not a shutdown");
         };
         assert!(reason.starts_with("server closed"), "{reason}");
-        assert!(matches!(rx.recv().await, Some(WsEvent::Bbo { .. })));
+        assert!(matches!(
+            rx.recv().await.map(observed_event),
+            Some(WsEvent::Bbo { .. })
+        ));
         assert!(
             lock(&inner)
                 .registry
@@ -3965,7 +4002,7 @@ mod tests {
             });
             let (mut stream, _) = connect_async(format!("ws://{addr}")).await.unwrap();
             let inner = connected_registry(&Subscription::Bbo { coin: "BTC".into() });
-            let (tx, mut rx) = mpsc::channel(8);
+            let (tx, mut rx) = event_channel(8);
             let (_cmd_tx, mut cmds) = mpsc::unbounded_channel();
             let cfg = WsPoolConfig {
                 ping_interval: Duration::from_secs(60),
@@ -4008,7 +4045,8 @@ mod tests {
             };
             assert_eq!(reason, "idle for more than 100 ms");
             assert!(report_disconnect(ConnectionId(0), &cfg, &inner, &tx, reason, false).await);
-            let WsEvent::Disconnected(disconnected) = rx.recv().await.unwrap() else {
+            let WsEvent::Disconnected(disconnected) = observed_event(rx.recv().await.unwrap())
+            else {
                 panic!("the first event must report the gap");
             };
             assert_eq!(disconnected.last_message_ms, Some(last));
@@ -4028,7 +4066,7 @@ mod tests {
 
         let bbo = Subscription::Bbo { coin: "BTC".into() };
         let inner = connected_registry(&bbo);
-        let (tx, _rx) = mpsc::channel(8);
+        let (tx, _rx) = event_channel(8);
         let (_cmd_tx, mut cmds) = mpsc::unbounded_channel();
         let cfg = WsPoolConfig {
             ping_interval: Duration::from_millis(40),
@@ -4070,7 +4108,7 @@ mod tests {
                 .record_failed_session(ConnectionId(0), 1, 0)
                 .is_some()
         );
-        let (tx, _rx) = mpsc::channel(8);
+        let (tx, _rx) = event_channel(8);
         let (cmd_tx, mut cmds) = mpsc::unbounded_channel();
         let cfg = WsPoolConfig {
             ping_interval: Duration::from_millis(40),
@@ -4133,6 +4171,7 @@ mod tests {
             let Ok(Some(event)) = tokio::time::timeout(remaining, rx.recv()).await else {
                 break;
             };
+            let event = observed_event(event);
             match &event {
                 WsEvent::Bbo { bid, ask, .. } => {
                     if let (Some(b), Some(a)) = (bid, ask) {
@@ -4222,6 +4261,7 @@ mod tests {
             let Ok(Some(event)) = tokio::time::timeout(deadline, rx.recv()).await else {
                 panic!("no bbo within 20 s");
             };
+            let event = observed_event(event);
             ticked = matches!(event, WsEvent::Bbo { .. });
         }
 
@@ -4241,6 +4281,7 @@ mod tests {
             let Ok(Some(event)) = tokio::time::timeout(remaining, rx.recv()).await else {
                 break;
             };
+            let event = observed_event(event);
             match event {
                 WsEvent::Disconnected(d) => {
                     println!(

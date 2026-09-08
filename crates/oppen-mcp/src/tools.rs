@@ -131,6 +131,8 @@ struct GatewayInner {
     #[cfg(test)]
     test_registry: Option<oppen_core::ledger::RegistryJournal>,
     #[cfg(test)]
+    test_feed: Mutex<Option<tests::LiveTestFeed>>,
+    #[cfg(test)]
     _test_dir: Option<tempfile::TempDir>,
 }
 
@@ -582,6 +584,8 @@ impl Gateway {
                 _test_dir: None,
                 #[cfg(test)]
                 test_registry: None,
+                #[cfg(test)]
+                test_feed: Mutex::new(None),
             }),
         })
     }
@@ -3932,6 +3936,20 @@ mod tests {
             .expect("evaluated and durably audited")
     }
 
+    pub(super) struct LiveTestFeed {
+        events: Option<oppen_hl::ws::EventSender>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl Drop for LiveTestFeed {
+        fn drop(&mut self) {
+            self.events.take();
+            if let Some(thread) = self.thread.take() {
+                thread.join().unwrap();
+            }
+        }
+    }
+
     fn reconcile_test_feed(gateway: &Gateway, account: Address) {
         use oppen_core::feed::pump::{FeedPump, FeedSubscriber};
         use oppen_core::reconcile::ReconcileSource;
@@ -3977,45 +3995,60 @@ mod tests {
         if gateway.inner.feed.state().reconciled {
             return;
         }
-        // These helpers also run inside Tokio tests; join a separate runtime
-        // rather than nesting block_on or exposing a production readiness setter.
-        std::thread::scope(|scope| {
-            scope
-                .spawn(|| {
-                    let ledger = oppen_core::ledger::Ledger::open_at(
-                        &gateway
-                            .inner
-                            ._test_dir
-                            .as_ref()
-                            .unwrap()
-                            .path()
-                            .join("testnet.db"),
-                        Network::Testnet,
+        // Retain a live consumer independently of any surrounding Tokio test.
+        // Gateway drop closes the sender and joins actual pump completion.
+        let mut owner = gateway.inner.test_feed.lock().unwrap();
+        drop(owner.take());
+        let path = gateway
+            .inner
+            ._test_dir
+            .as_ref()
+            .unwrap()
+            .path()
+            .join("testnet.db");
+        let feed = gateway.inner.feed.clone();
+        let alerts = gateway.inner.alerts.clone();
+        let quotes = gateway.inner.quotes.clone();
+        let (events, mut receiver) = oppen_hl::ws::event_channel(1);
+        let (ready, waiting) = std::sync::mpsc::sync_channel(1);
+        let thread = std::thread::spawn(move || {
+            let ledger = oppen_core::ledger::Ledger::open_at(&path, Network::Testnet).unwrap();
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let pump = FeedPump::new(
+                        &feed,
+                        &ledger,
+                        account,
+                        EmptyVenue,
+                        &alerts,
+                        &quotes,
+                        &EmptyVenue,
                     )
                     .unwrap();
-                    tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .unwrap()
-                        .block_on(async {
-                            let pump = FeedPump::new(
-                                &gateway.inner.feed,
-                                &ledger,
-                                account,
-                                EmptyVenue,
-                                &gateway.inner.alerts,
-                                &gateway.inner.quotes,
-                                &EmptyVenue,
-                            )
-                            .unwrap();
-                            let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-                            drop(tx);
-                            pump.run(&mut rx).await;
-                        });
-                })
-                .join()
-                .unwrap();
+                    {
+                        let mut run = std::pin::pin!(pump.run(&mut receiver));
+                        tokio::select! {
+                            () = &mut run => panic!("test feed exited during startup"),
+                            () = async {
+                                while !feed.state().reconciled { tokio::task::yield_now().await; }
+                            } => {}
+                        }
+                        ready.send(()).unwrap();
+                        run.await;
+                    }
+                    receiver.complete().unwrap();
+                });
         });
+        *owner = Some(LiveTestFeed {
+            events: Some(events),
+            thread: Some(thread),
+        });
+        waiting
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
         assert!(gateway.inner.feed.state().reconciled);
     }
 

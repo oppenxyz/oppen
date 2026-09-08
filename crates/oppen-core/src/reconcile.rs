@@ -215,6 +215,8 @@ const FIRST_RUN_LOOKBACK_MS: u64 = 30 * 24 * 60 * 60 * 1_000;
 pub enum ReconcileError {
     #[error("feed session is already bound to another network or account")]
     FeedScopeMismatch,
+    #[error("previous feed ingress has not completed a clean drain")]
+    FeedIngressUnavailable,
     /// The ledger refused a read or a write.
     #[error("reconcile ledger error: {0}")]
     Ledger(#[from] LedgerError),

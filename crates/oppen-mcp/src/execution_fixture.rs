@@ -151,6 +151,31 @@ struct Runtime {
     session: String,
     account: Address,
     port: u16,
+    pump: tokio::sync::Mutex<Option<FixturePump>>,
+}
+
+struct FixturePump {
+    events: oppen_hl::ws::EventSender,
+    quiesce: tokio::sync::oneshot::Sender<tokio::sync::oneshot::Sender<()>>,
+    producers_done: tokio::sync::oneshot::Sender<()>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl FixturePump {
+    async fn stop(self) {
+        let (ack, acknowledged) = tokio::sync::oneshot::channel();
+        self.quiesce.send(ack).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), acknowledged)
+            .await
+            .unwrap()
+            .unwrap();
+        drop(self.events);
+        self.producers_done.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), self.task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
 }
 
 impl Runtime {
@@ -276,6 +301,7 @@ impl Runtime {
             session: String::new(),
             account,
             port,
+            pump: tokio::sync::Mutex::new(None),
         };
         let response = runtime.request("POST", Some(json!({
             "jsonrpc":"2.0", "id":1, "method":"initialize",
@@ -376,22 +402,64 @@ impl Runtime {
     }
 
     async fn reconcile(&self) {
+        let mut owner = self.pump.lock().await;
+        if let Some(previous) = owner.take() {
+            previous.stop().await;
+        }
         let inner = &self.gateway.inner;
-        let pump = FeedPump::new(
-            &inner.feed,
-            &self.ledger,
-            self.account,
-            HttpSource(InfoClient::loopback_fixture(self.port).unwrap()),
-            &inner.alerts,
-            &inner.quotes,
-            &NoSocket,
-        )
-        .unwrap();
-        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-        drop(tx);
-        tokio::time::timeout(Duration::from_secs(10), pump.run(&mut rx))
-            .await
+        let feed = inner.feed.clone();
+        let ledger = self.ledger.clone();
+        let alerts = inner.alerts.clone();
+        let quotes = inner.quotes.clone();
+        let account = self.account;
+        let port = self.port;
+        let (events, mut receiver) = oppen_hl::ws::event_channel(1);
+        let (quiesce, quiescing) = tokio::sync::oneshot::channel();
+        let (producers_done, producers) = tokio::sync::oneshot::channel();
+        let (started, starting) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let pump = FeedPump::new(
+                &feed,
+                &ledger,
+                account,
+                HttpSource(InfoClient::loopback_fixture(port).unwrap()),
+                &alerts,
+                &quotes,
+                &NoSocket,
+            )
             .unwrap();
+            {
+                let mut run =
+                    std::pin::pin!(pump.run_until_shutdown(&mut receiver, quiescing, producers));
+                // Publish startup only after run has bound the new ingress.
+                std::future::poll_fn(|cx| {
+                    assert!(std::future::Future::poll(run.as_mut(), cx).is_pending());
+                    std::task::Poll::Ready(())
+                })
+                .await;
+                let _ = started.send(());
+                run.await;
+            }
+            receiver.complete().unwrap();
+        });
+        *owner = Some(FixturePump {
+            events,
+            quiesce,
+            producers_done,
+            task,
+        });
+        tokio::time::timeout(Duration::from_secs(10), async {
+            starting.await.unwrap();
+            while !inner.feed.state().reconciled {
+                assert!(
+                    !owner.as_ref().unwrap().task.is_finished(),
+                    "fixture pump exited during recovery"
+                );
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("real startup reconciliation deadline");
         assert!(
             inner.feed.state().reconciled,
             "real startup reconciliation must succeed"
@@ -401,6 +469,9 @@ impl Runtime {
 
     async fn shutdown(self) {
         assert!(self.request("DELETE", None).await.status().is_success());
+        if let Some(pump) = self.pump.lock().await.take() {
+            pump.stop().await;
+        }
         let weak = Arc::downgrade(&self.ledger);
         drop(self);
         tokio::time::timeout(Duration::from_secs(5), async {

@@ -38,8 +38,8 @@
 use std::time::Duration;
 
 use oppen_hl::Address;
+use oppen_hl::ws::{EventReceiver, FrameEnvelope};
 use oppen_hl::ws::{PoolError, Subscription, WsEvent, WsPool};
-use tokio::sync::mpsc::Receiver;
 
 use crate::alert::{self, AlertStore, Fired, MarketTick};
 use crate::features::quotes::QuoteCache;
@@ -184,9 +184,10 @@ impl<'a, S: ReconcileSource, F: FeedSubscriber> FeedPump<'a, S, F> {
     /// Returns after all event senders are dropped and the queue is consumed.
     /// Pool shutdown alone does not close this stream: the pool retains a
     /// sender. Owners retaining the pool should use `run_until_shutdown`.
-    pub async fn run(&self, events: &mut Receiver<WsEvent>) {
+    pub async fn run(&self, events: &mut EventReceiver) {
         self.run_inner(events, std::future::pending(), std::future::pending())
             .await;
+        self.session.unreconciled();
     }
 
     /// Finish active work and acknowledge quiescence before pool shutdown.
@@ -200,11 +201,13 @@ impl<'a, S: ReconcileSource, F: FeedSubscriber> FeedPump<'a, S, F> {
     ///
     /// The owner must retain this run future/task through completion, even if
     /// an observer stops waiting. Do not abort it to implement shutdown.
+    /// The receiver owner calls `EventReceiver::complete` after this returns
+    /// and all physical producers (including the pool's sender) are released.
     /// Completion proves drain, not healthy application: inspect the retained
     /// `FeedSession::state().failure` before reporting the owner's outcome.
     pub async fn run_until_shutdown(
         &self,
-        events: &mut Receiver<WsEvent>,
+        events: &mut EventReceiver,
         quiesce: tokio::sync::oneshot::Receiver<tokio::sync::oneshot::Sender<()>>,
         producers_done: tokio::sync::oneshot::Receiver<()>,
     ) {
@@ -212,14 +215,19 @@ impl<'a, S: ReconcileSource, F: FeedSubscriber> FeedPump<'a, S, F> {
             let _ = producers_done.await;
         })
         .await;
+        self.session.unreconciled();
     }
 
     async fn run_inner(
         &self,
-        events: &mut Receiver<WsEvent>,
+        events: &mut EventReceiver,
         quiesce: impl std::future::Future<Output = Option<tokio::sync::oneshot::Sender<()>>>,
         producers_done: impl std::future::Future<Output = ()>,
     ) {
+        if let Err(error) = self.session.bind_ingress(events.monitor()) {
+            self.session.record_failure(error.to_string());
+            return;
+        }
         tokio::pin!(quiesce, producers_done);
         let mut retry =
             tokio::time::interval_at(tokio::time::Instant::now() + RETRY_INTERVAL, RETRY_INTERVAL);
@@ -232,7 +240,7 @@ impl<'a, S: ReconcileSource, F: FeedSubscriber> FeedPump<'a, S, F> {
             Startup,
             SyncFeeds,
             Retry,
-            Event(Option<WsEvent>),
+            Event(Option<FrameEnvelope>),
         }
         loop {
             // Only readiness selection is cancellable. Shutdown has priority,
@@ -285,7 +293,7 @@ impl<'a, S: ReconcileSource, F: FeedSubscriber> FeedPump<'a, S, F> {
                         self.reconcile().await;
                     }
                 }
-                Next::Event(Some(event)) => self.handle(&event, quiescent).await,
+                Next::Event(Some(event)) => self.handle(event, quiescent).await,
                 Next::Event(None) => {
                     if quiescent {
                         producers_done.await;
@@ -296,10 +304,10 @@ impl<'a, S: ReconcileSource, F: FeedSubscriber> FeedPump<'a, S, F> {
         }
     }
 
-    async fn drain_events(&self, events: &mut Receiver<WsEvent>) {
+    async fn drain_events(&self, events: &mut EventReceiver) {
         events.close();
         while let Some(event) = events.recv().await {
-            self.handle(&event, true).await;
+            self.handle(event, true).await;
         }
     }
 
@@ -426,12 +434,15 @@ impl<'a, S: ReconcileSource, F: FeedSubscriber> FeedPump<'a, S, F> {
         self.reconcile().await;
     }
 
-    async fn handle(&self, event: &WsEvent, draining: bool) {
+    async fn handle(&self, envelope: FrameEnvelope, draining: bool) {
+        let event = envelope.event();
         self.evaluate_alerts(event, draining);
-        match self
-            .session
-            .apply(self.ledger, &self.account_id, event, now_ms_u64())
-        {
+        match self.session.apply(
+            self.ledger,
+            &self.account_id,
+            event,
+            envelope.received_at_ms(),
+        ) {
             Ok(Action::None) => {}
             Ok(Action::Reconcile) if !draining => self.reconcile().await,
             // The queued lifecycle evidence is durable, but a new venue walk
@@ -446,6 +457,12 @@ impl<'a, S: ReconcileSource, F: FeedSubscriber> FeedPump<'a, S, F> {
                 self.session
                     .record_failure(format!("feed event not recorded: {error}"));
             }
+        }
+        // Dropping without acknowledgment leaves the delivery monitor failed
+        // closed. A retryable reconciliation failure leaves readiness false,
+        // but its lifecycle event's durable application is still complete.
+        if self.session.state().failure.is_none() {
+            envelope.acknowledge();
         }
     }
 
@@ -590,7 +607,6 @@ mod tests {
     use oppen_hl::ws::{ConnectionId, Disconnected, GapWindow, Reconnected};
     use rust_decimal::Decimal;
     use tempfile::TempDir;
-    use tokio::sync::mpsc;
 
     use super::*;
     use crate::alert::{Condition, Direction};
@@ -888,17 +904,52 @@ mod tests {
             .count()
     }
 
-    /// Drive the pump over a fixed script of events and return once it stops.
-    ///
-    /// The channel is closed after the last one, which is what ends
-    /// [`FeedPump::run`] once every producer and the pool sender are gone.
-    async fn drive(pump: &FeedPump<'_, FakeVenue, Feeds>, script: Vec<WsEvent>) {
-        let (tx, mut rx) = mpsc::channel(16);
+    /// Exercise real startup and durable handling while retaining a live
+    /// scripted stream. Shutdown-loop ownership has separate tests below.
+    async fn drive(
+        pump: &FeedPump<'_, FakeVenue, Feeds>,
+        script: Vec<WsEvent>,
+    ) -> crate::feed::TestIngress {
+        let mut ingress = crate::feed::test_ingress(pump.session);
+        let count = script.len();
         for event in script {
-            tx.send(event).await.expect("send");
+            ingress
+                .sender
+                .as_ref()
+                .unwrap()
+                .send(event, now_ms_u64())
+                .await
+                .expect("send");
         }
-        drop(tx);
-        pump.run(&mut rx).await;
+        pump.catch_up().await;
+        pump.sync_alert_feeds();
+        for _ in 0..count {
+            pump.handle(
+                ingress.receiver.as_mut().unwrap().recv().await.unwrap(),
+                false,
+            )
+            .await;
+        }
+        ingress
+    }
+
+    async fn handle_one(
+        pump: &FeedPump<'_, FakeVenue, Feeds>,
+        event: WsEvent,
+        ingress: &mut crate::feed::TestIngress,
+    ) {
+        ingress
+            .sender
+            .as_ref()
+            .unwrap()
+            .send(event, now_ms_u64())
+            .await
+            .unwrap();
+        pump.handle(
+            ingress.receiver.as_mut().unwrap().recv().await.unwrap(),
+            false,
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -944,27 +995,31 @@ mod tests {
                 &feeds,
             )
             .unwrap();
-            let (tx, mut rx) = mpsc::channel(8);
+            let (tx, mut rx) = oppen_hl::ws::event_channel(8);
             let now = now_ms_u64();
             let scope = Subscription::UserFills { user: account() };
-            tx.send(disconnected(
-                now - 30_000,
-                now - 30_000,
-                vec![scope.clone()],
-            ))
+            tx.send(
+                disconnected(now - 30_000, now - 30_000, vec![scope.clone()]),
+                now_ms_u64(),
+            )
             .await
             .unwrap();
-            tx.send(reconnected(now, vec![scope])).await.unwrap();
+            tx.send(reconnected(now, vec![scope]), now_ms_u64())
+                .await
+                .unwrap();
             for tid in [1, 1, 2] {
-                tx.send(WsEvent::UserFills {
-                    user: account(),
-                    is_snapshot: false,
-                    fills: vec![fill(tid, now)],
-                })
+                tx.send(
+                    WsEvent::UserFills {
+                        user: account(),
+                        is_snapshot: false,
+                        fills: vec![fill(tid, now)],
+                    },
+                    now_ms_u64(),
+                )
                 .await
                 .unwrap();
             }
-            tx.send(asset_ctx("BTC", "64000", Some("64000")))
+            tx.send(asset_ctx("BTC", "64000", Some("64000")), now_ms_u64())
                 .await
                 .unwrap();
             let (stop, shutdown) = tokio::sync::oneshot::channel();
@@ -981,7 +1036,11 @@ mod tests {
             .await
             .unwrap();
             assert!(rx.is_closed());
-            assert!(tx.send(bbo_frame("BTC", "99", "101")).await.is_err());
+            assert!(
+                tx.send(bbo_frame("BTC", "99", "101"), now_ms_u64())
+                    .await
+                    .is_err()
+            );
             assert_eq!(
                 fill_rows(&ledger),
                 2,
@@ -1026,12 +1085,15 @@ mod tests {
             &feeds,
         )
         .unwrap();
-        let (tx, mut rx) = mpsc::channel(2);
-        tx.send(WsEvent::UserFills {
-            user: account(),
-            is_snapshot: false,
-            fills: vec![fill(7, now_ms_u64())],
-        })
+        let (tx, mut rx) = oppen_hl::ws::event_channel(2);
+        tx.send(
+            WsEvent::UserFills {
+                user: account(),
+                is_snapshot: false,
+                fills: vec![fill(7, now_ms_u64())],
+            },
+            now_ms_u64(),
+        )
         .await
         .unwrap();
         let (stop, shutdown) = tokio::sync::oneshot::channel();
@@ -1110,7 +1172,7 @@ mod tests {
                 &feeds,
             )
             .unwrap();
-            let (tx, mut rx) = mpsc::channel(1);
+            let (tx, mut rx) = oppen_hl::ws::event_channel(1);
             let (request, quiesce) = tokio::sync::oneshot::channel();
             let (ack, acknowledged) = tokio::sync::oneshot::channel();
             let (done, producers_done) = tokio::sync::oneshot::channel();
@@ -1141,17 +1203,22 @@ mod tests {
                         .unwrap();
                 }
                 quotes.lease("SOL", now_ms_u64());
-                tx.send(WsEvent::UserFills {
-                    user: account(),
-                    is_snapshot: false,
-                    fills: vec![fill(51, now_ms_u64())],
-                })
+                tx.send(
+                    WsEvent::UserFills {
+                        user: account(),
+                        is_snapshot: false,
+                        fills: vec![fill(51, now_ms_u64())],
+                    },
+                    now_ms_u64(),
+                )
                 .await
                 .unwrap();
-                tx.send(asset_ctx("BTC", "64000", Some("64000")))
+                tx.send(asset_ctx("BTC", "64000", Some("64000")), now_ms_u64())
                     .await
                     .unwrap();
-                tx.send(bbo_frame("SOL", "99", "101")).await.unwrap();
+                tx.send(bbo_frame("SOL", "99", "101"), now_ms_u64())
+                    .await
+                    .unwrap();
                 // Receipt of the final quote proves the preceding ledger and
                 // alert folds ran before producers_done was signaled.
                 tokio::time::timeout(Duration::from_secs(2), async {
@@ -1169,11 +1236,14 @@ mod tests {
                     !tx.is_closed(),
                     "consumer remains alive during producer drain"
                 );
-                tx.send(WsEvent::UserFills {
-                    user: account(),
-                    is_snapshot: false,
-                    fills: vec![fill(52, now_ms_u64())],
-                })
+                tx.send(
+                    WsEvent::UserFills {
+                        user: account(),
+                        is_snapshot: false,
+                        fills: vec![fill(52, now_ms_u64())],
+                    },
+                    now_ms_u64(),
+                )
                 .await
                 .unwrap();
                 done.send(()).unwrap();
@@ -1234,17 +1304,22 @@ mod tests {
                 &feeds,
             )
             .unwrap();
+            let _ingress = crate::feed::test_ingress(&session);
             pump.catch_up().await;
             assert!(
                 gaps(&ledger).is_empty(),
                 "startup refusal must not manufacture a gap"
             );
-            let (tx, mut rx) = mpsc::channel(1);
-            tx.send(WsEvent::UserFills {
-                user: account(),
-                is_snapshot: false,
-                fills: vec![fill(41, now_ms_u64())],
-            })
+            drop(_ingress);
+            let (tx, mut rx) = oppen_hl::ws::event_channel(1);
+            tx.send(
+                WsEvent::UserFills {
+                    user: account(),
+                    is_snapshot: false,
+                    fills: vec![fill(41, now_ms_u64())],
+                },
+                now_ms_u64(),
+            )
             .await
             .unwrap();
             let (stop, shutdown) = tokio::sync::oneshot::channel();
@@ -1298,6 +1373,7 @@ mod tests {
             &feeds,
         )
         .unwrap();
+        let _ingress = crate::feed::test_ingress(&session);
         pump.catch_up().await;
         assert!(session.state().reconciled);
         let gap = ledger
@@ -1333,6 +1409,7 @@ mod tests {
                 &feeds,
             )
             .unwrap();
+            let mut ingress = crate::feed::test_ingress(&session);
             pump.catch_up().await;
             assert!(session.state().reconciled);
             let gap = ledger.open_gap(scope, now_ms(), None).unwrap();
@@ -1350,7 +1427,7 @@ mod tests {
             ledger.mark_gap_reconciled(gap.gap_id, now_ms()).unwrap();
             assert!(gaps(&ledger).is_empty());
             pump.reconcile().await;
-            pump.handle(&bbo_frame("BTC", "99", "101"), false).await;
+            handle_one(&pump, bbo_frame("BTC", "99", "101"), &mut ingress).await;
             assert!(quotes.peek("BTC").is_some(), "later data still applies");
             assert!(session.state().last_tick_ms.is_some());
             assert_eq!(session.state().failure.as_deref(), Some(failure.as_str()));
@@ -1384,7 +1461,7 @@ mod tests {
         .expect("pump");
 
         assert!(!session.state().reconciled, "nothing has been checked yet");
-        drive(&pump, Vec::new()).await;
+        let _ingress = drive(&pump, Vec::new()).await;
 
         assert!(session.state().reconciled);
         assert!(
@@ -1417,7 +1494,7 @@ mod tests {
         )
         .expect("pump");
 
-        drive(&pump, Vec::new()).await;
+        let _ingress = drive(&pump, Vec::new()).await;
 
         assert_eq!(fill_rows(&ledger), 2);
         assert!(session.state().reconciled);
@@ -1456,19 +1533,24 @@ mod tests {
         )
         .expect("pump");
 
-        drive(&pump, Vec::new()).await;
+        let mut ingress = drive(&pump, Vec::new()).await;
         assert_eq!(fill_rows(&ledger), 1, "the chain now has an anchor");
 
         controls.prints(fill(21, dropped_at + 5_000));
         controls.prints(fill(22, dropped_at + 20_000));
-        pump.handle(
-            &disconnected(dropped_at, dropped_at, vec![user_fills.clone()]),
-            false,
+        handle_one(
+            &pump,
+            disconnected(dropped_at, dropped_at, vec![user_fills.clone()]),
+            &mut ingress,
         )
         .await;
         assert!(!session.state().reconciled, "the drop refuses new orders");
-        pump.handle(&reconnected(dropped_at + 30_000, vec![user_fills]), false)
-            .await;
+        handle_one(
+            &pump,
+            reconnected(dropped_at + 30_000, vec![user_fills]),
+            &mut ingress,
+        )
+        .await;
 
         assert_eq!(fill_rows(&ledger), 3, "both fills from inside the outage");
         assert!(session.state().reconciled);
@@ -1500,7 +1582,7 @@ mod tests {
         )
         .expect("pump");
 
-        drive(
+        let _ingress = drive(
             &pump,
             vec![
                 disconnected(at, at, vec![user_fills.clone(), book.clone()]),
@@ -1550,7 +1632,7 @@ mod tests {
         )
         .expect("pump");
 
-        drive(&pump, Vec::new()).await;
+        let _ingress = drive(&pump, Vec::new()).await;
 
         assert!(!session.state().reconciled);
         assert!(
@@ -1583,18 +1665,26 @@ mod tests {
         )
         .expect("pump");
 
-        let (tx, mut rx) = mpsc::channel::<WsEvent>(1);
+        let (tx, mut rx) = oppen_hl::ws::event_channel(1);
         let driver = async {
             // The startup walk has failed by now, and nothing further arrives.
             tokio::time::sleep(Duration::from_secs(1)).await;
             assert!(!session.state().reconciled);
             controls.recover();
             tokio::time::sleep(RETRY_INTERVAL * 2).await;
+            assert!(
+                session.state().reconciled,
+                "the timer came back to it while the stream was owned"
+            );
             drop(tx);
         };
         tokio::join!(pump.run(&mut rx), driver);
 
-        assert!(session.state().reconciled, "the timer came back to it");
+        assert!(
+            !session.state().reconciled,
+            "a stopped pump is not order admission"
+        );
+        rx.complete().unwrap();
         assert!(
             controls.walks() >= 1,
             "the retry actually walked the window"
@@ -1634,7 +1724,7 @@ mod tests {
         )
         .expect("pump");
 
-        drive(
+        let _ingress = drive(
             &pump,
             vec![
                 asset_ctx("BTC", "69999", Some("69999")),
@@ -1682,7 +1772,7 @@ mod tests {
         )
         .expect("pump");
 
-        drive(&pump, Vec::new()).await;
+        let _ingress = drive(&pump, Vec::new()).await;
 
         assert_eq!(
             feeds.keys(),
@@ -1724,7 +1814,7 @@ mod tests {
         )
         .expect("pump");
 
-        drive(&pump, vec![asset_ctx("BTC", "64000", Some("64000"))]).await;
+        let _ingress = drive(&pump, vec![asset_ctx("BTC", "64000", Some("64000"))]).await;
 
         assert_eq!(alert_rows(&ledger).len(), 1);
         assert!(
@@ -1768,7 +1858,7 @@ mod tests {
         .expect("pump");
 
         // markPx 4.72 with a null mid: the measured FRIEND case.
-        drive(&pump, vec![asset_ctx("FRIEND", "4.72", None)]).await;
+        let _ingress = drive(&pump, vec![asset_ctx("FRIEND", "4.72", None)]).await;
 
         assert!(alert_rows(&ledger).is_empty());
     }
@@ -1807,7 +1897,7 @@ mod tests {
             is_snapshot: false,
             fills: vec![fill(2, now_ms_u64())],
         };
-        drive(&pump, vec![backlog, live]).await;
+        let _ingress = drive(&pump, vec![backlog, live]).await;
 
         let rows = alert_rows(&ledger);
         assert_eq!(rows.len(), 1, "the live fill, not the replayed one");
@@ -1836,7 +1926,7 @@ mod tests {
         )
         .expect("pump");
 
-        let (tx, mut rx) = mpsc::channel::<WsEvent>(1);
+        let (tx, mut rx) = oppen_hl::ws::event_channel(1);
         let driver = async {
             tokio::time::sleep(Duration::from_secs(1)).await;
             assert!(feeds.keys().is_empty(), "nothing armed, nothing subscribed");
@@ -1900,7 +1990,7 @@ mod tests {
         )
         .expect("pump");
 
-        let (tx, mut rx) = mpsc::channel::<WsEvent>(1);
+        let (tx, mut rx) = oppen_hl::ws::event_channel(1);
         let driver = async {
             tokio::time::sleep(Duration::from_secs(1)).await;
             assert_eq!(feeds.keys(), ["activeAssetCtx:SOL"], "armed, so subscribed");
@@ -1954,7 +2044,7 @@ mod tests {
         )
         .expect("pump");
 
-        drive(&pump, vec![bbo_frame("BTC", "99", "101")]).await;
+        let _ingress = drive(&pump, vec![bbo_frame("BTC", "99", "101")]).await;
 
         assert!(quotes.peek("BTC").is_some(), "the frame is readable");
     }
@@ -1991,7 +2081,7 @@ mod tests {
         )
         .expect("pump");
 
-        drive(&pump, vec![bbo_frame("BTC", "99", "101")]).await;
+        let _ingress = drive(&pump, vec![bbo_frame("BTC", "99", "101")]).await;
 
         assert!(
             alert_rows(&ledger).is_empty(),
@@ -2020,7 +2110,7 @@ mod tests {
         )
         .expect("pump");
 
-        let (tx, mut rx) = mpsc::channel::<WsEvent>(1);
+        let (tx, mut rx) = oppen_hl::ws::event_channel(1);
         let driver = async {
             tokio::time::sleep(Duration::from_secs(1)).await;
             assert!(
@@ -2089,7 +2179,7 @@ mod tests {
         )
         .expect("pump");
 
-        let (tx, mut rx) = mpsc::channel::<WsEvent>(1);
+        let (tx, mut rx) = oppen_hl::ws::event_channel(1);
         let driver = async {
             tokio::time::sleep(Duration::from_secs(1)).await;
             quotes.lease("BTC", now_ms_u64());
