@@ -11,6 +11,14 @@ durable pilot authorization and account identity, usable pilot accounting, and
 pairing bindings covered by that single account pump. Revoked pairings still
 count because they retain cleanup obligations. At least one matching retained
 binding is required: an empty store gives pause enforcement no account target.
+ES35 permits an authenticated, identity-matching halted pilot with known
+accounting to restart supervision. A durable trading stop must not suppress the
+existing cleanup/retry worker. Startup preserves the original pilot budget,
+baseline and stop and leaves order admission inhibited. It is not a resume,
+policy acknowledgment, new consent or position-close operation. Authenticated
+but unavailable accounting still refuses startup; that recovery limitation is
+not resolved here. A running listener does not prove completed cancellation.
+
 Missing or conflicting authority
 blocks startup; startup never initializes, replaces, issues or acknowledges it.
 
@@ -69,7 +77,38 @@ No fixture counts as a live pilot, position-aware quit, client verification or
 installable build gate. Account confirmation and publication approval remain
 separate requirements. Broader Connect Agent onboarding follows safety work.
 
+### Halted Pilot Restart
+
+ES35 needs a persisted fee-driven budget stop, reopened through the same
+existing-authority startup path used by the desktop. Verify that opening does
+not append new consent, change its baseline or clear its stop. Keep policy
+acknowledgment inhibited and reject actual MCP order requests. Exercise the
+existing cleanup worker with a resting order, an initial failed cancellation
+and a later acknowledged retry. Separate those outcomes from listener startup.
+The fixture has no ordinary policy kill, but startup admission inhibition stays
+active and can itself request cleanup. This proves that a halted pilot can
+restart the existing cleanup worker, not that its halt is the sole trigger.
+After actual task drain and ledger reopen, original
+executed notional, reservations, realized result and halt remain authoritative.
+Missing or conflicting authority must still refuse startup. These tests cannot
+establish live venue acceptance or authorize real-account cleanup.
+
 ## Local Verification
+
+ES35 focused verification passes three synthetic/loopback tests. The startup
+regression failed before the fix with the explicit halted-pilot rejection,
+then passed after it. A second case runs the retained desktop supervisor with
+no ordinary policy kill and startup inhibition still active, observes a scripted
+cancellation failure, releases a
+gated successful retry and verifies an actual MCP order refusal. Task drain,
+physical ledger reopen and original pilot-state preservation are checked.
+The third case confirms unavailable accounting still refuses startup. The full
+workspace passes 1,178 Rust tests with 15 live/keychain tests ignored; all-target
+Clippy, formatting and offline dependency checks pass. No frontend change or
+frontend test rerun is included. Exact-head review and green CI remain required;
+these results do not establish a live recovery gate.
+
+Earlier ES20 verification:
 
 - Workspace: 929 Rust tests passed, 15 live-gated/helper tests ignored;
   formatting and all-target clippy with warnings denied passed.

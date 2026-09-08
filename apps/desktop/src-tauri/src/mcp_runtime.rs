@@ -141,14 +141,15 @@ impl Prepared {
             .ok_or("existing pilot authorization required")?;
         if pilot.agent != binding.agent
             || pilot.account != binding.account
-            || pilot.halt.is_some()
             || !matches!(
                 pilot.accounting,
                 oppen_core::ledger::PilotAccounting::Known { .. }
             )
         {
-            return Err("pilot must match the requested identity and have no halt".into());
+            return Err("pilot must match the requested identity and have known accounting".into());
         }
+        // A durable trading stop still needs its cancellation supervisor after
+        // restart. The new engine remains inhibited; opening never clears it.
         let pairings = TokenStore::open(
             PairingJournal::open(ledger.clone(), hmac).map_err(|error| error.to_string())?,
         )
@@ -673,6 +674,8 @@ mod tests {
         info_gate: Arc<Mutex<Option<InfoGate>>>,
         orders: Arc<Mutex<Vec<serde_json::Value>>>,
         accepted_order: Arc<Mutex<Option<serde_json::Value>>>,
+        cancel_script: Arc<Mutex<std::collections::VecDeque<(serde_json::Value, bool)>>>,
+        cancel_success_gate: Arc<Mutex<Option<oneshot::Receiver<()>>>>,
     }
 
     struct InfoGate {
@@ -704,8 +707,16 @@ mod tests {
             let gates = info_gate.clone();
             let orders = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
             let open_orders = orders.clone();
+            let closed_orders = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
             let accepted_order = Arc::new(Mutex::new(None::<serde_json::Value>));
             let acceptance = accepted_order.clone();
+            let cancel_script = Arc::new(Mutex::new(std::collections::VecDeque::<(
+                serde_json::Value,
+                bool,
+            )>::new()));
+            let cancellations = cancel_script.clone();
+            let cancel_success_gate = Arc::new(Mutex::new(None::<oneshot::Receiver<()>>));
+            let success_gate = cancel_success_gate.clone();
             let task = tokio::spawn(async move {
                 let mut clients = tokio::task::JoinSet::new();
                 loop {
@@ -718,7 +729,10 @@ mod tests {
                             let gates = gates.clone();
                             let stopped = stopping.clone();
                             let open_orders = open_orders.clone();
+                            let closed_orders = closed_orders.clone();
                             let acceptance = acceptance.clone();
+                            let cancellations = cancellations.clone();
+                            let success_gate = success_gate.clone();
                             clients.spawn(async move {
                                 let mut socket = BufReader::new(socket);
                                 let mut line = String::new();
@@ -748,13 +762,35 @@ mod tests {
                                     // No public venue, and no fictional healthy account socket.
                                     ("503 Service Unavailable", String::new())
                                 } else if path == "/exchange" {
-                                    let expected = acceptance.lock().unwrap().take().expect("this fixture did not authorize an exchange response");
                                     let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
-                                    assert_eq!(request["action"], expected);
                                     assert!(request["signature"]["r"].is_string());
                                     assert!(request["signature"]["s"].is_string());
                                     assert!(request["nonce"].is_u64());
-                                    ("200 OK", serde_json::json!({"status":"ok","response":{"type":"order","data":{"statuses":[{"resting":{"oid":501}}]}}}).to_string())
+                                    if request["action"]["type"] == "cancel" {
+                                        let succeeds = cancellations.lock().unwrap().front().is_some_and(|(_, success)| *success);
+                                        if succeeds {
+                                            let gate = success_gate.lock().unwrap().take();
+                                            if let Some(released) = gate { let _ = released.await; }
+                                        }
+                                        let (expected, success) = cancellations.lock().unwrap().pop_front().expect("this fixture did not authorize a cancellation response");
+                                        assert_eq!(request["action"], expected);
+                                        let statuses = request["action"]["cancels"].as_array().unwrap().iter().map(|target| {
+                                            if success {
+                                                open_orders.lock().unwrap().retain(|order| {
+                                                    if order["oid"] == target["o"] {
+                                                        closed_orders.lock().unwrap().push(order.clone());
+                                                        false
+                                                    } else { true }
+                                                });
+                                                serde_json::json!("success")
+                                            } else { serde_json::json!({"error":"synthetic cancellation refusal"}) }
+                                        }).collect::<Vec<_>>();
+                                        ("200 OK", serde_json::json!({"status":"ok","response":{"type":"cancel","data":{"statuses":statuses}}}).to_string())
+                                    } else {
+                                        let expected = acceptance.lock().unwrap().take().expect("this fixture did not authorize an exchange response");
+                                        assert_eq!(request["action"], expected);
+                                        ("200 OK", serde_json::json!({"status":"ok","response":{"type":"order","data":{"statuses":[{"resting":{"oid":501}}]}}}).to_string())
+                                    }
                                 } else {
                                     assert_eq!(path, "/info", "unexpected venue operation");
                                     let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
@@ -768,6 +804,13 @@ mod tests {
                                     }
                                     let response = if request["type"] == "frontendOpenOrders" {
                                         serde_json::json!(*open_orders.lock().unwrap())
+                                    } else if request["type"] == "orderStatus" {
+                                        let matches = |order: &&serde_json::Value| request["oid"] == order["oid"] || request["oid"] == order["cloid"];
+                                        let live = open_orders.lock().unwrap().iter().find(matches).cloned();
+                                        let (order, status) = if let Some(order) = live { (order, "open") } else {
+                                            (closed_orders.lock().unwrap().iter().find(matches).cloned().expect("unscripted order status"), "canceled")
+                                        };
+                                        serde_json::json!({"status":"order","order":{"order":order,"status":status,"statusTimestamp":now_ms()}})
                                     } else { Self::info(request) };
                                     ("200 OK", response.to_string())
                                 };
@@ -792,6 +835,8 @@ mod tests {
                 info_gate,
                 orders,
                 accepted_order,
+                cancel_script,
+                cancel_success_gate,
             }
         }
 
@@ -1870,6 +1915,350 @@ mod tests {
             trigger_condition: Some("Price below 99".into()),
             is_position_tpsl: true,
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn halted_pilot_reopens_for_supervision_without_reauthorizing_orders() {
+        halted_pilot_restart(false, false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn halted_pilot_supervisor_retries_cleanup_and_refuses_mcp_orders() {
+        halted_pilot_restart(true, false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn halted_pilot_unavailable_accounting_still_refuses_startup() {
+        halted_pilot_restart(false, true).await;
+    }
+
+    async fn halted_pilot_restart(supervise: bool, unavailable: bool) {
+        use oppen_core::guardrail::PilotMetric;
+        use oppen_core::ledger::{PilotAccounting, PilotStop};
+        use oppen_hl::ws::WsEvent;
+        use serde_json::json;
+
+        let (fixture, keys) = cancellation_signing_fixture();
+        let venue = LocalVenue::start_with_pending_handshake(true).await;
+        let prepared =
+            Prepared::open(fixture.dir.path(), fixture.binding.clone(), keys.clone()).unwrap();
+        let _proposal = controller_proposal(&prepared);
+        let seed_feed = reconcile_controller_feed(&prepared);
+        let target = accept_protective_order(&prepared, &venue).await;
+        let at = u64::try_from(now_ms()).unwrap();
+        let fill = serde_json::from_value(json!({
+            "coin":"TEST","px":"100","sz":"0.03","side":"A","time":at,
+            "startPosition":"0.15","dir":"Close Long","closedPnl":"0",
+            "hash":"synthetic-fee-fill","oid":target.oid,"crossed":true,
+            "fee":"5","feeToken":if unavailable { "HYPE" } else { "USDC" },"tid":35001,"cloid":target.cloid,
+        }))
+        .unwrap();
+        prepared
+            .feed
+            .apply(
+                &prepared.ledger,
+                &fixture.binding.account.to_string(),
+                &WsEvent::UserFills {
+                    user: fixture.binding.account,
+                    is_snapshot: false,
+                    fills: vec![fill],
+                },
+                at,
+            )
+            .unwrap();
+        let pilot = PilotJournal::new(Arc::new(
+            RegistryJournal::open(
+                prepared.ledger.clone(),
+                Arc::new(HmacKey::from_bytes([11; 32])),
+            )
+            .unwrap(),
+        ));
+        let before = pilot.status(fixture.binding.account).unwrap().unwrap();
+        if unavailable {
+            assert_eq!(
+                before.authentication,
+                oppen_core::ledger::PilotAuthentication::Verified
+            );
+            assert!(matches!(
+                before.accounting,
+                PilotAccounting::Unavailable { .. }
+            ));
+            assert!(prepared.ledger.verify().unwrap().is_intact());
+            let weak = Arc::downgrade(&prepared.ledger);
+            drop(pilot);
+            drop(seed_feed);
+            drop(prepared);
+            assert_eq!(weak.strong_count(), 0);
+            let refused = Prepared::open(fixture.dir.path(), fixture.binding.clone(), keys);
+            venue.shutdown().await;
+            assert!(matches!(refused, Err(error) if error.contains("known accounting")));
+            fixture.assert_pairing_owner_released();
+            return;
+        }
+        let budget_before = pilot.state(fixture.binding.account).unwrap().unwrap();
+        assert_eq!(budget_before.executed_usd, 3.into());
+        assert_eq!(budget_before.reserved_usd, 12.into());
+        assert_eq!(budget_before.net_realized_pnl_usd, (-5).into());
+        assert!(matches!(before.accounting, PilotAccounting::Known { .. }));
+        assert_eq!(
+            before.halt,
+            Some(PilotStop::Exhausted {
+                metric: PilotMetric::RealizedLoss,
+                observed_usd: 5.into(),
+                limit_usd: 5.into(),
+            })
+        );
+        let policy_before = prepared.engine.policy_status().cached_revision;
+        assert_eq!(
+            serde_json::to_value(prepared.engine.kill_switch()).unwrap(),
+            json!({"global":null,"agents":{}})
+        );
+        let weak = Arc::downgrade(&prepared.ledger);
+        drop(pilot);
+        drop(seed_feed);
+        drop(prepared);
+        assert_eq!(
+            weak.strong_count(),
+            0,
+            "restart requires physical ledger release"
+        );
+
+        let restarted =
+            match Prepared::open(fixture.dir.path(), fixture.binding.clone(), keys.clone()) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    venue.shutdown().await;
+                    panic!(
+                        "authenticated halted pilot must reopen for cleanup supervision: {error}"
+                    );
+                }
+            };
+        assert!(restarted.engine.policy_status().admission_inhibited);
+        assert!(restarted.engine.policy_status().acknowledgment.is_none());
+        assert_eq!(
+            restarted.engine.policy_status().cached_revision,
+            policy_before
+        );
+        let reopened = PilotJournal::new(Arc::new(
+            RegistryJournal::open(
+                restarted.ledger.clone(),
+                Arc::new(HmacKey::from_bytes([11; 32])),
+            )
+            .unwrap(),
+        ))
+        .status(fixture.binding.account)
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(&reopened).unwrap(),
+            serde_json::to_value(&before).unwrap()
+        );
+        let budget_after = PilotJournal::new(Arc::new(
+            RegistryJournal::open(
+                restarted.ledger.clone(),
+                Arc::new(HmacKey::from_bytes([11; 32])),
+            )
+            .unwrap(),
+        ))
+        .state(fixture.binding.account)
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            budget_after, budget_before,
+            "restart must preserve baseline, authorization and accounting"
+        );
+        if supervise {
+            supervise_halted_pilot(&fixture, restarted, &venue, &target).await;
+        } else {
+            drop(restarted);
+        }
+        fixture.assert_pairing_owner_released();
+        let final_open = Prepared::open(fixture.dir.path(), fixture.binding.clone(), keys).unwrap();
+        let final_budget = PilotJournal::new(Arc::new(
+            RegistryJournal::open(
+                final_open.ledger.clone(),
+                Arc::new(HmacKey::from_bytes([11; 32])),
+            )
+            .unwrap(),
+        ))
+        .state(fixture.binding.account)
+        .unwrap()
+        .unwrap();
+        let authority_rows = final_open
+            .ledger
+            .get_events(0, 1000)
+            .unwrap()
+            .events
+            .into_iter()
+            .filter(|row| {
+                matches!(
+                    row.kind,
+                    oppen_core::ledger::EventKind::PilotAuthorized
+                        | oppen_core::ledger::EventKind::PilotAdopted
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(final_budget, budget_before);
+        assert_eq!(
+            authority_rows.len(),
+            1,
+            "restart must not authorize or adopt again"
+        );
+        assert_eq!(
+            authority_rows[0].kind,
+            oppen_core::ledger::EventKind::PilotAuthorized
+        );
+        drop(final_open);
+        let order_posts = venue
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| {
+                request.path == "/exchange"
+                    && serde_json::from_slice::<serde_json::Value>(&request.body).unwrap()["action"]
+                        ["type"]
+                        == "order"
+            })
+            .count();
+        venue.shutdown().await;
+        assert_eq!(order_posts, 1, "restart must not submit another order");
+    }
+
+    async fn supervise_halted_pilot(
+        fixture: &Fixture,
+        mut prepared: Prepared,
+        venue: &LocalVenue,
+        target: &oppen_core::guardrail::CancelTarget,
+    ) {
+        use serde_json::json;
+        *venue.orders.lock().unwrap() = vec![json!({
+            "coin":target.symbol,"oid":target.oid,"cloid":target.cloid,"side":"A",
+            "limitPx":"100","sz":"0.12","origSz":"0.15","timestamp":target.timestamp,
+            "orderType":target.order_type,"tif":null,"reduceOnly":true,"isTrigger":true,
+            "triggerPx":"99","triggerCondition":target.trigger_condition,"isPositionTpsl":true,
+        })];
+        let action = json!({"type":"cancel","cancels":[{"a":0,"o":target.oid}]});
+        venue
+            .cancel_script
+            .lock()
+            .unwrap()
+            .extend([(action.clone(), false), (action.clone(), true)]);
+        let (release_success, success_released) = oneshot::channel();
+        *venue.cancel_success_gate.lock().unwrap() = Some(success_released);
+        let engine = prepared.engine.clone();
+        let weak = Arc::downgrade(&prepared.ledger);
+        let revision = engine.policy_status().cached_revision;
+        let port = venue.port;
+        prepared.gateway = prepared.gateway.with_loopback_fixture(port).unwrap();
+        let status = Arc::new(Mutex::new(McpStatus::starting(&fixture.binding)));
+        let mut owned = OwnedMcp::launch(
+            prepared,
+            0,
+            FixtureSource,
+            move || WsPool::loopback_fixture(port),
+            status.clone(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while status_lock(&status).supervision_error.is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first cleanup refusal must be reported");
+        let failed_target_retained = venue.orders.lock().unwrap().len() == 1;
+        let remaining_script = venue.cancel_script.lock().unwrap().len();
+        // Successful retry cannot consume its script or remove the target
+        // until the first failed attempt's state has been captured.
+        release_success.send(()).unwrap();
+        let address = status_lock(&status).listener.clone().unwrap();
+        let token = fixture.token.as_deref().unwrap();
+        let (code, session, _) = rpc(&address, token, None, json!({
+            "jsonrpc":"2.0","id":1,"method":"initialize",
+            "params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"halted-pilot-fixture","version":"0"}}
+        })).await;
+        assert_eq!(code, 200);
+        let session = session.unwrap();
+        assert_eq!(
+            rpc(
+                &address,
+                token,
+                Some(&session),
+                json!({"jsonrpc":"2.0","method":"notifications/initialized"})
+            )
+            .await
+            .0,
+            202
+        );
+        let response = retry_predecision_busy(|attempt| {
+            let address = &address;
+            let session = &session;
+            async move {
+                let (code, _, bytes) = rpc(address, token, Some(session), json!({
+                    "jsonrpc":"2.0","id":2 + attempt,"method":"tools/call","params":{"name":"place","arguments":{
+                        "symbol":"TEST","is_buy":true,"size":"0.10","order_type":"limit","limit_px":"100",
+                        "cloid":"0x35353535353535353535353535353535","reason":"must remain inhibited after pilot restart"
+                    }}
+                })).await;
+                assert_eq!(code, 200);
+                rpc_reply(&bytes)
+            }
+        }).await;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if venue.orders.lock().unwrap().is_empty()
+                    && status_lock(&status).supervision_error.is_none()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("same supervisor must retry cleanup successfully");
+        let inhibited = engine.policy_status();
+        owned.shutdown_and_drain().await.unwrap();
+        drop(owned);
+        drop(engine);
+        assert_eq!(
+            weak.strong_count(),
+            0,
+            "supervisor must release the physical ledger"
+        );
+        let cancellations = venue
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request.path == "/exchange")
+            .map(|request| serde_json::from_slice::<serde_json::Value>(&request.body).unwrap())
+            .filter(|request| request["action"]["type"] == "cancel")
+            .collect::<Vec<_>>();
+        assert!(failed_target_retained);
+        assert_eq!(
+            remaining_script, 1,
+            "first failure must not acknowledge the target"
+        );
+        assert_eq!(cancellations.len(), 2);
+        assert_eq!(cancellations[0]["action"], action);
+        assert_eq!(cancellations[1]["action"], action);
+        assert!(venue.cancel_script.lock().unwrap().is_empty());
+        assert!(inhibited.admission_inhibited);
+        assert!(inhibited.acknowledgment.is_none());
+        assert_eq!(inhibited.cached_revision, revision);
+        assert!(response.get("error").is_none(), "{response}");
+        let refusal: serde_json::Value =
+            serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(refusal["status"], "rejected", "{refusal}");
+        assert_eq!(refusal["refusal"]["refusal"], "unevaluable", "{refusal}");
+        assert_eq!(
+            refusal["refusal"]["unevaluable"], "policy_authority",
+            "{refusal}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
