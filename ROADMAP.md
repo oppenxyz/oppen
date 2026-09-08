@@ -155,7 +155,15 @@ before expanding features:
    implemented on `feat/durable-approval-lifecycle`, with journal/engine integration
    and production-constructor failure/restart tests. Local verification passes
    1,008 Rust tests (15 live-gated ignored), 152 frontend tests, build, formatting
-   and workspace all-target Clippy. Exact-head review and CI remain pending;
+   and workspace all-target Clippy. PR #65 at `125e899` has separate exact-head
+   automated review; CI run `34186908204` did not start because GitHub reports
+   account payment/spending-limit restrictions. No billing changes or CI bypass.
+   ES26 original-request evidence is implemented on
+   `feat/approval-request-evidence`, including distinct market/IOC/stop/close
+   origins, historical-unknown handling and same-CLOID quote-observation retries.
+   Local workspace verification passes 1,020 Rust tests (15 live-gated ignored),
+   152 frontend tests, build, formatting and all-target Clippy; independent review
+   and exact-head CI remain gates;
    original-request repricing and native approval UI remain open. This is not a
    completed live gate.
    No dedicated-account activity has been performed during this development.

@@ -791,6 +791,7 @@ fn exposure(equity: Decimal) -> Exposure {
 
 fn intent(symbol: &str, is_buy: bool, px: Decimal, sz: Decimal) -> OrderIntent {
     OrderIntent {
+        original: None,
         symbol: symbol.to_owned(),
         is_buy,
         px,
@@ -4652,6 +4653,97 @@ fn approval_is_the_last_check_and_is_not_charged_twice() {
         ),
         Err(Refusal::Unevaluable(Unevaluable::UnknownProposal { .. }))
     ));
+}
+
+#[test]
+fn original_request_evidence_distinguishes_market_from_explicit_ioc() {
+    let mut config = permissive(&["BTC"]);
+    config.approval_required = true;
+    let f = Fixture::new(config);
+    let btc = asset("BTC", 2, 40);
+    let market = MarketRef::fresh("BTC", d("100"), NOW_MS);
+    let mut order = intent("BTC", true, d("100.5"), d("1"));
+    order.kind = OrderKind::Limit { tif: Tif::Ioc };
+    for kind in [
+        RequestedOrderKind::Market {
+            slippage_bps: d("50"),
+        },
+        RequestedOrderKind::Limit {
+            limit_px: d("100.5"),
+            tif: Tif::Ioc,
+        },
+    ] {
+        order.original = Some(OriginalRequest {
+            kind,
+            reference_px: Some(d("100")),
+            reference_at_ms: NOW_MS,
+        });
+        assert!(matches!(
+            f.evaluate(&order, &btc, &market, &exposure(d("100000"))),
+            Err(Refusal::ApprovalRequired { .. })
+        ));
+    }
+    let pending = f.engine.pending_proposals(NOW_MS).unwrap();
+    assert_eq!(pending.len(), 2);
+    assert_eq!(pending[0].intent().px, pending[1].intent().px);
+    assert_ne!(pending[0].intent().original, pending[1].intent().original);
+}
+
+#[test]
+fn original_request_mismatch_never_mints_approval() {
+    let mut config = permissive(&["BTC"]);
+    config.approval_required = true;
+    let f = Fixture::new(config);
+    let btc = asset("BTC", 2, 40);
+    let market = MarketRef::fresh("BTC", d("100"), NOW_MS);
+    let mut order = intent("BTC", true, d("100.5"), d("1"));
+    order.kind = OrderKind::Limit { tif: Tif::Ioc };
+    for kind in [
+        RequestedOrderKind::Limit {
+            limit_px: d("101"),
+            tif: Tif::Ioc,
+        },
+        RequestedOrderKind::Limit {
+            limit_px: d("100.5"),
+            tif: Tif::Gtc,
+        },
+        RequestedOrderKind::Market {
+            slippage_bps: d("10"),
+        },
+        RequestedOrderKind::ClosePosition {
+            position_size: d("1"),
+            slippage_bps: d("50"),
+        },
+        RequestedOrderKind::StopMarket {
+            trigger_px: d("100"),
+            tpsl: Tpsl::Sl,
+            slippage_bps: d("50"),
+        },
+    ] {
+        order.original = Some(OriginalRequest {
+            kind,
+            reference_px: Some(d("100")),
+            reference_at_ms: NOW_MS,
+        });
+        assert_eq!(
+            f.evaluate(&order, &btc, &market, &exposure(d("100000")))
+                .unwrap_err(),
+            Refusal::Unevaluable(Unevaluable::OriginalRequestMismatch)
+        );
+    }
+    order.original = Some(OriginalRequest {
+        kind: RequestedOrderKind::Market {
+            slippage_bps: Decimal::MAX,
+        },
+        reference_px: Some(Decimal::MAX),
+        reference_at_ms: NOW_MS,
+    });
+    assert_eq!(
+        f.evaluate(&order, &btc, &market, &exposure(d("100000")))
+            .unwrap_err(),
+        Refusal::Unevaluable(Unevaluable::OriginalRequestMismatch)
+    );
+    assert!(f.engine.pending_proposals(NOW_MS).unwrap().is_empty());
 }
 
 /// The whole of finding 2: there must be no value a caller can build that

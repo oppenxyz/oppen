@@ -384,6 +384,60 @@ fn place(cloid: &str, size: &str) -> Value {
 }
 
 #[tokio::test]
+async fn same_cloid_limit_retry_retains_original_approval_after_new_quote_observation() {
+    let dir = tempfile::tempdir().unwrap();
+    let venue = Venue::start().await;
+    let keys = Arc::new(FixtureKeys::default());
+    let runtime = Runtime::open(dir.path(), venue.port(), keys.clone()).await;
+    let agent = AgentId::new("fixture-agent");
+    let engine = &runtime.gateway.inner.engine;
+    let mut policy = engine.guardrails(&agent).unwrap();
+    policy.approval_required = true;
+    engine
+        .operator_set_guardrails(&agent, policy, now_ms())
+        .unwrap();
+    runtime.activate_orders().await;
+    let cloid = Cloid::from_bytes([31; 16]).as_str().to_owned();
+    let first = runtime.call("place", place(&cloid, "0.12")).await;
+    assert_eq!(first["status"], "pending_approval", "{first}");
+    let original = engine.pending_proposals(now_ms()).unwrap();
+    assert_eq!(original.len(), 1);
+    let observed_at = original[0]
+        .intent()
+        .original
+        .as_ref()
+        .unwrap()
+        .reference_at_ms;
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while now_ms() <= observed_at {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let retry = runtime.call("place", place(&cloid, "0.12")).await;
+    assert_eq!(retry["status"], "pending_approval", "{retry}");
+    assert_eq!(retry["approval_id"], first["approval_id"]);
+    assert_eq!(retry["expires_at_ms"], first["expires_at_ms"]);
+    assert_eq!(engine.pending_proposals(now_ms()).unwrap(), original);
+    assert_eq!(
+        runtime
+            .ledger
+            .get_events(0, 100)
+            .unwrap()
+            .events
+            .iter()
+            .filter(|event| event.kind == EventKind::ApprovalProposed)
+            .count(),
+        1
+    );
+    assert!(venue.submissions().is_empty());
+    assert!(keys.read_heads.lock().unwrap().is_empty());
+    runtime.shutdown().await;
+    venue.shutdown().await;
+}
+
+#[tokio::test]
 async fn operator_halt_requested_sweep_retries_real_cancellation_without_closing_position() {
     use crate::server::{BoundServer, SupervisionControl, SupervisionStatus};
     use oppen_core::guardrail::KillReason;

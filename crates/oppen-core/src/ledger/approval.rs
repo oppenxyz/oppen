@@ -14,8 +14,8 @@ use super::{
     Appended, AuthorizedRoute, Event, EventKind, Ledger, LedgerError, NewEvent, PolicyJournal,
 };
 use crate::guardrail::{
-    APPROVAL_TTL_MS, AgentId, Cleared, ClearedKind, MAX_REASON_BYTES, OrderIntent, Proposal,
-    Refusal,
+    APPROVAL_TTL_MS, AgentId, Cleared, ClearedKind, MAX_REASON_BYTES, OrderIntent, OriginalRequest,
+    Proposal, Refusal,
 };
 
 type Result<T> = std::result::Result<T, ApprovalError>;
@@ -116,6 +116,9 @@ struct NormalizedIntent {
     )]
     max_slippage_bps: Option<Decimal>,
     reason: String,
+    // Absence is historical unknown provenance, not an inferred request kind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    original: Option<OriginalRequest>,
 }
 
 fn optional_decimal<'de, D: serde::Deserializer<'de>>(
@@ -142,6 +145,17 @@ enum NormalizedKind {
     },
 }
 impl NormalizedIntent {
+    fn same_request(&self, other: &Self) -> bool {
+        let mut comparable = other.clone();
+        if let (Some(original), Some(other_original)) = (&self.original, &other.original)
+            && original.kind == other_original.kind
+        {
+            // Quote evidence may advance on retry; retain the first signed observation.
+            comparable.original = self.original.clone();
+        }
+        self == &comparable
+    }
+
     fn from_intent(intent: &OrderIntent) -> Result<Self> {
         let value = Self {
             symbol: intent.symbol.clone(),
@@ -169,6 +183,7 @@ impl NormalizedIntent {
             builder: intent.builder.clone(),
             max_slippage_bps: intent.max_slippage_bps,
             reason: intent.reason.clone(),
+            original: intent.original.clone(),
         };
         value.validate()?;
         Ok(value)
@@ -186,6 +201,10 @@ impl NormalizedIntent {
                 .chars()
                 .any(|ch| ch.is_control() && ch != '\n' && ch != '\t')
             || matches!(self.kind, NormalizedKind::Trigger { trigger_px, .. } if trigger_px <= Decimal::ZERO)
+            || self
+                .original
+                .as_ref()
+                .is_some_and(|original| !original.matches_intent(&self.intent()))
         {
             return Err(unavailable("invalid normalized approval intent"));
         }
@@ -215,6 +234,7 @@ impl NormalizedIntent {
             builder: self.builder.clone(),
             max_slippage_bps: self.max_slippage_bps,
             reason: self.reason.clone(),
+            original: self.original.clone(),
         }
     }
 }
@@ -693,7 +713,7 @@ impl ApprovalJournal {
             e.data.route.binding.container == route.binding.container
                 && e.data.intent.cloid == intent.cloid
         }) {
-            if existing.data.intent != intent
+            if !existing.data.intent.same_request(&intent)
                 || existing.data.agent != candidate.agent
                 || existing.data.route != route
                 || existing.data.policy.seq != candidate.policy_revision

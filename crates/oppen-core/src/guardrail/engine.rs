@@ -72,6 +72,8 @@ const TWO: Decimal = Decimal::from_parts(2, 0, 0, false, 0);
 /// request can assert about itself — see [`Proposal`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrderIntent {
+    /// None means normalized-only evidence; never infer a market request from IOC.
+    pub original: Option<super::OriginalRequest>,
     pub symbol: String,
     pub is_buy: bool,
     pub px: Decimal,
@@ -1550,6 +1552,13 @@ impl GuardrailEngine {
         mode: Mode<'_>,
     ) -> Result<Cleared, Refusal> {
         check_reason(&intent.reason)?;
+        if intent
+            .original
+            .as_ref()
+            .is_some_and(|original| !original.matches_normalization(intent, asset))
+        {
+            return Err(Unevaluable::OriginalRequestMismatch.into());
+        }
         self.refresh_policy()
             .map_err(|error| Unevaluable::PolicyAuthority {
                 detail: error.to_string(),

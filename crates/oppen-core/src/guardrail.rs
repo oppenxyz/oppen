@@ -84,6 +84,7 @@ mod deadman;
 mod engine;
 mod kill;
 mod refusal;
+mod request;
 mod snapshot;
 mod store;
 
@@ -106,6 +107,7 @@ pub use engine::{
 };
 pub use kill::{Engagement, KillEffect, KillReason, KillScope, KillSwitch};
 pub use refusal::{PilotMetric, ReduceOnlyBreach, Refusal, Unevaluable, VenueRule};
+pub use request::{OriginalRequest, RequestedOrderKind};
 pub use snapshot::{
     AccountSnapshot, Exposure, FeedQuality, MarketRef, MarketSnapshotRef, PositionSnapshot,
     RestingExposure,

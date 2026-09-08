@@ -7,7 +7,7 @@ use serde_json::json;
 use tempfile::TempDir;
 
 use super::*;
-use crate::guardrail::{AgentGuardrails, LegacyPolicyReview, PersistedState};
+use crate::guardrail::{AgentGuardrails, LegacyPolicyReview, PersistedState, RequestedOrderKind};
 use crate::keys::{AgentWallet, HmacKey};
 use crate::ledger::{Anchor, HeadAnchor, RegistryBinding, RegistryJournal};
 
@@ -87,6 +87,7 @@ impl Fixture {
                 builder: None,
                 max_slippage_bps: None,
                 reason: "operator-reviewed\nagent claim\tverbatim".into(),
+                original: None,
             },
         }
     }
@@ -364,6 +365,7 @@ impl Fixture {
                 builder: None,
                 max_slippage_bps: None,
                 reason: "synthetic".into(),
+                original: None,
             },
             route: self.route.clone(),
             policy_revision: 3,
@@ -783,4 +785,288 @@ fn approved_finish_rejects_missing_wrong_hash_and_nonmatching_actual_payload() {
         assert_eq!(f.ledger.chain_head().unwrap(), before);
         assert!(f.journal.claim(p.id(), NOW + 4).unwrap().is_none());
     }
+}
+
+fn sourced_candidate(f: &Fixture, kind: RequestedOrderKind) -> Candidate {
+    let mut candidate = f.candidate(1, NOW);
+    candidate.intent.px = 101.into();
+    candidate.intent.kind = OrderKind::Limit { tif: Tif::Ioc };
+    candidate.intent.max_slippage_bps = Some(100.into());
+    match &kind {
+        RequestedOrderKind::Limit { limit_px, tif } => {
+            candidate.intent.px = *limit_px;
+            candidate.intent.kind = OrderKind::Limit { tif: *tif };
+        }
+        RequestedOrderKind::Market { .. } => {}
+        RequestedOrderKind::StopMarket {
+            trigger_px, tpsl, ..
+        } => {
+            candidate.intent.kind = OrderKind::Trigger {
+                is_market: true,
+                trigger_px: *trigger_px,
+                tpsl: *tpsl,
+            };
+        }
+        RequestedOrderKind::ClosePosition { position_size, .. } => {
+            candidate.intent.is_buy = *position_size < Decimal::ZERO;
+            candidate.intent.sz = position_size.abs();
+            candidate.intent.reduce_only = true;
+        }
+    }
+    candidate.intent.original = Some(OriginalRequest {
+        kind,
+        reference_px: Some(100.into()),
+        reference_at_ms: NOW,
+    });
+    candidate
+}
+
+#[test]
+fn original_request_variants_survive_signed_replay_and_claim() {
+    for kind in [
+        RequestedOrderKind::Limit {
+            limit_px: 101.into(),
+            tif: Tif::Ioc,
+        },
+        RequestedOrderKind::Market {
+            slippage_bps: 100.into(),
+        },
+        RequestedOrderKind::StopMarket {
+            trigger_px: 100.into(),
+            tpsl: Tpsl::Sl,
+            slippage_bps: 100.into(),
+        },
+        RequestedOrderKind::ClosePosition {
+            position_size: -Decimal::ONE,
+            slippage_bps: 100.into(),
+        },
+    ] {
+        let f = Fixture::new();
+        let mut candidate = sourced_candidate(&f, kind);
+        if matches!(
+            candidate.intent.original.as_ref().unwrap().kind,
+            RequestedOrderKind::Limit { .. }
+        ) {
+            candidate.intent.original.as_mut().unwrap().reference_px = None;
+        }
+        let expected = candidate.intent.clone();
+        let proposal = f.journal.mint(candidate).unwrap();
+        let reopened = f.reopened();
+        let pending = reopened.pending(NOW + 1).unwrap();
+        assert_eq!(pending[0].intent(), &expected);
+        let claim = reopened.claim(proposal.id(), NOW + 2).unwrap().unwrap();
+        assert_eq!(claim.proposal().intent().original, expected.original);
+    }
+}
+
+#[test]
+fn same_normalized_ioc_retains_source_but_rejects_kind_slippage_and_repricing() {
+    let f = Fixture::new();
+    let market = RequestedOrderKind::Market {
+        slippage_bps: 100.into(),
+    };
+    let proposal = f
+        .journal
+        .mint(sourced_candidate(&f, market.clone()))
+        .unwrap();
+    let head = f.ledger.chain_head().unwrap();
+    let mut retry = sourced_candidate(&f, market.clone());
+    retry.at_ms += 1;
+    assert_eq!(f.journal.mint(retry).unwrap(), proposal);
+    let mut limit = sourced_candidate(
+        &f,
+        RequestedOrderKind::Limit {
+            limit_px: 101.into(),
+            tif: Tif::Ioc,
+        },
+    );
+    let mut without_source = proposal.intent().clone();
+    without_source.original = None;
+    let saved_source = limit.intent.original.take();
+    assert_eq!(limit.intent, without_source);
+    limit.intent.original = saved_source;
+    assert!(matches!(
+        f.journal.mint(limit),
+        Err(ApprovalError::Conflict { .. })
+    ));
+    let mut changed_reference = sourced_candidate(&f, market.clone());
+    changed_reference
+        .intent
+        .original
+        .as_mut()
+        .unwrap()
+        .reference_at_ms -= 1;
+    assert_eq!(f.journal.mint(changed_reference).unwrap(), proposal);
+    let mut repriced = sourced_candidate(&f, market.clone());
+    repriced.intent.px = 102.into();
+    assert!(matches!(
+        f.journal.mint(repriced),
+        Err(ApprovalError::Conflict { .. })
+    ));
+    let changed_slippage = sourced_candidate(
+        &f,
+        RequestedOrderKind::Market {
+            slippage_bps: 101.into(),
+        },
+    );
+    assert!(matches!(
+        f.journal.mint(changed_slippage),
+        Err(ApprovalError::Conflict { .. })
+    ));
+    let mut unknown = sourced_candidate(&f, market);
+    unknown.intent.original = None;
+    assert!(matches!(
+        f.journal.mint(unknown),
+        Err(ApprovalError::Conflict { .. })
+    ));
+    assert_eq!(f.ledger.chain_head().unwrap(), head);
+}
+
+#[test]
+fn explicit_limit_retry_keeps_original_quote_and_expiry_across_new_ticks() {
+    let f = Fixture::new();
+    let kind = RequestedOrderKind::Limit {
+        limit_px: 101.into(),
+        tif: Tif::Ioc,
+    };
+    let proposal = f.journal.mint(sourced_candidate(&f, kind.clone())).unwrap();
+    let head = f.ledger.chain_head().unwrap();
+    let mut retry = sourced_candidate(&f, kind.clone());
+    retry.at_ms = NOW + 10;
+    let source = retry.intent.original.as_mut().unwrap();
+    source.reference_px = Some(102.into());
+    source.reference_at_ms = NOW + 10;
+    assert_eq!(f.journal.mint(retry).unwrap(), proposal);
+    assert_eq!(
+        f.reopened().pending(NOW + 11).unwrap(),
+        vec![proposal.clone()]
+    );
+    assert_eq!(proposal.expires_at_ms(), NOW + APPROVAL_TTL_MS);
+    assert_eq!(
+        proposal.intent().original.as_ref().unwrap().reference_px,
+        Some(100.into())
+    );
+    assert_eq!(
+        proposal.intent().original.as_ref().unwrap().reference_at_ms,
+        NOW
+    );
+    assert_eq!(f.ledger.chain_head().unwrap(), head);
+
+    let changed_limit = sourced_candidate(
+        &f,
+        RequestedOrderKind::Limit {
+            limit_px: 102.into(),
+            tif: Tif::Ioc,
+        },
+    );
+    assert!(matches!(
+        f.journal.mint(changed_limit),
+        Err(ApprovalError::Conflict { .. })
+    ));
+    let mut changed_slippage = sourced_candidate(&f, kind.clone());
+    changed_slippage.intent.max_slippage_bps = Some(101.into());
+    assert!(matches!(
+        f.journal.mint(changed_slippage),
+        Err(ApprovalError::Conflict { .. })
+    ));
+    let current = f.policy.current().unwrap();
+    let mut next = current.state;
+    next.guardrails
+        .get_mut(&f.route.binding.agent)
+        .unwrap()
+        .max_order_usd = 7.into();
+    f.policy.replace(current.revision, next, NOW + 12).unwrap();
+    let updated = f.ledger.chain_head().unwrap();
+    assert!(matches!(
+        f.journal.mint(sourced_candidate(&f, kind)),
+        Err(ApprovalError::Conflict { .. })
+    ));
+    assert_eq!(f.ledger.chain_head().unwrap(), updated);
+}
+
+#[test]
+fn historical_v1_absent_original_preserves_bytes_and_never_infers_market() {
+    let f = Fixture::new();
+    let mut historical = sourced_candidate(
+        &f,
+        RequestedOrderKind::Market {
+            slippage_bps: 100.into(),
+        },
+    );
+    historical.intent.original = None;
+    let proposal = f.journal.mint(historical).unwrap();
+    let head = f.ledger.chain_head().unwrap();
+    let event = row(&f.ledger.lock().unwrap(), head.seq).unwrap();
+    let payload = event.payload.as_ref().unwrap();
+    assert_eq!(payload["envelope"]["version"], 1);
+    assert!(
+        payload
+            .pointer("/envelope/operation/proposal/intent/original")
+            .is_none()
+    );
+    let raw = crate::ledger::hash::canonical_json(payload).unwrap();
+    let decoded = f.journal.decode(&event, &raw).unwrap();
+    assert_eq!(
+        crate::ledger::hash::canonical_json(&serde_json::to_value(decoded).unwrap()).unwrap(),
+        raw
+    );
+    let reopened = f.reopened();
+    let pending = reopened.pending(NOW + 1).unwrap();
+    assert_eq!(pending, vec![proposal]);
+    assert!(pending[0].intent().original.is_none());
+    assert_eq!(f.ledger.chain_head().unwrap(), head);
+    assert!(matches!(
+        f.journal.mint(sourced_candidate(
+            &f,
+            RequestedOrderKind::Market {
+                slippage_bps: 100.into()
+            }
+        )),
+        Err(ApprovalError::Conflict { .. })
+    ));
+}
+
+#[test]
+fn source_must_match_intent_and_is_authenticated_not_display_only() {
+    let f = Fixture::new();
+    let mut mismatched = sourced_candidate(
+        &f,
+        RequestedOrderKind::Limit {
+            limit_px: 101.into(),
+            tif: Tif::Ioc,
+        },
+    );
+    mismatched.intent.px = 102.into();
+    let head = f.ledger.chain_head().unwrap();
+    assert!(matches!(
+        f.journal.mint(mismatched),
+        Err(ApprovalError::Unavailable { .. })
+    ));
+    assert_eq!(f.ledger.chain_head().unwrap(), head);
+    f.journal
+        .mint(sourced_candidate(
+            &f,
+            RequestedOrderKind::Market {
+                slippage_bps: 100.into(),
+            },
+        ))
+        .unwrap();
+    let head = f.ledger.chain_head().unwrap();
+    let mut event = row(&f.ledger.lock().unwrap(), head.seq).unwrap();
+    let payload = event.payload.as_mut().unwrap();
+    payload["envelope"]["operation"]["proposal"]["intent"]["original"]["reference_at_ms"] =
+        json!(NOW - 1);
+    let raw = crate::ledger::hash::canonical_json(payload).unwrap();
+    assert!(
+        matches!(f.journal.decode(&event, &raw), Err(ApprovalError::Unavailable { detail }) if detail == "approval MAC mismatch")
+    );
+    let payload = event.payload.as_mut().unwrap();
+    payload["envelope"]["operation"]["proposal"]["intent"]
+        .as_object_mut()
+        .unwrap()
+        .remove("original");
+    let raw = crate::ledger::hash::canonical_json(payload).unwrap();
+    assert!(
+        matches!(f.journal.decode(&event, &raw), Err(ApprovalError::Unavailable { detail }) if detail == "approval MAC mismatch")
+    );
 }

@@ -399,6 +399,23 @@ operator-only gateway execution and recovery acceptance are tracked in
 [operator-approvals.md](specs/operator-approvals.md). No dependency or live
 authorization is introduced.
 
+### Original approval request evidence (ES26)
+
+Spec items 12/19/28 require preserving a typed original request alongside its
+normalized execution intent. Market, explicit limit (including IOC), stop-market
+and position-close origins remain distinct. Capture the reference price/time and
+operator slippage used for normalization; preserve explicit limit/trigger values
+and the original signed close-position size. Core validates correspondence before
+minting approval evidence; metadata never grants clearance or changes guards.
+
+Authenticate this evidence in the existing approval journal, preserving historical
+bytes and MACs. Absent evidence means normalized-only, original request unknown:
+never infer market semantics from IOC. Add a reader barrier before new writers;
+do not rewrite old proposals, reset TTLs or revive consumed claims. No dependency
+or second event store. Evidence preservation does not itself enable repricing;
+bounded retained native review and existing gateway submission remain subsequent
+integration work.
+
 ### Durable approval lifecycle (ES25)
 
 Spec items 18, 19 and 28 require recoverable approval evidence before operator

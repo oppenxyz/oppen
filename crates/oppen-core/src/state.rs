@@ -719,6 +719,7 @@ mod tests {
             vol_ratio: None,
         };
         let intent = OrderIntent {
+            original: None,
             symbol: "BTC".into(),
             is_buy: true,
             px: d("100"),
@@ -892,6 +893,7 @@ mod tests {
             vol_ratio: None,
         };
         let intent = OrderIntent {
+            original: None,
             symbol: "BTC".into(),
             is_buy: true,
             px: d("72000"),

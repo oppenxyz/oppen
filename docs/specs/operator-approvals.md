@@ -4,7 +4,7 @@ Implementation planning for spec items 18, 19, 28 and 32. Existing core approval
 methods are not a completed operator workflow. All stages below remain safety
 gates before exposing a usable approval action or claiming live acceptance.
 
-## Current Evidence
+## Baseline Before ES24/ES25
 
 The core queue retains an ID, agent, normalized order intent and TTL in memory.
 Approval consumes a proposal atomically and re-evaluates it, but does not submit
@@ -102,9 +102,37 @@ item-28 surface. Local verification passes 34 focused approval tests and the ful
 workspace (1,008 Rust tests passed, 15 live-gated ignored), plus formatting,
 all-target Clippy, 152 frontend tests and the desktop frontend build. Fixtures
 exercise production constructors without live account activity or signing keys.
-Independent automated diff review found no blocking issues; committed-head review
-and CI remain pending. Native approval execution/UI and original-request
-repricing remain integration work.
+PR #65 at `125e899` has separate exact-head automated review with no blocking
+findings. CI run `34186908204` did not start: GitHub reports account payment or
+spending-limit restrictions. Local tests are not a substitute for green CI.
+Native approval execution/UI and original-request repricing remain integration
+work.
+
+## Original Request Evidence
+
+ES26 preserves typed market, explicit limit/IOC, stop-market and position-close
+origins alongside the normalized order. The actual normalization quote/time and
+slippage are retained, as are explicit limit/trigger constraints and signed close
+size. Core refuses mismatched evidence before minting; evidence never supplies
+approval authority or changes the existing signing/reservation path.
+
+Historical absent evidence stays absent and means original request unknown.
+V10 prevents older writers from discarding the new semantics; prior event bytes,
+MACs, claims and TTLs are not rewritten. The ES25 stopped-writer and preservation
+rules also apply to V10. No actual operator ledger is migrated during development.
+
+Deduplication ignores refreshed quote observations only when the original request
+kind and every normalized field still match. Return the retained evidence and
+expiry unchanged. A changed normalized market price still conflicts, as before;
+this does not introduce automatic repricing or extend consent. A future native
+review must retain and recheck a displayed candidate before gateway submission.
+Core normalization checks do not establish end-to-end overflow safety for the
+existing gateway pricing helpers. Local verification passes 1,020 Rust workspace
+tests (15 live-gated ignored), including actual MCP-to-journal retry with no
+signing-key read or submission, source mismatch refusal, variant reopen, source
+identity conflicts and historical-unknown byte preservation. Formatting,
+all-target Clippy, 152 frontend tests and typecheck/build pass. Independent review
+and exact-head CI remain gates; no live acceptance or native approval UI is claimed.
 
 Upgrade requires stopping older writers first: an open-time version check cannot
 evict a process that already holds an older connection. Keep the ledger and its
