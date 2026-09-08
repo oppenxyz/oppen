@@ -298,6 +298,13 @@ impl ApprovalQueueControl {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) fn task_finished(&self) -> bool {
+        self.task
+            .try_lock()
+            .is_ok_and(|task| task.as_ref().is_none_or(|task| task.inner().is_finished()))
+    }
+
     pub(crate) fn status(&self, binding: &Binding) -> Result<ApprovalQueueStatus, String> {
         self.check_binding(binding)?;
         Ok(self.admission()?.status.clone())

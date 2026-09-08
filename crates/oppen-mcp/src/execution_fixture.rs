@@ -27,6 +27,8 @@ mod decision;
 mod pilot;
 #[path = "execution_fixture/policy.rs"]
 mod policy;
+#[path = "execution_fixture/provenance.rs"]
+mod provenance;
 #[path = "execution_fixture/registry.rs"]
 mod registry;
 #[path = "execution_fixture/http.rs"]
@@ -41,6 +43,8 @@ struct FixtureKeys {
     ledger: Mutex<Weak<Ledger>>,
     read_heads: Mutex<Vec<EventKind>>,
     read_gate: Mutex<Option<KeyReadGate>>,
+    read_return_gate: Mutex<Option<(EntryName, KeyReadGate)>>,
+    written_entries: Mutex<Vec<EntryName>>,
 }
 
 #[derive(Debug)]
@@ -54,6 +58,7 @@ impl KeyStore for FixtureKeys {
         Network::Testnet
     }
     fn write(&self, entry: &EntryName, secret: &str) -> Result<(), KeyStoreError> {
+        self.written_entries.lock().unwrap().push(entry.clone());
         self.values
             .lock()
             .unwrap()
@@ -73,13 +78,26 @@ impl KeyStore for FixtureKeys {
                 self.read_heads.lock().unwrap().push(events.events[0].kind);
             }
         }
-        Ok(self
+        let value = self
             .values
             .lock()
             .unwrap()
             .get(entry)
             .cloned()
-            .map(SecretText::new))
+            .map(SecretText::new);
+        let gate = {
+            let mut slot = self.read_return_gate.lock().unwrap();
+            if slot.as_ref().is_some_and(|(target, _)| target == entry) {
+                slot.take().map(|(_, gate)| gate)
+            } else {
+                None
+            }
+        };
+        if let Some(gate) = gate {
+            gate.entered.notify_one();
+            let _ = gate.release.recv_timeout(Duration::from_secs(15));
+        }
+        Ok(value)
     }
     fn remove(&self, entry: &EntryName) -> Result<(), KeyStoreError> {
         self.values.lock().unwrap().remove(entry);

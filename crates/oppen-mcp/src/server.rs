@@ -11,7 +11,7 @@
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::pin::Pin;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, Weak};
 use std::task::{Context, Poll, ready};
 use std::time::Duration;
 
@@ -34,8 +34,9 @@ use tokio::sync::{Notify, watch};
 use tokio_util::io::ReaderStream;
 use tokio_util::sync::CancellationToken;
 
-use crate::auth::{SessionAuthority, TokenStore};
+use crate::auth::{Binding, SessionAuthority, TokenStore};
 use crate::guard::{Refusal, bearer_token, check_host, check_origin};
+use crate::outcome::ToolError;
 use crate::tools::Gateway;
 
 mod operator;
@@ -60,11 +61,64 @@ pub(crate) struct ExecutionTracker {
 
 #[derive(Clone)]
 enum ExecutionOwner {
-    Session { _authority: SessionAuthority },
-    Supervision { _pairings: Pairings },
+    Session {
+        authority: SessionAuthority,
+        pairings: Pairings,
+        shutdown: CancellationToken,
+        call_cancel: CancellationToken,
+    },
+    Native {
+        _authority: SessionAuthority,
+    },
+    Supervision {
+        _pairings: Pairings,
+    },
+}
+
+pub(crate) struct SigningAdmission<'a> {
+    _pairings: std::sync::RwLockReadGuard<'a, TokenStore>,
 }
 
 impl ExecutionTracker {
+    pub(crate) fn signing_admission(
+        &self,
+        binding: &Binding,
+    ) -> Result<SigningAdmission<'_>, ToolError> {
+        let ExecutionOwner::Session {
+            authority,
+            pairings,
+            shutdown,
+            call_cancel,
+        } = &self._owner
+        else {
+            return Err(ToolError::unavailable(
+                "signing admission",
+                "order requires ordinary session authority or explicit native admission",
+            ));
+        };
+        let pairings = pairings
+            .try_read()
+            .map_err(|error| ToolError::unavailable("pairing authority", error))?;
+        if authority.binding() != binding {
+            return Err(ToolError::unavailable(
+                "pairing authority",
+                "execution binding differs from authenticated session",
+            ));
+        }
+        pairings
+            .check_authority(authority)
+            .map_err(|error| ToolError::unavailable("pairing authority", error))?;
+        if shutdown.is_cancelled() || call_cancel.is_cancelled() {
+            return Err(ToolError::unavailable(
+                "signing admission",
+                "method or server stopped before signing or dispatch",
+            ));
+        }
+        Ok(SigningAdmission {
+            _pairings: pairings,
+        })
+    }
+
     pub(crate) fn supervision(execution: &watch::Sender<()>, pairings: Pairings) -> Self {
         Self {
             _execution: execution.subscribe(),
@@ -117,6 +171,7 @@ fn router_with_lifecycle(
     let network = gateway.gateway().network();
     let handler = ShutdownHandler {
         inner: gateway,
+        pairings: Arc::downgrade(&pairings),
         shutdown: shutdown.clone(),
         execution,
     };
@@ -140,6 +195,7 @@ fn router_with_lifecycle(
 #[derive(Clone)]
 struct ShutdownHandler<H> {
     inner: H,
+    pairings: Weak<RwLock<TokenStore>>,
     shutdown: CancellationToken,
     execution: watch::Sender<()>,
 }
@@ -162,10 +218,18 @@ impl<H: ServerHandler> ServerHandler for ShutdownHandler<H> {
                 what: "pairing authority",
                 detail: "this method task carries no authenticated pairing authority".into(),
             })?;
+        let call_cancel = context.ct.child_token();
+        let _cancel_on_exit = call_cancel.clone().drop_guard();
+        let pairings = self.pairings.upgrade().ok_or_else(|| {
+            ToolError::unavailable("pairing authority", "listener pairing owner has stopped")
+        })?;
         context.extensions.insert(ExecutionTracker {
             _execution: self.execution.subscribe(),
             _owner: ExecutionOwner::Session {
-                _authority: authority.clone(),
+                authority: authority.clone(),
+                pairings,
+                shutdown: self.shutdown.clone(),
+                call_cancel: call_cancel.clone(),
             },
         });
         // Keep authority outside the selected inner future: HTTP disconnects
@@ -179,6 +243,10 @@ impl<H: ServerHandler> ServerHandler for ShutdownHandler<H> {
             () = self.shutdown.cancelled() => Err(crate::outcome::ToolError::TimeoutUnknownOutcome {
                 cloid: None,
                 detail: "gateway shutdown interrupted execution; reconcile before resubmitting".into(),
+            }.into()),
+            () = call_cancel.cancelled() => Err(crate::outcome::ToolError::TimeoutUnknownOutcome {
+                cloid: None,
+                detail: "method cancellation interrupted execution; reconcile before resubmitting".into(),
             }.into()),
             result = async { self.inner.call_tool(request, context).await } => result,
         }
@@ -994,8 +1062,10 @@ mod authority_tests {
         let token = store.issue(binding.clone()).unwrap();
         let authority = store.authenticate(token.reveal()).unwrap().authority();
         store.revoke(token.id).unwrap();
+        let pairings = Arc::new(RwLock::new(store));
         let handler = ShutdownHandler {
             inner: MustNotRun,
+            pairings: Arc::downgrade(&pairings),
             shutdown: CancellationToken::new(),
             execution: watch::channel(()).0,
         };
@@ -1024,6 +1094,125 @@ mod authority_tests {
             assert_eq!(error.data.unwrap()["code"], expected);
             assert_eq!(handler.execution.receiver_count(), 0);
         }
+        drop(pairings);
+        assert!(
+            handler.pairings.upgrade().is_none(),
+            "idle handler must not retain TokenStore"
+        );
+        let mut context = RequestContext::new(
+            rmcp::model::NumberOrString::Number(2),
+            service.peer().clone(),
+        );
+        let (mut parts, ()) = http::Request::new(()).into_parts();
+        parts.extensions.insert(authority);
+        context.extensions.insert(parts);
+        let error = handler
+            .call_tool(CallToolRequestParams::new("must_not_run"), context)
+            .await
+            .unwrap_err();
+        assert_eq!(error.data.unwrap()["code"], "unavailable");
+        assert_eq!(handler.execution.receiver_count(), 0);
         service.cancel().await.unwrap();
+    }
+
+    #[derive(Clone)]
+    struct CaptureExecution {
+        tracker: Arc<std::sync::Mutex<Option<ExecutionTracker>>>,
+        entered: Arc<Notify>,
+    }
+
+    impl ServerHandler for CaptureExecution {
+        async fn call_tool(
+            &self,
+            request: CallToolRequestParams,
+            context: RequestContext<RoleServer>,
+        ) -> Result<CallToolResponse, ErrorData> {
+            *self.tracker.lock().unwrap() = Some(ExecutionTracker::from_context(&context).unwrap());
+            self.entered.notify_one();
+            if request.name == "complete" {
+                return Ok(rmcp::model::CallToolResult::success(vec![]).into());
+            }
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn retained_session_admission_checks_binding_revocation_and_actual_call_lifetime() {
+        for end in ["drop", "complete", "cancel", "shutdown", "revoke"] {
+            let (transport, _client) = tokio::io::duplex(4096);
+            let service = rmcp::service::serve_directly(MustNotRun, transport, None);
+            let dir = tempfile::tempdir().unwrap();
+            let ledger = Arc::new(
+                Ledger::open_at(&dir.path().join("ledger.db"), oppen_hl::Network::Testnet).unwrap(),
+            );
+            let mut store = TokenStore::open(
+                PairingJournal::open(ledger, Arc::new(HmacKey::from_bytes([42; 32]))).unwrap(),
+            )
+            .unwrap();
+            let binding = Binding {
+                agent: AgentId::new("alpha"),
+                account: oppen_hl::Address::from_bytes([9; 20]),
+            };
+            let token = store.issue(binding.clone()).unwrap();
+            let authority = store.authenticate(token.reveal()).unwrap().authority();
+            let pairings = Arc::new(RwLock::new(store));
+            let captured = Arc::new(std::sync::Mutex::new(None));
+            let entered = Arc::new(Notify::new());
+            let shutdown = CancellationToken::new();
+            let execution = watch::channel(()).0;
+            let handler = ShutdownHandler {
+                inner: CaptureExecution {
+                    tracker: captured.clone(),
+                    entered: entered.clone(),
+                },
+                pairings: Arc::downgrade(&pairings),
+                shutdown: shutdown.clone(),
+                execution: execution.clone(),
+            };
+            let mut context = RequestContext::new(
+                rmcp::model::NumberOrString::Number(1),
+                service.peer().clone(),
+            );
+            let cancel = context.ct.clone();
+            let (mut parts, ()) = http::Request::new(()).into_parts();
+            parts.extensions.insert(authority);
+            context.extensions.insert(parts);
+            let task = tokio::spawn(async move {
+                handler
+                    .call_tool(CallToolRequestParams::new(end), context)
+                    .await
+            });
+            entered.notified().await;
+            let tracker = captured.lock().unwrap().take().unwrap();
+            if end != "complete" {
+                assert!(tracker.signing_admission(&binding).is_ok());
+                let mut wrong = binding.clone();
+                wrong.account = oppen_hl::Address::from_bytes([8; 20]);
+                assert!(tracker.signing_admission(&wrong).is_err());
+            }
+            match end {
+                "drop" => task.abort(),
+                "cancel" => cancel.cancel(),
+                "shutdown" => shutdown.cancel(),
+                "revoke" => {
+                    assert!(pairings.write().unwrap().revoke(token.id).unwrap());
+                }
+                "complete" => {}
+                _ => unreachable!(),
+            }
+            let _result = task.await;
+            assert!(tracker.signing_admission(&binding).is_err(), "{end}");
+            assert_eq!(
+                execution.receiver_count(),
+                1,
+                "worker retains drain after {end}"
+            );
+            let supervision = ExecutionTracker::supervision(&execution, pairings.clone());
+            assert!(supervision.signing_admission(&binding).is_err());
+            drop(supervision);
+            drop(tracker);
+            assert_eq!(execution.receiver_count(), 0);
+            service.cancel().await.unwrap();
+        }
     }
 }

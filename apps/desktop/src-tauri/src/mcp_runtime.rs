@@ -1378,9 +1378,8 @@ mod tests {
                         | QueuePhase::Reviewing
                         | QueuePhase::Confirming
                         | QueuePhase::Rejecting
-                ) {
-                    // The supervisor publishes status immediately before returning.
-                    tokio::task::yield_now().await;
+                ) && queue.task_finished()
+                {
                     return status;
                 }
                 tokio::task::yield_now().await;
@@ -2297,6 +2296,15 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        // launch_mcp returns before serve validates pairing authority. Wait for
+        // an actual sweep before blocking the already-running supervisor.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while runtime.mcp_status().supervision_last_completed_ms.is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("supervisor did not complete its initial sweep");
         // The real sweep cannot acquire a binding snapshot. Its completed error
         // must not be mistaken for target cancellation acknowledgments.
         let (holding, held) = oneshot::channel();

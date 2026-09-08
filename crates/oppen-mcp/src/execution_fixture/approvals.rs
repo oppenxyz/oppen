@@ -402,7 +402,7 @@ impl HeadAnchor for AnchorHandle {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn signing_admission_wins_close_without_hiding_actual_submission_or_drain() {
+async fn close_during_ledger_wait_refuses_at_final_signing_admission_and_drains() {
     let dir = tempfile::tempdir().unwrap();
     let venue = Venue::start().await;
     let keys = Arc::new(FixtureKeys::default());
@@ -422,10 +422,6 @@ async fn signing_admission_wins_close_without_hiding_actual_submission_or_drain(
         .prepare(&binding(&runtime), &id)
         .await
         .unwrap();
-    let oppen_core::guardrail::ApprovalReviewDisplay::Order(displayed) = review.display().clone()
-    else {
-        panic!("expected order review");
-    };
     let entered = Arc::new(tokio::sync::Notify::new());
     let (release, wait) = std::sync::mpsc::channel();
     *anchor.signing_wait.lock().unwrap() = Some((
@@ -474,33 +470,40 @@ async fn signing_admission_wins_close_without_hiding_actual_submission_or_drain(
         .unwrap()
         .unwrap()
         .unwrap();
-    assert_eq!(reply["status"], "resting", "{reply}");
+    assert_eq!(reply["status"], "rejected", "{reply}");
+    assert_eq!(
+        reply["refusal"]["unevaluable"], "route_authority",
+        "{reply}"
+    );
     serving.finish().await;
-    let submitted = venue.submissions();
-    assert_eq!(submitted.len(), 1);
-    assert_eq!(
-        submitted[0]["action"]["orders"][0]["c"],
-        displayed.cloid.as_str()
-    );
-    assert_eq!(
-        submitted[0]["action"]["orders"][0]["p"],
-        WireFloat::from_decimal(displayed.px).unwrap().as_str()
-    );
-    assert!(matches!(
-        submitted[0]["signature"]["v"].as_u64(),
-        Some(27 | 28)
-    ));
+    assert!(venue.submissions().is_empty());
+    assert_eq!(count(&runtime, EventKind::SubmissionSigned), 0);
+    assert_eq!(count(&runtime, EventKind::SubmissionAccepted), 0);
     assert_eq!(count(&runtime, EventKind::SubmissionStarted), 1);
-    assert_eq!(count(&runtime, EventKind::SubmissionResolved), 0);
+    let resolved: Vec<_> = runtime
+        .ledger
+        .get_events(0, 1000)
+        .unwrap()
+        .events
+        .into_iter()
+        .filter(|event| event.kind == EventKind::SubmissionResolved)
+        .collect();
+    assert_eq!(resolved.len(), 1);
+    assert_eq!(
+        resolved[0].payload.as_ref().unwrap()["outcome"]["resolution"],
+        "not_sent"
+    );
     let pending = runtime
         .gateway
         .inner
         .submissions
         .state(runtime.account)
         .unwrap()
-        .pending
-        .expect("shutdown must retain the submitted order for authoritative reconciliation");
-    assert_eq!(pending.cloid(), &displayed.cloid);
+        .pending;
+    assert!(
+        pending.is_none(),
+        "final refusal must resolve the unsubmitted reservation"
+    );
     runtime.shutdown().await;
     venue.shutdown().await;
 }

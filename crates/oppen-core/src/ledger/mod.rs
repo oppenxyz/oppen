@@ -322,6 +322,10 @@ pub enum EventKind {
     SubmissionStarted,
     /// Authoritative evidence that a reservation is no longer in flight.
     SubmissionResolved,
+    /// Authenticated digest of a request produced by guarded signing.
+    SubmissionSigned,
+    /// Authenticated direct response associated with that exact request.
+    SubmissionAccepted,
     /// Operator-confirmed testnet pilot identity and cumulative authority.
     PilotAuthorized,
     /// Explicit authenticated adoption of original legacy pilot consent.
@@ -382,6 +386,8 @@ impl EventKind {
             EventKind::OrderStateChange => "order_state_change",
             EventKind::SubmissionStarted => "submission_started",
             EventKind::SubmissionResolved => "submission_resolved",
+            EventKind::SubmissionSigned => "submission_signed",
+            EventKind::SubmissionAccepted => "submission_accepted",
             EventKind::PilotAuthorized => "pilot_authorized",
             EventKind::PilotAdopted => "pilot_adopted",
             EventKind::PilotHalted => "pilot_halted",
@@ -419,6 +425,8 @@ impl std::str::FromStr for EventKind {
             "order_state_change" => Ok(EventKind::OrderStateChange),
             "submission_started" => Ok(EventKind::SubmissionStarted),
             "submission_resolved" => Ok(EventKind::SubmissionResolved),
+            "submission_signed" => Ok(EventKind::SubmissionSigned),
+            "submission_accepted" => Ok(EventKind::SubmissionAccepted),
             "pilot_authorized" => Ok(EventKind::PilotAuthorized),
             "pilot_adopted" => Ok(EventKind::PilotAdopted),
             "pilot_halted" => Ok(EventKind::PilotHalted),
@@ -994,9 +1002,10 @@ impl Ledger {
             EventKind::OrderIntent => Err(LedgerError::UseRecordIntent),
             EventKind::PayloadRedacted => Err(LedgerError::UseRedact),
             EventKind::Fill => Err(LedgerError::UseRecordFill),
-            EventKind::SubmissionStarted | EventKind::SubmissionResolved => {
-                Err(LedgerError::UseSubmissionJournal)
-            }
+            EventKind::SubmissionStarted
+            | EventKind::SubmissionResolved
+            | EventKind::SubmissionSigned
+            | EventKind::SubmissionAccepted => Err(LedgerError::UseSubmissionJournal),
             EventKind::PilotAuthorized | EventKind::PilotAdopted | EventKind::PilotHalted => {
                 Err(LedgerError::UsePilotJournal)
             }
@@ -1366,7 +1375,7 @@ impl Ledger {
         let mut statement = guard.prepare(&format!(
             "SELECT {SELECT_EVENT_COLUMNS} FROM events WHERE seq > ?1{} ORDER BY seq ASC LIMIT ?2",
             match scope {
-                Some(_) => " AND (agent_id = ?3 OR agent_id IS NULL) AND kind NOT IN ('pairing_issued', 'pairing_revoked', 'registry_granted', 'registry_retired', 'policy_initialized', 'policy_replaced', 'approval_proposed', 'approval_claimed', 'approval_disposed')",
+                Some(_) => " AND (agent_id = ?3 OR agent_id IS NULL) AND kind NOT IN ('pairing_issued', 'pairing_revoked', 'registry_granted', 'registry_retired', 'policy_initialized', 'policy_replaced', 'approval_proposed', 'approval_claimed', 'approval_disposed', 'submission_signed', 'submission_accepted')",
                 None => "",
             }
         ))?;
@@ -1908,28 +1917,93 @@ impl DerefMut for LedgerGuard<'_> {
 
 // Own the read transaction as well as the coordination guard through crypto.
 // A borrowing rusqlite::Transaction cannot be stored beside its owned guard.
-struct LedgerSigningPermit<'a>(LedgerGuard<'a>);
+struct LedgerSigningPermit<'a> {
+    guard: LedgerGuard<'a>,
+    sink: Option<&'a LedgerAuditSink>,
+    transaction_active: bool,
+}
 
 impl<'a> LedgerSigningPermit<'a> {
     fn new(guard: LedgerGuard<'a>) -> Result<Self> {
         guard.execute_batch("BEGIN DEFERRED")?;
-        Ok(Self(guard))
+        Ok(Self {
+            guard,
+            sink: None,
+            transaction_active: true,
+        })
     }
 }
 
-impl crate::guardrail::SigningPermit for LedgerSigningPermit<'_> {}
+impl crate::guardrail::SigningPermit for LedgerSigningPermit<'_> {
+    fn publish_submission(
+        &mut self,
+        evidence: &crate::guardrail::GuardedSignature<'_>,
+    ) -> std::result::Result<Appended, crate::guardrail::Refusal> {
+        let failure = |e: String| {
+            crate::guardrail::Refusal::from(crate::guardrail::Unevaluable::SubmissionAuthority {
+                detail: e,
+            })
+        };
+        let sink = self
+            .sink
+            .ok_or_else(|| failure("no authenticated submission sink".into()))?;
+        evidence
+            .journal()
+            .verify_owner(sink.policy.registry())
+            .map_err(|e| failure(e.to_string()))?;
+        self.guard
+            .execute_batch("ROLLBACK")
+            .map_err(|e| failure(e.to_string()))?;
+        self.transaction_active = false;
+        let tx = self
+            .guard
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| failure(e.to_string()))?;
+        sink.check_signing_in(
+            &tx,
+            evidence.clearance(),
+            evidence.wallet(),
+            evidence.signer(),
+        )?;
+        let appended = evidence
+            .journal()
+            .publish_signed_in(&tx, evidence)
+            .map_err(|e| failure(e.to_string()))?;
+        tx.commit().map_err(|e| failure(e.to_string()))?;
+        sink.policy
+            .registry()
+            .ledger()
+            .note_head(&appended)
+            .map_err(|e| failure(e.to_string()))?;
+        Ok(appended)
+    }
+
+    fn validate_submission(
+        &self,
+        submission: &crate::guardrail::SignedSubmission,
+    ) -> std::result::Result<(), crate::guardrail::Refusal> {
+        let sink = self.sink.ok_or_else(|| {
+            crate::guardrail::Refusal::from(crate::guardrail::Unevaluable::SubmissionAuthority {
+                detail: "no authenticated submission sink".into(),
+            })
+        })?;
+        submission.validate_in(&self.guard, sink.policy.registry())
+    }
+}
 
 impl Deref for LedgerSigningPermit<'_> {
     type Target = Connection;
 
     fn deref(&self) -> &Connection {
-        &self.0
+        &self.guard
     }
 }
 
 impl Drop for LedgerSigningPermit<'_> {
     fn drop(&mut self) {
-        if let Err(error) = self.0.execute_batch("ROLLBACK") {
+        if self.transaction_active
+            && let Err(error) = self.guard.execute_batch("ROLLBACK")
+        {
             // lock() refuses a connection left in a transaction after failure.
             tracing::error!(%error, "could not release signing snapshot");
         }
@@ -1998,6 +2072,8 @@ impl AgentView {
                     | EventKind::ApprovalProposed
                     | EventKind::ApprovalClaimed
                     | EventKind::ApprovalDisposed
+                    | EventKind::SubmissionSigned
+                    | EventKind::SubmissionAccepted
             ) && event
                 .agent_id
                 .as_ref()
@@ -2481,6 +2557,73 @@ impl std::fmt::Debug for LedgerAuditSink {
     }
 }
 
+impl LedgerAuditSink {
+    fn check_signing_in(
+        &self,
+        connection: &Connection,
+        clearance: &crate::guardrail::Clearance,
+        actual_wallet: &crate::keys::AgentWallet,
+        actual_signer: oppen_hl::Address,
+    ) -> std::result::Result<(), crate::guardrail::Refusal> {
+        let registry = self.policy.registry();
+        if clearance.route.network != clearance.network
+            || clearance.route.binding.agent != clearance.agent
+            || clearance.route.binding.vault_address != clearance.vault_address
+            || &clearance.route.binding.wallet != actual_wallet
+            || actual_wallet.address != actual_signer
+        {
+            return Err(crate::guardrail::Unevaluable::RouteAuthority {
+                detail: "clearance identity differs from the loaded signer or route".into(),
+            }
+            .into());
+        }
+        registry
+            .verify_route_in(connection, &clearance.route, actual_signer)
+            .map_err(|error| {
+                crate::guardrail::Refusal::from(crate::guardrail::Unevaluable::RouteAuthority {
+                    detail: error.to_string(),
+                })
+            })?;
+        if matches!(
+            clearance.kind,
+            crate::guardrail::ClearedKind::Order { .. }
+                | crate::guardrail::ClearedKind::DiscretionaryCancel { .. }
+        ) {
+            let policy = self.policy.current_in(connection).map_err(|error| {
+                crate::guardrail::Refusal::from(crate::guardrail::Unevaluable::PolicyAuthority {
+                    detail: error.to_string(),
+                })
+            })?;
+            if policy.revision != clearance.policy_revision {
+                return Err(crate::guardrail::Unevaluable::PolicyChanged.into());
+            }
+            if !policy.state.guardrails.contains_key(&clearance.agent) {
+                return Err(crate::guardrail::Unevaluable::UnknownAgent {
+                    agent: clearance.agent.clone(),
+                }
+                .into());
+            }
+            if matches!(clearance.kind, crate::guardrail::ClearedKind::Order { .. })
+                && let Some((scope, engagement)) = policy.state.kill.blocking(&clearance.agent)
+            {
+                return Err(crate::guardrail::Refusal::TradingPaused {
+                    scope,
+                    since_ms: engagement.engaged_at_ms,
+                    reason: engagement.reason.clone(),
+                });
+            }
+        }
+        pilot::check_authenticated_before_sign(
+            registry,
+            connection,
+            clearance,
+            self.pilot_required,
+        )
+        .map_err(PilotError::into_refusal)?;
+        Ok(())
+    }
+}
+
 impl crate::guardrail::AuditSink for LedgerAuditSink {
     fn route_for_agent(
         &self,
@@ -2508,61 +2651,17 @@ impl crate::guardrail::AuditSink for LedgerAuditSink {
         let ledger = registry.ledger();
         let permit = ledger
             .lock()
-            .and_then(LedgerSigningPermit::new)
+            .and_then(|guard| {
+                let mut permit = LedgerSigningPermit::new(guard)?;
+                permit.sink = Some(self);
+                Ok(permit)
+            })
             .map_err(|error| {
                 crate::guardrail::Refusal::from(crate::guardrail::Unevaluable::RouteAuthority {
                     detail: error.to_string(),
                 })
             })?;
-        if clearance.route.network != clearance.network
-            || clearance.route.binding.agent != clearance.agent
-            || clearance.route.binding.vault_address != clearance.vault_address
-            || &clearance.route.binding.wallet != actual_wallet
-            || actual_wallet.address != actual_signer
-        {
-            return Err(crate::guardrail::Unevaluable::RouteAuthority {
-                detail: "clearance identity differs from the loaded signer or route".into(),
-            }
-            .into());
-        }
-        registry
-            .verify_route_in(&permit, &clearance.route, actual_signer)
-            .map_err(|error| {
-                crate::guardrail::Refusal::from(crate::guardrail::Unevaluable::RouteAuthority {
-                    detail: error.to_string(),
-                })
-            })?;
-        if matches!(
-            clearance.kind,
-            crate::guardrail::ClearedKind::Order { .. }
-                | crate::guardrail::ClearedKind::DiscretionaryCancel { .. }
-        ) {
-            let policy = self.policy.current_in(&permit).map_err(|error| {
-                crate::guardrail::Refusal::from(crate::guardrail::Unevaluable::PolicyAuthority {
-                    detail: error.to_string(),
-                })
-            })?;
-            if policy.revision != clearance.policy_revision {
-                return Err(crate::guardrail::Unevaluable::PolicyChanged.into());
-            }
-            if !policy.state.guardrails.contains_key(&clearance.agent) {
-                return Err(crate::guardrail::Unevaluable::UnknownAgent {
-                    agent: clearance.agent.clone(),
-                }
-                .into());
-            }
-            if matches!(clearance.kind, crate::guardrail::ClearedKind::Order { .. })
-                && let Some((scope, engagement)) = policy.state.kill.blocking(&clearance.agent)
-            {
-                return Err(crate::guardrail::Refusal::TradingPaused {
-                    scope,
-                    since_ms: engagement.engaged_at_ms,
-                    reason: engagement.reason.clone(),
-                });
-            }
-        }
-        pilot::check_authenticated_before_sign(registry, &permit, clearance, self.pilot_required)
-            .map_err(PilotError::into_refusal)?;
+        self.check_signing_in(&permit, clearance, actual_wallet, actual_signer)?;
         Ok(Box::new(permit))
     }
 

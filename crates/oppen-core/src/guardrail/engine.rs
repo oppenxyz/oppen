@@ -40,7 +40,10 @@ use oppen_hl::{Action, Address, AgentKey, ExchangeRequest, Network};
 
 use crate::keys::{AgentWallet, KeyStore, KeyStoreError};
 use crate::ledger::approval::{ApprovalJournal, Candidate, ReviewCommitment, ReviewEvidence};
-use crate::ledger::{AuthorizedRoute, LedgerAuditSink, PolicyJournal};
+use crate::ledger::{
+    Appended, AuthorizedRoute, LedgerAuditSink, PolicyJournal, SubmissionError, SubmissionJournal,
+    SubmissionReceipt,
+};
 
 use super::breaker::{self, BudgetScope, LossBudget, LossKind};
 use super::bucket::{BucketError, TokenBucket};
@@ -597,7 +600,117 @@ pub struct AuditEntry<'a> {
 
 /// Opaque authority retained until signing finishes. The ledger implementation
 /// holds its coordination lock; test sinks may use the unit implementation.
-pub trait SigningPermit {}
+pub trait SigningPermit {
+    fn publish_submission(
+        &mut self,
+        _evidence: &GuardedSignature<'_>,
+    ) -> Result<Appended, Refusal> {
+        Err(submission_refusal(
+            "signing permit cannot publish submission evidence",
+        ))
+    }
+    fn validate_submission(&self, _submission: &SignedSubmission) -> Result<(), Refusal> {
+        Err(submission_refusal(
+            "signing permit cannot verify submission evidence",
+        ))
+    }
+}
+
+/// Borrowed proof constructed only after successful guarded crypto. Not a
+/// caller-supplied request certification API.
+pub struct GuardedSignature<'a> {
+    journal: &'a SubmissionJournal,
+    receipt: &'a SubmissionReceipt,
+    request: &'a ExchangeRequest,
+    clearance: &'a Clearance,
+    wallet: &'a AgentWallet,
+    signer: Address,
+    signed_at_ms: u64,
+}
+
+impl GuardedSignature<'_> {
+    pub(crate) fn journal(&self) -> &SubmissionJournal {
+        self.journal
+    }
+    pub(crate) fn receipt(&self) -> &SubmissionReceipt {
+        self.receipt
+    }
+    pub(crate) fn request(&self) -> &ExchangeRequest {
+        self.request
+    }
+    pub(crate) fn clearance(&self) -> &Clearance {
+        self.clearance
+    }
+    pub(crate) fn wallet(&self) -> &AgentWallet {
+        self.wallet
+    }
+    pub(crate) fn signer(&self) -> Address {
+        self.signer
+    }
+    pub(crate) fn signed_at_ms(&self) -> u64 {
+        self.signed_at_ms
+    }
+}
+
+/// One in-memory transport capability. The ledger stores its digest, never
+/// executable request bytes. Dropping this does not release a reservation.
+pub struct SignedSubmission {
+    owner: Arc<()>,
+    journal: SubmissionJournal,
+    receipt: SubmissionReceipt,
+    signed: Appended,
+    request: ExchangeRequest,
+    clearance: Clearance,
+    deadline: Option<u64>,
+    wallet: AgentWallet,
+    signer: Address,
+}
+
+impl SignedSubmission {
+    pub(crate) fn validate_in(
+        &self,
+        connection: &rusqlite::Connection,
+        registry: &crate::ledger::RegistryJournal,
+    ) -> Result<(), Refusal> {
+        self.journal
+            .verify_owner(registry)
+            .map_err(submission_refusal)?;
+        self.journal
+            .verify_signed_in(
+                connection,
+                &self.receipt,
+                &self.signed,
+                &self.request,
+                &self.clearance,
+            )
+            .map_err(submission_refusal)
+    }
+}
+
+type SignedParts = (
+    ExchangeRequest,
+    Clearance,
+    Option<Appended>,
+    AgentWallet,
+    Address,
+);
+
+#[derive(Debug, thiserror::Error)]
+pub enum SubmissionPostError {
+    #[error("submission not dispatched: {0}")]
+    NotSent(Refusal),
+    #[error(transparent)]
+    Transport(oppen_hl::Error),
+    #[error("submission result could not be durably recorded: {0}")]
+    JournalUncertain(SubmissionError),
+}
+
+fn submission_refusal(error: impl std::fmt::Display) -> Refusal {
+    Unevaluable::SubmissionAuthority {
+        detail: error.to_string(),
+    }
+    .into()
+}
 
 #[cfg(test)]
 impl SigningPermit for () {}
@@ -802,6 +915,7 @@ impl EngineState {
 /// gateway and the workflow runner all hold the same instance, and a type
 /// parameter would leak into every one of their signatures.
 pub struct GuardrailEngine {
+    submission_owner: Arc<()>,
     submissions: Option<crate::ledger::SubmissionJournal>,
     approvals: Option<ApprovalJournal>,
     store: Arc<dyn GuardrailStore>,
@@ -935,6 +1049,7 @@ impl GuardrailEngine {
         }
         Ok(Self {
             submissions: None,
+            submission_owner: Arc::new(()),
             approvals: None,
             store,
             sink,
@@ -2917,6 +3032,87 @@ impl GuardrailEngine {
         clock: impl Fn() -> u64,
         authorize: impl FnOnce() -> Result<G, Refusal>,
     ) -> Result<(ExchangeRequest, Clearance), SignClearedError> {
+        self.sign_common(cleared, nonce, expires_after, clock, authorize, None, None)
+            .map(|(request, clearance, _, _, _)| (request, clearance))
+    }
+
+    /// Signs and publishes digest-only evidence before granting one dispatch.
+    ///
+    /// `authorize` must be observational, nonblocking, perform no I/O, and not
+    /// depend on invocation count. Its initial guard is retained; repeated
+    /// checks after ledger/state/publication waits discard only their new guard.
+    /// Cancellation observed at the final pre-crypto check prevents crypto.
+    /// Cancellation after that observation can race with crypto; a refusal at
+    /// the post-publication check withholds dispatch capability, not the already
+    /// produced signature. The dispatch boundary checks again separately.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sign_submission_authorized<G>(
+        &self,
+        cleared: Cleared,
+        journal: &SubmissionJournal,
+        receipt: &SubmissionReceipt,
+        nonce: u64,
+        expires_after: Option<u64>,
+        clock: impl Fn() -> u64,
+        authorize: impl Fn() -> Result<G, Refusal>,
+    ) -> Result<SignedSubmission, SignClearedError> {
+        let deadline = cleared.approval_deadline_ms;
+        let final_authorize = || authorize().map(drop);
+        let (request, clearance, signed, wallet, signer) = self.sign_common(
+            cleared,
+            nonce,
+            expires_after,
+            clock,
+            &authorize,
+            Some((journal, receipt)),
+            Some(&final_authorize),
+        )?;
+        let signed = signed.ok_or_else(|| {
+            SignClearedError::Refused(submission_refusal("missing signing publication"))
+        })?;
+        Ok(SignedSubmission {
+            owner: self.submission_owner.clone(),
+            journal: journal.clone(),
+            receipt: receipt.clone(),
+            signed,
+            request,
+            clearance,
+            deadline,
+            wallet,
+            signer,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn sign_common<G>(
+        &self,
+        cleared: Cleared,
+        nonce: u64,
+        expires_after: Option<u64>,
+        clock: impl Fn() -> u64,
+        authorize: impl FnOnce() -> Result<G, Refusal>,
+        submission: Option<(&SubmissionJournal, &SubmissionReceipt)>,
+        final_authorize: Option<&dyn Fn() -> Result<(), Refusal>>,
+    ) -> Result<SignedParts, SignClearedError> {
+        if let Some((journal, receipt)) = submission {
+            let check = self
+                .submissions()
+                .map_err(submission_refusal)
+                .and_then(|own| {
+                    if !own.same_authority(journal) {
+                        return Err(submission_refusal(
+                            "submission journal differs from engine authority",
+                        ));
+                    }
+                    journal
+                        .verify_reserved(receipt, cleared.clearance())
+                        .map_err(submission_refusal)
+                });
+            if let Err(refusal) = check {
+                self.record_pre_sign_refusal(&cleared.clearance.agent, clock(), &refusal);
+                return Err(SignClearedError::Refused(refusal));
+            }
+        }
         let (action, clearance, approval_deadline_ms) = cleared.into_parts();
         let (key, wallet): (AgentKey, AgentWallet) =
             self.keys.load_agent_key_with_wallet(&clearance.agent)?;
@@ -2930,9 +3126,10 @@ impl GuardrailEngine {
             clearance: &clearance,
             approval_deadline_ms,
             clock: &clock,
+            final_authorize,
             observed_at_ms: std::cell::Cell::new(None),
             actual_signer,
-            wallet,
+            wallet: wallet.clone(),
             held_state: std::cell::RefCell::new(None),
             held_authority: std::cell::RefCell::new(None),
         };
@@ -2945,6 +3142,39 @@ impl GuardrailEngine {
             clearance.network,
             &gate,
         );
+        let mut publication = None;
+        let signed = signed.and_then(|request| {
+            if let Some((journal, receipt)) = submission {
+                let signed_at_ms = gate.observed_at_ms.get().ok_or_else(|| {
+                    SignError::Refused(submission_refusal("signing clock missing"))
+                })?;
+                gate.held_state.borrow_mut().take();
+                let evidence = GuardedSignature {
+                    journal,
+                    receipt,
+                    request: &request,
+                    clearance: &clearance,
+                    wallet: &wallet,
+                    signer: actual_signer,
+                    signed_at_ms,
+                };
+                let mut permit = gate.held_authority.borrow_mut();
+                publication = Some(
+                    permit
+                        .as_mut()
+                        .ok_or_else(|| {
+                            SignError::Refused(submission_refusal("signing authority missing"))
+                        })?
+                        .publish_submission(&evidence)
+                        .map_err(SignError::Refused)?,
+                );
+                let state = self.state();
+                gate.check_state(&state, request.action())
+                    .map_err(SignError::Refused)?;
+                *gate.held_state.borrow_mut() = Some(state);
+            }
+            Ok(request)
+        });
         // Release durable authority only after signing, and before refusal
         // auditing (which needs the same ledger lock).
         let observed_at_ms = gate.observed_at_ms.get();
@@ -2969,7 +3199,106 @@ impl GuardrailEngine {
             }
             SignError::Signing(e) => SignClearedError::Signing(e),
         })?;
-        Ok((request, clearance))
+        Ok((request, clearance, publication, wallet, actual_signer))
+    }
+
+    /// Consumes a private request once. First polling is local dispatch admission,
+    /// not proof that any bytes reached a socket or that the venue accepted them.
+    /// `authorize` has the same observational/nonblocking contract as
+    /// [`Self::sign_submission_authorized`]. The final observation follows all
+    /// ledger/state/evidence waits, before the clock sample and first HTTP poll.
+    /// Cancellation after that observation may race with local dispatch.
+    pub async fn post_submission_authorized<G, C, A>(
+        &self,
+        signed: SignedSubmission,
+        exchange: &oppen_hl::exchange::ExchangeClient,
+        clock: C,
+        authorize: A,
+    ) -> Result<oppen_hl::exchange::ExchangeResponse, SubmissionPostError>
+    where
+        C: Fn() -> u64 + Send + Sync,
+        A: Fn() -> Result<G, Refusal> + Send,
+    {
+        use std::future::Future;
+        let mut authorize = Some(authorize);
+        let mut post = std::pin::pin!(exchange.post(&signed.request));
+        let response = std::future::poll_fn(|cx| {
+            if let Some(authorize) = authorize.take() {
+                let mut admit = || -> Result<_, Refusal> {
+                    if !Arc::ptr_eq(&self.submission_owner, &signed.owner)
+                        || exchange.network() != signed.clearance.network
+                        || !self
+                            .submissions()
+                            .map_err(submission_refusal)?
+                            .same_authority(&signed.journal)
+                    {
+                        return Err(submission_refusal("dispatch network or authority mismatch"));
+                    }
+                    let caller = authorize()?;
+                    let final_authorize = || authorize().map(drop);
+                    let gate = PreSignGate {
+                        engine: self,
+                        clearance: &signed.clearance,
+                        approval_deadline_ms: signed.deadline,
+                        clock: &clock,
+                        final_authorize: Some(&final_authorize),
+                        observed_at_ms: std::cell::Cell::new(None),
+                        actual_signer: signed.signer,
+                        wallet: signed.wallet.clone(),
+                        held_state: std::cell::RefCell::new(None),
+                        held_authority: std::cell::RefCell::new(None),
+                    };
+                    gate.check(PreSign {
+                        action: signed.request.action(),
+                        nonce: signed.request.nonce(),
+                        vault_address: signed.request.vault_address(),
+                        expires_after: signed.request.expires_after(),
+                        network: signed.clearance.network,
+                    })?;
+                    gate.held_authority
+                        .borrow()
+                        .as_ref()
+                        .ok_or_else(|| submission_refusal("dispatch authority missing"))?
+                        .validate_submission(&signed)?;
+                    // Evidence verification may block; sample the same predicates again.
+                    gate.check_state(
+                        gate.held_state
+                            .borrow()
+                            .as_ref()
+                            .ok_or_else(|| submission_refusal("dispatch state missing"))?,
+                        signed.request.action(),
+                    )?;
+                    let polled = post.as_mut().poll(cx);
+                    drop(gate);
+                    drop(caller);
+                    Ok(polled)
+                };
+                match admit() {
+                    Ok(polled) => polled.map_err(SubmissionPostError::Transport),
+                    Err(refusal) => {
+                        self.record_pre_sign_refusal(&signed.clearance.agent, clock(), &refusal);
+                        std::task::Poll::Ready(Err(SubmissionPostError::NotSent(refusal)))
+                    }
+                }
+            } else {
+                post.as_mut()
+                    .poll(cx)
+                    .map_err(SubmissionPostError::Transport)
+            }
+        })
+        .await;
+        signed
+            .journal
+            .record_post_result(
+                &signed.receipt,
+                &signed.signed,
+                &signed.request,
+                &signed.clearance,
+                &response,
+                clock(),
+            )
+            .map_err(SubmissionPostError::JournalUncertain)?;
+        response
     }
 
     /// Writes the ledger row for a refusal that happened at the signer rather
@@ -2984,6 +3313,14 @@ impl GuardrailEngine {
     /// reading as [`GuardrailEngine::record`]'s refusal branch: losing the
     /// row is bad, but the safe outcome has already happened.
     fn record_pre_sign_refusal(&self, agent: &AgentId, now_ms: u64, refusal: &Refusal) {
+        // A committed evidence row may still need head-anchor publication.
+        // Do not turn that recoverable one-row window into a second append.
+        if matches!(
+            refusal,
+            Refusal::Unevaluable(Unevaluable::SubmissionAuthority { .. })
+        ) {
+            return;
+        }
         let entry = AuditEntry {
             agent: Some(agent),
             at_ms: now_ms,
@@ -3059,12 +3396,106 @@ struct PreSignGate<'a> {
     clearance: &'a Clearance,
     approval_deadline_ms: Option<u64>,
     clock: &'a dyn Fn() -> u64,
+    final_authorize: Option<&'a dyn Fn() -> Result<(), Refusal>>,
     observed_at_ms: std::cell::Cell<Option<u64>>,
     actual_signer: Address,
     wallet: AgentWallet,
     // Declaration order releases state before the enclosing ledger authority.
     held_state: std::cell::RefCell<Option<MutexGuard<'a, EngineState>>>,
     held_authority: std::cell::RefCell<Option<Box<dyn SigningPermit + 'a>>>,
+}
+
+impl PreSignGate<'_> {
+    fn check_state(&self, state: &EngineState, action: &Action) -> Result<(), Refusal> {
+        if let Some(authorize) = self.final_authorize {
+            authorize()?;
+        }
+        // Sample only after every potentially blocking admission dependency.
+        let now_ms = (self.clock)();
+        self.observed_at_ms.set(Some(now_ms));
+        if let Some(expires_at_ms) = self.approval_deadline_ms
+            && now_ms >= expires_at_ms
+        {
+            return Err(Unevaluable::ApprovalExpired {
+                expires_at_ms,
+                now_ms,
+            }
+            .into());
+        }
+        // Exhaustive on purpose, and `ClearedKind` is `#[non_exhaustive]`
+        // only outside this crate: a new kind cannot be added without an
+        // answer here to "what does this clearance's age make untrue?".
+        match &self.clearance.kind {
+            ClearedKind::Order { .. } => {
+                check_order_approval_window(&self.clearance.route, now_ms)?;
+                if self.clearance.policy_revision != state.policy_revision {
+                    return Err(Unevaluable::PolicyChanged.into());
+                }
+                state.check_acknowledgment()?;
+                let config = state.guardrails.get(&self.clearance.agent).ok_or_else(|| {
+                    Unevaluable::UnknownAgent {
+                        agent: self.clearance.agent.clone(),
+                    }
+                })?;
+                let evaluated_at_ms = self.clearance.evaluated_at_ms;
+                if now_ms < evaluated_at_ms {
+                    return Err(Unevaluable::ClockWentBackwards {
+                        now_ms,
+                        last_ms: evaluated_at_ms,
+                    }
+                    .into());
+                }
+                let age_ms = now_ms.saturating_sub(evaluated_at_ms);
+                let max_age_ms = config.freshness.max_market_age_ms;
+                if age_ms > max_age_ms {
+                    return Err(Unevaluable::StaleClearance { age_ms, max_age_ms }.into());
+                }
+            }
+            ClearedKind::DiscretionaryCancel { observed_at_ms, .. } => {
+                if self.clearance.policy_revision != state.policy_revision {
+                    return Err(Unevaluable::PolicyChanged.into());
+                }
+                let config = state.guardrails.get(&self.clearance.agent).ok_or_else(|| {
+                    Unevaluable::UnknownAgent {
+                        agent: self.clearance.agent.clone(),
+                    }
+                })?;
+                let last_ms = self.clearance.evaluated_at_ms.max(*observed_at_ms);
+                if now_ms < last_ms {
+                    return Err(Unevaluable::ClockWentBackwards { now_ms, last_ms }.into());
+                }
+                let age_ms = now_ms - observed_at_ms;
+                let max_age_ms = config.freshness.max_account_age_ms;
+                if age_ms > max_age_ms {
+                    return Err(Unevaluable::StaleClearance { age_ms, max_age_ms }.into());
+                }
+            }
+            ClearedKind::ScheduleCancel {
+                cancel_at_ms: Some(at),
+            } => {
+                let earliest_ms = now_ms.saturating_add(DEAD_MAN_MIN_LEAD_MS);
+                if *at < earliest_ms {
+                    return Err(VenueRule::ScheduleCancelTooSoon {
+                        cancel_at_ms: *at,
+                        earliest_ms,
+                    }
+                    .into());
+                }
+            }
+            ClearedKind::Cancel { .. } | ClearedKind::ScheduleCancel { cancel_at_ms: None } => {}
+        }
+        if !is_risk_reducing(action)
+            && let Some((scope, engagement)) =
+                state.effective_kill().blocking(&self.clearance.agent)
+        {
+            return Err(Refusal::TradingPaused {
+                scope,
+                since_ms: engagement.engaged_at_ms,
+                reason: engagement.reason.clone(),
+            });
+        }
+        Ok(())
+    }
 }
 
 impl PreSignCheck for PreSignGate<'_> {
@@ -3099,93 +3530,7 @@ impl PreSignCheck for PreSignGate<'_> {
             self.actual_signer,
         )?);
         let state = engine.state();
-        // Sample only after every potentially blocking admission dependency.
-        let now_ms = (self.clock)();
-        self.observed_at_ms.set(Some(now_ms));
-        if let Some(expires_at_ms) = self.approval_deadline_ms
-            && now_ms >= expires_at_ms
-        {
-            return Err(Unevaluable::ApprovalExpired {
-                expires_at_ms,
-                now_ms,
-            }
-            .into());
-        }
-        // Exhaustive on purpose, and `ClearedKind` is `#[non_exhaustive]`
-        // only outside this crate: a new kind cannot be added without an
-        // answer here to "what does this clearance's age make untrue?".
-        match &self.clearance.kind {
-            ClearedKind::Order { .. } => {
-                check_order_approval_window(&self.clearance.route, now_ms)?;
-                if self.clearance.policy_revision != state.policy_revision {
-                    return Err(Unevaluable::PolicyChanged.into());
-                }
-                state.check_acknowledgment()?;
-                let config =
-                    state
-                        .guardrails
-                        .get(agent)
-                        .ok_or_else(|| Unevaluable::UnknownAgent {
-                            agent: agent.clone(),
-                        })?;
-                let evaluated_at_ms = self.clearance.evaluated_at_ms;
-                if now_ms < evaluated_at_ms {
-                    return Err(Unevaluable::ClockWentBackwards {
-                        now_ms,
-                        last_ms: evaluated_at_ms,
-                    }
-                    .into());
-                }
-                let age_ms = now_ms.saturating_sub(evaluated_at_ms);
-                let max_age_ms = config.freshness.max_market_age_ms;
-                if age_ms > max_age_ms {
-                    return Err(Unevaluable::StaleClearance { age_ms, max_age_ms }.into());
-                }
-            }
-            ClearedKind::DiscretionaryCancel { observed_at_ms, .. } => {
-                if self.clearance.policy_revision != state.policy_revision {
-                    return Err(Unevaluable::PolicyChanged.into());
-                }
-                let config =
-                    state
-                        .guardrails
-                        .get(agent)
-                        .ok_or_else(|| Unevaluable::UnknownAgent {
-                            agent: agent.clone(),
-                        })?;
-                let last_ms = self.clearance.evaluated_at_ms.max(*observed_at_ms);
-                if now_ms < last_ms {
-                    return Err(Unevaluable::ClockWentBackwards { now_ms, last_ms }.into());
-                }
-                let age_ms = now_ms - observed_at_ms;
-                let max_age_ms = config.freshness.max_account_age_ms;
-                if age_ms > max_age_ms {
-                    return Err(Unevaluable::StaleClearance { age_ms, max_age_ms }.into());
-                }
-            }
-            ClearedKind::ScheduleCancel {
-                cancel_at_ms: Some(at),
-            } => {
-                let earliest_ms = now_ms.saturating_add(DEAD_MAN_MIN_LEAD_MS);
-                if *at < earliest_ms {
-                    return Err(VenueRule::ScheduleCancelTooSoon {
-                        cancel_at_ms: *at,
-                        earliest_ms,
-                    }
-                    .into());
-                }
-            }
-            ClearedKind::Cancel { .. } | ClearedKind::ScheduleCancel { cancel_at_ms: None } => {}
-        }
-        if !is_risk_reducing(request.action)
-            && let Some((scope, engagement)) = state.effective_kill().blocking(agent)
-        {
-            return Err(Refusal::TradingPaused {
-                scope,
-                since_ms: engagement.engaged_at_ms,
-                reason: engagement.reason.clone(),
-            });
-        }
+        self.check_state(&state, request.action)?;
         *self.held_state.borrow_mut() = Some(state);
         Ok(())
     }

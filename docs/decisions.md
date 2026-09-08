@@ -11,6 +11,43 @@ decisions" section until then.
 
 ---
 
+## 2026-09-08 · Non-replayable submission commitments
+
+ES31b implements the evidence boundary required by D1, using the existing
+submission journal. Persist an authenticated, domain-separated digest of the
+complete guarded signed request, not its replayable signature bytes. Commit to
+network and ledger identity, exact action, nonce, vault, expiry and signature;
+authenticate the digest together with the historical route, signer generation,
+reservation and intent receipts. Preserve unsigned order attributes for identity
+validation. Canonical encoding must be versioned and tested without rewriting
+wire price/size strings or historical records.
+
+Only the existing guarded signing boundary may create this evidence. Keep the
+executable request private in an opaque consuming transport capability. Durable
+publication must succeed before transport; neither Debug nor event/export paths
+may reveal the executable request. An accepted-OID record must link the actual
+validated response of that request, not caller-supplied response data.
+
+Signed evidence is not submission or acceptance evidence. A signed-only record
+after restart grants no cancellation ownership. Digest identity alone cannot
+authenticate a node record's attached response; trustworthy execution association
+remains required for lost-response recovery. No automatic reconstruction,
+re-signing, resend, historical ownership adoption or budget reset is allowed.
+This decision adds no dependency or node/provider requirement and authorizes no
+live activity or publication. Lock ordering and the concrete handoff must pass
+implementation review before this evidence path is treated as usable.
+
+Order submission runs in one bounded, retained blocking worker per gateway,
+separate from the decision worker so stalled submission I/O cannot occupy that
+worker. It owns the account reservation and actual server/session lifetime
+through guarded signing, HTTP and acceptance publication. Dropping its waiter
+does not release these obligations. Ordinary session cancellation/revocation and
+server shutdown are rechecked before signing and local HTTP admission; native
+work retains its pinned operator authority. After HTTP starts, interruption is
+not rollback or NotSent. Worker panic is a typed recovery failure. Runtime
+cleanup does not compete for the order-submission slot. This bounds new blocking
+I/O; it is not a claim that all historical ledger callers are nonblocking.
+
 ## 2026-09-08 · Exchange response identity
 
 ES31a is a prerequisite for D1 provenance and spec item 19's factual execution

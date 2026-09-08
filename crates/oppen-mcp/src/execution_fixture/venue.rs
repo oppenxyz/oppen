@@ -22,6 +22,7 @@ pub(super) enum Behavior {
     Resting,
     Rejected,
     AppliedMalformed,
+    AppliedDropped,
     WrongKind,
     WrongKindError,
     ExtraStatus,
@@ -560,7 +561,12 @@ async fn info(State(state): State<Arc<Mutex<Book>>>, Json(request): Json<Value>)
 
 async fn exchange(State(state): State<Arc<Mutex<Book>>>, Json(request): Json<Value>) -> Response {
     let mut book = state.lock().expect("fixture lock");
+    let drop_response = matches!(book.behaviors.front(), Some(Behavior::AppliedDropped));
     match book.exchange(request) {
+        Ok(_) if drop_response => Response::builder()
+            .header("content-length", "1")
+            .body(axum::body::Body::empty())
+            .unwrap(),
         Ok((_, true)) => (StatusCode::OK, "{malformed").into_response(),
         Ok((value, false)) => Json(value).into_response(),
         Err(message) => failure(&mut book, message),

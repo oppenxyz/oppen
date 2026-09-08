@@ -16,6 +16,9 @@ use crate::guardrail::{Clearance, ClearedKind};
 
 type Result<T> = std::result::Result<T, SubmissionError>;
 
+#[path = "submission_evidence.rs"]
+mod evidence;
+
 #[cfg(test)]
 thread_local! {
     static AFTER_VERIFIED_WALK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
@@ -171,6 +174,9 @@ impl SubmissionJournal {
         // handles while the anchor and chain are checked.
         let tx = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut replay = self.replay(&tx)?;
+        if self.1.is_some() {
+            self.verify_evidence_in(&tx)?;
+        }
         Ok(replay.accounts.remove(&account).unwrap_or_default())
     }
 
@@ -224,6 +230,9 @@ impl SubmissionJournal {
         let mut guard = self.0.lock()?;
         let tx = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let replay = self.replay(&tx)?;
+        if self.1.is_some() {
+            self.verify_evidence_in(&tx)?;
+        }
         let state = replay.accounts.get(&account).cloned().unwrap_or_default();
         if let Some(pending) = state.pending {
             return Err(SubmissionError::Busy {

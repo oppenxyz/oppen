@@ -23,6 +23,7 @@ sha3 = { version = "0.11", default-features = false }
 tokio.workspace = true
 
 [dev-dependencies]
+oppen-hl = { path = "../oppen-hl", features = ["test-support"] }
 tempfile = "3"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 

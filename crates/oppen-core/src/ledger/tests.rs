@@ -2752,7 +2752,7 @@ fn generic_writers_cannot_forge_submission_lifecycle_events() {
 
 #[test]
 fn authority_reader_barriers_preserve_the_existing_chain_on_upgrade() {
-    for prior_version in [3, 4, 5, 6, 7, 8, 9, 10, 11] {
+    for prior_version in [3, 4, 5, 6, 7, 8, 9, 10, 11, 12] {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("testnet.db");
         let (head, original) = {
@@ -2787,7 +2787,7 @@ fn authority_reader_barriers_preserve_the_existing_chain_on_upgrade() {
             .unwrap()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 12);
+        assert_eq!(version, 13);
     }
 }
 
@@ -2864,14 +2864,14 @@ fn a_reader_refuses_a_newer_authority_schema_without_rewriting_history() {
         .connection
         .lock()
         .unwrap()
-        .pragma_update(None, "user_version", 13)
+        .pragma_update(None, "user_version", 14)
         .unwrap();
     drop(ledger);
     assert!(matches!(
         Ledger::open_at(&path, Network::Testnet),
         Err(LedgerError::SchemaTooNew {
-            found: 13,
-            supported: 12
+            found: 14,
+            supported: 13
         })
     ));
     let connection = rusqlite::Connection::open(&path).unwrap();
@@ -2879,8 +2879,44 @@ fn a_reader_refuses_a_newer_authority_schema_without_rewriting_history() {
         connection
             .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
             .unwrap(),
-        13
+        14
     );
     let (seq, hash) = super::head(&connection).unwrap();
     assert_eq!(Anchor { seq, hash }, head);
+}
+
+#[test]
+fn submission_evidence_is_operator_only_even_without_an_agent_column() {
+    let dir = TempDir::new().unwrap();
+    let ledger = Arc::new(Ledger::open(dir.path(), Network::Testnet).unwrap());
+    let views = EventViews::new(ledger.clone());
+    for kind in [EventKind::SubmissionSigned, EventKind::SubmissionAccepted] {
+        for agent_id in [None, Some("alpha")] {
+            let event = NewEvent {
+                kind,
+                ts_ms: 1,
+                agent_id,
+                payload: &json!({"fixture": "private signed submission evidence"}),
+                snapshot: None,
+            };
+            assert!(matches!(
+                ledger.append(&event),
+                Err(LedgerError::UseSubmissionJournal)
+            ));
+            // The private test writer isolates visibility from authentication.
+            let written = ledger.append_committed(&event).unwrap();
+            for agent in ["alpha", "beta"] {
+                assert!(
+                    ledger
+                        .get_events_for_agent(agent, 0, 100)
+                        .unwrap()
+                        .events
+                        .is_empty()
+                );
+                assert!(views.for_agent(agent).event(written.seq).unwrap().is_none());
+            }
+            assert!(ledger.event(written.seq).unwrap().is_some());
+        }
+    }
+    assert_eq!(ledger.get_events(0, 100).unwrap().events.len(), 4);
 }

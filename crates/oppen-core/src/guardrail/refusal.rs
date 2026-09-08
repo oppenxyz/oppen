@@ -386,6 +386,8 @@ pub enum Unevaluable {
     OriginalRequestMismatch,
     #[error("approval authority unavailable: {detail}")]
     ApprovalAuthority { detail: String },
+    #[error("submission evidence unavailable: {detail}")]
+    SubmissionAuthority { detail: String },
     #[error("policy authority unavailable or unacknowledged: {detail}")]
     PolicyAuthority { detail: String },
     /// Missing, inconsistent or revoked account and wallet routing authority.

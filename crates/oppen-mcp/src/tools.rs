@@ -86,6 +86,7 @@ struct GatewayInner {
     pilot_reader: Arc<tokio::sync::Semaphore>,
     route_reader: Arc<tokio::sync::Semaphore>,
     decision_worker: Arc<tokio::sync::Semaphore>,
+    submission_worker: Arc<tokio::sync::Semaphore>,
     submissions: SubmissionJournal,
     network: Network,
     info: InfoClient,
@@ -540,6 +541,7 @@ impl Gateway {
                 pilot_reader: Arc::new(tokio::sync::Semaphore::new(1)),
                 route_reader: Arc::new(tokio::sync::Semaphore::new(1)),
                 decision_worker: Arc::new(tokio::sync::Semaphore::new(1)),
+                submission_worker: Arc::new(tokio::sync::Semaphore::new(1)),
                 submissions: engine.submissions()?,
                 network,
                 info: InfoClient::new(network)?,
@@ -611,6 +613,7 @@ impl Gateway {
             .clone()
     }
 
+    #[cfg(test)]
     async fn reserve_submission(&self, bound: &Binding) -> Result<ExecutionPermit, ToolError> {
         self.reserve_submission_tracked(bound, None).await
     }
@@ -621,20 +624,45 @@ impl Gateway {
         tracker: Option<ExecutionTracker>,
     ) -> Result<ExecutionPermit, ToolError> {
         self.require_route_tracked(bound, tracker.clone()).await?;
-        reserve_account(
-            self.execution_queue(bound.account),
-            &self.inner.submissions,
-            bound.account,
-            |cloid| async move {
-                self.require_route_tracked(bound, tracker).await?;
-                self.inner
-                    .info
-                    .order_status(bound.account, OrderRef::Cloid(cloid))
-                    .await
-                    .map_err(|e| ToolError::unavailable("submission reconciliation", e))
-            },
-        )
+        self.reserve_submission_account(bound, tracker).await
+    }
+
+    async fn reserve_submission_account(
+        &self,
+        bound: &Binding,
+        tracker: Option<ExecutionTracker>,
+    ) -> Result<ExecutionPermit, ToolError> {
+        let held = self.execution_queue(bound.account).lock_owned().await;
+        let slot = self
+            .inner
+            .submission_worker
+            .clone()
+            .try_acquire_owned()
+            .map_err(|error| ToolError::unavailable("submission worker busy", error))?;
+        let gateway = self.clone();
+        let bound = bound.clone();
+        let runtime = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || {
+            let _slot = slot;
+            runtime.block_on(reserve_account_held(
+                held,
+                &gateway.inner.submissions,
+                bound.account,
+                |cloid| async {
+                    gateway
+                        .require_route_tracked(&bound, tracker.clone())
+                        .await?;
+                    gateway
+                        .inner
+                        .info
+                        .order_status(bound.account, OrderRef::Cloid(cloid))
+                        .await
+                        .map_err(|e| ToolError::unavailable("submission reconciliation", e))
+                },
+            ))
+        })
         .await
+        .map_err(|error| ToolError::worker_failed("submission reservation worker", error))?
     }
 
     async fn require_route(&self, bound: &Binding) -> Result<(), ToolError> {
@@ -880,7 +908,9 @@ impl Gateway {
     ) -> Result<CallToolResult, ErrorData> {
         let tracker = ExecutionTracker::from_context(&ctx)?;
         let bound = Self::bound(&ctx)?;
-        let permit = self.reserve_submission(&bound).await?;
+        let permit = self
+            .reserve_submission_tracked(&bound, Some(tracker.clone()))
+            .await?;
         let now_ms = now_ms();
 
         let context = self
@@ -933,7 +963,7 @@ impl Gateway {
         let agent = bound.agent.clone();
         let asset = asset.clone();
         let cleared = match self
-            .decision(tracker, move |engine| {
+            .decision(tracker.clone(), move |engine| {
                 engine.evaluate(
                     &agent,
                     &intent,
@@ -950,7 +980,7 @@ impl Gateway {
         };
 
         let response = match self
-            .submit(cleared, Some(&cloid), &bound, Some(&permit))
+            .submit(cleared, Some(&cloid), &bound, Some(permit), Some(tracker))
             .await
         {
             Ok(response) => response,
@@ -1048,7 +1078,7 @@ impl Gateway {
         };
 
         let response = self
-            .submit(cleared, order.cloid.as_ref(), &bound, None)
+            .submit(cleared, order.cloid.as_ref(), &bound, None, None)
             .await?;
         Ok(cancel_outcome(
             response,
@@ -1103,7 +1133,7 @@ impl Gateway {
                     .map_err(|e| ToolError::unavailable("orders", e))?;
                 Ok((orders, self.universe().await?))
             },
-            |cleared| self.submit(cleared, None, bound, None),
+            |cleared| self.submit(cleared, None, bound, None, None),
         )
         .await
     }
@@ -1237,7 +1267,9 @@ impl Gateway {
     ) -> Result<CallToolResult, ErrorData> {
         let tracker = ExecutionTracker::from_context(&ctx)?;
         let bound = Self::bound(&ctx)?;
-        let permit = self.reserve_submission(&bound).await?;
+        let permit = self
+            .reserve_submission_tracked(&bound, Some(tracker.clone()))
+            .await?;
         let now_ms = now_ms();
 
         let context = self
@@ -1295,7 +1327,7 @@ impl Gateway {
         let agent = bound.agent.clone();
         let asset = asset.clone();
         let cleared = match self
-            .decision(tracker, move |engine| {
+            .decision(tracker.clone(), move |engine| {
                 engine.evaluate(
                     &agent,
                     &intent,
@@ -1312,7 +1344,7 @@ impl Gateway {
         };
 
         let response = match self
-            .submit(cleared, cloid.as_ref(), &bound, Some(&permit))
+            .submit(cleared, cloid.as_ref(), &bound, Some(permit), Some(tracker))
             .await
         {
             Ok(response) => response,
@@ -1918,21 +1950,23 @@ impl Gateway {
         cleared: Cleared,
         cloid: Option<&Cloid>,
         bound: &Binding,
-        submission: Option<&ExecutionPermit>,
+        submission: Option<ExecutionPermit>,
+        tracker: Option<ExecutionTracker>,
     ) -> Result<ExchangeResponse, ToolError> {
-        self.submit_authorized(cleared, cloid, bound, submission, None)
+        self.submit_authorized(cleared, cloid, bound, submission, None, tracker)
             .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn submit_authorized(
         &self,
         cleared: Cleared,
         cloid: Option<&Cloid>,
         bound: &Binding,
-        submission: Option<&ExecutionPermit>,
+        submission: Option<ExecutionPermit>,
         operator: Option<&crate::server::OperatorWork>,
+        tracker: Option<ExecutionTracker>,
     ) -> Result<ExchangeResponse, ToolError> {
-        let inner = &self.inner;
         if cleared.clearance().agent != bound.agent
             || cleared.clearance().route.binding.container != bound.account
         {
@@ -1941,6 +1975,65 @@ impl Gateway {
                 "clearance and pairing identity differ",
             ));
         }
+        if matches!(
+            cleared.clearance().kind,
+            oppen_core::guardrail::ClearedKind::Order { .. }
+        ) {
+            let submission = submission.ok_or_else(|| {
+                ToolError::unavailable("submission ledger", "order has no account reservation")
+            })?;
+            if submission.account != bound.account {
+                return Err(ToolError::unavailable(
+                    "submission ledger",
+                    "reservation and bound account differ",
+                ));
+            }
+            let tracker = operator
+                .map(|work| work.tracker.clone())
+                .or(tracker)
+                .ok_or_else(|| {
+                    ToolError::unavailable("submission owner", "order has no execution tracker")
+                })?;
+            let slot = self
+                .inner
+                .submission_worker
+                .clone()
+                .try_acquire_owned()
+                .map_err(|error| ToolError::unavailable("submission worker busy", error))?;
+            let gateway = self.clone();
+            let bound = bound.clone();
+            let cloid = cloid.cloned();
+            let operator = operator.cloned();
+            let runtime = tokio::runtime::Handle::current();
+            return tokio::task::spawn_blocking(move || {
+                let _slot = slot;
+                runtime.block_on(gateway.submit_inline(
+                    cleared,
+                    cloid.as_ref(),
+                    &bound,
+                    Some(&submission),
+                    operator.as_ref(),
+                    Some(&tracker),
+                ))
+            })
+            .await
+            .map_err(|error| ToolError::worker_failed("submission worker", error))?;
+        }
+        self.submit_inline(cleared, cloid, bound, None, operator, None)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn submit_inline(
+        &self,
+        cleared: Cleared,
+        cloid: Option<&Cloid>,
+        bound: &Binding,
+        submission: Option<&ExecutionPermit>,
+        operator: Option<&crate::server::OperatorWork>,
+        tracker: Option<&ExecutionTracker>,
+    ) -> Result<ExchangeResponse, ToolError> {
+        let inner = &self.inner;
         let receipt = if matches!(
             cleared.clearance().kind,
             oppen_core::guardrail::ClearedKind::Order { .. }
@@ -1969,51 +2062,74 @@ impl Gateway {
             None
         };
         let nonce = inner.nonces.next();
+        let authorize = || {
+            operator
+                .map(|work| work.signing_admission())
+                .or_else(|| tracker.map(|tracker| tracker.signing_admission(bound)))
+                .transpose()
+                .map_err(|error| {
+                    oppen_core::guardrail::Refusal::from(
+                        oppen_core::guardrail::Unevaluable::RouteAuthority {
+                            detail: error.to_string(),
+                        },
+                    )
+                })
+        };
+        if let Some(receipt) = &receipt {
+            let signed = inner
+                .engine
+                .sign_submission_authorized(
+                    cleared,
+                    &inner.submissions,
+                    receipt,
+                    nonce,
+                    None,
+                    self::now_ms,
+                    authorize,
+                )
+                .map_err(|error| {
+                    signing_submission_error(&inner.submissions, Some(receipt), error)
+                })?;
+            let result = match inner
+                .engine
+                .post_submission_authorized(signed, &inner.exchange, self::now_ms, authorize)
+                .await
+            {
+                Ok(response) => Ok(response),
+                Err(oppen_core::guardrail::SubmissionPostError::Transport(error)) => Err(error),
+                Err(oppen_core::guardrail::SubmissionPostError::NotSent(refusal)) => {
+                    return Err(signing_submission_error(
+                        &inner.submissions,
+                        Some(receipt),
+                        oppen_core::guardrail::SignClearedError::Refused(refusal),
+                    ));
+                }
+                Err(oppen_core::guardrail::SubmissionPostError::JournalUncertain(error)) => {
+                    return Err(ToolError::TimeoutUnknownOutcome {
+                        cloid: Some(receipt.cloid().as_str().to_owned()),
+                        detail: error.to_string(),
+                    });
+                }
+            };
+            return track_submission(
+                cloid,
+                Some((&inner.submissions, receipt)),
+                std::future::ready(result),
+            )
+            .await;
+        }
         let signed =
             inner
                 .engine
-                .sign_cleared_authorized(cleared, nonce, None, self::now_ms, || {
-                    operator
-                        .map(|work| work.signing_admission())
-                        .transpose()
-                        .map_err(|error| {
-                            oppen_core::guardrail::Refusal::from(
-                                oppen_core::guardrail::Unevaluable::RouteAuthority {
-                                    detail: error.to_string(),
-                                },
-                            )
-                        })
-                });
+                .sign_cleared_authorized(cleared, nonce, None, self::now_ms, authorize);
         let (request, _clearance) = match signed {
             Ok(signed) => signed,
             Err(error) => {
-                if let Some(receipt) = &receipt {
-                    inner
-                        .submissions
-                        .resolve(
-                            receipt,
-                            SubmissionResolution::NotSent {
-                                detail: error.to_string(),
-                            },
-                            now_ms(),
-                        )
-                        .map_err(submission_error)?;
-                }
-                return Err(match error {
-                    oppen_core::guardrail::SignClearedError::Refused(refusal) => {
-                        ToolError::GuardrailRefused { refusal }
-                    }
-                    other => ToolError::unavailable("signer", other),
-                });
+                return Err(signing_submission_error(&inner.submissions, None, error));
             }
         };
 
-        track_submission(
-            cloid,
-            receipt.as_ref().map(|r| (&inner.submissions, r)),
-            inner.exchange.post(&request),
-        )
-        .await
+        track_submission(cloid, None, inner.exchange.post(&request)).await
     }
 
     /// Everything [`GuardrailEngine::evaluate`] needs, assembled once.
@@ -2416,6 +2532,30 @@ fn cancellation_context(
     })
 }
 
+fn signing_submission_error(
+    journal: &SubmissionJournal,
+    receipt: Option<&SubmissionReceipt>,
+    error: oppen_core::guardrail::SignClearedError,
+) -> ToolError {
+    if let Some(receipt) = receipt
+        && let Err(error) = journal.resolve(
+            receipt,
+            SubmissionResolution::NotSent {
+                detail: error.to_string(),
+            },
+            now_ms(),
+        )
+    {
+        return submission_error(error);
+    }
+    match error {
+        oppen_core::guardrail::SignClearedError::Refused(refusal) => {
+            ToolError::GuardrailRefused { refusal }
+        }
+        other => ToolError::unavailable("signer", other),
+    }
+}
+
 async fn track_submission(
     cloid: Option<&Cloid>,
     durable: Option<(&SubmissionJournal, &SubmissionReceipt)>,
@@ -2470,6 +2610,7 @@ async fn track_submission(
 
 // Return the account lock only after the previous submission is visible at the
 // venue. Callers then refresh exposure and keep this lock through submission.
+#[cfg(test)]
 async fn reserve_account<F, Fut>(
     queue: Arc<tokio::sync::Mutex<()>>,
     journal: &SubmissionJournal,
@@ -2481,6 +2622,19 @@ where
     Fut: Future<Output = Result<OrderStatusResponse, ToolError>>,
 {
     let held = queue.lock_owned().await;
+    reserve_account_held(held, journal, account, lookup).await
+}
+
+async fn reserve_account_held<F, Fut>(
+    held: tokio::sync::OwnedMutexGuard<()>,
+    journal: &SubmissionJournal,
+    account: Address,
+    lookup: F,
+) -> Result<ExecutionPermit, ToolError>
+where
+    F: FnOnce(Cloid) -> Fut,
+    Fut: Future<Output = Result<OrderStatusResponse, ToolError>>,
+{
     let mut state = journal.state(account).map_err(submission_error)?;
     if let Some(receipt) = state.pending.as_ref() {
         match lookup(receipt.cloid().clone()).await? {
@@ -3697,7 +3851,7 @@ mod tests {
         let bound = binding_for("alpha");
         let cleared = cleared_test_order(&gateway, &bound, a_cloid());
         let error = gateway
-            .submit(cleared, Some(&a_cloid()), &bound, None)
+            .submit(cleared, Some(&a_cloid()), &bound, None, None)
             .await
             .expect_err("no permit");
         assert!(matches!(
@@ -3728,7 +3882,7 @@ mod tests {
         };
         let cleared = cleared_test_order(&gateway, &bound, a_cloid());
         let error = gateway
-            .submit(cleared, Some(&a_cloid()), &other, None)
+            .submit(cleared, Some(&a_cloid()), &other, None, None)
             .await
             .unwrap_err();
         assert!(matches!(
@@ -3748,7 +3902,13 @@ mod tests {
         .unwrap();
         let cleared = cleared_test_order(&gateway, &bound, a_cloid());
         let error = gateway
-            .submit(cleared, Some(&a_cloid()), &bound, Some(&permit))
+            .submit(
+                cleared,
+                Some(&a_cloid()),
+                &bound,
+                Some(permit),
+                Some(test_tracker(&gateway)),
+            )
             .await
             .unwrap_err();
         assert!(matches!(
@@ -3792,7 +3952,13 @@ mod tests {
         .expect("permit");
         let cleared = cleared_test_order(&gateway, &bound, a_cloid());
         let error = gateway
-            .submit(cleared, Some(&a_cloid()), &bound, Some(&permit))
+            .submit(
+                cleared,
+                Some(&a_cloid()),
+                &bound,
+                Some(permit),
+                Some(test_tracker(&gateway)),
+            )
             .await
             .expect_err("test store has no key");
         assert!(matches!(
@@ -3866,12 +4032,56 @@ mod tests {
             )
             .expect("other process resolved");
         let error = gateway
-            .submit(cleared, Some(&a_cloid()), &bound, Some(&permit))
+            .submit(
+                cleared,
+                Some(&a_cloid()),
+                &bound,
+                Some(permit),
+                Some(test_tracker(&gateway)),
+            )
             .await
             .expect_err("stale snapshot");
         assert!(
             matches!(error, ToolError::Unavailable { what: "submission ledger", detail } if detail.contains("revision"))
         );
+    }
+
+    #[tokio::test]
+    async fn waiting_for_an_account_does_not_take_its_owners_submission_slot() {
+        let gateway = activated_gateway();
+        let bound = binding_for("alpha");
+        grant_test_route(&gateway, &bound);
+        let permit = gateway.reserve_submission(&bound).await.unwrap();
+        let tracker = test_tracker(&gateway);
+        let waiting = gateway.reserve_submission_account(&bound, Some(tracker.clone()));
+        let mut waiting = std::pin::pin!(waiting);
+        std::future::poll_fn(|cx| {
+            assert!(waiting.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert_eq!(gateway.inner.submission_worker.available_permits(), 1);
+        let cleared = cleared_test_order(&gateway, &bound, a_cloid());
+        let error = gateway
+            .submit(
+                cleared,
+                Some(&a_cloid()),
+                &bound,
+                Some(permit),
+                Some(tracker),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, ToolError::Unavailable { what: "signer", .. }),
+            "{error:?}"
+        );
+        let next = tokio::time::timeout(std::time::Duration::from_secs(2), waiting)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(next.account, bound.account);
+        assert!(next.revision > 0);
     }
 
     #[tokio::test]

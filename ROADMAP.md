@@ -227,7 +227,8 @@ before expanding features:
    ES31's [provenance contract](docs/specs/order-provenance.md) records the
    inspected reservation/signing gap, required authenticated evidence and
    recovery acceptance tests. Signer publication ordering and sufficient venue
-   identity evidence remain design gates; no ownership implementation is claimed.
+   identity evidence are tracked separately below; full ownership enforcement
+   is not yet implemented.
    ES31a on `fix/exchange-response-identity` preserves the exchange envelope
    discriminator and rejects wrong response types or single-order cardinality.
    Wrong-kind errors retain pending reservations. Synthetic real-HTTP tests
@@ -236,6 +237,22 @@ before expanding features:
    pass (1,093 Rust, 15 live/keychain-gated ignored). Separate automated diff
    review found no blocking issues; exact-head CI remains required. This is a
    response-classification fix, not completed ownership or live recovery.
+   ES31b on `feat/authenticated-submission-evidence` adds authenticated signed
+   and direct-response accepted evidence to the existing ledger (V13). Opaque
+   submission capabilities retain the single guarded signer; only a digest,
+   never a replayable signature, is persisted. Bounded retained workers own
+   account locks and session authority through publication and HTTP completion;
+   cancellation is rechecked after ledger waits. Publication uncertainty keeps
+   pending liability. Workspace tests pass (1,121 Rust, 15 live/keychain-gated
+   ignored), as do 174 frontend tests, build, QA typecheck, three release-script
+   fixture tests, all-target Clippy, formatting and dependency-policy checks.
+   Separate automated working-diff review found no blocking issues; exact-head
+   review/CI remain required. Test synchronization now waits for actual native
+   task completion and a running supervisor; canonical digest fixtures also
+   cover workspace JSON feature unification without changing the wire format.
+   Discretionary cancellation provenance enforcement and sufficient lost-response
+   ownership recovery remain open. Stop older writers before upgrading; rollback
+   must preserve V13 history and cumulative accounting without schema downgrade.
    No dedicated-account activity has been performed during this development.
 4. **Recovery:** PR #44 merged as `06fc0e3` after green CI and separate automated
    review. The durable submission journal has SQLite reopen, independent
