@@ -42,7 +42,9 @@ use crate::tools::Gateway;
 
 mod operator;
 pub(crate) use operator::OperatorWork;
-pub use operator::{OperatorControl, OperatorReview};
+pub use operator::{
+    ActivationAdmission, ActivationAdmissionGuard, OperatorControl, OperatorReview,
+};
 
 /// The path agents connect to. `claude mcp add --transport http oppen
 /// http://127.0.0.1:<port>/mcp`.

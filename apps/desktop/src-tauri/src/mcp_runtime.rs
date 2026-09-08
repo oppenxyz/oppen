@@ -24,6 +24,7 @@ use serde::Serialize;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
+use crate::operator_activation::ActivationControl;
 use crate::operator_approvals::ApprovalQueueControl;
 use crate::operator_halt::{HaltControl, HaltStatus};
 
@@ -52,7 +53,11 @@ pub(crate) struct McpStatus {
     pub supervision_last_completed_ms: Option<u64>,
     pub supervision_in_progress: bool,
     pub supervision_error: Option<String>,
+    /// Cached policy acknowledgment/effective kill inhibition, NOT full order eligibility.
+    /// Unknown or stopping runtime observations conservatively report true.
     pub orders_inhibited: bool,
+    /// Local engine observation only; neither a receipt nor full order eligibility.
+    pub policy_status: Option<oppen_core::guardrail::PolicyStatus>,
     pub halt: HaltStatus,
     pub detail: Option<String>,
 }
@@ -71,6 +76,7 @@ impl McpStatus {
             supervision_in_progress: false,
             supervision_error: None,
             orders_inhibited: true,
+            policy_status: None,
             halt: HaltStatus::default(),
             detail: None,
         }
@@ -101,6 +107,7 @@ struct Prepared {
     alerts: Arc<AlertStore>,
     quotes: Arc<QuoteCache>,
     engine: Arc<GuardrailEngine>,
+    activation_info: oppen_hl::InfoClient,
 }
 
 impl Prepared {
@@ -184,6 +191,8 @@ impl Prepared {
             alerts,
             quotes,
             engine,
+            activation_info: oppen_hl::InfoClient::new(Network::Testnet)
+                .map_err(|error| error.to_string())?,
         })
     }
 }
@@ -195,6 +204,7 @@ pub(crate) struct OwnedMcp {
     completed: Option<Result<(), String>>,
     halt: Option<Arc<HaltControl>>,
     approvals: Option<Arc<ApprovalQueueControl>>,
+    activation: Option<Arc<ActivationControl>>,
 }
 
 impl Drop for OwnedMcp {
@@ -228,6 +238,7 @@ impl OwnedMcp {
                 completed: Some(Ok(())),
                 halt: None,
                 approvals: None,
+                activation: None,
             });
         }
         let source = VenueSource::new(Network::Testnet).map_err(|error| error.to_string())?;
@@ -285,6 +296,8 @@ impl OwnedMcp {
             status.account_feeds_ready = None;
             status.supervision_in_progress = false;
             status.detail = result.as_ref().err().cloned();
+            status.orders_inhibited = true;
+            status.policy_status = None;
             result
         });
         let mut owned = Self {
@@ -293,11 +306,13 @@ impl OwnedMcp {
             completed: None,
             halt: None,
             approvals: None,
+            activation: None,
         };
         match observing.await {
-            Ok((halt, approvals)) => {
+            Ok((halt, approvals, activation)) => {
                 owned.halt = Some(halt);
                 owned.approvals = Some(approvals);
+                owned.activation = Some(activation);
             }
             Err(_) => owned.shutdown_and_drain().await?,
         }
@@ -319,6 +334,10 @@ impl OwnedMcp {
 
     pub(crate) async fn shutdown_and_drain(&mut self) -> Result<(), String> {
         self.stop.cancel();
+        let activation_close_error = self
+            .activation
+            .as_ref()
+            .and_then(|control| control.close().err());
         let close_error = self
             .approvals
             .as_ref()
@@ -343,6 +362,17 @@ impl OwnedMcp {
         // Save the parent result before another await: a dropped drain waiter
         // must not poll the completed parent handle twice or lose its failure.
         self.completed = Some(result.clone());
+        if let Some(control) = &self.activation
+            && let Err(error) = control.close_and_drain().await
+            && result.is_ok()
+        {
+            result = Err(error);
+        }
+        if result.is_ok()
+            && let Some(error) = activation_close_error
+        {
+            result = Err(error);
+        }
         if let Some(queue) = &self.approvals
             && let Err(error) = queue.close_and_drain().await
             && result.is_ok()
@@ -351,8 +381,15 @@ impl OwnedMcp {
         }
         self.halt = None;
         self.approvals = None;
+        self.activation = None;
         self.completed = Some(result.clone());
         result
+    }
+
+    pub(crate) fn activation(&self) -> Result<&Arc<ActivationControl>, String> {
+        self.activation
+            .as_ref()
+            .ok_or_else(|| "MCP activation owner is unavailable".into())
     }
 }
 
@@ -363,7 +400,11 @@ async fn run<S, F>(
     pool: F,
     status: SharedStatus,
     stop: CancellationToken,
-    ready: oneshot::Sender<(Arc<HaltControl>, Arc<ApprovalQueueControl>)>,
+    ready: oneshot::Sender<(
+        Arc<HaltControl>,
+        Arc<ApprovalQueueControl>,
+        Arc<ActivationControl>,
+    )>,
 ) -> Result<(), String>
 where
     S: ReconcileSource + Send + 'static,
@@ -388,6 +429,13 @@ where
         prepared.engine.clone(),
         prepared.binding.clone(),
         bound.operator_control(),
+    )?;
+    let activation = ActivationControl::new(
+        prepared.engine.clone(),
+        prepared.binding.clone(),
+        bound.operator_control(),
+        prepared.activation_info.clone(),
+        stop.clone(),
     )?;
     let (pool, mut events) = pool().map_err(|error| error.to_string())?;
     let pool = Arc::new(pool);
@@ -462,6 +510,8 @@ where
         let observed_pool = pool.clone();
         let observed_status = status.clone();
         let observed_halt = halt.clone();
+        let observed_engine = prepared.engine.clone();
+        let observed_agent = prepared.binding.agent.clone();
         // Monitoring can fail independently. The parent keeps every actual
         // task handle and still drains them if this observer panics.
         let monitor = tauri::async_runtime::spawn(async move {
@@ -485,6 +535,13 @@ where
                             status.supervision_error = sweep.last_error;
                             status.reconciled = Some(feed.reconciled);
                             status.account_feeds_ready = Some(fresh);
+                            if status.phase == McpPhase::Listening {
+                                status.policy_status = Some(observed_engine.policy_status());
+                                status.orders_inhibited = observed_engine.cancellation_needed(&observed_agent);
+                            } else {
+                                status.policy_status = None;
+                                status.orders_inhibited = true;
+                            }
                         }
                         if let Some(detail) = feed.failure { return Some(detail); }
                         if pump_finished.is_finished() || server_finished.is_finished() {
@@ -494,13 +551,21 @@ where
                 }
             }
         });
-        let _ = ready.send((halt.clone(), approvals.clone()));
+        let _ = ready.send((halt.clone(), approvals.clone(), activation.clone()));
         failure = match monitor.await {
             Ok(failure) => failure,
             Err(error) => Some(format!("MCP monitor task: {error}")),
         };
     }
-    status_lock(&status).phase = McpPhase::Stopping;
+    {
+        let mut status = status_lock(&status);
+        status.phase = McpPhase::Stopping;
+        status.orders_inhibited = true;
+        status.policy_status = None;
+    }
+    if let Err(error) = activation.close_and_drain().await {
+        failure.get_or_insert(error);
+    }
     if let Err(error) = approvals.close_and_drain().await {
         failure.get_or_insert(error);
     }
@@ -711,6 +776,7 @@ mod tests {
         accepted_order: Arc<Mutex<Option<serde_json::Value>>>,
         cancel_script: Arc<Mutex<std::collections::VecDeque<(serde_json::Value, bool)>>>,
         cancel_success_gate: Arc<Mutex<Option<oneshot::Receiver<()>>>>,
+        activation_wallet: Arc<Mutex<Option<(Address, Address, u64)>>>,
     }
 
     struct InfoGate {
@@ -752,6 +818,8 @@ mod tests {
             let cancellations = cancel_script.clone();
             let cancel_success_gate = Arc::new(Mutex::new(None::<oneshot::Receiver<()>>));
             let success_gate = cancel_success_gate.clone();
+            let activation_wallet = Arc::new(Mutex::new(None::<(Address, Address, u64)>));
+            let wallet_roles = activation_wallet.clone();
             let task = tokio::spawn(async move {
                 let mut clients = tokio::task::JoinSet::new();
                 loop {
@@ -768,6 +836,7 @@ mod tests {
                             let acceptance = acceptance.clone();
                             let cancellations = cancellations.clone();
                             let success_gate = success_gate.clone();
+                            let wallet_roles = wallet_roles.clone();
                             clients.spawn(async move {
                                 let mut socket = BufReader::new(socket);
                                 let mut line = String::new();
@@ -837,7 +906,18 @@ mod tests {
                                         let _ = gate.entered.send(());
                                         let _ = gate.released.await;
                                     }
-                                    let response = if request["type"] == "frontendOpenOrders" {
+                                    let response = if request["type"] == "userRole" || request["type"] == "extraAgents" {
+                                        let (account, wallet, valid_until) = wallet_roles.lock().unwrap().expect("unscripted activation evidence");
+                                        if request["type"] == "extraAgents" {
+                                            assert_eq!(request["user"], account.to_string());
+                                            serde_json::json!([{"name":"fixture","address":wallet,"validUntil":valid_until}])
+                                        } else if request["user"] == account.to_string() {
+                                            serde_json::json!({"role":"user"})
+                                        } else {
+                                            assert_eq!(request["user"], wallet.to_string());
+                                            serde_json::json!({"role":"agent","data":{"user":account}})
+                                        }
+                                    } else if request["type"] == "frontendOpenOrders" {
                                         serde_json::json!(*open_orders.lock().unwrap())
                                     } else if request["type"] == "orderStatus" {
                                         let matches = |order: &&serde_json::Value| request["oid"] == order["oid"] || request["oid"] == order["cloid"];
@@ -872,6 +952,7 @@ mod tests {
                 accepted_order,
                 cancel_script,
                 cancel_success_gate,
+                activation_wallet,
             }
         }
 
@@ -1299,6 +1380,7 @@ mod tests {
                 completed: None,
                 halt: None,
                 approvals: Some(queue.clone()),
+                activation: None,
             };
             assert!(
                 tokio::time::timeout(
@@ -1386,7 +1468,66 @@ mod tests {
         )
     }
 
-    fn controller_proposal(prepared: &Prepared) -> String {
+    async fn activate_controller_fixture(prepared: &Prepared, venue: &LocalVenue) {
+        use crate::operator_activation::Phase;
+        let route = prepared
+            .engine
+            .route_for_agent(&prepared.binding.agent)
+            .unwrap();
+        *venue.activation_wallet.lock().unwrap() = Some((
+            prepared.binding.account,
+            route.binding.wallet.address,
+            route.binding.wallet.valid_until_ms,
+        ));
+        let gateway = prepared.gateway.clone();
+        let bound = BoundServer::bind(0, &gateway, &prepared.pairings)
+            .await
+            .unwrap();
+        let operator = bound.operator_control();
+        let stopping = CancellationToken::new();
+        let control = ActivationControl::new(
+            prepared.engine.clone(),
+            prepared.binding.clone(),
+            operator.clone(),
+            oppen_hl::InfoClient::loopback_fixture(venue.port).unwrap(),
+            stopping.clone(),
+        )
+        .unwrap();
+        let pairings = prepared.pairings.clone();
+        let server_stop = stopping.clone();
+        let server = tokio::spawn(async move { bound.serve(gateway, pairings, server_stop).await });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if operator.activation_admission(&prepared.binding).is_ok() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("fixture activation listener must start");
+        control.request_review(&prepared.binding).unwrap();
+        let reviewed = activation_settled(&control, &prepared.binding).await;
+        let confirmed = if let Some(review) = &reviewed.review {
+            control
+                .confirm(&prepared.binding, &reviewed.owner_id, &review.id)
+                .unwrap();
+            Some(activation_settled(&control, &prepared.binding).await)
+        } else {
+            None
+        };
+        control.close_and_drain().await.unwrap();
+        drop(control);
+        drop(operator);
+        stopping.cancel();
+        server.await.unwrap().unwrap();
+        assert_eq!(reviewed.phase, Phase::ReviewReady, "{reviewed:?}");
+        let confirmed = confirmed.unwrap();
+        assert_eq!(confirmed.phase, Phase::Acknowledged, "{confirmed:?}");
+        assert_eq!(confirmed.receipt.unwrap().route, route);
+    }
+
+    async fn controller_proposal(prepared: &Prepared, venue: &LocalVenue) -> String {
         use oppen_core::guardrail::{
             AccountSnapshot, Exposure, FeedQuality, KillScope, MarketRef, OrderIntent, Refusal,
             RestingExposure,
@@ -1400,13 +1541,15 @@ mod tests {
         let mut config = engine.guardrails(agent).unwrap();
         config.symbols.insert("TEST".into());
         config.approval_required = true;
+        config.max_order_usd = 15.into();
+        config.risk.max_leverage = 1;
+        config.risk.max_open_exposure_usd = Some(25.into());
         engine.operator_set_guardrails(agent, config, at).unwrap();
         engine
             .operator_release_kill(&KillScope::Global, at)
             .unwrap();
-        engine
-            .operator_acknowledge_policy(engine.policy_observation().unwrap(), at)
-            .unwrap();
+        activate_controller_fixture(prepared, venue).await;
+        let at = u64::try_from(now_ms()).unwrap();
         let intent = OrderIntent {
             symbol: "TEST".into(),
             is_buy: true,
@@ -1519,7 +1662,8 @@ mod tests {
         let fixture = Fixture::authorized();
         let venue = LocalVenue::start_with_pending_handshake(true).await;
         let mut prepared = fixture.prepare().unwrap();
-        let id = controller_proposal(&prepared);
+        prepared.gateway = prepared.gateway.with_loopback_fixture(venue.port).unwrap();
+        let id = controller_proposal(&prepared, &venue).await;
         let engine = prepared.engine.clone();
         let ledger = prepared.ledger.clone();
         let feed = prepared.feed.clone();
@@ -1628,7 +1772,8 @@ mod tests {
             let fixture = Fixture::authorized();
             let venue = LocalVenue::start_with_pending_handshake(true).await;
             let mut prepared = fixture.prepare().unwrap();
-            let id = controller_proposal(&prepared);
+            prepared.gateway = prepared.gateway.with_loopback_fixture(venue.port).unwrap();
+            let id = controller_proposal(&prepared, &venue).await;
             let feed = prepared.feed.clone();
             prepared.gateway = prepared.gateway.with_loopback_fixture(venue.port).unwrap();
             let port = venue.port;
@@ -1806,6 +1951,671 @@ mod tests {
         )
     }
 
+    async fn activation_settled(
+        control: &ActivationControl,
+        binding: &Binding,
+    ) -> crate::operator_activation::ActivationStatus {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !control.task_finished() {
+                tokio::task::yield_now().await;
+            }
+            control.snapshot(binding).unwrap()
+        })
+        .await
+        .expect("activation worker must finish")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn native_activation_fresh_confirmation_from_non_tokio_command_thread() {
+        native_activation_case("confirm").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn native_activation_revoked_review_never_falls_back_to_live_pairing() {
+        native_activation_case("revoke").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn native_activation_close_discards_idle_review_before_listener_drain() {
+        native_activation_case("idle_close").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn native_activation_close_retains_blocked_confirmation_after_observer_drop() {
+        native_activation_case("blocked_close").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn native_activation_halt_during_publication_cannot_acknowledge_or_revive_review() {
+        native_activation_case("halt_publication").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn native_activation_queued_fill_during_publication_cannot_acknowledge_or_revive_review()
+    {
+        native_activation_case("ingress_publication").await;
+    }
+
+    type ActivationPublicationGate =
+        Arc<Mutex<Option<(oneshot::Sender<()>, std::sync::mpsc::Receiver<()>)>>>;
+
+    #[derive(Debug)]
+    struct ActivationPublicationAnchor {
+        inner: oppen_core::ledger::FileAnchor,
+        gate: ActivationPublicationGate,
+    }
+
+    impl oppen_core::ledger::HeadAnchor for ActivationPublicationAnchor {
+        fn load(
+            &self,
+        ) -> Result<Option<oppen_core::ledger::Anchor>, oppen_core::ledger::LedgerError> {
+            oppen_core::ledger::HeadAnchor::load(&self.inner)
+        }
+
+        fn store(
+            &self,
+            anchor: &oppen_core::ledger::Anchor,
+        ) -> Result<(), oppen_core::ledger::LedgerError> {
+            oppen_core::ledger::HeadAnchor::store(&self.inner, anchor)?;
+            let gate = self.gate.lock().unwrap().take();
+            if let Some((entered, release)) = gate {
+                let _ = entered.send(());
+                let _ = release.recv();
+            }
+            Ok(())
+        }
+    }
+
+    fn activation_pilot_evidence(
+        ledger: Arc<Ledger>,
+        account: Address,
+    ) -> (serde_json::Value, Vec<serde_json::Value>) {
+        let state = PilotJournal::new(Arc::new(
+            RegistryJournal::open(ledger.clone(), Arc::new(HmacKey::from_bytes([11; 32]))).unwrap(),
+        ))
+        .state(account)
+        .unwrap()
+        .unwrap();
+        let consent = ledger
+            .get_events(0, 1000)
+            .unwrap()
+            .events
+            .into_iter()
+            .filter(|row| {
+                matches!(
+                    row.kind,
+                    oppen_core::ledger::EventKind::PilotAuthorized
+                        | oppen_core::ledger::EventKind::PilotAdopted
+                )
+            })
+            .map(|row| serde_json::to_value(row).unwrap())
+            .collect();
+        (serde_json::to_value(state).unwrap(), consent)
+    }
+
+    async fn native_activation_case(mode: &str) {
+        use crate::operator_activation::{ActivationOperation, Phase};
+        use oppen_core::guardrail::KillScope;
+        let (fixture, keys) = cancellation_signing_fixture();
+        let venue = LocalVenue::start_with_pending_handshake(true).await;
+        let mut prepared =
+            Prepared::open(fixture.dir.path(), fixture.binding.clone(), keys.clone()).unwrap();
+        let publication_gate: ActivationPublicationGate = Arc::new(Mutex::new(None));
+        if matches!(mode, "halt_publication" | "ingress_publication") {
+            let path = fixture
+                .dir
+                .path()
+                .join(oppen_core::db_file_name(Network::Testnet));
+            let ledger = Arc::new(
+                Ledger::open_anchored(
+                    &path,
+                    Network::Testnet,
+                    Some(Box::new(ActivationPublicationAnchor {
+                        inner: oppen_core::ledger::FileAnchor::beside(&path),
+                        gate: publication_gate.clone(),
+                    })),
+                )
+                .unwrap(),
+            );
+            let registry = Arc::new(
+                RegistryJournal::open(ledger.clone(), Arc::new(HmacKey::from_bytes([11; 32])))
+                    .unwrap(),
+            );
+            prepared.engine = Arc::new(
+                GuardrailEngine::new_supervised_alpha(
+                    Arc::new(PolicyJournal::new(registry)),
+                    keys,
+                    prepared.feed.clone(),
+                )
+                .unwrap(),
+            );
+            prepared.ledger = ledger.clone();
+            prepared.gateway = Gateway::new(
+                Network::Testnet,
+                prepared.engine.clone(),
+                EventViews::new(ledger),
+                Arc::new(Journal::open(fixture.dir.path().join("journal-testnet.db")).unwrap()),
+                prepared.alerts.clone(),
+                prepared.quotes.clone(),
+            )
+            .unwrap();
+        }
+        let original_pilot =
+            activation_pilot_evidence(prepared.ledger.clone(), fixture.binding.account);
+        let engine = prepared.engine.clone();
+        let at = u64::try_from(now_ms()).unwrap();
+        let mut policy = engine.guardrails(&fixture.binding.agent).unwrap();
+        policy.max_order_usd = 15.into();
+        policy.risk.max_leverage = 1;
+        policy.risk.max_open_exposure_usd = Some(25.into());
+        policy.approval_required = false;
+        policy.symbols.insert("TEST".into());
+        engine
+            .operator_set_guardrails(&fixture.binding.agent, policy, at)
+            .unwrap();
+        engine
+            .operator_release_kill(&KillScope::Global, at)
+            .unwrap();
+        assert!(engine.policy_status().acknowledgment.is_none());
+        let route = engine.route_for_agent(&fixture.binding.agent).unwrap();
+        *venue.activation_wallet.lock().unwrap() = Some((
+            fixture.binding.account,
+            route.binding.wallet.address,
+            route.binding.wallet.valid_until_ms,
+        ));
+        prepared.activation_info = oppen_hl::InfoClient::loopback_fixture(venue.port).unwrap();
+        prepared.gateway = prepared.gateway.with_loopback_fixture(venue.port).unwrap();
+        let feed = prepared.feed.clone();
+        let weak = Arc::downgrade(&prepared.ledger);
+        let pairings = prepared.pairings.clone();
+        let pinned = pairings
+            .read()
+            .unwrap()
+            .authenticate(fixture.token.as_deref().unwrap())
+            .unwrap()
+            .id;
+        let status = Arc::new(Mutex::new(McpStatus::starting(&fixture.binding)));
+        let port = venue.port;
+        let ingress = Arc::new(Mutex::new(None));
+        let published_ingress = ingress.clone();
+        let inject_ingress = mode == "ingress_publication";
+        let mut owned = OwnedMcp::launch(
+            prepared,
+            0,
+            FixtureSource,
+            move || {
+                if inject_ingress {
+                    let (pool, receiver, sender) = WsPool::loopback_fixture_with_ingress(port)?;
+                    *published_ingress.lock().unwrap() = Some((sender, receiver.monitor()));
+                    Ok((pool, receiver))
+                } else {
+                    WsPool::loopback_fixture(port)
+                }
+            },
+            status.clone(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        controller_reconciled(&feed).await;
+        let control = owned.activation().unwrap().clone();
+        let idle = control.snapshot(&fixture.binding).unwrap();
+        assert_eq!(idle.operation_seq, 0);
+        assert_eq!(idle.last_operation, None);
+        let command = control.clone();
+        let binding = fixture.binding.clone();
+        let initial = std::thread::spawn(move || {
+            assert!(tokio::runtime::Handle::try_current().is_err());
+            command.request_review(&binding)
+        })
+        .join()
+        .unwrap()
+        .unwrap();
+        assert_eq!(initial.phase, Phase::Reviewing);
+        assert_eq!(initial.operation_seq, 1);
+        assert_eq!(initial.last_operation, Some(ActivationOperation::Review));
+        let reviewed = activation_settled(&control, &fixture.binding).await;
+        assert_eq!(reviewed.phase, Phase::ReviewReady, "{reviewed:?}");
+        assert!(engine.policy_status().acknowledgment.is_none());
+        let review = reviewed.review.unwrap();
+        assert_eq!(review.display.route, route);
+        assert_eq!(review.display.account.address, fixture.binding.account);
+        assert!(
+            control
+                .confirm(&fixture.binding, "foreign-owner", &review.id)
+                .is_err()
+        );
+        assert_eq!(control.snapshot(&fixture.binding).unwrap().operation_seq, 1);
+        if mode == "idle_close" {
+            let discarded = control
+                .discard(&fixture.binding, &reviewed.owner_id, &review.id)
+                .unwrap();
+            assert_eq!(discarded.operation_seq, 2);
+            assert_eq!(
+                discarded.last_operation,
+                Some(ActivationOperation::Discard {
+                    review_id: review.id.clone()
+                })
+            );
+            assert!(
+                control
+                    .discard(&fixture.binding, &reviewed.owner_id, &review.id)
+                    .is_err()
+            );
+            let next = control.request_review(&fixture.binding).unwrap();
+            assert_eq!(next.operation_seq, 3);
+            assert_eq!(next.last_operation, Some(ActivationOperation::Review));
+            assert_eq!(
+                activation_settled(&control, &fixture.binding).await.phase,
+                Phase::ReviewReady
+            );
+        }
+        if mode == "revoke" {
+            let pairings = pairings.clone();
+            let binding = fixture.binding.clone();
+            tokio::task::spawn_blocking(move || {
+                let mut store = pairings.write().unwrap();
+                assert!(store.revoke(pinned).unwrap());
+                drop(store.issue(binding).unwrap());
+            })
+            .await
+            .unwrap();
+        }
+        let mut release = None;
+        let mut entering = None;
+        let mut publication_release = None;
+        let mut publishing = None;
+        if matches!(mode, "halt_publication" | "ingress_publication") {
+            let (entered, started) = oneshot::channel();
+            let (released, waiting) = std::sync::mpsc::channel();
+            *publication_gate.lock().unwrap() = Some((entered, waiting));
+            publication_release = Some(released);
+            publishing = Some(started);
+        }
+        if mode == "blocked_close" {
+            let (entered, started) = oneshot::channel();
+            let (released, waiting) = oneshot::channel();
+            *venue.info_gate.lock().unwrap() = Some(InfoGate {
+                kind: "clearinghouseState",
+                entered,
+                released: waiting,
+            });
+            release = Some(released);
+            entering = Some(started);
+        }
+        if mode == "confirm" {
+            // Human review outlives the original account freshness window.
+            tokio::time::sleep(Duration::from_millis(2100)).await;
+        }
+        if mode != "idle_close" {
+            let confirming = control
+                .confirm(&fixture.binding, &reviewed.owner_id, &review.id)
+                .unwrap();
+            assert_eq!(confirming.operation_seq, 2);
+            assert_eq!(
+                confirming.last_operation,
+                Some(ActivationOperation::Confirm {
+                    review_id: review.id.clone()
+                })
+            );
+            drop(confirming);
+            if let Some(publishing) = publishing {
+                tokio::time::timeout(Duration::from_secs(5), publishing)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(
+                    matches!(
+                        pairings.try_write(),
+                        Err(std::sync::TryLockError::WouldBlock)
+                    ),
+                    "confirmation must hold its actual pinned authority during publication"
+                );
+                if mode == "ingress_publication" {
+                    // The pool's real monitored channel and native pump, not WS wire decoding.
+                    let received = u64::try_from(now_ms()).unwrap();
+                    let fill = serde_json::from_value(serde_json::json!({
+                        "coin":"TEST","px":"100","sz":"0.01","side":"B","time":received,
+                        "startPosition":"0","dir":"Open Long","closedPnl":"0",
+                        "hash":"synthetic-activation-ingress","oid":37001,"crossed":true,
+                        "fee":"0","feeToken":"USDC","tid":37001
+                    }))
+                    .unwrap();
+                    let (sender, monitor) = ingress.lock().unwrap().as_ref().unwrap().clone();
+                    assert_eq!(monitor.status().pending, 0);
+                    sender
+                        .send(
+                            oppen_hl::ws::WsEvent::UserFills {
+                                user: fixture.binding.account,
+                                is_snapshot: false,
+                                fills: vec![fill],
+                            },
+                            received,
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        monitor.status().pending,
+                        1,
+                        "ledger publication prevents pump apply/ack"
+                    );
+                } else {
+                    let generation = engine.policy_status().stop_generation;
+                    owned.request_halt(&fixture.binding).unwrap();
+                    tokio::time::timeout(Duration::from_secs(5), async {
+                        while engine.policy_status().stop_generation == generation {
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .expect(
+                        "operator HALT must engage locally before its durable writer can proceed",
+                    );
+                }
+                assert!(!control.task_finished());
+                publication_release.take().unwrap().send(()).unwrap();
+            }
+            if let Some(entering) = entering {
+                tokio::time::timeout(Duration::from_secs(5), entering)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                control.close().unwrap();
+                assert!(control.request_review(&fixture.binding).is_err());
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(30), owned.shutdown_and_drain())
+                        .await
+                        .is_err()
+                );
+                assert!(weak.strong_count() > 0);
+                release.take().unwrap().send(()).unwrap();
+            }
+            let completed = activation_settled(&control, &fixture.binding).await;
+            if mode == "confirm" {
+                assert_eq!(completed.phase, Phase::Acknowledged, "{completed:?}");
+                let receipt = completed.receipt.unwrap();
+                assert_eq!(receipt.route, review.display.route);
+                assert_eq!(receipt.policy_revision, review.display.policy_revision);
+                assert!(receipt.acknowledged_at_ms > review.display.observed_at_ms + 2000);
+                assert!(engine.policy_status().acknowledgment.is_some());
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while status_lock(&status).orders_inhibited {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("monitor must observe cleared cached policy/kill inhibition");
+            } else {
+                assert!(completed.receipt.is_none());
+                assert!(engine.policy_status().acknowledgment.is_none());
+                if mode == "ingress_publication" {
+                    assert_eq!(completed.phase, Phase::Refused, "{completed:?}");
+                    assert!(
+                        matches!(
+                            completed
+                                .error
+                                .as_ref()
+                                .and_then(|error| error.refusal.as_ref()),
+                            Some(oppen_core::guardrail::Refusal::Unevaluable(
+                                oppen_core::guardrail::Unevaluable::FeedAdmission
+                            ))
+                        ),
+                        "{completed:?}"
+                    );
+                    let monitor = ingress.lock().unwrap().as_ref().unwrap().1.clone();
+                    tokio::time::timeout(Duration::from_secs(5), async {
+                        while monitor.status().pending != 0 {
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .expect("actual native pump must apply and acknowledge the queued fill");
+                    assert!(monitor.status().failure.is_none());
+                    assert!(
+                        feed.state().reconciled,
+                        "acknowledged ingestion must not revive the old review"
+                    );
+                    let rows = weak.upgrade().unwrap().get_events(0, 1000).unwrap().events;
+                    assert_eq!(
+                        rows.iter()
+                            .filter(|row| row.kind == oppen_core::ledger::EventKind::Fill
+                                && row
+                                    .payload
+                                    .as_ref()
+                                    .is_some_and(|payload| payload["tid"] == 37001))
+                            .count(),
+                        1
+                    );
+                    assert_eq!(
+                        rows.iter()
+                            .filter(|row| row
+                                .payload
+                                .as_ref()
+                                .is_some_and(|payload| payload["action"]
+                                    == "activation_acknowledgment_requested"))
+                            .count(),
+                        1
+                    );
+                    assert!(engine.policy_status().acknowledgment.is_none());
+                }
+                if mode == "halt_publication" {
+                    assert_eq!(completed.phase, Phase::Refused, "{completed:?}");
+                    tokio::time::timeout(Duration::from_secs(5), async {
+                        while !matches!(
+                            status_lock(&status).halt.phase,
+                            crate::operator_halt::HaltPhase::Persisted
+                        ) {
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .unwrap();
+                    let release_engine = engine.clone();
+                    let agent = fixture.binding.agent.clone();
+                    tokio::task::spawn_blocking(move || {
+                        release_engine.operator_release_kill(
+                            &KillScope::Agent { agent },
+                            u64::try_from(now_ms()).unwrap(),
+                        )
+                    })
+                    .await
+                    .unwrap()
+                    .unwrap();
+                    assert!(engine.policy_status().acknowledgment.is_none());
+                    let rows = weak.upgrade().unwrap().get_events(0, 1000).unwrap().events;
+                    assert_eq!(
+                        rows.iter()
+                            .filter(|row| row
+                                .payload
+                                .as_ref()
+                                .is_some_and(|payload| payload["action"]
+                                    == "activation_acknowledgment_requested"))
+                            .count(),
+                        1
+                    );
+                }
+            }
+            assert!(
+                control
+                    .confirm(&fixture.binding, &reviewed.owner_id, &review.id)
+                    .is_err()
+            );
+        }
+        if mode == "confirm" {
+            use serde_json::json;
+            let cloid = "0x36363636363636363636363636363636";
+            *venue.accepted_order.lock().unwrap() = Some(json!({
+                "type":"order","orders":[{"a":0,"b":true,"p":"100","s":"0.1","r":false,
+                    "t":{"limit":{"tif":"Gtc"}},"c":cloid}],"grouping":"na"
+            }));
+            let address = status_lock(&status).listener.clone().unwrap();
+            let token = fixture.token.as_deref().unwrap();
+            let (code, session, _) = rpc(&address, token, None, json!({
+                "jsonrpc":"2.0","id":1,"method":"initialize",
+                "params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"activation-fixture","version":"0"}}
+            })).await;
+            assert_eq!(code, 200);
+            let session = session.unwrap();
+            assert_eq!(
+                rpc(
+                    &address,
+                    token,
+                    Some(&session),
+                    json!({"jsonrpc":"2.0","method":"notifications/initialized"})
+                )
+                .await
+                .0,
+                202
+            );
+            let response = retry_predecision_busy(|attempt| {
+                let address = &address;
+                let session = &session;
+                async move {
+                    let (code, _, body) = rpc(address, token, Some(session), json!({
+                        "jsonrpc":"2.0","id":2+attempt,"method":"tools/call","params":{"name":"place","arguments":{
+                            "symbol":"TEST","is_buy":true,"size":"0.10","order_type":"limit","limit_px":"100","tif":"gtc",
+                            "cloid":cloid,"reason":"Explicitly activated account guarded order"
+                        }}
+                    })).await;
+                    assert_eq!(code, 200);
+                    rpc_reply(&body)
+                }
+            }).await;
+            assert!(response.get("error").is_none(), "{response}");
+            let outcome: serde_json::Value =
+                serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap())
+                    .unwrap();
+            assert_eq!(outcome["status"], "resting", "{outcome}");
+            let ledger = weak.upgrade().unwrap();
+            let events = ledger.get_events(0, 1000).unwrap().events;
+            for kind in [
+                oppen_core::ledger::EventKind::SubmissionSigned,
+                oppen_core::ledger::EventKind::SubmissionAccepted,
+            ] {
+                assert_eq!(events.iter().filter(|row| row.kind == kind).count(), 1);
+            }
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|row| row.kind == oppen_core::ledger::EventKind::SubmissionResolved)
+                    .count(),
+                0
+            );
+            let pending = engine
+                .submissions()
+                .unwrap()
+                .state(fixture.binding.account)
+                .unwrap()
+                .pending
+                .unwrap();
+            assert_eq!(pending.cloid().as_str(), cloid);
+            let pilot = PilotJournal::new(Arc::new(
+                RegistryJournal::open(ledger, Arc::new(HmacKey::from_bytes([11; 32]))).unwrap(),
+            ))
+            .state(fixture.binding.account)
+            .unwrap()
+            .unwrap();
+            assert_eq!(pilot.reserved_usd, 10.into());
+            assert_eq!(pilot.executed_usd, 0.into());
+            owned.request_halt(&fixture.binding).unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let observed = status_lock(&status).clone();
+                    if observed.orders_inhibited
+                        && matches!(
+                            observed.halt.phase,
+                            crate::operator_halt::HaltPhase::Persisted
+                        )
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("later HALT must restore cached policy/kill inhibition");
+        }
+        let operation_before_close = control.snapshot(&fixture.binding).unwrap();
+        // A retained producer would correctly prevent receiver completion during drain.
+        drop(ingress.lock().unwrap().take());
+        if mode != "confirm" {
+            let ledger = weak.upgrade().unwrap();
+            let mut expected_pilot = original_pilot.clone();
+            if mode == "ingress_publication" {
+                // The unlinked fill counts toward usage and inhibits admission;
+                // it does not authorize a replacement consent or reset the pilot.
+                expected_pilot.0["executed_usd"] = serde_json::json!("1.00");
+                expected_pilot.0["halt"] = serde_json::json!({"reason": "awaiting_reconciliation"});
+            }
+            assert_eq!(
+                activation_pilot_evidence(ledger.clone(), fixture.binding.account),
+                expected_pilot
+            );
+            assert!(
+                ledger
+                    .get_events(0, 1000)
+                    .unwrap()
+                    .events
+                    .iter()
+                    .all(|row| !matches!(
+                        row.kind,
+                        oppen_core::ledger::EventKind::SubmissionSigned
+                            | oppen_core::ledger::EventKind::SubmissionAccepted
+                    ))
+            );
+        }
+        owned.shutdown_and_drain().await.unwrap();
+        assert!(control.snapshot(&fixture.binding).unwrap().review.is_none());
+        let closed = control.snapshot(&fixture.binding).unwrap();
+        assert_eq!(closed.operation_seq, operation_before_close.operation_seq);
+        assert_eq!(closed.last_operation, operation_before_close.last_operation);
+        assert!(status_lock(&status).orders_inhibited);
+        assert!(status_lock(&status).policy_status.is_none());
+        assert!(control.request_review(&fixture.binding).is_err());
+        drop(control);
+        drop(owned);
+        drop(pairings);
+        drop(engine);
+        drop(feed);
+        let requests = venue
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|request| {
+                (
+                    request.path.clone(),
+                    serde_json::from_slice::<serde_json::Value>(&request.body).ok(),
+                )
+            })
+            .collect::<Vec<_>>();
+        venue.shutdown().await;
+        assert_eq!(
+            weak.strong_count(),
+            0,
+            "activation must release the actual ledger owner"
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|(path, _)| path == "/exchange")
+                .count(),
+            usize::from(mode == "confirm")
+        );
+        if mode == "confirm" {
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(|(_, request)| request
+                        .as_ref()
+                        .is_some_and(|request| request["type"] == "extraAgents"))
+                    .count(),
+                2
+            );
+        }
+        fixture.assert_pairing_owner_released();
+    }
+
     async fn accept_protective_order(
         prepared: &Prepared,
         venue: &LocalVenue,
@@ -1975,9 +2785,10 @@ mod tests {
 
         let (fixture, keys) = cancellation_signing_fixture();
         let venue = LocalVenue::start_with_pending_handshake(true).await;
-        let prepared =
+        let mut prepared =
             Prepared::open(fixture.dir.path(), fixture.binding.clone(), keys.clone()).unwrap();
-        let _proposal = controller_proposal(&prepared);
+        prepared.gateway = prepared.gateway.with_loopback_fixture(venue.port).unwrap();
+        let _proposal = controller_proposal(&prepared, &venue).await;
         let seed_feed = reconcile_controller_feed(&prepared);
         let target = accept_protective_order(&prepared, &venue).await;
         let at = u64::try_from(now_ms()).unwrap();
@@ -2385,7 +3196,8 @@ mod tests {
         let venue = LocalVenue::start_with_pending_handshake(true).await;
         let mut prepared =
             Prepared::open(fixture.dir.path(), fixture.binding.clone(), keys).unwrap();
-        let order_id = controller_proposal(&prepared);
+        prepared.gateway = prepared.gateway.with_loopback_fixture(venue.port).unwrap();
+        let order_id = controller_proposal(&prepared, &venue).await;
         let seed_feed = reconcile_controller_feed(&prepared);
         let target = accept_protective_order(&prepared, &venue).await;
         let at = u64::try_from(now_ms()).unwrap();
@@ -2589,7 +3401,7 @@ mod tests {
         .unwrap()
         .with_loopback_fixture(venue.port)
         .unwrap();
-        let id = controller_proposal(&prepared);
+        let id = controller_proposal(&prepared, &venue).await;
         let feed = prepared.feed.clone();
         let port = venue.port;
         let mut owned = OwnedMcp::launch(

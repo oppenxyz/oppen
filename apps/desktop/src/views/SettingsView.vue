@@ -5,6 +5,7 @@ import PanelHousing from "../components/housing/PanelHousing.vue";
 import ReadoutRows from "../components/housing/ReadoutRows.vue";
 import UiButton from "../components/ui/UiButton.vue";
 import PolicySetupPanel from "../components/PolicySetupPanel.vue";
+import ActivationPanel from "../components/ActivationPanel.vue";
 import { policySetup, policySetupOwnsContext } from "../stores/policy-setup";
 import { setNetwork, shell, refreshKeychain, type Network } from "../stores/shell";
 import { decimal } from "../lib/display";
@@ -32,7 +33,7 @@ const mcpRows = computed(() => [
   { k: "Account feeds ready", v: mcp.status?.account_feeds_ready === true ? "Yes" : mcp.status?.account_feeds_ready === false ? "No" : "Unknown" },
   { k: "Pause enforcement", v: pauseSweepLabel(mcp.status) },
   { k: "Last completed pause sweep", v: mcp.status?.supervision_last_completed_ms != null ? new Date(mcp.status.supervision_last_completed_ms).toLocaleString() : "Never observed" },
-  { k: "Orders inhibited", v: mcp.status ? (mcp.status.orders_inhibited ? "Yes" : "No - not an authorization to trade") : "Unknown" },
+  { k: "Cached policy / kill inhibition", v: mcp.status ? (mcp.status.orders_inhibited ? "Yes" : "No - not current order eligibility") : "Unknown" },
 ]);
 async function stopRuntime(): Promise<void> {
   confirmStop.value = false;
@@ -155,6 +156,7 @@ const local = computed(() => [
           </div>
           <p v-if="mcp.stopRequested" class="copy supervision-warning" role="status">Runtime shutdown requested. {{ mcp.runtime?.phase === 'stopped' ? 'Desktop tasks stopped.' : mcp.runtime?.phase === 'stopped_with_error' ? 'Desktop tasks stopped with errors.' : 'Completion is not confirmed here.' }} Restarting the app is required; this panel cannot reopen it.</p>
           <p v-if="mcp.runtime?.detail" class="copy supervision-warning">{{ mcp.runtime.detail }}</p>
+          <ActivationPanel />
         </template>
         <template v-else>
           <p class="copy">Dark theme · Space Mono + Archivo. Bright values carry facts; subdued rules define the housings.</p>

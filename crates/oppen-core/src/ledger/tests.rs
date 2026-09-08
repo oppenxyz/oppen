@@ -377,9 +377,12 @@ fn engine_order_signing(change_policy: bool) {
             crate::feed::test_session(oppen_hl::Address::from_bytes([1; 20])),
         )
         .unwrap();
-        supervised
-            .operator_acknowledge_policy(supervised.policy_observation().unwrap(), now_ms)
-            .unwrap();
+        assert!(
+            supervised
+                .operator_acknowledge_policy(supervised.policy_observation().unwrap(), now_ms)
+                .is_err()
+        );
+        assert!(supervised.begin_activation_review(&agent, account).is_err());
         let before = ledger.chain_head().unwrap();
         assert!(
             engine
@@ -391,7 +394,7 @@ fn engine_order_signing(change_policy: bool) {
         assert!(matches!(
             verdict.refusal,
             Some(crate::guardrail::Refusal::Unevaluable(
-                crate::guardrail::Unevaluable::PilotBudgetUnavailable { .. }
+                crate::guardrail::Unevaluable::PolicyAuthority { .. }
             ))
         ));
         assert_eq!(

@@ -59,6 +59,13 @@ use super::store::{
 };
 use super::{AgentId, CancelContext, CancelIntent, CancelTarget};
 
+#[path = "activation.rs"]
+mod activation;
+pub use activation::{
+    ActivationDisplay, ActivationEvidence, ActivationObservation, ActivationReceipt,
+    ActivationReview,
+};
+
 /// One basis point is a ten-thousandth.
 const BPS: Decimal = Decimal::from_parts(10_000, 0, 0, false, 0);
 const HUNDRED: Decimal = Decimal::from_parts(100, 0, 0, false, 0);
@@ -816,6 +823,7 @@ pub struct PolicyStatus {
 struct EngineState {
     policy_revision: u64,
     acknowledged: Option<PolicyAcknowledgment>,
+    activation_scope: Option<AuthorizedRoute>,
     stop_generation: u64,
     emergency: BTreeMap<KillScope, Engagement>,
     guardrails: BTreeMap<AgentId, AgentGuardrails>,
@@ -852,6 +860,7 @@ struct EngineState {
 impl EngineState {
     fn inhibit(&mut self) {
         self.acknowledged = None;
+        self.activation_scope = None;
         // Exhaustion is permanently inhibited, never an ABA generation wrap.
         self.stop_generation = self.stop_generation.saturating_add(1);
     }
@@ -906,6 +915,23 @@ impl EngineState {
         Ok(())
     }
 
+    fn check_scoped_acknowledgment(
+        &self,
+        route: &AuthorizedRoute,
+        supervised: bool,
+    ) -> Result<(), Refusal> {
+        self.check_acknowledgment()?;
+        if (supervised || self.activation_scope.is_some())
+            && self.activation_scope.as_ref() != Some(route)
+        {
+            return Err(Unevaluable::PolicyAuthority {
+                detail: "acknowledgment does not cover this route".into(),
+            }
+            .into());
+        }
+        Ok(())
+    }
+
     fn stop(&mut self, scope: KillScope, engagement: Engagement) -> KillEffect {
         let newly_engaged = self
             .effective_kill()
@@ -953,6 +979,8 @@ impl EngineState {
 /// gateway and the workflow runner all hold the same instance, and a type
 /// parameter would leak into every one of their signatures.
 pub struct GuardrailEngine {
+    activation_authority: Option<Arc<PolicyJournal>>,
+    supervised_alpha: bool,
     feed: Arc<crate::feed::FeedSession>,
     submission_owner: Arc<()>,
     submissions: Option<crate::ledger::SubmissionJournal>,
@@ -995,13 +1023,14 @@ impl GuardrailEngine {
         let approvals = ApprovalJournal::new(authority.clone());
         let mut engine = Self::build(
             Arc::new(SqliteGuardrailStore::new(authority.clone())),
-            Arc::new(LedgerAuditSink::new(authority)),
+            Arc::new(LedgerAuditSink::new(authority.clone())),
             keys,
             network,
             feed,
         )?;
         engine.submissions = Some(submissions);
         engine.approvals = Some(approvals);
+        engine.activation_authority = Some(authority);
         Ok(engine)
     }
 
@@ -1023,13 +1052,15 @@ impl GuardrailEngine {
         let approvals = ApprovalJournal::new(authority.clone());
         let mut engine = Self::build(
             Arc::new(SqliteGuardrailStore::new(authority.clone())),
-            Arc::new(LedgerAuditSink::supervised(authority)),
+            Arc::new(LedgerAuditSink::supervised(authority.clone())),
             keys,
             network,
             feed,
         )?;
         engine.submissions = Some(submissions);
         engine.approvals = Some(approvals);
+        engine.activation_authority = Some(authority);
+        engine.supervised_alpha = true;
         Ok(engine)
     }
 
@@ -1074,6 +1105,7 @@ impl GuardrailEngine {
         let mut state = EngineState {
             policy_revision: 0,
             acknowledged: None,
+            activation_scope: None,
             stop_generation: 0,
             emergency: BTreeMap::new(),
             guardrails: BTreeMap::new(),
@@ -1093,6 +1125,8 @@ impl GuardrailEngine {
             let _ = state.publish(version);
         }
         Ok(Self {
+            activation_authority: None,
+            supervised_alpha: false,
             feed,
             submissions: None,
             submission_owner: Arc::new(()),
@@ -1168,6 +1202,11 @@ impl GuardrailEngine {
         observed: PolicyAcknowledgment,
         at_ms: u64,
     ) -> Result<(), GuardrailError> {
+        if self.supervised_alpha {
+            return Err(GuardrailError::Policy {
+                detail: "supervised alpha requires bound activation review".into(),
+            });
+        }
         let _mutation = self.mutation_lock()?;
         self.refresh_policy()?;
         {
@@ -2421,7 +2460,7 @@ impl GuardrailEngine {
         }
 
         // The caller must supply the asset and the market tick for the symbol
-        state.check_acknowledgment()?;
+        state.check_scoped_acknowledgment(&route, self.supervised_alpha)?;
 
         // it is asking about. A mismatch would measure the order against
         // another instrument's price, which is the worst silent failure in
@@ -3645,7 +3684,10 @@ impl PreSignGate<'_> {
                 if self.clearance.policy_revision != state.policy_revision {
                     return Err(Unevaluable::PolicyChanged.into());
                 }
-                state.check_acknowledgment()?;
+                state.check_scoped_acknowledgment(
+                    &self.clearance.route,
+                    self.engine.supervised_alpha,
+                )?;
                 let config = state.guardrails.get(&self.clearance.agent).ok_or_else(|| {
                     Unevaluable::UnknownAgent {
                         agent: self.clearance.agent.clone(),

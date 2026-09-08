@@ -1,6 +1,6 @@
 # Supervised Testnet Operator Activation
 
-Next safety gate after ES36; planned, not implemented or authorized. Traces to
+Next safety gate after ES36; implementation in progress, not accepted or authorized. Traces to
 spec items 9, 15, 24-29 and 34. Broad agent-client onboarding follows this gate.
 
 ## Scope
@@ -22,6 +22,14 @@ Kill release is a separate explicit action identifying its scope and current
 stop evidence. Activation cannot silently release a global or agent kill.
 Permanent pilot stops and exhausted budgets cannot be released here. A
 separately completed kill release invalidates prior activation review.
+
+Desktop delivery prerequisite: the current command surface exposes neither an
+initial pilot-consent ceremony nor a reviewed kill-release operation. Existing
+tests establish those prerequisites through operator APIs using synthetic
+fixtures. Therefore this activation slice is not a standalone first-run path
+to an order. Deliver the missing explicit ceremonies as separate gates, with
+account-identity/exclusivity confirmation and original-state preservation; do
+not work around them with manual production-ledger edits or implicit activation.
 
 ## Review Contract
 
@@ -81,6 +89,12 @@ eligibility, feed readiness and venue acceptance. Later stops, expiry, revocatio
 and policy changes remain visible and effective; do not replace hardcoded
 inhibition status with a success latch.
 
+Correlate command outcomes with the native owner, monotonic operation sequence,
+operation kind and review ID where applicable. An old acknowledgment cannot
+resolve a newer lost command reply. A verified replacement owner permits fresh
+explicit review while retaining the prior owner's unresolved outcome as a
+separate notice; it does not prove that earlier work succeeded or failed.
+
 ## Acceptance And Delivery
 
 1. Exercise native review/confirmation on the actual owned engine with synthetic
@@ -105,3 +119,48 @@ and exercise the complete UI flow before marking activation done. Select and
 verify actual read-only venue approval evidence during implementation; missing
 evidence means refusal, not a local-metadata fallback. Account confirmation and
 publication remain separate user approval gates. No mock completes a live gate.
+
+## Implementation Checkpoint - 2026-09-08
+
+Core/ledger confirmation, read-only venue approval evidence, retained native
+ownership and the UI are implemented on the local activation branch, not yet
+accepted through exact-head review/CI or installed-artifact verification.
+Final combined local Rust validation passed 1,218 tests with 15 ignored,
+including 27 core activation regressions and six native activation scenarios.
+Strict workspace/all-target clippy and formatting passed. Earlier sandboxed
+loopback failures were rerun with local networking permission, not bypassed by
+changing product behavior or ignoring additional tests.
+
+The latest complete frontend run passed 194 tests, production build and QA
+typechecking. Focused independent re-review cleared the operation-correlation,
+replacement-owner uncertainty and cached inhibition fixes. Mock-only browser
+checks passed explicit confirmation, receipt, stale and lost-reply states at
+1440px, plus the unchanged activation panel in a 390px fixture. Receipt and
+narrow confirmation screenshots were visually inspected; the entire console
+is not claimed mobile-ready. Neither focused review nor a build replaces exact-head review,
+CI, installed-artifact verification or the explicitly authorized live gates.
+
+New integration regressions now prove physical ledger reopen with nonzero
+cumulative accounting, persisted exhaustion/unknown-liability refusals, ledger
+head churn during review, competing writer exclusion during final-permit
+retention, and uncertain audit publication across physical restart. Historical
+accounting uses synthetic submission/fill evidence, not venue execution.
+
+Real agent/global kill APIs are exercised during review and post-commit audit
+publication. Native HALT and queued-account events race actual retained
+confirmation. Both refuse acknowledgment and keep old reviews invalid, with
+zero extra Signed/Accepted evidence or exchange POSTs and actual owner drain.
+The queued unlinked $1 fill is durably applied once, increases executed usage
+to $1, and latches awaiting-reconciliation without replacing original consent
+or baseline. Its test-only helper uses the real pool ingress monitor and pump;
+it does not prove WebSocket wire decoding. No fictional unchanged usage is
+asserted after a real fixture fill.
+
+The previous full Rust run failed one core and seven native legacy fixtures;
+all eight are fixed and verified in focused suites and the full rerun. The
+aggregate automated working-tree review found no remaining production-code
+blockers; focused independent review also cleared the final race tests and
+test-only helper. Exact-head review/CI remain pending. Offline cargo-deny passed using cached advisory
+data with existing warnings; this does not dismiss the handoff's open Linux
+glib advisory or claim a fresh zero-alert scan. Account identity confirmation and real testnet activity remain
+unauthorized; no budget has been reset or exercised by these synthetic tests.

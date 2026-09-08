@@ -241,9 +241,11 @@ fn supervised_orders_require_consent_at_reservation_and_final_signing() {
             crate::feed::test_session(oppen_hl::Address::from_bytes([1; 20])),
         )
         .unwrap();
-        engine
-            .operator_acknowledge_policy(engine.policy_observation().unwrap(), 100)
-            .unwrap();
+        assert!(
+            engine
+                .operator_acknowledge_policy(engine.policy_observation().unwrap(), 100)
+                .is_err()
+        );
         if let ClearedKind::Order {
             reduce_only,
             sz,

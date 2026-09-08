@@ -11,6 +11,38 @@ decisions" section until then.
 
 ---
 
+## 2026-09-08 · Scoped supervised operator activation
+
+ES37 implements the operator-activation contract for spec items 9, 15, 24-29
+and 34. Listener startup, policy acknowledgment and venue acceptance are distinct
+facts. The existing unbound acknowledgment leaves venue validation to its caller
+and is engine-wide; it is not a sufficient supervised desktop activation API.
+
+Use an opaque core-owned review on the existing supervised engine. Bind the
+reviewed account and agent, authenticated route and policy, original pilot
+consent/accounting, and feed observation captured before venue reads. Final
+confirmation must revalidate under ledger, state and feed coordination, sample
+freshness after waits, durably audit the request and publish only scoped
+acknowledgment. The unbound acknowledgment path must not enable supervised
+production execution. Every order still needs the existing signing/dispatch
+checks. Native ownership retains work through lost IPC observers and actual
+shutdown drain; the frontend supplies review identity, not authority.
+
+Read-only venue approval observations use `extraAgents` and `userRole`, with
+exact signer/account relationship and expiry checks. They are not cryptographic
+proof, a shared venue snapshot or an execution lease. Top-level and subaccount
+relationships must be distinguished; a vault role alone proves no applicable
+approval. No owner signature, approval replacement or new service is part of
+this observation. Sources: [official SDK](https://github.com/hyperliquid-dex/hyperliquid-python-sdk/blob/master/hyperliquid/info.py),
+[official recorded response](https://github.com/hyperliquid-dex/hyperliquid-python-sdk/blob/master/tests/cassettes/info_test/test_extra_agents.yaml),
+[role schema](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint#query-a-users-role).
+
+Initial consent and scoped kill release remain separate explicit operations;
+activation cannot reset usage, replace the baseline, clear an exhausted pilot
+or claim account exclusivity from local records. No new dependency is required.
+Implementation and validation are in progress; no live gate or account action
+is authorized by this decision.
+
 ## 2026-09-08 · Cleanup with authenticated unavailable accounting
 
 ES36 addresses spec items 25, 26 and 34 and the explicit ES35 recovery

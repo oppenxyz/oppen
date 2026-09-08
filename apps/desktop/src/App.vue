@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, type Component } from "vue";
+import { computed, onMounted, onUnmounted, watch, type Component } from "vue";
 import AppHeader from "./components/shell/AppHeader.vue";
 import AppStatusBar from "./components/shell/AppStatusBar.vue";
 import { isOpen as tourOpen } from "./stores/tour";
@@ -8,6 +8,7 @@ import DesktopRuntimeBanner from "./components/shell/DesktopRuntimeBanner.vue";
 import AgentHaltBanner from "./components/shell/AgentHaltBanner.vue";
 import { supervision } from "./stores/supervision";
 import { policySetup } from "./stores/policy-setup";
+import { activation, activationContext } from "./stores/activation";
 import TourSpotlight from "./components/tour/TourSpotlight.vue";
 import {
   refreshKeychain,
@@ -37,6 +38,7 @@ const VIEWS: Record<View, Component> = {
 };
 
 const current = computed(() => VIEWS[shell.view]);
+watch(() => activationContext(shell.network, supervision.state), context => activation.setContext(context), { immediate: true, flush: "sync" });
 
 onMounted(() => {
   startAccountPolling();
@@ -45,6 +47,7 @@ onMounted(() => {
   startRuntimePolling();
   supervision.startPolling();
   policySetup.startPolling();
+  activation.startPolling();
   // The socket, the rail poll and the staleness clock (items 31, 34). Started
   // here rather than in TradeView: the status bar reads the feed from every
   // view, so it must not stop when the operator opens Agents.
@@ -59,6 +62,7 @@ onUnmounted(() => {
   stopRuntimePolling();
   supervision.stopPolling();
   policySetup.stopPolling();
+  activation.stopPolling();
   stopMarketFeed();
 });
 </script>

@@ -8,9 +8,9 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::types::{
-    Candle, ClearinghouseState, Fill, FundingHistoryPage, FundingHistoryRow, L2Book, Meta,
-    MetaAndAssetCtxs, OpenOrder, OrderStatusResponse, Portfolio, PredictedFundings,
-    SpotClearinghouseState, SubAccount, UserRateLimit, ValidatorDexCoin,
+    Candle, ClearinghouseState, ExtraAgent, Fill, FundingHistoryPage, FundingHistoryRow, L2Book,
+    Meta, MetaAndAssetCtxs, OpenOrder, OrderStatusResponse, Portfolio, PredictedFundings,
+    SpotClearinghouseState, SubAccount, UserRateLimit, UserRole, ValidatorDexCoin,
 };
 use crate::wire::Cloid;
 use crate::{Address, Error, Network, Universe};
@@ -258,6 +258,17 @@ impl InfoClient {
             .await
     }
 
+    /// Read extra-agent registrations without granting or renewing any agent.
+    pub async fn extra_agents(&self, user: Address) -> Result<Vec<ExtraAgent>, Error> {
+        self.post(serde_json::json!({ "type": "extraAgents", "user": user }))
+            .await
+    }
+
+    pub async fn user_role(&self, user: Address) -> Result<UserRole, Error> {
+        self.post(serde_json::json!({ "type": "userRole", "user": user }))
+            .await
+    }
+
     /// `null` from the venue means no sub-accounts.
     pub async fn sub_accounts(&self, user: Address) -> Result<Vec<SubAccount>, Error> {
         let subs: Option<Vec<SubAccount>> = self
@@ -293,6 +304,10 @@ fn parse_funding_history(
         }),
     }
 }
+
+#[cfg(test)]
+#[path = "info_activation_tests.rs"]
+mod activation_tests;
 
 #[cfg(test)]
 mod tests {

@@ -253,20 +253,25 @@ pub(super) fn verify_route(
     history: &History,
     clearance: &Clearance,
 ) -> Result<()> {
+    verify_authorized_route(registry, connection, history, &clearance.route)
+}
+
+pub(super) fn verify_authorized_route(
+    registry: &RegistryJournal,
+    connection: &Connection,
+    history: &History,
+    route: &AuthorizedRoute,
+) -> Result<()> {
     let Some(authority) = history.authorities.first() else {
         return Ok(());
     };
     let event = history.adoption.as_ref().unwrap_or(&authority.event);
     let signed = read(registry.ledger(), connection, event)?;
-    if signed.envelope.route != clearance.route {
+    if &signed.envelope.route != route {
         return Err(unavailable("pilot consent signing route changed"));
     }
     registry
-        .verify_route_in(
-            connection,
-            &clearance.route,
-            clearance.route.binding.wallet.address,
-        )
+        .verify_route_in(connection, route, route.binding.wallet.address)
         .map_err(|error| unavailable(error.to_string()))
 }
 

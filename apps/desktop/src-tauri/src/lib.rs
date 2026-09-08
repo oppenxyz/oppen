@@ -9,6 +9,7 @@
 mod feed;
 mod local_reads;
 mod mcp_runtime;
+mod operator_activation;
 mod operator_approvals;
 mod operator_halt;
 mod policy_setup;
@@ -491,6 +492,54 @@ async fn stop_mcp(runtime: State<'_, Runtime>) -> Result<RuntimeStatus, ConsoleE
 }
 
 #[tauri::command]
+fn activation_status(
+    runtime: State<'_, Runtime>,
+    agent: String,
+    account: String,
+) -> Result<operator_activation::ActivationStatus, ConsoleError> {
+    runtime
+        .activation_status(agent, account)
+        .map_err(ConsoleError::from)
+}
+
+#[tauri::command]
+fn review_activation(
+    runtime: State<'_, Runtime>,
+    agent: String,
+    account: String,
+) -> Result<operator_activation::ActivationStatus, ConsoleError> {
+    runtime
+        .review_activation(agent, account)
+        .map_err(ConsoleError::from)
+}
+
+#[tauri::command]
+fn confirm_activation(
+    runtime: State<'_, Runtime>,
+    agent: String,
+    account: String,
+    owner_id: String,
+    review_id: String,
+) -> Result<operator_activation::ActivationStatus, ConsoleError> {
+    runtime
+        .confirm_activation(agent, account, owner_id, review_id)
+        .map_err(ConsoleError::from)
+}
+
+#[tauri::command]
+fn discard_activation(
+    runtime: State<'_, Runtime>,
+    agent: String,
+    account: String,
+    owner_id: String,
+    review_id: String,
+) -> Result<operator_activation::ActivationStatus, ConsoleError> {
+    runtime
+        .discard_activation(agent, account, owner_id, review_id)
+        .map_err(ConsoleError::from)
+}
+
+#[tauri::command]
 fn approval_queue_status(
     runtime: State<'_, Runtime>,
     agent: String,
@@ -600,6 +649,10 @@ pub fn run() {
             stop_mcp,
             halt_mcp,
             approval_queue_status,
+            activation_status,
+            review_activation,
+            confirm_activation,
+            discard_activation,
             refresh_approval_queue,
             reject_approval_proposal,
             prepare_approval_review,

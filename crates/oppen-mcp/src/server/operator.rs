@@ -52,6 +52,36 @@ pub struct OperatorReview {
     review: oppen_core::guardrail::ApprovalReview,
 }
 
+/// Pins one live pairing and the listener's execution drain for native activation.
+/// It does not acknowledge policy or grant signing authority.
+pub struct ActivationAdmission {
+    work: OperatorWork,
+}
+
+/// Held only during synchronous final confirmation, never across venue I/O.
+pub struct ActivationAdmissionGuard<'a> {
+    _held: SigningAdmission<'a>,
+}
+
+impl ActivationAdmission {
+    pub fn binding(&self) -> &Binding {
+        self.work.binding()
+    }
+
+    pub fn pairing_id(&self) -> crate::auth::PairingId {
+        self.work.authority.id
+    }
+
+    /// Nonblocking verification; keep the returned guard through acknowledgment
+    /// so revocation cannot slip between this check and the mutation.
+    pub fn check(&self) -> Result<ActivationAdmissionGuard<'_>, rmcp::ErrorData> {
+        self.work
+            .signing_admission()
+            .map(|held| ActivationAdmissionGuard { _held: held })
+            .map_err(Into::into)
+    }
+}
+
 impl OperatorReview {
     pub fn display(&self) -> &oppen_core::guardrail::ApprovalReviewDisplay {
         self.review.display()
@@ -99,6 +129,15 @@ impl OperatorControl {
     /// its owner finishes halt cleanup and stops the listener itself.
     pub fn close(&self) {
         self.owner.lifecycle.close();
+    }
+
+    pub fn activation_admission(
+        &self,
+        binding: &Binding,
+    ) -> Result<ActivationAdmission, rmcp::ErrorData> {
+        self.admit(binding, None)
+            .map(|work| ActivationAdmission { work })
+            .map_err(Into::into)
     }
 
     pub async fn prepare(
