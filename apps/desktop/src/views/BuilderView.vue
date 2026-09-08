@@ -2,7 +2,8 @@
 import PanelHousing from "../components/housing/PanelHousing.vue";
 import DecisionStream from "../components/DecisionStream.vue";
 import UiButton from "../components/ui/UiButton.vue";
-import { shell, setView } from "../stores/shell";
+import { shell } from "../stores/shell";
+import { openMcpSettings } from "../stores/settings";
 
 interface Source {
   name: string;
@@ -12,7 +13,7 @@ interface Source {
 }
 
 const SOURCES: readonly Source[] = [
-  { name: "External via MCP", desc: "Claude Code or any MCP client. Agent lives elsewhere, keys stay here." },
+  { name: "External via MCP", desc: "Compatible MCP clients. Client verification pending." },
   { name: "oppen template", desc: "Prompt templates describe responsibilities; they do not prescribe trading thresholds.", planned: "planned" },
   { name: "Bring-your-own model", desc: "Hosted loop via API key. Planned.", planned: "v1.5" },
   { name: "Script strategy", desc: "Sandboxed Python/TS runtime. Planned.", planned: "v2" },
@@ -36,7 +37,7 @@ const SOURCES: readonly Source[] = [
           <div class="source__desc">{{ source.desc }}</div>
         </li>
       </ul>
-      <template #footer>02 · Policy → 03 · Testnet → 04 · Arm</template>
+      <template #footer>02 · Authority → 03 · Testnet → 04 · Status</template>
     </PanelHousing>
 
     <div class="builder__center">
@@ -50,17 +51,18 @@ const SOURCES: readonly Source[] = [
       </PanelHousing>
 
       <div class="builder__pair">
-        <PanelHousing label="02 · Connect the gateway" :brackets="['tl']">
+        <PanelHousing label="02 · Existing TESTNET authority" :brackets="['tl']">
           <div class="guide">
-            <p>This development build runs the gateway separately. The console cannot create pairings or edit its active risk policy yet.</p>
+            <p>The desktop owns MCP supervision. Missing authority setup is a blocker: this console cannot create pairings, grant registry authority, edit active policy or authorize a pilot.</p>
             <ol>
-              <li>Configure the testnet account in <code>OPPEN_TESTNET_USER</code>. Keep account-owner keys in your wallet.</li>
-              <li>From the repository, run:<pre>cargo run -p oppen-mcp --example serve</pre></li>
-              <li>Set <code>OPPEN_DATA_DIR</code> to the same directory for the gateway and desktop app, then restart the app to read its ledger and stored limits.</li>
-              <li>The gateway prints a one-time pairing command for your MCP client. Use that command locally.</li>
-              <li>Ask the connected agent to read state and run preflight. Inspect any refusal before considering execution.</li>
+              <li>Configure <code>OPPEN_TESTNET_USER</code> for the already-authorized TESTNET account and <code>OPPEN_DATA_DIR</code> for its existing authority records. Restart the app after changing configuration. Keep account-owner keys in your wallet.</li>
+              <li>Use the agent ID and account already confirmed in the durable pilot authorization. Unverified roster suggestions are not authority.</li>
+              <li>Open Settings → MCP server, enter that identity, and explicitly select <strong>Start supervision</strong>. Native setup blockers must be resolved before supervision can start.</li>
+              <li>Connect the external client using its existing pairing configuration and the reported local listener. Starting supervision does not issue a pairing token.</li>
+              <li>Inspect account reconciliation, account feeds, pause enforcement and order inhibition separately. Listening is not trading activation.</li>
             </ol>
-            <p>This path binds <code>agent-alpha</code> to the configured testnet account. The gateway's default allowlist is empty; registration is not trading permission.</p>
+            <p>Starting may enforce existing pauses and cancel resting orders under the existing authorized pilot. Positions may remain open. Policy acknowledgment and arming are not available here. This path is TESTNET only.</p>
+            <div class="actions"><UiButton @click="openMcpSettings">Open supervision settings</UiButton></div>
           </div>
           <template #footer>Policy is checked before every order. The model cannot change it.</template>
         </PanelHousing>
@@ -86,12 +88,12 @@ const SOURCES: readonly Source[] = [
         <template #footer>Recent events, not a validated testnet run report.</template>
       </PanelHousing>
 
-      <PanelHousing inset label="04 · Verify readiness">
+      <PanelHousing inset label="04 · Inspect supervision">
         <p class="copy copy--sm">
-          Pairing, policy editing and arming are not available in this console yet. Follow the testnet gateway setup, then verify the account and active limits in your MCP client.
+          Setup blockers and pause-sweep errors appear in Settings → MCP server. A connection or completed sweep does not authorize orders. Startup failure requires restarting the app; Stop runtime is terminal.
         </p>
         <div class="actions">
-          <UiButton block @click="setView('onboarding')">Check setup</UiButton>
+          <UiButton block @click="openMcpSettings">Open supervision settings</UiButton>
         </div>
       </PanelHousing>
     </div>
@@ -103,7 +105,6 @@ const SOURCES: readonly Source[] = [
 .guide p + p, .guide ol, .guide blockquote { margin-top: var(--s-3); }
 .guide ol { padding-left: var(--s-5); }
 .guide li + li { margin-top: var(--s-2); }
-.guide pre { white-space: pre-wrap; overflow-wrap: anywhere; padding: var(--s-2); margin-block: var(--s-2); border: 1px solid var(--rule); color: var(--signal); font: 11px/1.5 var(--font-mono); }
 .guide blockquote { padding-left: var(--s-3); border-left: 1px solid var(--bracket); color: var(--signal-dim); }
 
 .builder {

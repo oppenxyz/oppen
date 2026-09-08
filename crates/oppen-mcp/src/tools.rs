@@ -545,6 +545,19 @@ impl Gateway {
         })
     }
 
+    /// Redirect only transport to loopback for cross-crate lifecycle fixtures.
+    /// Authority, guards and signing ownership remain the real gateway's.
+    #[cfg(feature = "test-support")]
+    pub fn with_loopback_fixture(mut self, port: u16) -> std::io::Result<Self> {
+        let info = InfoClient::loopback_fixture(port).map_err(std::io::Error::other)?;
+        let exchange = ExchangeClient::loopback_fixture(port).map_err(std::io::Error::other)?;
+        let inner = Arc::get_mut(&mut self.inner)
+            .ok_or_else(|| std::io::Error::other("fixture gateway must be uniquely owned"))?;
+        inner.info = info;
+        inner.exchange = exchange;
+        Ok(self)
+    }
+
     /// Who this request's token names (`docs/spec.md` item 15).
     ///
     /// `rmcp` republishes the request's `http::request::Parts` into the tool's

@@ -88,7 +88,16 @@ before expanding features:
    on `fix/mcp-supervisor-failure` closes MCP admission when pause supervision
    terminates, retains actual execution drain, and reports failure instead of
    successful shutdown. This is a prerequisite, not desktop MCP activation.
-   Neither branch activates a trading account.
+   Desktop-owned MCP integration is implemented on `feat/desktop-mcp-runtime`
+   (ES20): existing-authority-only testnet startup, pre-bound loopback listener,
+   actual gateway/pump ownership, explicit queued-event drain and operator
+   start/status/stop controls. Local verification passes 929 Rust tests
+   (15 live-gated/helper tests ignored), 116 desktop tests, the web build,
+   formatting and workspace all-target clippy. Separate automated review
+   cleared the failure-latch, quiescence and late-status fixes. Exact committed
+   head review and CI remain PR gates; no live gate is claimed. See
+   [desktop-mcp-runtime.md](docs/specs/desktop-mcp-runtime.md).
+   No dedicated-account activity has been performed during this development.
 4. **Recovery:** PR #44 merged as `06fc0e3` after green CI and separate automated
    review. The durable submission journal has SQLite reopen, independent
    handle, stale-revision, corruption and dropped-request regressions. Starts and

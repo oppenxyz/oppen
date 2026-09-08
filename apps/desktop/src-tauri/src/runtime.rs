@@ -3,12 +3,16 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use oppen_core::guardrail::AgentId;
 use oppen_hl::Network;
+use oppen_mcp::auth::Binding;
 use serde::Serialize;
 use tokio::sync::{Mutex as AsyncMutex, Notify, oneshot};
+use tokio_util::sync::CancellationToken;
 
 use crate::feed::ConsoleFeed;
 use crate::local_reads::{LocalReads, ReadKind};
+use crate::mcp_runtime::{McpPhase, McpStatus, OwnedMcp, SharedStatus, status_lock};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct FeedBinding {
@@ -603,6 +607,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dropped_mcp_start_observer_keeps_blocking_start_owned_through_stop() {
+        let runtime = runtime();
+        let account = oppen_hl::Address::from_bytes([7; 20]).to_string();
+        let (release, gate) = mpsc::channel::<()>();
+        let (started, observing) = oneshot::channel();
+        let response = runtime
+            .launch_mcp(
+                "fixture-agent".into(),
+                account,
+                move |_, _, _, _| async move {
+                    tauri::async_runtime::spawn_blocking(move || {
+                        let _ = started.send(());
+                        let _ = gate.recv();
+                    })
+                    .await
+                    .unwrap();
+                    Err("controlled authority startup failure".into())
+                },
+            )
+            .unwrap();
+        observing.await.unwrap();
+        drop(response);
+        assert_eq!(runtime.mcp_status().phase, McpPhase::Starting);
+        let (driver, _) = Driver::new();
+        assert!(matches!(
+            runtime.submit_watch(
+                FeedSource::Controlled(driver),
+                Selection {
+                    network: Network::Mainnet,
+                    account: None,
+                    coin: "BTC".into(),
+                    interval: "1m".into(),
+                }
+            ),
+            Err(RuntimeError::Busy)
+        ));
+        pending(&runtime).await;
+        assert_eq!(runtime.mcp_status().phase, McpPhase::Stopping);
+        drop(release);
+        assert!(
+            matches!(drained(&runtime).await, Err(RuntimeError::Failed(detail))
+            if detail == "controlled authority startup failure")
+        );
+        assert_eq!(runtime.mcp_status().phase, McpPhase::Failed);
+        assert_eq!(runtime.status().phase, RuntimePhase::StoppedWithError);
+    }
+
+    #[tokio::test]
+    async fn mcp_start_rejects_existing_feed_account_before_startup_work() {
+        let runtime = runtime();
+        let (driver, _) = Driver::new();
+        let account = oppen_hl::Address::from_bytes([7; 20]).to_string();
+        reply(watch(
+            &runtime,
+            &driver,
+            Network::Testnet,
+            Some(&account),
+            "BTC",
+        ))
+        .await;
+        let other = oppen_hl::Address::from_bytes([8; 20]).to_string();
+        let refused = runtime.launch_mcp("fixture-agent".into(), other, |_, _, _, _| async {
+            panic!("mismatched context must not load authority");
+        });
+        assert!(matches!(refused, Err(RuntimeError::ContextChanged)));
+        assert_eq!(runtime.mcp_status().phase, McpPhase::Idle);
+        drained(&runtime).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn update_claim_excludes_exit_even_after_drain_and_drop_never_reopens() {
         let runtime = runtime();
         let guard = runtime.begin_update().unwrap();
@@ -751,6 +825,8 @@ struct Control {
     active_reads: usize,
     terminal_mode: Option<TerminalMode>,
     exit_task: Option<tauri::async_runtime::JoinHandle<()>>,
+    mcp_binding: Option<Binding>,
+    mcp_worker: Option<tauri::async_runtime::JoinHandle<()>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -795,6 +871,9 @@ struct Inner {
     control: Mutex<Control>,
     feed: AsyncMutex<Option<OwnedFeed>>,
     changed: Notify,
+    mcp: AsyncMutex<Option<OwnedMcp>>,
+    mcp_status: SharedStatus,
+    mcp_stop: CancellationToken,
 }
 
 #[derive(Clone)]
@@ -833,9 +912,14 @@ impl Runtime {
                 active_reads: 0,
                 terminal_mode: None,
                 exit_task: None,
+                mcp_binding: None,
+                mcp_worker: None,
             }),
             feed: AsyncMutex::new(None),
             changed: Notify::new(),
+            mcp: AsyncMutex::new(None),
+            mcp_status: Arc::new(Mutex::new(McpStatus::idle())),
+            mcp_stop: CancellationToken::new(),
         }))
     }
 
@@ -855,6 +939,7 @@ impl Runtime {
     }
 
     pub(crate) fn status(&self) -> RuntimeStatus {
+        self.mcp_status();
         let failure = self
             .0
             .feed
@@ -870,6 +955,106 @@ impl Runtime {
             binding: control.binding.clone(),
             detail: control.detail.clone(),
         }
+    }
+
+    /// Cached only: this path never opens authority or touches the keychain.
+    pub(crate) fn mcp_status(&self) -> McpStatus {
+        let status = status_lock(&self.0.mcp_status).clone();
+        if status.phase == McpPhase::Failed {
+            self.fail(
+                status
+                    .detail
+                    .clone()
+                    .unwrap_or_else(|| "MCP owner failed".into()),
+            );
+        }
+        status
+    }
+
+    pub(crate) fn start_mcp(
+        &self,
+        agent: String,
+        account: String,
+    ) -> Result<oneshot::Receiver<Result<McpStatus, RuntimeError>>, RuntimeError> {
+        self.launch_mcp(agent, account, OwnedMcp::start)
+    }
+
+    pub(super) fn launch_mcp<F, Fut>(
+        &self,
+        agent: String,
+        account: String,
+        start: F,
+    ) -> Result<oneshot::Receiver<Result<McpStatus, RuntimeError>>, RuntimeError>
+    where
+        F: FnOnce(PathBuf, Binding, SharedStatus, CancellationToken) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<OwnedMcp, String>> + Send + 'static,
+    {
+        if agent.trim().is_empty() {
+            return Err(RuntimeError::Failed("an existing agent is required".into()));
+        }
+        let binding = Binding {
+            agent: AgentId::new(agent),
+            account: account
+                .parse()
+                .map_err(|error| RuntimeError::Failed(format!("invalid MCP account: {error}")))?,
+        };
+        self.status();
+        let (reply, observing) = oneshot::channel();
+        let mut control = self.control();
+        Self::admit(&mut control, Network::Testnet)?;
+        if control.mcp_binding.is_some() {
+            return Err(RuntimeError::Busy);
+        }
+        if control.selection.as_ref().is_some_and(|selection| {
+            selection.network != Network::Testnet
+                || selection
+                    .account
+                    .as_deref()
+                    .and_then(|account| account.parse().ok())
+                    != Some(binding.account)
+        }) {
+            return Err(RuntimeError::ContextChanged);
+        }
+        control.mcp_binding = Some(binding.clone());
+        *status_lock(&self.0.mcp_status) = McpStatus::starting(&binding);
+        let runtime = self.clone();
+        control.mcp_worker = Some(tauri::async_runtime::spawn(async move {
+            let owner = runtime.clone();
+            let result = tauri::async_runtime::spawn(async move {
+                start(
+                    owner.0.data_dir.clone(),
+                    binding,
+                    owner.0.mcp_status.clone(),
+                    owner.0.mcp_stop.clone(),
+                )
+                .await
+            })
+            .await
+            .map_err(|error| format!("MCP startup owner: {error}"))
+            .and_then(|result| result);
+            match result {
+                Ok(owned) => {
+                    *runtime.0.mcp.lock().await = Some(owned);
+                    let response = if runtime.control().terminal {
+                        Err(RuntimeError::Stopping)
+                    } else {
+                        Ok(runtime.mcp_status())
+                    };
+                    let _ = reply.send(response);
+                }
+                Err(detail) => {
+                    {
+                        let mut status = status_lock(&runtime.0.mcp_status);
+                        status.phase = McpPhase::Failed;
+                        status.detail = Some(detail.clone());
+                        status.listener = None;
+                    }
+                    runtime.fail(detail.clone());
+                    let _ = reply.send(Err(RuntimeError::Failed(detail)));
+                }
+            }
+        }));
+        Ok(observing)
     }
 
     fn admit(control: &mut Control, network: Network) -> Result<(), RuntimeError> {
@@ -942,6 +1127,16 @@ impl Runtime {
         let mut control = self.control();
         if control.terminal {
             return Err(RuntimeError::Stopping);
+        }
+        if control.mcp_binding.as_ref().is_some_and(|binding| {
+            selection.network != Network::Testnet
+                || selection
+                    .account
+                    .as_deref()
+                    .and_then(|account| account.parse().ok())
+                    != Some(binding.account)
+        }) {
+            return Err(RuntimeError::Busy);
         }
         if !control.worker_running
             && control.selection.as_ref() == Some(&selection)
@@ -1209,6 +1404,13 @@ impl Runtime {
         let mut control = self.control();
         control.terminal = true;
         control.reads.begin_stop();
+        self.0.mcp_stop.cancel();
+        {
+            let mut status = status_lock(&self.0.mcp_status);
+            if matches!(status.phase, McpPhase::Starting | McpPhase::Listening) {
+                status.phase = McpPhase::Stopping;
+            }
+        }
         if matches!(
             control.phase,
             RuntimePhase::Stopped | RuntimePhase::StoppedWithError
@@ -1222,8 +1424,23 @@ impl Runtime {
             let _ = pending.reply.send(Err(RuntimeError::Stopping));
         }
         let worker = control.worker.take();
+        let mcp_worker = control.mcp_worker.take();
         let runtime = self.clone();
         control.drain = Some(tauri::async_runtime::spawn(async move {
+            if let Some(worker) = mcp_worker
+                && let Err(error) = worker.await
+            {
+                runtime.fail(format!("MCP startup join: {error}"));
+            }
+            {
+                let mut mcp = runtime.0.mcp.lock().await;
+                if let Some(owned) = mcp.as_mut()
+                    && let Err(error) = owned.shutdown_and_drain().await
+                {
+                    runtime.fail(error);
+                }
+                *mcp = None;
+            }
             if let Some(worker) = worker
                 && let Err(error) = worker.await
             {

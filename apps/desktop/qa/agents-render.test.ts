@@ -54,6 +54,15 @@ test.each(["unverified_legacy", "unverified_ledger"] as const)("agent roster ren
     expect(settings).toContain(provenance === "unverified_ledger" ? "Unverified ledger policy" : "Unverified legacy policy");
     expect(settings).toContain("Runtime policy not read.");
     expect(settings).toContain("Snapshot revision");
+    const { default: BuilderView } = await server.ssrLoadModule("/src/views/BuilderView.vue");
+    const builder = await renderToString(createSSRApp(BuilderView));
+    expect(builder).toContain("Open supervision settings");
+    expect(builder).toContain("Missing authority setup is a blocker");
+    expect(builder).toContain("Starting supervision does not issue a pairing token");
+    expect(builder).toContain("TESTNET only");
+    expect(builder).not.toContain("runs the gateway separately");
+    expect(builder).not.toContain("cargo run");
+    expect(builder).not.toContain("default allowlist is empty");
   } finally {
     await server.close();
     globals.forEach((name, index) => {

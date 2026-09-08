@@ -8,6 +8,7 @@
 
 mod feed;
 mod local_reads;
+mod mcp_runtime;
 mod runtime;
 mod updates;
 
@@ -374,6 +375,39 @@ async fn watch_market(
 fn runtime_status(runtime: State<'_, Runtime>) -> RuntimeStatus {
     runtime.status()
 }
+
+#[tauri::command]
+fn mcp_status(runtime: State<'_, Runtime>) -> mcp_runtime::McpStatus {
+    runtime.mcp_status()
+}
+
+#[tauri::command]
+async fn start_mcp(
+    runtime: State<'_, Runtime>,
+    agent: String,
+    account: String,
+) -> Result<mcp_runtime::McpStatus, ConsoleError> {
+    let requested: Address = account.parse().map_err(|error| {
+        ConsoleError::NotConfigured(format!("invalid testnet account: {error}"))
+    })?;
+    if configured_account(Network::Testnet)? != requested {
+        return Err(ConsoleError::NotConfigured(
+            "Requested supervisor account differs from the console's configured testnet account"
+                .into(),
+        ));
+    }
+    runtime
+        .start_mcp(agent, requested.to_string())?
+        .await
+        .map_err(|error| ConsoleError::LocalStatus(format!("MCP startup reply: {error}")))?
+        .map_err(ConsoleError::from)
+}
+
+#[tauri::command]
+async fn stop_mcp(runtime: State<'_, Runtime>) -> Result<RuntimeStatus, ConsoleError> {
+    runtime.shutdown().await?;
+    Ok(runtime.status())
+}
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -402,6 +436,9 @@ pub fn run() {
             chart_series,
             watch_market,
             runtime_status,
+            mcp_status,
+            start_mcp,
+            stop_mcp,
             updates::check_update,
             updates::download_update,
             updates::install_update

@@ -1,0 +1,83 @@
+# Desktop MCP Runtime
+
+Execution-owner integration after ES19. Traces to spec items 9, 14, 15, 26,
+27 and 34. This is not approval to activate the dedicated testnet account.
+
+## Startup Authority
+
+An explicit operator command starts one testnet agent/account supervisor. It
+requires existing authenticated registry and policy authority, the matching
+durable pilot authorization and account identity, usable pilot accounting, and
+pairing bindings covered by that single account pump. Revoked pairings still
+count because they retain cleanup obligations. At least one matching retained
+binding is required: an empty store gives pause enforcement no account target.
+Missing or conflicting authority
+blocks startup; startup never initializes, replaces, issues or acknowledges it.
+
+The console's configured account and requested account must agree. The runtime
+owns retained startup work independently of the IPC observer. Local socket
+ownership is established before venue work so an occupied port cannot leave an
+orphan pump. Wallet material remains in Rust; status observation never opens
+keys or databases.
+
+## Lifecycle
+
+The real Gateway, execution FeedSession, FeedPump and WsPool belong to the
+desktop runtime. They are not simulated by console market freshness. Orders
+remain inhibited until a separate future operator review/reconciliation and
+acknowledgment path. Starting supervision can enforce existing pauses and cancel
+resting orders, so it is not a read-only connection test.
+
+Quit, update installation and context replacement cannot pass the retained MCP
+startup/server/pump drain. Close MCP admission and await actual execution;
+request pump quiescence and await its acknowledgment after active work finishes.
+The quiescent pump keeps folding events but starts no subscriptions or new
+reconciliation walks. Then stop and join socket producers, close the pump
+receiver and consume queued events. Only after actual tasks finish may their
+pairing ownership be released.
+An interrupted observer does not abort ledger work or establish completion.
+An in-flight socket frame can be lost at shutdown; restart reconciliation is
+mandatory and a drained process is not evidence of a flat venue account.
+
+Local persistence/application and malformed-gap failures latch for the session
+lifetime. Later ticks and an empty reconciliation walk cannot hide them.
+Transient venue failures remain retryable and clear reconciliation while
+outstanding; they do not make a completed process drain a permanent failure.
+Listener, account-feed health, reconciliation and pause-sweep observations stay
+separate. A completed cleanup sweep is not policy verification or order admission.
+
+## Evidence Gates
+
+Use synthetic authenticated authority and local loopback fixtures to exercise
+real MCP reads, refused order admission, occupied ports, wrong account/network,
+duplicate ownership, partial startup, dropped observers, stalled work and queued
+event drain. Separately verify UI empty/error/running/stopping states. Preserve
+explicit unknown and stale observations; a bound port is not a completed MCP
+handshake and neither is trading activation.
+
+No fixture counts as a live pilot, position-aware quit, client verification or
+installable build gate. Account confirmation and publication approval remain
+separate requirements. Broader Connect Agent onboarding follows safety work.
+
+## Local Verification
+
+- Workspace: 929 Rust tests passed, 15 live-gated/helper tests ignored;
+  formatting and all-target clippy with warnings denied passed.
+- Desktop: 116 JavaScript tests and the production web build passed.
+- Real desktop-owned MCP fixture: authenticated event read, actual order
+  request returning `trading_paused`, durable refusal, no order intent or
+  submission, zero exchange requests, and ownership release after shutdown.
+- Pump: 31 focused feed tests cover quiescence, queued-event persistence,
+  dropped observers, malformed evidence, failure latching and venue retries.
+- Browser fixture: default wide viewport and 1280x720 screenshots, long-error
+  wrapping, missing-authority diagnostics, stop confirmation, terminal controls
+  and Builder-to-Settings navigation. Temporary browser/server were closed.
+- Normal/build feature graph excludes `test-support` from both protocol and
+  MCP crates. Final request-capable native fixtures use loopback transports.
+
+An initial zero-connection fixture was not isolated: the pool clamps that
+limit upward and could attempt the default venue socket for a synthetic
+account. It was replaced with a pre-shutdown loopback pool before final
+verification. No real wallet keys, orders or dedicated-account operations
+were used. Separate automated review cleared the corrected working diff;
+committed-head review and CI remain required before any merge.

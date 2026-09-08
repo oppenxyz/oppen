@@ -1411,6 +1411,8 @@ impl fmt::Debug for ConnectionTask {
 #[derive(Debug)]
 pub struct WsPool {
     cfg: WsPoolConfig,
+    #[cfg(feature = "test-support")]
+    fixture_url: Option<String>,
     inner: Arc<Mutex<PoolInner>>,
     events: mpsc::Sender<WsEvent>,
     /// Captured at construction so [`WsPool::subscribe`] can stay synchronous
@@ -1455,12 +1457,22 @@ impl WsPool {
         Ok((
             WsPool {
                 cfg,
+                #[cfg(feature = "test-support")]
+                fixture_url: None,
                 inner: Arc::new(Mutex::new(inner)),
                 events: tx,
                 handle,
             },
             rx,
         ))
+    }
+
+    /// Loopback-only pool for cross-crate ownership and shutdown tests.
+    #[cfg(feature = "test-support")]
+    pub fn loopback_fixture(port: u16) -> Result<(Self, mpsc::Receiver<WsEvent>), PoolError> {
+        let (mut pool, events) = Self::new(WsPoolConfig::default())?;
+        pool.fixture_url = Some(format!("ws://127.0.0.1:{port}/ws"));
+        Ok((pool, events))
     }
 
     /// Add a subscription, opening a connection if every existing one is full.
@@ -1473,6 +1485,10 @@ impl WsPool {
     /// coin closes the whole connection (measured), and the pool cannot tell
     /// that apart from a network drop.
     pub fn subscribe(&self, sub: Subscription) -> Result<(), PoolError> {
+        #[cfg(feature = "test-support")]
+        if let Some(url) = &self.fixture_url {
+            return self.subscribe_to(sub, url);
+        }
         self.subscribe_to(sub, self.cfg.network.ws_url())
     }
 

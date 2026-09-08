@@ -277,6 +277,115 @@ async fn wrong_network_fails_closed_in_router_and_before_binding() {
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
 }
 
+#[tokio::test]
+async fn bound_server_owns_loopback_port_before_serving_and_rechecks_network() {
+    use oppen_mcp::server::BoundServer;
+    let fixture = Fixture::new(Network::Testnet);
+    let pairings = Arc::new(RwLock::new(fixture.store()));
+    let bound = BoundServer::bind(0, &fixture.gateway, &pairings)
+        .await
+        .unwrap();
+    let address = bound.local_addr();
+    assert_eq!(address.ip(), std::net::Ipv4Addr::LOCALHOST);
+    assert_ne!(address.port(), 0);
+    let error = BoundServer::bind(address.port(), &fixture.gateway, &pairings)
+        .await
+        .err()
+        .expect("occupied port");
+    assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
+    let wrong = Fixture::new(Network::Mainnet);
+    let error = bound
+        .serve(
+            wrong.gateway.clone(),
+            pairings.clone(),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    let rebound = BoundServer::bind(address.port(), &fixture.gateway, &pairings)
+        .await
+        .unwrap();
+    let wrong_pairings = Arc::new(RwLock::new(wrong.store()));
+    let error = rebound
+        .serve(
+            fixture.gateway.clone(),
+            wrong_pairings,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    BoundServer::bind(address.port(), &fixture.gateway, &pairings)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn bound_server_reports_actual_failed_sweep_without_claiming_readiness() {
+    use oppen_mcp::server::BoundServer;
+    let fixture = Fixture::new(Network::Testnet);
+    let pairings = Arc::new(RwLock::new(fixture.store()));
+    let bound = BoundServer::bind(0, &fixture.gateway, &pairings)
+        .await
+        .unwrap();
+    let mut status = bound.supervision_status();
+    assert!(status.borrow().last_completed_ms.is_none());
+    assert!(status.borrow().last_error.is_none());
+    let stop = tokio_util::sync::CancellationToken::new();
+    let serving =
+        tokio::spawn(bound.serve(fixture.gateway.clone(), pairings.clone(), stop.clone()));
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if status.borrow().last_completed_ms.is_some() {
+                break;
+            }
+            status.changed().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!status.borrow().in_progress);
+    assert!(
+        status.borrow().last_error.is_none(),
+        "empty cleanup can finish while order admission remains inhibited"
+    );
+    let poison = pairings.clone();
+    assert!(
+        std::thread::spawn(move || {
+            let _guard = poison.write().unwrap();
+            panic!("fixture pairing cache failure");
+        })
+        .join()
+        .is_err()
+    );
+    tokio::time::timeout(Duration::from_secs(7), async {
+        loop {
+            if status.borrow().last_error.is_some() {
+                break;
+            }
+            status.changed().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!status.borrow().in_progress);
+    assert!(
+        status
+            .borrow()
+            .last_error
+            .as_deref()
+            .unwrap()
+            .contains("pairing authority unavailable")
+    );
+    stop.cancel();
+    tokio::time::timeout(Duration::from_secs(3), serving)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+}
+
 #[derive(Debug, Default)]
 struct MutationAnchor {
     head: std::sync::Mutex<Option<oppen_core::ledger::Anchor>>,

@@ -1,5 +1,5 @@
 // UI fixture transport only. Every read is local; no invoke, venue, key or signer call.
-import type { AccountState, ChartSeries, FeedBinding, MarketSnapshot, OperatorRead, RuntimeStatus } from "../src/lib/bridge";
+import type { AccountState, ChartSeries, FeedBinding, MarketSnapshot, McpStatus, OperatorRead, RuntimeStatus } from "../src/lib/bridge";
 export type * from "../src/lib/bridge";
 export { isConsoleError } from "../src/lib/bridge";
 export let failedRead = false;
@@ -39,7 +39,9 @@ export async function fetchMarketSnapshot(): Promise<MarketSnapshot> { throw new
 export async function watchMarket(network: FeedBinding["network"]): Promise<FeedBinding> { return { network, generation: "1" }; }
 export async function onFeedUpdate() { return () => {}; }
 
+let stoppedRuntime: RuntimeStatus | null = null;
 export async function fetchRuntimeStatus(): Promise<RuntimeStatus> {
+  if (stoppedRuntime) return { ...stoppedRuntime };
   const requested = new URLSearchParams(location.search).get("runtime");
   const phase: RuntimeStatus["phase"] = requested === "stopping" || requested === "stopped_with_error" || requested === "replacing" || requested === "stopped" ? requested : "running";
   const detail = phase === "stopped_with_error"
@@ -50,6 +52,34 @@ export async function fetchRuntimeStatus(): Promise<RuntimeStatus> {
     binding: phase === "running" ? { network: "testnet", generation: "1" } : null,
     detail: phase === "running" || phase === "stopped" ? null : detail + "retained-task-context/".repeat(24),
   };
+}
+
+const mcpScenario = new URLSearchParams(location.search).get("mcp") ?? "idle";
+let mcpStatus: McpStatus = {
+  phase: mcpScenario === "listening" || mcpScenario === "sweep_error" ? "listening" : mcpScenario === "failed" ? "failed" : "idle",
+  network: "testnet", agent: null, account: null, listener: null,
+  reconciled: null, account_feeds_ready: null, orders_inhibited: true,
+  supervision_last_completed_ms: null, supervision_in_progress: false, supervision_error: null,
+  detail: mcpScenario === "failed" ? "UI fixture: existing pilot authorization is missing. No authority or keys were created." : null,
+};
+if (mcpStatus.phase === "listening") {
+  mcpStatus = { ...mcpStatus, agent: "fixture-agent", account: account.address, listener: "127.0.0.1:7433", reconciled: true, account_feeds_ready: true };
+}
+if (mcpScenario === "sweep_error") {
+  mcpStatus.supervision_last_completed_ms = 1_788_998_400_000;
+  mcpStatus.supervision_error = "UI fixture: pause cancellation failed; next sweep will retry. " + "retained-cancel-error/".repeat(20);
+}
+export async function fetchMcpStatus(): Promise<McpStatus> { return { ...mcpStatus }; }
+export async function startMcp(agent: string, requestedAccount: string): Promise<McpStatus> {
+  if (stoppedRuntime) throw { detail: "UI fixture: runtime shutdown is terminal. Restart required." };
+  if (mcpScenario === "failed" || requestedAccount !== account.address) throw { detail: "UI fixture: existing authorized pilot/account setup does not match. No setup was created." };
+  mcpStatus = { ...mcpStatus, phase: "listening", agent, account: requestedAccount, listener: "127.0.0.1:7433", orders_inhibited: true };
+  return { ...mcpStatus };
+}
+export async function stopMcp(): Promise<RuntimeStatus> {
+  mcpStatus = { ...mcpStatus, phase: "stopped", listener: null, reconciled: null, account_feeds_ready: null, supervision_in_progress: false };
+  stoppedRuntime = { phase: "stopped", binding: null, detail: "UI fixture: desktop tasks stopped. Restart required." };
+  return { ...stoppedRuntime };
 }
 
 export async function checkUpdate() { throw { kind: "unavailable", detail: "Updates are unavailable in the UI fixture." }; }

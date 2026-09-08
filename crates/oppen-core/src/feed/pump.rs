@@ -179,28 +179,102 @@ impl<'a, S: ReconcileSource, F: FeedSubscriber> FeedPump<'a, S, F> {
 
     /// Catch up, then fold events until the pool is gone.
     ///
-    /// Returns when `events` closes, which is what dropping the
-    /// [`oppen_hl::ws::WsPool`] or calling its `shutdown` does.
+    /// Returns after all event senders are dropped and the queue is consumed.
+    /// Pool shutdown alone does not close this stream: the pool retains a
+    /// sender. Owners retaining the pool should use `run_until_shutdown`.
     pub async fn run(&self, events: &mut Receiver<WsEvent>) {
-        self.catch_up().await;
-        self.sync_alert_feeds();
-        let mut retry = tokio::time::interval(RETRY_INTERVAL);
-        // The first tick of a tokio interval is immediate, and `catch_up` has
-        // just done that work.
-        retry.tick().await;
+        self.run_inner(events, std::future::pending(), std::future::pending())
+            .await;
+    }
+
+    /// Finish active work and acknowledge quiescence before pool shutdown.
+    /// After acknowledgment no new subscription or reconciliation work starts,
+    /// but events keep folding while producers finish. Send `producers_done`
+    /// only after `WsPool::shutdown_and_drain` has joined them; the receiver is
+    /// then closed and its queued events drained. Pool shutdown may discard
+    /// in-flight frames, so this is not lossless venue reconciliation.
+    /// Dropping either signal sender activates its phase. Early producer
+    /// completion implies quiescence and final drain without further work.
+    ///
+    /// The owner must retain this run future/task through completion, even if
+    /// an observer stops waiting. Do not abort it to implement shutdown.
+    /// Completion proves drain, not healthy application: inspect the retained
+    /// `FeedSession::state().failure` before reporting the owner's outcome.
+    pub async fn run_until_shutdown(
+        &self,
+        events: &mut Receiver<WsEvent>,
+        quiesce: tokio::sync::oneshot::Receiver<tokio::sync::oneshot::Sender<()>>,
+        producers_done: tokio::sync::oneshot::Receiver<()>,
+    ) {
+        self.run_inner(events, async { quiesce.await.ok() }, async {
+            let _ = producers_done.await;
+        })
+        .await;
+    }
+
+    async fn run_inner(
+        &self,
+        events: &mut Receiver<WsEvent>,
+        quiesce: impl std::future::Future<Output = Option<tokio::sync::oneshot::Sender<()>>>,
+        producers_done: impl std::future::Future<Output = ()>,
+    ) {
+        tokio::pin!(quiesce, producers_done);
+        let mut retry =
+            tokio::time::interval_at(tokio::time::Instant::now() + RETRY_INTERVAL, RETRY_INTERVAL);
+        let mut started = false;
+        let mut subscribed = false;
+        let mut quiescent = false;
+        enum Next {
+            Shutdown,
+            Quiesce(Option<tokio::sync::oneshot::Sender<()>>),
+            Startup,
+            SyncFeeds,
+            Retry,
+            Event(Option<WsEvent>),
+        }
         loop {
-            tokio::select! {
-                event = events.recv() => match event {
-                    Some(event) => self.handle(&event).await,
-                    None => return,
-                },
-                // An alert armed while the market is quiet must not wait for a
-                // tick on a feed nothing is subscribed to yet.
-                () = self.alerts.armed_changed() => self.sync_alert_feeds(),
-                // A symbol leased by `get_features` needs its `bbo` now, not
-                // at the next tick on a feed nothing has subscribed.
-                () = self.quotes.leased_changed() => self.sync_alert_feeds(),
-                _ = retry.tick() => {
+            // Only readiness selection is cancellable. Shutdown has priority,
+            // while ordinary sources retain fair selection under demand churn.
+            let next = tokio::select! {
+                biased;
+                () = &mut producers_done => Next::Shutdown,
+                ack = &mut quiesce, if !quiescent => Next::Quiesce(ack),
+                next = async {
+                    if quiescent { return Next::Event(events.recv().await); }
+                    if !started { return Next::Startup; }
+                    if !subscribed { return Next::SyncFeeds; }
+                    tokio::select! {
+                        // Quiet markets must still acquire newly demanded feeds.
+                        () = self.alerts.armed_changed() => Next::SyncFeeds,
+                        () = self.quotes.leased_changed() => Next::SyncFeeds,
+                        _ = retry.tick() => Next::Retry,
+                        event = events.recv() => Next::Event(event),
+                    }
+                } => next,
+            };
+            match next {
+                Next::Shutdown => {
+                    self.drain_events(events).await;
+                    return;
+                }
+                Next::Quiesce(ack) => {
+                    quiescent = true;
+                    if let Some(ack) = ack {
+                        let _ = ack.send(());
+                    }
+                }
+                Next::Startup => {
+                    // Active work is outside every cancellable select. The
+                    // acknowledgment cannot run ahead of its durable effects.
+                    self.catch_up().await;
+                    retry.reset();
+                    started = true;
+                }
+                Next::SyncFeeds => {
+                    self.sync_alert_feeds();
+                    subscribed = true;
+                }
+                Next::Retry => {
                     // Unconditional: a lease expires on a clock, not on an
                     // event, so a healthy session that reconciles nothing is
                     // exactly when a swept lease has to give its socket back.
@@ -209,7 +283,21 @@ impl<'a, S: ReconcileSource, F: FeedSubscriber> FeedPump<'a, S, F> {
                         self.reconcile().await;
                     }
                 }
+                Next::Event(Some(event)) => self.handle(&event, quiescent).await,
+                Next::Event(None) => {
+                    if quiescent {
+                        producers_done.await;
+                    }
+                    return;
+                }
             }
+        }
+    }
+
+    async fn drain_events(&self, events: &mut Receiver<WsEvent>) {
+        events.close();
+        while let Some(event) = events.recv().await {
+            self.handle(&event, true).await;
         }
     }
 
@@ -231,6 +319,8 @@ impl<'a, S: ReconcileSource, F: FeedSubscriber> FeedPump<'a, S, F> {
                 // a reason to keep the feeds already flowing, not to stop
                 // watching what is still armed.
                 tracing::error!(%error, "could not read the alert watch list");
+                self.session
+                    .record_failure(format!("could not read the alert watch list: {error}"));
                 return;
             }
         };
@@ -257,6 +347,8 @@ impl<'a, S: ReconcileSource, F: FeedSubscriber> FeedPump<'a, S, F> {
                 Ok(()) => held.push(sub),
                 Err(error) => {
                     tracing::error!(%error, feed = %sub.key(), "no feed for this demand");
+                    self.session
+                        .record_failure(format!("could not subscribe {}: {error}", sub.key()));
                 }
             }
         }
@@ -266,6 +358,8 @@ impl<'a, S: ReconcileSource, F: FeedSubscriber> FeedPump<'a, S, F> {
             }
             if let Err(error) = self.feeds.unsubscribe(sub) {
                 tracing::warn!(%error, feed = %sub.key(), "could not drop a feed");
+                self.session
+                    .record_failure(format!("could not unsubscribe {}: {error}", sub.key()));
             }
             false
         });
@@ -279,7 +373,7 @@ impl<'a, S: ReconcileSource, F: FeedSubscriber> FeedPump<'a, S, F> {
     /// nobody else. A row that cannot be written is reported and the others
     /// still go: the alert has already been marked fired, so dropping the
     /// batch would lose the rest of the wakeups too.
-    fn chain(&self, fired: Vec<Fired>, now: i64) {
+    fn chain(&self, fired: Vec<Fired>, now: i64, draining: bool) {
         for alert in fired {
             let payload = alert.payload();
             let event = NewEvent {
@@ -291,11 +385,17 @@ impl<'a, S: ReconcileSource, F: FeedSubscriber> FeedPump<'a, S, F> {
             };
             if let Err(error) = self.ledger.append(&event) {
                 tracing::error!(%error, alert_id = alert.alert_id, "alert fired unrecorded");
+                self.session.record_failure(format!(
+                    "alert {} fired unrecorded: {error}",
+                    alert.alert_id
+                ));
             }
         }
         // A firing changes the armed set, so a feed nothing watches any more
         // is given back.
-        self.sync_alert_feeds();
+        if !draining {
+            self.sync_alert_feeds();
+        }
     }
 
     /// Open and immediately close a window for everything before now, then
@@ -312,30 +412,37 @@ impl<'a, S: ReconcileSource, F: FeedSubscriber> FeedPump<'a, S, F> {
                 .and_then(|gap| self.ledger.close_gap(gap.gap_id, at_ms))
             {
                 Ok(_) => {}
-                // Left unreconciled, so the retry timer comes back to it.
+                // No later empty work list can prove this missing evidence safe.
                 Err(error) => {
                     tracing::error!(%error, scope, "could not open the startup window");
+                    self.session.record_failure(format!(
+                        "could not open or close startup window {scope}: {error}"
+                    ));
                 }
             }
         }
         self.reconcile().await;
     }
 
-    async fn handle(&self, event: &WsEvent) {
-        self.evaluate_alerts(event);
+    async fn handle(&self, event: &WsEvent, draining: bool) {
+        self.evaluate_alerts(event, draining);
         match self
             .session
             .apply(self.ledger, &self.account_id, event, now_ms_u64())
         {
             Ok(Action::None) => {}
-            Ok(Action::Reconcile) => self.reconcile().await,
+            Ok(Action::Reconcile) if !draining => self.reconcile().await,
+            // The queued lifecycle evidence is durable, but a new venue walk
+            // belongs to the next startup after this owner has stopped.
+            Ok(Action::Reconcile) => {}
             Err(error) => {
                 // A fill the chain did not take, or a gap row the ledger
                 // refused. Either way oppen's account of the position is now
                 // short of the venue's, and the only honest posture is the one
                 // a disconnect produces.
                 tracing::error!(%error, "feed event not recorded; the account is not caught up");
-                self.session.unreconciled();
+                self.session
+                    .record_failure(format!("feed event not recorded: {error}"));
             }
         }
     }
@@ -346,7 +453,7 @@ impl<'a, S: ReconcileSource, F: FeedSubscriber> FeedPump<'a, S, F> {
     /// matched by name rather than by a wildcard for the reason
     /// `FeedSession::apply` matches that way: a feed oppen starts consuming
     /// should be a decision about what it can answer.
-    fn evaluate_alerts(&self, event: &WsEvent) {
+    fn evaluate_alerts(&self, event: &WsEvent, draining: bool) {
         let now = now_ms();
         let fired = match event {
             // Not an alert condition: the quote cache is what `get_features`
@@ -389,13 +496,18 @@ impl<'a, S: ReconcileSource, F: FeedSubscriber> FeedPump<'a, S, F> {
         };
         match fired {
             Ok(fired) if fired.is_empty() => {}
-            Ok(fired) => self.chain(fired, now),
-            Err(error) => tracing::error!(%error, "could not evaluate alerts"),
+            Ok(fired) => self.chain(fired, now, draining),
+            Err(error) => {
+                tracing::error!(%error, "could not evaluate alerts");
+                self.session
+                    .record_failure(format!("could not evaluate alerts: {error}"));
+            }
         }
     }
 
     /// Work every open window, and clear the flag only if none is outstanding.
     async fn reconcile(&self) {
+        self.session.unreconciled();
         // No pending cloids: item 19's settle-by-client-id needs the set of
         // orders the *gateway* believes live, which this has no access to. An
         // `orderUpdates` gap still re-reads the resting book, so what is
@@ -405,6 +517,7 @@ impl<'a, S: ReconcileSource, F: FeedSubscriber> FeedPump<'a, S, F> {
             Ok(outcomes) => outcomes,
             Err(error) => {
                 tracing::error!(%error, "could not read the gap work list");
+                self.record_reconcile_failure(&error);
                 return;
             }
         };
@@ -420,6 +533,9 @@ impl<'a, S: ReconcileSource, F: FeedSubscriber> FeedPump<'a, S, F> {
                 GapStatus::Reconciled | GapStatus::NotAnAccountFeed => {}
                 status => {
                     outstanding += 1;
+                    if let GapStatus::Failed(error) = status {
+                        self.record_reconcile_failure(error);
+                    }
                     tracing::warn!(
                         gap_id = outcome.gap_id,
                         scope = outcome.scope,
@@ -432,6 +548,20 @@ impl<'a, S: ReconcileSource, F: FeedSubscriber> FeedPump<'a, S, F> {
 
         if outstanding == 0 {
             self.session.reconciled(now_ms_u64());
+        }
+    }
+
+    fn record_reconcile_failure(&self, error: &ReconcileError) {
+        // Venue/transport and pagination failures remain retryable. Missing or
+        // malformed local evidence requires an operator restart, not a timer.
+        if matches!(
+            error,
+            ReconcileError::Ledger(_)
+                | ReconcileError::UnusableWindow { .. }
+                | ReconcileError::UnreadableScope { .. }
+        ) {
+            self.session
+                .record_failure(format!("reconcile local evidence failure: {error}"));
         }
     }
 }
@@ -468,6 +598,8 @@ mod tests {
     #[derive(Debug, Default)]
     struct Feeds {
         subscribed: Mutex<Vec<String>>,
+        calls: AtomicUsize,
+        shutdown: AtomicBool,
     }
 
     impl Feeds {
@@ -480,11 +612,19 @@ mod tests {
 
     impl FeedSubscriber for Feeds {
         fn subscribe(&self, sub: Subscription) -> Result<(), PoolError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.shutdown.load(Ordering::SeqCst) {
+                return Err(PoolError::Shutdown);
+            }
             self.subscribed.lock().expect("feeds").push(sub.key());
             Ok(())
         }
 
         fn unsubscribe(&self, sub: &Subscription) -> Result<(), PoolError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.shutdown.load(Ordering::SeqCst) {
+                return Err(PoolError::Shutdown);
+            }
             self.subscribed
                 .lock()
                 .expect("feeds")
@@ -574,6 +714,7 @@ mod tests {
     #[derive(Debug)]
     struct FakeVenue {
         controls: Controls,
+        gate: Option<Arc<tokio::sync::Semaphore>>,
     }
 
     /// The half of [`FakeVenue`] a test still holds after the pump owns it.
@@ -617,11 +758,17 @@ mod tests {
             for fill in fills {
                 controls.prints(fill);
             }
-            FakeVenue { controls }
+            FakeVenue {
+                controls,
+                gate: None,
+            }
         }
 
         fn refusing(controls: Controls) -> Self {
-            FakeVenue { controls }
+            FakeVenue {
+                controls,
+                gate: None,
+            }
         }
 
         fn refused(&self) -> bool {
@@ -651,6 +798,9 @@ mod tests {
                 return Err(unavailable());
             }
             self.controls.walks.fetch_add(1, Ordering::SeqCst);
+            if let Some(gate) = &self.gate {
+                gate.acquire().await.expect("test gate open").forget();
+            }
             let mut rows: Vec<Fill> = self
                 .controls
                 .fills
@@ -739,7 +889,7 @@ mod tests {
     /// Drive the pump over a fixed script of events and return once it stops.
     ///
     /// The channel is closed after the last one, which is what ends
-    /// [`FeedPump::run`] — the same thing dropping the pool does.
+    /// [`FeedPump::run`] once every producer and the pool sender are gone.
     async fn drive(pump: &FeedPump<'_, FakeVenue, Feeds>, script: Vec<WsEvent>) {
         let (tx, mut rx) = mpsc::channel(16);
         for event in script {
@@ -747,6 +897,464 @@ mod tests {
         }
         drop(tx);
         pump.run(&mut rx).await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_closes_retained_sender_and_drains_ledger_events_without_new_work() {
+        for dropped in [false, true] {
+            let dir = TempDir::new().expect("tempdir");
+            let ledger = ledger(&dir);
+            let session = FeedSession::new();
+            let alerts = alerts();
+            let quotes = QuoteCache::new();
+            let feeds = Feeds::default();
+            let controls = Controls::new(false);
+            alerts
+                .arm(
+                    "agent-a",
+                    &Condition::PriceCross {
+                        symbol: "BTC".into(),
+                        direction: Direction::Above,
+                        px: Decimal::ONE,
+                    },
+                    now_ms(),
+                )
+                .unwrap();
+            alerts
+                .arm(
+                    "agent-a",
+                    &Condition::PriceCross {
+                        symbol: "ETH".into(),
+                        direction: Direction::Above,
+                        px: Decimal::ONE,
+                    },
+                    now_ms(),
+                )
+                .unwrap();
+            quotes.lease("SOL", now_ms_u64());
+            let pump = FeedPump::new(
+                &session,
+                &ledger,
+                account(),
+                FakeVenue::refusing(controls.clone()),
+                &alerts,
+                &quotes,
+                &feeds,
+            )
+            .unwrap();
+            let (tx, mut rx) = mpsc::channel(8);
+            let now = now_ms_u64();
+            let scope = Subscription::UserFills { user: account() };
+            tx.send(disconnected(
+                now - 30_000,
+                now - 30_000,
+                vec![scope.clone()],
+            ))
+            .await
+            .unwrap();
+            tx.send(reconnected(now, vec![scope])).await.unwrap();
+            for tid in [1, 1, 2] {
+                tx.send(WsEvent::UserFills {
+                    user: account(),
+                    is_snapshot: false,
+                    fills: vec![fill(tid, now)],
+                })
+                .await
+                .unwrap();
+            }
+            tx.send(asset_ctx("BTC", "64000", Some("64000")))
+                .await
+                .unwrap();
+            let (stop, shutdown) = tokio::sync::oneshot::channel();
+            let (_request, quiesce) = tokio::sync::oneshot::channel();
+            if dropped {
+                drop(stop);
+            } else {
+                stop.send(()).unwrap();
+            }
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                pump.run_until_shutdown(&mut rx, quiesce, shutdown),
+            )
+            .await
+            .unwrap();
+            assert!(rx.is_closed());
+            assert!(tx.send(bbo_frame("BTC", "99", "101")).await.is_err());
+            assert_eq!(
+                fill_rows(&ledger),
+                2,
+                "queued fills persisted and deduplicated"
+            );
+            assert_eq!(alert_rows(&ledger).len(), 1, "queued alert still chained");
+            assert!(ledger.verify().unwrap().is_intact());
+            assert!(!session.state().reconciled);
+            assert!(
+                !gaps(&ledger).is_empty(),
+                "reconnect evidence retained for next startup"
+            );
+            assert_eq!(controls.walks(), 0, "drain never starts a remote walk");
+            assert!(
+                feeds.keys().is_empty(),
+                "neither startup nor queued alerts subscribe during drain"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_active_reconcile_after_observer_drops_then_drains_queue() {
+        let dir = TempDir::new().expect("tempdir");
+        let ledger = ledger(&dir);
+        let session = FeedSession::new();
+        let alerts = alerts();
+        let quotes = QuoteCache::new();
+        let feeds = Feeds::default();
+        let controls = Controls::new(false);
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let source = FakeVenue {
+            controls: controls.clone(),
+            gate: Some(gate.clone()),
+        };
+        let pump = FeedPump::new(
+            &session,
+            &ledger,
+            account(),
+            source,
+            &alerts,
+            &quotes,
+            &feeds,
+        )
+        .unwrap();
+        let (tx, mut rx) = mpsc::channel(2);
+        tx.send(WsEvent::UserFills {
+            user: account(),
+            is_snapshot: false,
+            fills: vec![fill(7, now_ms_u64())],
+        })
+        .await
+        .unwrap();
+        let (stop, shutdown) = tokio::sync::oneshot::channel();
+        let (request, quiesce) = tokio::sync::oneshot::channel();
+        let (ack, mut acknowledged) = tokio::sync::oneshot::channel();
+        // Retain the actual run future; timing out only drops the observer's
+        // borrow. Production retains its owning task and completion handle.
+        let run = pump.run_until_shutdown(&mut rx, quiesce, shutdown);
+        tokio::pin!(run);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut run)
+                .await
+                .is_err()
+        );
+        assert_eq!(controls.walks(), 1);
+        assert_eq!(fill_rows(&ledger), 0);
+        request.send(ack).unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut run)
+                .await
+                .is_err(),
+            "shutdown does not cancel in-progress reconciliation"
+        );
+        assert_eq!(fill_rows(&ledger), 0);
+        assert!(
+            matches!(
+                acknowledged.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ),
+            "active reconciliation prevents acknowledgment"
+        );
+        gate.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::select! {
+                result = &mut acknowledged => result.unwrap(),
+                () = &mut run => panic!("pump ended before producer completion"),
+            }
+        })
+        .await
+        .unwrap();
+        stop.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), &mut run)
+            .await
+            .unwrap();
+        assert_eq!(fill_rows(&ledger), 1);
+        assert!(ledger.verify().unwrap().is_intact());
+        assert_eq!(
+            controls.walks(),
+            1,
+            "no timed retry or second walk after shutdown"
+        );
+        assert!(
+            tx.is_closed(),
+            "retained outer sender does not prevent completion"
+        );
+        assert!(feeds.keys().is_empty());
+    }
+
+    #[tokio::test]
+    async fn quiesced_demand_changes_do_not_touch_stopping_pool_while_events_keep_folding() {
+        for dropped_request in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let ledger = ledger(&dir);
+            let session = FeedSession::new();
+            let alerts = alerts();
+            let quotes = QuoteCache::new();
+            let feeds = Feeds::default();
+            let controls = Controls::new(false);
+            let pump = FeedPump::new(
+                &session,
+                &ledger,
+                account(),
+                FakeVenue::refusing(controls.clone()),
+                &alerts,
+                &quotes,
+                &feeds,
+            )
+            .unwrap();
+            let (tx, mut rx) = mpsc::channel(1);
+            let (request, quiesce) = tokio::sync::oneshot::channel();
+            let (ack, acknowledged) = tokio::sync::oneshot::channel();
+            let (done, producers_done) = tokio::sync::oneshot::channel();
+            if dropped_request {
+                drop(request);
+                drop(ack);
+            } else {
+                request.send(ack).unwrap();
+            }
+            let driver = async {
+                if !dropped_request {
+                    acknowledged.await.unwrap();
+                }
+                // The real owner starts pool shutdown only after the ack.
+                // This fake returns Shutdown for any accidental later call.
+                feeds.shutdown.store(true, Ordering::SeqCst);
+                for symbol in ["BTC", "ETH"] {
+                    alerts
+                        .arm(
+                            "agent-a",
+                            &Condition::PriceCross {
+                                symbol: symbol.into(),
+                                direction: Direction::Above,
+                                px: Decimal::ONE,
+                            },
+                            now_ms(),
+                        )
+                        .unwrap();
+                }
+                quotes.lease("SOL", now_ms_u64());
+                tx.send(WsEvent::UserFills {
+                    user: account(),
+                    is_snapshot: false,
+                    fills: vec![fill(51, now_ms_u64())],
+                })
+                .await
+                .unwrap();
+                tx.send(asset_ctx("BTC", "64000", Some("64000")))
+                    .await
+                    .unwrap();
+                tx.send(bbo_frame("SOL", "99", "101")).await.unwrap();
+                // Receipt of the final quote proves the preceding ledger and
+                // alert folds ran before producers_done was signaled.
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while quotes.peek("SOL").is_none() {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                assert_eq!(fill_rows(&ledger), 1);
+                assert_eq!(alert_rows(&ledger).len(), 1);
+                assert_eq!(feeds.calls.load(Ordering::SeqCst), 0);
+                assert!(session.state().failure.is_none());
+                assert!(
+                    !tx.is_closed(),
+                    "consumer remains alive during producer drain"
+                );
+                tx.send(WsEvent::UserFills {
+                    user: account(),
+                    is_snapshot: false,
+                    fills: vec![fill(52, now_ms_u64())],
+                })
+                .await
+                .unwrap();
+                done.send(()).unwrap();
+            };
+            tokio::time::timeout(Duration::from_secs(3), async {
+                tokio::join!(
+                    pump.run_until_shutdown(&mut rx, quiesce, producers_done),
+                    driver
+                );
+            })
+            .await
+            .unwrap();
+            assert_eq!(fill_rows(&ledger), 2);
+            assert_eq!(feeds.calls.load(Ordering::SeqCst), 0);
+            assert_eq!(controls.walks(), 0);
+            assert!(session.state().failure.is_none());
+            assert!(ledger.verify().unwrap().is_intact());
+        }
+    }
+
+    #[tokio::test]
+    async fn persistence_failure_survives_empty_reconcile_and_completed_drain() {
+        for target in ["startup", "fill", "alert"] {
+            let dir = TempDir::new().unwrap();
+            let ledger = ledger(&dir);
+            let session = FeedSession::new();
+            let alerts = alerts();
+            let quotes = QuoteCache::new();
+            let feeds = Feeds::default();
+            if target == "alert" {
+                alerts
+                    .arm("agent-a", &Condition::Fill { symbol: None }, now_ms())
+                    .unwrap();
+            }
+            let sql =
+                rusqlite::Connection::open(dir.path().join(crate::db_file_name(Network::Testnet)))
+                    .unwrap();
+            let trigger = match target {
+                "startup" => {
+                    "CREATE TRIGGER fail_pump BEFORE INSERT ON feed_gaps BEGIN SELECT RAISE(ABORT, 'synthetic startup write failure'); END"
+                }
+                "fill" => {
+                    "CREATE TRIGGER fail_pump BEFORE INSERT ON events WHEN NEW.kind = 'fill' BEGIN SELECT RAISE(ABORT, 'synthetic fill write failure'); END"
+                }
+                "alert" => {
+                    "CREATE TRIGGER fail_pump BEFORE INSERT ON events WHEN NEW.kind = 'alert' BEGIN SELECT RAISE(ABORT, 'synthetic alert write failure'); END"
+                }
+                _ => unreachable!(),
+            };
+            sql.execute_batch(trigger).unwrap();
+            let pump = FeedPump::new(
+                &session,
+                &ledger,
+                account(),
+                FakeVenue::holding(Vec::new()),
+                &alerts,
+                &quotes,
+                &feeds,
+            )
+            .unwrap();
+            pump.catch_up().await;
+            assert!(
+                gaps(&ledger).is_empty(),
+                "startup refusal must not manufacture a gap"
+            );
+            let (tx, mut rx) = mpsc::channel(1);
+            tx.send(WsEvent::UserFills {
+                user: account(),
+                is_snapshot: false,
+                fills: vec![fill(41, now_ms_u64())],
+            })
+            .await
+            .unwrap();
+            let (stop, shutdown) = tokio::sync::oneshot::channel();
+            let (_request, quiesce) = tokio::sync::oneshot::channel();
+            stop.send(()).unwrap();
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                pump.run_until_shutdown(&mut rx, quiesce, shutdown),
+            )
+            .await
+            .unwrap();
+            assert!(
+                tx.is_closed(),
+                "failed application still finishes actual drain"
+            );
+            let failure = session
+                .state()
+                .failure
+                .expect("drain exposes persistent local failure");
+            assert!(failure.contains("synthetic"), "{target}: {failure}");
+            assert!(!session.state().reconciled);
+            assert_eq!(fill_rows(&ledger), usize::from(target != "fill"));
+            sql.execute_batch("DROP TRIGGER fail_pump").unwrap();
+            pump.reconcile().await;
+            assert!(gaps(&ledger).is_empty());
+            assert_eq!(session.state().failure.as_deref(), Some(failure.as_str()));
+            assert!(
+                !session.state().reconciled,
+                "empty reconcile cannot bless lost {target} evidence"
+            );
+            assert!(ledger.verify().unwrap().is_intact());
+        }
+    }
+
+    #[tokio::test]
+    async fn retryable_venue_failure_clears_previous_readiness_without_permanent_latch() {
+        let dir = TempDir::new().unwrap();
+        let ledger = ledger(&dir);
+        let session = FeedSession::new();
+        let alerts = alerts();
+        let quotes = QuoteCache::new();
+        let feeds = Feeds::default();
+        let controls = Controls::new(false);
+        let pump = FeedPump::new(
+            &session,
+            &ledger,
+            account(),
+            FakeVenue::refusing(controls.clone()),
+            &alerts,
+            &quotes,
+            &feeds,
+        )
+        .unwrap();
+        pump.catch_up().await;
+        assert!(session.state().reconciled);
+        let gap = ledger
+            .open_gap(&account_scopes(account())[0], now_ms(), None)
+            .unwrap();
+        ledger.close_gap(gap.gap_id, now_ms()).unwrap();
+        controls.refusing.store(true, Ordering::SeqCst);
+        pump.reconcile().await;
+        assert!(!session.state().reconciled);
+        assert!(session.state().failure.is_none());
+        controls.recover();
+        pump.reconcile().await;
+        assert!(session.state().reconciled);
+        assert!(session.state().failure.is_none());
+    }
+
+    #[tokio::test]
+    async fn unreadable_persisted_scope_stays_failed_after_work_list_resolution_and_tick() {
+        for scope in ["userFills:not-an-address", "orderUpdates:not-an-address"] {
+            let dir = TempDir::new().unwrap();
+            let ledger = ledger(&dir);
+            let session = FeedSession::new();
+            let alerts = alerts();
+            let quotes = QuoteCache::new();
+            let feeds = Feeds::default();
+            let pump = FeedPump::new(
+                &session,
+                &ledger,
+                account(),
+                FakeVenue::holding(Vec::new()),
+                &alerts,
+                &quotes,
+                &feeds,
+            )
+            .unwrap();
+            pump.catch_up().await;
+            assert!(session.state().reconciled);
+            let gap = ledger.open_gap(scope, now_ms(), None).unwrap();
+            ledger.close_gap(gap.gap_id, now_ms()).unwrap();
+            pump.reconcile().await;
+            let failure = session
+                .state()
+                .failure
+                .expect("malformed account scope is local evidence failure");
+            assert!(failure.contains(scope));
+            assert!(failure.contains("does not name a valid address"));
+            assert!(!session.state().reconciled);
+            // Removing the malformed entry from pending work is not permission
+            // to clear the already observed failure in this session.
+            ledger.mark_gap_reconciled(gap.gap_id, now_ms()).unwrap();
+            assert!(gaps(&ledger).is_empty());
+            pump.reconcile().await;
+            pump.handle(&bbo_frame("BTC", "99", "101"), false).await;
+            assert!(quotes.peek("BTC").is_some(), "later data still applies");
+            assert!(session.state().last_tick_ms.is_some());
+            assert_eq!(session.state().failure.as_deref(), Some(failure.as_str()));
+            assert!(!session.state().reconciled);
+            assert!(ledger.verify().unwrap().is_intact());
+        }
     }
 
     /// The pool emits `Reconnected` only in answer to a `Disconnected`, so a
@@ -851,14 +1459,13 @@ mod tests {
 
         controls.prints(fill(21, dropped_at + 5_000));
         controls.prints(fill(22, dropped_at + 20_000));
-        pump.handle(&disconnected(
-            dropped_at,
-            dropped_at,
-            vec![user_fills.clone()],
-        ))
+        pump.handle(
+            &disconnected(dropped_at, dropped_at, vec![user_fills.clone()]),
+            false,
+        )
         .await;
         assert!(!session.state().reconciled, "the drop refuses new orders");
-        pump.handle(&reconnected(dropped_at + 30_000, vec![user_fills]))
+        pump.handle(&reconnected(dropped_at + 30_000, vec![user_fills]), false)
             .await;
 
         assert_eq!(fill_rows(&ledger), 3, "both fills from inside the outage");

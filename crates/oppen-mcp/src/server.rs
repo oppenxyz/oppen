@@ -210,7 +210,72 @@ pub async fn serve(
     pairings: Pairings,
     shutdown: tokio_util::sync::CancellationToken,
 ) -> std::io::Result<()> {
-    let network = gateway.gateway().network();
+    BoundServer::bind(port, gateway.gateway(), &pairings)
+        .await?
+        .serve(gateway, pairings, shutdown)
+        .await
+}
+
+/// An owned loopback listener, bound before the desktop starts venue work.
+/// Binding proves only local socket ownership, not MCP or trading readiness.
+pub struct BoundServer {
+    listener: tokio::net::TcpListener,
+    address: SocketAddr,
+    network: oppen_hl::Network,
+    supervision: watch::Sender<SupervisionStatus>,
+}
+
+/// Cached pause-sweep observation, not proof that the venue is flat or ready.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct SupervisionStatus {
+    pub in_progress: bool,
+    pub last_completed_ms: Option<u64>,
+    pub last_error: Option<String>,
+}
+
+impl BoundServer {
+    pub async fn bind(port: u16, gateway: &Gateway, pairings: &Pairings) -> std::io::Result<Self> {
+        validate_pairing_network(gateway.network(), pairings)?;
+        let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+        let listener = tokio::net::TcpListener::bind(address).await?;
+        let address = listener.local_addr()?;
+        Ok(Self {
+            listener,
+            address,
+            network: gateway.network(),
+            supervision: watch::channel(SupervisionStatus::default()).0,
+        })
+    }
+
+    pub fn local_addr(&self) -> SocketAddr {
+        self.address
+    }
+
+    pub fn supervision_status(&self) -> watch::Receiver<SupervisionStatus> {
+        self.supervision.subscribe()
+    }
+
+    pub async fn serve(
+        self,
+        gateway: impl GatewayHandler,
+        pairings: Pairings,
+        shutdown: CancellationToken,
+    ) -> std::io::Result<()> {
+        if self.network != gateway.gateway().network() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "bound listener and gateway networks do not match",
+            ));
+        }
+        validate_pairing_network(self.network, &pairings)?;
+        serve_bound(self.listener, gateway, pairings, shutdown, self.supervision).await
+    }
+}
+
+fn validate_pairing_network(
+    network: oppen_hl::Network,
+    pairings: &Pairings,
+) -> std::io::Result<()> {
     let pairing_network = pairings
         .try_read()
         .map(|store| store.network())
@@ -227,8 +292,17 @@ pub async fn serve(
             "pairing store and gateway networks do not match",
         ));
     }
-    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    Ok(())
+}
+
+async fn serve_bound(
+    listener: tokio::net::TcpListener,
+    gateway: impl GatewayHandler,
+    pairings: Pairings,
+    shutdown: CancellationToken,
+    supervision: watch::Sender<SupervisionStatus>,
+) -> std::io::Result<()> {
+    let addr = listener.local_addr()?;
     tracing::info!(%addr, path = MCP_PATH, "MCP gateway listening on loopback");
 
     let shutdown = shutdown.child_token();
@@ -252,17 +326,21 @@ pub async fn serve(
                 () = enforcement_shutdown.cancelled() => break,
                 () = async {
                     interval.tick().await;
+                    supervision.send_modify(|status| status.in_progress = true);
                     let bindings = match enforcement_pairings.try_read() {
                         Ok(store) => store.bindings(),
                         Err(error) => {
                             tracing::warn!(%error, "pause enforcement could not read pairings; will retry");
+                            finish_supervision(&supervision, Some("pairing authority unavailable; pause sweep will retry".into()));
                             return;
                         }
                     };
                     let tracker = ExecutionTracker::supervision(&enforcement_execution, enforcement_pairings.clone());
-                    if let Err(error) = enforcement_gateway.enforce_pauses(&bindings, tracker).await {
+                    let result = enforcement_gateway.enforce_pauses(&bindings, tracker).await;
+                    if let Err(error) = &result {
                         tracing::warn!(%error, "pause enforcement failed; will retry");
                     }
+                    finish_supervision(&supervision, result.err().map(|error| error.to_string()));
                 } => {}
             }
         }
@@ -286,6 +364,17 @@ pub async fn serve(
         execution,
     )
     .await
+}
+
+fn finish_supervision(status: &watch::Sender<SupervisionStatus>, error: Option<String>) {
+    status.send_modify(|status| {
+        status.in_progress = false;
+        status.last_completed_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok());
+        status.last_error = error;
+    });
 }
 
 // A dead supervisor must not leave an apparently healthy transport running.
