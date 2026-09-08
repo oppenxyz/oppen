@@ -1,6 +1,7 @@
 import { reactive, readonly } from "vue";
 import { fetchRuntimeStatus, inTauri, isConsoleError, type RuntimeStatus } from "../lib/bridge";
 import { reportChartFailure } from "./market";
+import { marketHealth } from "./market-health";
 
 interface RuntimeReading {
   status: RuntimeStatus | null;
@@ -19,6 +20,7 @@ export function createRuntimeMonitor(
   read: () => Promise<RuntimeStatus>,
   schedule: typeof after = after,
   observe: (status: RuntimeStatus) => void = () => {},
+  unavailable: (detail: string) => void = () => {},
 ) {
   const state = reactive<RuntimeReading>({ status: null, error: null, checkedAt: null, pending: false });
   let active = false;
@@ -35,6 +37,7 @@ export function createRuntimeMonitor(
       if (active && current === generation) {
         expiredRead = true;
         state.error = "Desktop task status has not responded within 5 seconds.";
+        unavailable(state.error);
       }
     }, 5_000);
   }
@@ -56,6 +59,7 @@ export function createRuntimeMonitor(
     } catch (error) {
       if (!active || current !== generation || expiredRead) return;
       state.error = isConsoleError(error) ? error.detail : error instanceof Error ? error.message : String(error);
+      unavailable(state.error);
     } finally {
       reading = false;
       state.pending = false;
@@ -93,6 +97,7 @@ export function createRuntimeMonitor(
     cancelDeadline = null;
     // Do not clear the last known stop or pretend the actual IPC was canceled.
     state.error = "Desktop task status polling is stopped.";
+    unavailable(state.error);
   }
 
   return { state: readonly(state), start, stop, refresh };
@@ -100,7 +105,9 @@ export function createRuntimeMonitor(
 
 const monitor = createRuntimeMonitor(fetchRuntimeStatus, after, status => {
   if (status.chart_failure) reportChartFailure(status.chart_failure);
-});
+  if (status.phase !== "running") marketHealth.historical("Runtime " + status.phase);
+  else marketHealth.accept(status.channel_health);
+}, detail => marketHealth.historical(detail));
 export const runtime = monitor.state;
 
 export function startRuntimePolling(): void {
@@ -108,6 +115,7 @@ export function startRuntimePolling(): void {
 }
 
 export function stopRuntimePolling(): void {
+  marketHealth.historical("Status polling stopped");
   monitor.stop();
 }
 

@@ -367,6 +367,44 @@ export interface ChartFailure {
   detail: string;
 }
 
+export type MarketChannel = "context" | "bbo" | "depth" | "trades" | "candles";
+export type ChannelOwner = "console" | "chart";
+export interface ChannelHealthDiagnostic {
+  subscription_key: string | null;
+  owner: ChannelOwner;
+  connection_id: string | null;
+  channel: MarketChannel | null;
+  kind: "disconnect" | "reconnect" | "quarantine" | "parse_loss" | "venue_error" | "consumer_failure";
+  received_at_ms: number;
+  detail: string;
+}
+export interface ChannelHealthRow {
+  owner: ChannelOwner;
+  channel: MarketChannel;
+  connection_id: string | null;
+  subscribed: boolean;
+  connected: boolean;
+  acked: boolean;
+  quarantined: boolean;
+  last_received_at_ms: number | null;
+  age_ms: number | null;
+  threshold_ms: number | null;
+  age_budget_exceeded: boolean | null;
+  clock_uncertain: boolean;
+  last_loss: ChannelHealthDiagnostic | null;
+  consumer_failure: string | null;
+}
+export interface ChannelHealthSnapshot {
+  pool_last_losses: readonly ChannelHealthDiagnostic[];
+  binding: ChartBinding;
+  revision: string;
+  observed_at_ms: number;
+  clock_uncertain: boolean;
+  rows: readonly ChannelHealthRow[];
+  diagnostics: readonly ChannelHealthDiagnostic[];
+  omitted_diagnostics: number;
+}
+
 export interface WatchMarketReply {
   feed: FeedBinding;
   chart: ChartBinding;
@@ -431,6 +469,7 @@ export interface FeedEnvelope extends FeedBinding {
 
 /** Cached desktop task lifecycle only; not execution or reconciliation readiness. */
 export interface RuntimeStatus {
+  channel_health: ChannelHealthSnapshot | null;
   chart_failure: ChartFailure | null;
   phase: "running" | "replacing" | "stopping" | "stopped" | "stopped_with_error";
   binding: FeedBinding | null;

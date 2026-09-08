@@ -188,12 +188,12 @@ describe("pilot local polling", () => {
   });
 
   it("updates local evidence without changing any venue-feed freshness", async () => {
-    const before = JSON.stringify({ feeds: shell.feeds, tick: shell.lastMarketTickMs, accountError: shell.accountError });
+    const before = JSON.stringify({ feeds: shell.feeds, accountError: shell.accountError });
     const monitor = createPilotMonitor(async () => STOP);
     monitor.setNetwork("testnet");
     await monitor.refresh();
     expect(monitor.state.status).toEqual(STOP);
-    expect(JSON.stringify({ feeds: shell.feeds, tick: shell.lastMarketTickMs, accountError: shell.accountError })).toBe(before);
+    expect(JSON.stringify({ feeds: shell.feeds, accountError: shell.accountError })).toBe(before);
   });
 });
 

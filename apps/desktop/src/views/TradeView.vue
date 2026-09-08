@@ -4,6 +4,7 @@ import { operator, recordedAgents } from "../stores/operator";
 import DecisionStream from "../components/DecisionStream.vue";
 import AsciiGauge from "../components/ascii/AsciiGauge.vue";
 import CandleChart from "../components/CandleChart.vue";
+import MarketChannelHealth from "../components/MarketChannelHealth.vue";
 import AccountPositions from "../components/AccountPositions.vue";
 import AccountNotice from "../components/AccountNotice.vue";
 import { shell, setView } from "../stores/shell";
@@ -17,6 +18,7 @@ import {
   chartObservation,
   quotes,
   quoteSpread,
+  quoteValidity,
   refreshSnapshot,
   select,
   selectedRow,
@@ -306,7 +308,9 @@ const ledger = ref<Ledger>("positions");
     </div>
 
     <div class="trade__col trade__col--right">
+      <MarketChannelHealth />
       <PanelHousing label="Book · Hyperliquid" :meta="quotes.depth?.source === 'rest' ? 'REST snapshot' : 'L2 depth'">
+        <p class="quote-time" data-quote="validity">Quote · {{ quoteValidity }}{{ quotes.touch && !quotes.touch.live ? ' · Retained' : '' }}</p>
         <p class="quote-time" data-quote="depth-clock">{{ !quotes.depth ? 'Depth unavailable' : quotes.depth.live ? 'Latest observed depth' : 'Retained depth · not live' }}<br />Venue {{ quoteTime(quotes.depth?.venueMs) }}<br />Observed by UI {{ quoteTime(quotes.depth?.observedMs) }} · {{ observationAge(quotes.depth?.observedMs) }}</p>
         <EmptyState
           v-if="bids.length === 0 && asks.length === 0"

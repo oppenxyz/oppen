@@ -860,6 +860,52 @@ mod tests {
         drained(&runtime).await.unwrap();
     }
 
+    #[tokio::test]
+    async fn channel_health_final_publication_rejects_replacement_and_stop_after_sampling() {
+        use crate::channel_health::{Clock, PoolObservation};
+        let runtime = runtime();
+        let (driver, _events) = Driver::new();
+        let first = watch(&runtime, &driver, Network::Testnet, None, "BTC")
+            .await
+            .unwrap()
+            .unwrap();
+        let captured = Clock::default()
+            .project(
+                first.chart.clone(),
+                PoolObservation::missing(),
+                PoolObservation::missing(),
+                crate::now_ms(),
+            )
+            .unwrap();
+        let held = runtime.0.control.lock().unwrap();
+        assert!(runtime.channel_health().is_none());
+        drop(held);
+        let replacement = watch(&runtime, &driver, Network::Testnet, None, "ETH");
+        assert!(
+            runtime
+                .status_with_health(Some(captured))
+                .channel_health
+                .is_none()
+        );
+        let second = replacement.await.unwrap().unwrap();
+        let captured = Clock::default()
+            .project(
+                second.chart,
+                PoolObservation::missing(),
+                PoolObservation::missing(),
+                crate::now_ms(),
+            )
+            .unwrap();
+        runtime.begin_stop();
+        assert!(
+            runtime
+                .status_with_health(Some(captured))
+                .channel_health
+                .is_none()
+        );
+        drained(&runtime).await.unwrap();
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn completed_chart_failure_refuses_watch_but_keeps_account_owner_and_allows_retry() {
         use crate::chart_transport::{
@@ -1495,6 +1541,7 @@ pub(crate) enum RuntimePhase {
 
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct RuntimeStatus {
+    pub channel_health: Option<crate::channel_health::Snapshot>,
     pub chart_failure: Option<crate::chart_transport::ChartFailure>,
     pub phase: RuntimePhase,
     pub binding: Option<FeedBinding>,
@@ -1691,6 +1738,7 @@ impl Drop for UpdateGuard {
 }
 
 struct Inner {
+    health_clock: Mutex<crate::channel_health::Clock>,
     data_dir: PathBuf,
     control: Mutex<Control>,
     feed: AsyncMutex<Option<OwnedFeed>>,
@@ -1718,6 +1766,7 @@ impl Drop for ReadLease {
 impl Runtime {
     pub(crate) fn new(data_dir: PathBuf) -> Self {
         Self(Arc::new(Inner {
+            health_clock: Mutex::new(crate::channel_health::Clock::default()),
             data_dir,
             control: Mutex::new(Control {
                 phase: RuntimePhase::Running,
@@ -2174,6 +2223,14 @@ impl Runtime {
     }
 
     pub(crate) fn status(&self) -> RuntimeStatus {
+        let channel_health = self.channel_health();
+        self.status_with_health(channel_health)
+    }
+
+    fn status_with_health(
+        &self,
+        channel_health: Option<crate::channel_health::Snapshot>,
+    ) -> RuntimeStatus {
         self.mcp_status();
         // Chart transport health is not account or execution feed health.
         let chart_failure = self
@@ -2193,6 +2250,9 @@ impl Runtime {
         }
         let control = self.control();
         RuntimeStatus {
+            channel_health: channel_health.filter(|snapshot| {
+                !control.terminal && control.chart_binding.as_ref() == Some(&snapshot.binding)
+            }),
             chart_failure: chart_failure
                 .filter(|failure| control.chart_binding.as_ref() == Some(&failure.binding))
                 .or_else(|| {
@@ -2216,6 +2276,34 @@ impl Runtime {
                 .as_ref()
                 .is_some_and(|owner| owner.owned()),
         }
+    }
+
+    fn channel_health(&self) -> Option<crate::channel_health::Snapshot> {
+        let binding = {
+            let control = self.0.control.try_lock().ok()?;
+            if control.terminal {
+                return None;
+            }
+            control.chart_binding.clone()?
+        };
+        let at = crate::now_ms();
+        let (console, chart) = {
+            let feed = self.0.feed.try_lock().ok()?;
+            match feed.as_ref()? {
+                OwnedFeed::Desktop(feed) => feed.channel_health(&binding, at)?,
+                #[cfg(test)]
+                OwnedFeed::Controlled(_) => return None,
+            }
+        };
+        let control = self.0.control.try_lock().ok()?;
+        if control.terminal || control.chart_binding.as_ref() != Some(&binding) {
+            return None;
+        }
+        self.0
+            .health_clock
+            .try_lock()
+            .ok()?
+            .project(binding, console, chart, crate::now_ms())
     }
 
     /// Cached only: this path never opens authority or touches the keychain.

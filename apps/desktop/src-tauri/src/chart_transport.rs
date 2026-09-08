@@ -135,6 +135,7 @@ pub(crate) struct ChartTransport {
     consumer: Option<JoinHandle<Result<(), String>>>,
     failure: Arc<Mutex<Option<String>>>,
     drained: Option<Result<(), String>>,
+    diagnostics: Arc<crate::channel_health::Diagnostics>,
 }
 
 impl ChartTransport {
@@ -163,6 +164,17 @@ impl ChartTransport {
         + 'static,
     ) -> Self {
         let task_failure = failure.clone();
+        let diagnostics = Arc::new(crate::channel_health::Diagnostics::default());
+        diagnostics.select(&[
+            Subscription::Trades {
+                coin: binding.symbol.clone(),
+            },
+            Subscription::Candle {
+                coin: binding.symbol.clone(),
+                interval: binding.interval.clone(),
+            },
+        ]);
+        let task_diagnostics = diagnostics.clone();
         let producer_binding = binding.clone();
         let handle = tokio::runtime::Handle::current();
         let consumer = tokio::task::spawn_blocking(move || {
@@ -174,6 +186,7 @@ impl ChartTransport {
                         biased;
                         frame = events.recv() => {
                             let Some(frame) = frame else { break; };
+                            task_diagnostics.record(crate::channel_health::Owner::Chart, frame.event(), frame.received_at_ms());
                             match apply(&producer_binding, Some(frame.event()), frame.received_at_ms()) {
                                 Ok(()) => frame.acknowledge(),
                                 Err(error) => remember(&task_failure, error),
@@ -216,6 +229,7 @@ impl ChartTransport {
             consumer: Some(consumer),
             failure,
             drained: None,
+            diagnostics,
         }
     }
 
@@ -234,6 +248,30 @@ impl ChartTransport {
                 binding: self.binding.clone(),
                 detail,
             })
+    }
+
+    pub(crate) fn channel_health(
+        &self,
+        binding: &ChartBinding,
+        at: u64,
+    ) -> Option<crate::channel_health::PoolObservation> {
+        if binding != &self.binding {
+            return None;
+        }
+        let health = match &self.pool {
+            Some(pool) => pool.try_health()?,
+            None => Vec::new(),
+        };
+        let failure = self.failure.try_lock().ok()?.clone().or_else(|| {
+            (self.drained.is_none() && self.consumer.as_ref().is_some_and(JoinHandle::is_finished))
+                .then(|| "chart consumer terminated before shutdown".into())
+        });
+        self.diagnostics.sample(
+            health,
+            crate::channel_health::Owner::Chart,
+            failure.as_deref(),
+            at,
+        )
     }
 
     /// The owning watch worker retains self if its observer disappears. Keep the
@@ -353,13 +391,13 @@ pub(crate) mod tests {
         }
 
         pub(crate) async fn trades(&self, prints: Vec<serde_json::Value>) {
+            self.frame(serde_json::json!({"channel":"trades","data":prints}).to_string())
+                .await;
+        }
+
+        pub(crate) async fn frame(&self, frame: String) {
             let (sent, reply) = tokio::sync::oneshot::channel();
-            self.send
-                .send((
-                    serde_json::json!({"channel":"trades","data":prints}).to_string(),
-                    sent,
-                ))
-                .unwrap();
+            self.send.send((frame, sent)).unwrap();
             tokio::time::timeout(Duration::from_secs(3), reply)
                 .await
                 .unwrap()
@@ -630,6 +668,26 @@ pub(crate) mod tests {
         .unwrap();
         let running_failure = transport.failure().unwrap();
         let ticket = owner.begin_history().unwrap();
+        let held = owner.failure.lock().unwrap();
+        assert!(
+            transport
+                .channel_health(&owner.binding, crate::now_ms())
+                .is_none()
+        );
+        drop(held);
+        let health = transport
+            .channel_health(&owner.binding, crate::now_ms())
+            .unwrap();
+        let health = crate::channel_health::Clock::default()
+            .project(
+                owner.binding.clone(),
+                crate::channel_health::PoolObservation::missing(),
+                health,
+                crate::now_ms(),
+            )
+            .unwrap();
+        assert!(health.rows[3].consumer_failure.is_some());
+        assert!(health.rows[4].consumer_failure.is_some());
         let projection = owner
             .finish_history(ticket, Err("history unavailable".into()))
             .unwrap();

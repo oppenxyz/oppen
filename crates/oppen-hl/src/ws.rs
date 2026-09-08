@@ -1589,6 +1589,14 @@ impl WsPool {
             .health(now_ms(), &self.cfg.thresholds)
     }
 
+    /// Nonblocking observation for desktop status polling. Contention or poison
+    /// means no observation, not an empty registry or a healthy subscription.
+    /// Execution callers retain the existing fail-closed blocking accessors.
+    pub fn try_health(&self) -> Option<Vec<FeedHealth>> {
+        let inner = self.inner.try_lock().ok()?;
+        Some(inner.registry.health(now_ms(), &self.cfg.thresholds))
+    }
+
     /// **The pre-sign gate.** The feeds among `required` a caller must not sign
     /// against, in key order; empty means go ahead.
     ///
@@ -3496,6 +3504,63 @@ mod tests {
             refused.to_string(),
             "websocket pool needs a tokio runtime handle; construct it from inside a runtime"
         );
+    }
+
+    #[tokio::test]
+    async fn try_health_reuses_registry_projection_without_connecting() {
+        let (pool, _events) = WsPool::new(WsPoolConfig::default()).unwrap();
+        assert_eq!(pool.try_health(), Some(Vec::new()));
+        let subscription = Subscription::Bbo { coin: "BTC".into() };
+        lock(&pool.inner)
+            .registry
+            .place(subscription.clone())
+            .unwrap();
+        let health = pool.try_health().unwrap();
+        assert_eq!(health, pool.health());
+        assert_eq!(health.len(), 1);
+        assert_eq!(health[0].subscription, subscription);
+        assert!(!health[0].connected && !health[0].acked);
+        assert!(health[0].stale);
+        assert_eq!(health[0].threshold_ms, Some(2_000));
+        assert!(health[0].last_message_ms.is_none());
+        assert!(lock(&pool.inner).tasks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn try_health_returns_no_observation_while_registry_is_held() {
+        let (pool, _events) = WsPool::new(WsPoolConfig::default()).unwrap();
+        std::thread::scope(|scope| {
+            let held = pool.inner.lock().unwrap();
+            let (send, receive) = std::sync::mpsc::channel();
+            let observed_pool = &pool;
+            let observer = scope.spawn(move || {
+                send.send(observed_pool.try_health()).unwrap();
+            });
+            let result = receive.recv_timeout(Duration::from_secs(1));
+            // Release before asserting so a blocking regression still terminates.
+            drop(held);
+            observer.join().unwrap();
+            assert_eq!(
+                result.expect("status sampling must not await the registry"),
+                None
+            );
+        });
+        assert_eq!(pool.try_health(), Some(Vec::new()));
+    }
+
+    #[tokio::test]
+    async fn try_health_does_not_treat_poisoned_registry_as_empty() {
+        let (pool, _events) = WsPool::new(WsPoolConfig::default()).unwrap();
+        let inner = pool.inner.clone();
+        assert!(
+            std::thread::spawn(move || {
+                let _held = inner.lock().unwrap();
+                panic!("synthetic registry poison");
+            })
+            .join()
+            .is_err()
+        );
+        assert!(pool.try_health().is_none());
     }
 
     /// A pool watching nothing is not a healthy pool. `any_stale` is the

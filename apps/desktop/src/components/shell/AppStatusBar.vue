@@ -2,6 +2,7 @@
 import AppUpdates from "./AppUpdates.vue";
 import { computed, ref } from "vue";
 import { feedLabel, shell, setView } from "../../stores/shell";
+import { marketTransport, marketChannels } from "../../stores/market-health";
 
 import { events, operator } from "../../stores/operator";
 import { eventText, isAgentDecision } from "../../lib/display";
@@ -9,7 +10,6 @@ const lastDecision = computed(() => [...events.value].reverse().find(event => is
 const detailsOpen = ref(false);
 
 const feeds = computed(() => ({
-  market: feedLabel(shell.feeds.wsMarket),
   user: feedLabel(shell.feeds.wsUser),
   rest: feedLabel(shell.feeds.rest),
 }));
@@ -36,7 +36,7 @@ const feeds = computed(() => ({
 
     <span>
       Feeds ·
-      <span class="sb__k" data-tour="feeds">WS·MKT {{ feeds.market }} · WS·USER {{ feeds.user }} · REST {{ feeds.rest }}</span>
+      <span class="sb__k" data-tour="feeds">WS {{ marketTransport }} · Channels {{ marketChannels }} · WS·USER {{ feeds.user }} · REST {{ feeds.rest }}</span>
     </span>
     <AppUpdates />
     <span>Ledger · {{ operator.error || operator.ledgerError ? (operator.ledger ? 'last read' : 'unavailable') : operator.ledger ? `#${operator.ledger.head_seq}` : 'not read' }}</span>

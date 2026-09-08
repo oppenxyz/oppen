@@ -3,6 +3,8 @@ import { renderToString } from "vue/server-renderer";
 import type { ChartBinding, ChartProjection, RuntimeStatus } from "../lib/bridge";
 import { createRuntimeMonitor, runtimeNotice } from "./runtime";
 import { createChartObservations } from "./market";
+import { createMarketHealth } from "./market-health";
+import { channelHealthFixture } from "../../qa/channel-health";
 
 interface Assertions {
   toBe(expected: unknown): void;
@@ -13,11 +15,11 @@ declare const describe: (name: string, body: () => void) => void;
 declare const it: (name: string, body: () => void | Promise<void>) => void;
 declare const expect: (actual: unknown) => Assertions & { not: Assertions };
 
-const RUNNING: RuntimeStatus = { phase: "running", binding: null, detail: null, chart_failure: null };
+const RUNNING: RuntimeStatus = { phase: "running", binding: null, detail: null, channel_health: null, chart_failure: null };
 const STOPPING: RuntimeStatus = {
   phase: "stopping", binding: { network: "testnet", generation: "9007199254740993" },
   detail: "Waiting for retained desktop work to drain.",
-  chart_failure: null,
+  channel_health: null, chart_failure: null,
 };
 
 function deferred<T>() {
@@ -57,6 +59,28 @@ function fixture(observe: (status: RuntimeStatus) => void = () => {}) {
 }
 
 describe("desktop runtime polling", () => {
+  it("successful null polls cannot renew channel health and stale remount replies cannot restore it", async () => {
+    const binding: ChartBinding = { network: "testnet", generation: "1", selection_id: "1", symbol: "BTC", interval: "1h" };
+    let clock = 0;
+    let expire = () => {};
+    const health = createMarketHealth(() => clock, callback => { expire = callback; return () => {}; });
+    health.bind(binding);
+    const f = fixture(status => { if (status.phase === "running") health.accept(status.channel_health); else health.historical("Runtime stopping"); });
+    f.monitor.start(); f.requests[0]!.resolve({ ...RUNNING, channel_health: channelHealthFixture(binding) }); await settle();
+    expect(health.state.current).toBe(true);
+    for (let second = 1; second <= 5; second++) {
+      clock = second * 1000; f.fire(1000); f.requests[second]!.resolve(RUNNING); await settle();
+    }
+    expire(); expect(health.state.current).toBe(false);
+    f.fire(1000); f.monitor.stop(); f.monitor.start();
+    const next = { ...binding, selection_id: "3" }; health.bind(next);
+    f.requests[6]!.resolve({ ...RUNNING, channel_health: channelHealthFixture(binding, "99") }); await settle();
+    expect(health.state.current).toBe(false);
+    f.requests[7]!.resolve({ ...RUNNING, channel_health: channelHealthFixture(next) }); await settle();
+    expect(health.state.current).toBe(true);
+    f.fire(1000); f.requests[8]!.resolve(STOPPING); await settle();
+    expect(health.state.current).toBe(false); f.monitor.stop();
+  });
   it("delivers exact-bound chart failure during ordinary polling and latches it against later projections", async () => {
     const binding: ChartBinding = { network: "testnet", generation: "1", selection_id: "10", symbol: "BTC", interval: "1h" };
     const projection = (owner: ChartBinding, revision: string): ChartProjection => ({
