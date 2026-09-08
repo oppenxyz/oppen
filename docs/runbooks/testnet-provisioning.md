@@ -1,5 +1,12 @@
 # Testnet provisioning runbook
 
+For the current supervised alpha, follow
+[supervised testnet acceptance](supervised-testnet-acceptance.md). This older
+provisioning record includes a low-level signing example and historical account
+observations; neither establishes current identity, consent, remaining pilot
+capacity or guarded-runtime acceptance. Do not use the low-level order example
+as a substitute for the supervised pilot path.
+
 Done by hand in the Hyperliquid web UI. It cannot be automated: every step is a
 signature from an account's own wallet, and D5 forbids a master-key path in the
 app.
