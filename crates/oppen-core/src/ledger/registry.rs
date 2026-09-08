@@ -375,12 +375,20 @@ impl RegistryJournal {
         connection: &Connection,
         agent: &AgentId,
     ) -> Result<AuthorizedRoute> {
+        self.optional_route_in(connection, agent)?
+            .ok_or_else(|| unavailable("agent has no live authenticated registry route"))
+    }
+
+    pub(super) fn optional_route_in(
+        &self,
+        connection: &Connection,
+        agent: &AgentId,
+    ) -> Result<Option<AuthorizedRoute>> {
         let grants = replay(&self.ledger, connection, &self.key)?;
-        grants
+        Ok(grants
             .into_values()
             .find(|grant| !grant.retired && &grant.route.binding.agent == agent)
-            .map(|grant| grant.route)
-            .ok_or_else(|| unavailable("agent has no live authenticated registry route"))
+            .map(|grant| grant.route))
     }
 
     /// Caller keeps the same ledger guard through the cryptographic signing step.

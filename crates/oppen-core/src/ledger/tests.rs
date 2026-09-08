@@ -549,6 +549,168 @@ fn fill(ledger: &Ledger, count: u64, seed: u64) -> Vec<u64> {
 // --- durability configuration ------------------------------------------------
 
 #[test]
+fn existing_only_open_never_creates_a_missing_database_or_directory() {
+    let dir = TempDir::new().unwrap();
+    assert!(Ledger::open_existing(dir.path(), Network::Testnet).is_err());
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    let missing = dir.path().join("missing");
+    assert!(Ledger::open_existing(&missing, Network::Testnet).is_err());
+    assert!(!missing.exists());
+}
+
+#[test]
+fn existing_only_open_never_adopts_missing_or_rewrites_malformed_anchors() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join(crate::db_file_name(Network::Testnet));
+    let ledger = open(&dir, Network::Testnet);
+    fill(&ledger, 3, 41);
+    drop(ledger);
+    let database = std::fs::read(&path).unwrap();
+    let anchor = FileAnchor::beside(&path);
+    std::fs::remove_file(anchor.path()).unwrap();
+    assert!(
+        matches!(Ledger::open_existing(dir.path(), Network::Testnet), Err(LedgerError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound)
+    );
+    assert!(!anchor.path().exists());
+    assert_eq!(std::fs::read(&path).unwrap(), database);
+    std::fs::write(anchor.path(), b"{}").unwrap();
+    assert!(Ledger::open_existing(dir.path(), Network::Testnet).is_err());
+    assert_eq!(std::fs::read(anchor.path()).unwrap(), b"{}");
+    assert_eq!(std::fs::read(&path).unwrap(), database);
+}
+
+#[test]
+fn existing_only_open_preserves_history_and_enables_durable_writes() {
+    let dir = TempDir::new().unwrap();
+    let ledger = open(&dir, Network::Testnet);
+    fill(&ledger, 3, 42);
+    let before = ledger.get_events(0, 100).unwrap();
+    let head = ledger.chain_head().unwrap();
+    drop(ledger);
+    let path = dir.path().join(crate::db_file_name(Network::Testnet));
+    let anchor = FileAnchor::beside(&path);
+    let anchor_bytes = std::fs::read(anchor.path()).unwrap();
+    let reopened = Ledger::open_existing(dir.path(), Network::Testnet).unwrap();
+    assert_eq!(reopened.chain_head().unwrap(), head);
+    assert_eq!(std::fs::read(anchor.path()).unwrap(), anchor_bytes);
+    for (before, after) in before
+        .events
+        .iter()
+        .zip(reopened.get_events(0, 100).unwrap().events.iter())
+    {
+        assert_eq!(before.hash, after.hash);
+        assert_eq!(before.payload, after.payload);
+    }
+    {
+        let guard = reopened.lock().unwrap();
+        assert_eq!(
+            schema::supported_version(&guard).unwrap(),
+            schema::CURRENT_VERSION
+        );
+        let synchronous: i64 = guard
+            .pragma_query_value(None, "synchronous", |row| row.get(0))
+            .unwrap();
+        assert_eq!(synchronous, 2);
+    }
+    fill(&reopened, 1, 43);
+    assert_eq!(anchor.load().unwrap().unwrap().seq, head.seq + 1);
+    assert!(reopened.verify().unwrap().is_intact());
+}
+
+#[test]
+fn existing_only_open_does_not_publish_the_one_row_crash_window() {
+    let dir = TempDir::new().unwrap();
+    let ledger = open(&dir, Network::Testnet);
+    fill(&ledger, 1, 44);
+    let witnessed = ledger.chain_head().unwrap();
+    fill(&ledger, 1, 45);
+    let committed = ledger.chain_head().unwrap();
+    let anchor = FileAnchor::beside(&dir.path().join(crate::db_file_name(Network::Testnet)));
+    anchor.store(&witnessed).unwrap();
+    drop(ledger);
+    let reopened = Ledger::open_existing(dir.path(), Network::Testnet).unwrap();
+    assert_eq!(reopened.chain_head().unwrap(), committed);
+    assert_eq!(anchor.load().unwrap(), Some(witnessed));
+    assert!(reopened.verify().unwrap().is_intact());
+}
+
+#[test]
+fn existing_only_open_refuses_old_schema_wrong_network_and_corrupt_history() {
+    let dir = TempDir::new().unwrap();
+    let ledger = open(&dir, Network::Testnet);
+    fill(&ledger, 1, 46);
+    let head = ledger.chain_head().unwrap();
+    {
+        let guard = ledger.lock().unwrap();
+        guard
+            .pragma_update(None, "user_version", schema::CURRENT_VERSION - 1)
+            .unwrap();
+    }
+    assert!(Ledger::open_existing(dir.path(), Network::Testnet).is_err());
+    {
+        let guard = ledger.lock().unwrap();
+        assert_eq!(
+            schema::supported_version(&guard).unwrap(),
+            schema::CURRENT_VERSION - 1
+        );
+        guard
+            .pragma_update(None, "user_version", schema::CURRENT_VERSION + 1)
+            .unwrap();
+    }
+    assert!(matches!(
+        Ledger::open_existing(dir.path(), Network::Testnet),
+        Err(LedgerError::SchemaTooNew { .. })
+    ));
+    {
+        let guard = ledger.lock().unwrap();
+        let version: usize = guard
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, schema::CURRENT_VERSION + 1);
+        guard
+            .pragma_update(None, "user_version", schema::CURRENT_VERSION)
+            .unwrap();
+        guard
+            .execute("UPDATE events SET ts_ms = ts_ms + 1 WHERE seq = 1", [])
+            .unwrap();
+    }
+    assert!(Ledger::open_existing(dir.path(), Network::Testnet).is_err());
+    assert_eq!(ledger.chain_head().unwrap(), head);
+
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join(crate::db_file_name(Network::Testnet));
+    let ledger = Ledger::open_at(&path, Network::Mainnet).unwrap();
+    let head = ledger.chain_head().unwrap();
+    assert!(matches!(
+        Ledger::open_existing(dir.path(), Network::Testnet),
+        Err(LedgerError::NetworkMismatch { .. })
+    ));
+    assert_eq!(ledger.chain_head().unwrap(), head);
+}
+
+#[cfg(unix)]
+#[test]
+fn existing_only_open_uses_canonical_anchor_and_refuses_conflicting_alias_anchor() {
+    let dir = TempDir::new().unwrap();
+    let ledger = open(&dir, Network::Testnet);
+    fill(&ledger, 1, 47);
+    let path = dir.path().join(crate::db_file_name(Network::Testnet));
+    let alias_dir = dir.path().join("alias");
+    std::fs::create_dir(&alias_dir).unwrap();
+    let alias_path = alias_dir.join(crate::db_file_name(Network::Testnet));
+    std::os::unix::fs::symlink(&path, &alias_path).unwrap();
+    let alias = Ledger::open_existing(&alias_dir, Network::Testnet).unwrap();
+    assert_eq!(alias.coordination_path, ledger.coordination_path);
+    assert_eq!(alias.chain_head().unwrap(), ledger.chain_head().unwrap());
+    let alias_anchor = FileAnchor::beside(&alias_path);
+    assert!(!alias_anchor.path().exists());
+    alias_anchor.store(&ledger.chain_head().unwrap()).unwrap();
+    assert!(Ledger::open_existing(&alias_dir, Network::Testnet).is_err());
+    assert!(Ledger::open_at(&alias_path, Network::Testnet).is_err());
+    assert!(ledger.verify().unwrap().is_intact());
+}
+
+#[test]
 fn wal_and_synchronous_full_are_set() {
     let dir = TempDir::new().expect("tempdir");
     let ledger = open(&dir, Network::Testnet);

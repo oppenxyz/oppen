@@ -60,6 +60,21 @@ impl Default for PersistedState {
 }
 
 impl PersistedState {
+    pub fn is_globally_paused(&self) -> bool {
+        self.kill.global().is_some()
+    }
+
+    /// Preserve an existing engagement's reason and timestamp.
+    pub fn engage_global_pause(&mut self, at_ms: u64) {
+        self.kill.engage(
+            KillScope::Global,
+            Engagement {
+                engaged_at_ms: at_ms,
+                reason: KillReason::Operator,
+            },
+        );
+    }
+
     pub(crate) fn validate(&self) -> Result<(), StoreError> {
         validate_policy_state(self)
     }
@@ -68,13 +83,7 @@ impl PersistedState {
     /// complete agent policies; the journal still requires review evidence.
     pub fn paused(at_ms: u64) -> Self {
         let mut state = Self::default();
-        state.kill.engage(
-            KillScope::Global,
-            Engagement {
-                engaged_at_ms: at_ms,
-                reason: KillReason::Operator,
-            },
-        );
+        state.engage_global_pause(at_ms);
         state
     }
 }
@@ -286,6 +295,26 @@ impl LegacyPolicyReview {
 
     pub fn evidence(&self) -> &LegacyPolicyEvidence {
         &self.evidence
+    }
+
+    /// Decode the retained review for explicit setup, never from a fresh file.
+    /// An unrecognized source requires a different reviewed migration, not
+    /// silent omission of settings this workflow does not understand.
+    pub fn state(&self) -> Result<PersistedState, StoreError> {
+        if !self.evidence.file_present
+            || self.evidence.schema.len() != 2
+            || self.evidence.tables.len() != 2
+            || self.evidence.schema.iter().any(|entry| {
+                entry.kind != "table"
+                    || entry.name != entry.table
+                    || !matches!(entry.name.as_str(), "guardrail_config" | "guardrail_state")
+            })
+        {
+            return Err(invalid(
+                "legacy setup requires the recognized complete policy schema",
+            ));
+        }
+        self.inspect()
     }
 
     /// Open and compare a FRESH source snapshot; retain the result through the
@@ -569,10 +598,12 @@ mod tests {
         let missing = LegacyPolicyReview::open(&path, Network::Testnet, 1).unwrap();
         assert!(!missing.evidence().file_present);
         assert!(!path.exists());
+        assert!(missing.state().is_err());
         let _writer = fixture(&path);
         assert!(matches!(missing.recheck(2), Err(StoreError::LegacyChanged)));
         let review = LegacyPolicyReview::open(&path, Network::Testnet, 2).unwrap();
         assert!(review.inspect().is_err());
+        assert!(review.state().is_err());
         assert_eq!(
             review
                 .evidence()
@@ -592,6 +623,69 @@ mod tests {
                 .unwrap()
                 .rows
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn setup_state_preserves_retained_values_and_refuses_unrecognized_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.db");
+        let writer = fixture(&path);
+        let mut expected = PersistedState::paused(1);
+        let stopped = expected.clone();
+        expected.engage_global_pause(999);
+        assert_eq!(
+            expected, stopped,
+            "existing stop identity cannot be rewritten"
+        );
+        assert!(expected.is_globally_paused());
+        let mut config = AgentGuardrails::default();
+        config.risk.max_leverage = 1;
+        expected
+            .guardrails
+            .insert(AgentId::new("alpha"), config.clone());
+        writer
+            .execute(
+                "UPDATE guardrail_config SET config_json = ?1",
+                [serde_json::to_string(&config).unwrap()],
+            )
+            .unwrap();
+        for (key, value) in [
+            ("kill_switch", serde_json::to_value(&expected.kill).unwrap()),
+            (
+                "account_limits",
+                serde_json::to_value(expected.account_limits).unwrap(),
+            ),
+        ] {
+            writer
+                .execute(
+                    "INSERT INTO guardrail_state VALUES (?1, ?2)",
+                    [key, &value.to_string()],
+                )
+                .unwrap();
+        }
+        let review = LegacyPolicyReview::open(&path, Network::Testnet, 1).unwrap();
+        assert_eq!(review.state().unwrap(), expected);
+        writer
+            .execute_batch("CREATE TABLE unknown_safety_state (value TEXT);")
+            .unwrap();
+        assert_eq!(
+            review.state().unwrap(),
+            expected,
+            "retained review must not reopen its source"
+        );
+        assert!(matches!(review.recheck(2), Err(StoreError::LegacyChanged)));
+        let changed = LegacyPolicyReview::open(&path, Network::Testnet, 2).unwrap();
+        assert!(
+            changed.state().is_err(),
+            "unknown data cannot disappear during setup"
+        );
+        assert!(
+            changed
+                .evidence()
+                .tables
+                .iter()
+                .any(|table| table.name == "unknown_safety_state")
         );
     }
 

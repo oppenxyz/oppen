@@ -8,6 +8,7 @@ import UiButton from "../components/ui/UiButton.vue";
 import { decimal } from "../lib/display";
 import { events, operator, recordedAgents, storedPolicy, policySourceLabel, refreshOperator } from "../stores/operator";
 import { setView } from "../stores/shell";
+import { openPolicySettings } from "../stores/settings";
 
 const selected = ref("");
 watch(recordedAgents, agents => { if (!agents.includes(selected.value)) selected.value = agents[0] ?? ""; }, { immediate: true });
@@ -55,7 +56,8 @@ const policyRows = computed(() => policy.value ? [
             <p class="agents__note" role="status">{{ policySourceLabel }}<span v-if="operator.policy?.revision != null"> · Revision {{ operator.policy.revision }}</span></p>
             <ReadoutRows v-if="policy" :rows="policyRows" />
             <EmptyState v-else line="No policy read for this agent." />
-            <p class="agents__note">{{ operator.policyReadMs ? `Read ${new Date(operator.policyReadMs).toLocaleTimeString()}` : 'Not read' }} · editing requires the live operator connection.</p>
+            <p class="agents__note">{{ operator.policyReadMs ? `Read ${new Date(operator.policyReadMs).toLocaleTimeString()}` : 'Not read' }} · Paused policy setup requires existing TESTNET authority and idle MCP.</p>
+            <UiButton size="sm" @click="openPolicySettings">Set up paused policy</UiButton>
           </PanelHousing>
           <PanelHousing inset label="Live approvals" meta="Not connected" :brackets="['br']">
             <EmptyState line="Pending proposals live in the gateway. Recorded approval decisions are in the log; they do not prove the current queue is empty." />

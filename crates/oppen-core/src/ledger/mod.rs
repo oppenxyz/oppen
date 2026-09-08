@@ -787,6 +787,72 @@ impl Ledger {
         Self::open_at(&dir.join(crate::db_file_name(network)), network)
     }
 
+    /// Open existing, current-schema authority for an explicit operator write.
+    /// Never creates a database, migrates its schema, binds a network, or adopts
+    /// a missing anchor. Verification retains the normal one-row crash window;
+    /// opening does not publish that outstanding head either.
+    pub fn open_existing(dir: &Path, network: Network) -> Result<Self> {
+        let path = dir.join(crate::db_file_name(network));
+        let canonical = std::fs::canonicalize(&path)?;
+        let mut coordination_path = canonical.clone().into_os_string();
+        coordination_path.push(".lock");
+        let coordination_path = PathBuf::from(coordination_path);
+        let _coordination = acquire_coordination(&coordination_path)?;
+        let anchor = default_anchor(&path, &canonical)?;
+        let witnessed = anchor.load()?.ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "existing ledger anchor required; refusing adoption",
+            )
+        })?;
+        let mut connection =
+            Connection::open_with_flags(&canonical, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+        connection.busy_timeout(BUSY_TIMEOUT)?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let version = schema::supported_version(&tx)?;
+        if version != schema::CURRENT_VERSION {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "existing ledger requires an explicit schema upgrade before operator writes",
+            )
+            .into());
+        }
+        let found: String = tx.query_row(
+            "SELECT value FROM ledger_meta WHERE key = 'network'",
+            [],
+            |row| row.get(0),
+        )?;
+        let expected = network_key(network);
+        if found != expected {
+            return Err(LedgerError::NetworkMismatch { expected, found });
+        }
+        let genesis = hash::genesis_hash(network);
+        let report = verify::walk(&tx, &genesis, Some(&witnessed))?;
+        if let Some(broken) = report.first_break {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "existing ledger chain broken at {}: {}",
+                    broken.seq, broken.reason
+                ),
+            )
+            .into());
+        }
+        let mode: String = tx.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
+        if !mode.eq_ignore_ascii_case("wal") {
+            return Err(LedgerError::JournalMode(mode));
+        }
+        tx.commit()?;
+        configure(&connection)?;
+        Ok(Self {
+            connection: Mutex::new(connection),
+            coordination_path,
+            network,
+            genesis,
+            anchor: Some(Box::new(anchor)),
+        })
+    }
+
     /// Open a ledger at an explicit path, anchored by the default sidecar.
     ///
     /// For tooling that is handed a file — a backup, an export to verify — and
@@ -802,24 +868,7 @@ impl Ledger {
             .truncate(false)
             .open(path)?;
         let canonical = std::fs::canonicalize(path)?;
-        let anchor = FileAnchor::beside(&canonical);
-        match std::fs::canonicalize(FileAnchor::beside(path).path()) {
-            Ok(legacy) => {
-                let target = match std::fs::canonicalize(anchor.path()) {
-                    Ok(target) => target,
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                        anchor.path().to_owned()
-                    }
-                    Err(error) => return Err(error.into()),
-                };
-                if legacy != target {
-                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput,
-                        "legacy anchor beside a database alias requires explicit migration; refusing to discard it").into());
-                }
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
+        let anchor = default_anchor(path, &canonical)?;
         Self::open_anchored(&canonical, network, Some(Box::new(anchor)))
     }
 
@@ -1984,6 +2033,29 @@ impl EventViews {
     pub fn for_agent(&self, agent_id: impl Into<String>) -> AgentView {
         self.0.agent_view(agent_id)
     }
+}
+
+/// Aliases must not silently discard a pre-existing, separately located anchor.
+fn default_anchor(path: &Path, canonical: &Path) -> Result<FileAnchor> {
+    let anchor = FileAnchor::beside(canonical);
+    match std::fs::canonicalize(FileAnchor::beside(path).path()) {
+        Ok(legacy) => {
+            let target = match std::fs::canonicalize(anchor.path()) {
+                Ok(target) => target,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    anchor.path().to_owned()
+                }
+                Err(error) => return Err(error.into()),
+            };
+            if legacy != target {
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput,
+                    "legacy anchor beside a database alias requires explicit migration; refusing to discard it").into());
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    Ok(anchor)
 }
 
 /// Set the pragmas the durability guarantee depends on.

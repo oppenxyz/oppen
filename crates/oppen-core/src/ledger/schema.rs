@@ -168,6 +168,8 @@ CREATE INDEX events_submission_account
 // V8 requires authenticated pilot consent; legacy history is never auto-adopted.
 const MIGRATIONS: &[&str] = &[V1, V2, V3, "", "", "", "", ""];
 
+pub(super) const CURRENT_VERSION: usize = MIGRATIONS.len();
+
 /// Bring the database up to the schema this build expects.
 ///
 /// Refuses a database written by a newer build rather than guessing at it: a

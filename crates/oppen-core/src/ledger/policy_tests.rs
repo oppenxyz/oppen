@@ -92,6 +92,56 @@ fn constructor_never_initializes_or_substitutes_empty_policy() {
 }
 
 #[test]
+fn setup_commit_requires_the_reviewed_route_for_initialization_and_replacement() {
+    for existing in [false, true] {
+        let (dir, ledger, registry, journal) = fixture();
+        let agent = AgentId::new("synthetic-agent");
+        let original = registry
+            .grant(
+                crate::ledger::tests::audit_route(
+                    agent.clone(),
+                    oppen_hl::Address::from_bytes([1; 20]),
+                    90,
+                )
+                .binding,
+                90,
+            )
+            .unwrap();
+        let legacy = review(&dir);
+        let previous = if existing {
+            Some(
+                journal
+                    .initialize_for_route(&legacy, state(), 100, &original)
+                    .unwrap(),
+            )
+        } else {
+            None
+        };
+        registry.retire(&original, 101).unwrap();
+        let mut binding = original.binding.clone();
+        binding.container = oppen_hl::Address::from_bytes([2; 20]);
+        binding.wallet.address = oppen_hl::Address::from_bytes([9; 20]);
+        binding.wallet.generation += 1;
+        let replacement = registry.grant(binding, 102).unwrap();
+        let before = ledger.chain_head().unwrap();
+        let mut proposed = state();
+        proposed.guardrails.get_mut(&agent).unwrap().max_order_usd = 5.into();
+        let save = |route: &crate::ledger::AuthorizedRoute| match &previous {
+            Some(current) => {
+                journal.replace_for_route(current.revision, proposed.clone(), 103, route)
+            }
+            None => journal.initialize_for_route(&legacy, proposed.clone(), 103, route),
+        };
+        assert!(matches!(save(&original), Err(PolicyError::RouteChanged)));
+        assert_eq!(ledger.chain_head().unwrap(), before);
+        let written = save(&replacement).unwrap();
+        assert_eq!(written.state, proposed);
+        assert!(written.state.is_globally_paused());
+        assert!(ledger.verify().unwrap().is_intact());
+    }
+}
+
+#[test]
 fn inspection_is_read_only_and_explicitly_does_not_authenticate_mac() {
     let (dir, ledger, _registry, journal) = fixture();
     assert_eq!(journal.network(), Network::Testnet);

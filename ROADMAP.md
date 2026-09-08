@@ -126,6 +126,16 @@ before expanding features:
    CI remain gates. End-to-end forged-consent reproduction remains unavailable
    under the documented tooling restriction. No operator activation or live gate
    is claimed.
+   Paused operator policy setup is implemented on `feat/paused-policy-setup`
+   (ES23): native-owned review and persistence, preserving complete policy and
+   stops without activation. The existing frontend inspection type is partial
+   and must not be used as a replacement payload. Local verification passes 977
+   Rust tests (15 live-gated ignored), 152 frontend tests and the web build.
+   Synthetic browser checks cover explicit review/retry, retained stops and
+   nonretryable recovery-required evidence at the supported desktop minimum.
+   Exact-head review and CI remain PR gates; no activation or live gate is
+   claimed. See
+   [paused-policy-setup.md](docs/specs/paused-policy-setup.md).
    No dedicated-account activity has been performed during this development.
 4. **Recovery:** PR #44 merged as `06fc0e3` after green CI and separate automated
    review. The durable submission journal has SQLite reopen, independent

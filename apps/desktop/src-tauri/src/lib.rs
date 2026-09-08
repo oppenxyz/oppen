@@ -10,6 +10,7 @@ mod feed;
 mod local_reads;
 mod mcp_runtime;
 mod operator_halt;
+mod policy_setup;
 mod runtime;
 mod updates;
 
@@ -40,6 +41,11 @@ enum ConsoleError {
     LocalStatus(String),
     /// The halt was refused before any operator mutation was admitted.
     HaltNotAdmitted(String),
+    Prerequisite(String),
+    Conflict(String),
+    Validation(String),
+    Uncertain(String),
+    Unavailable(String),
 }
 
 impl std::fmt::Display for ConsoleError {
@@ -48,11 +54,70 @@ impl std::fmt::Display for ConsoleError {
             ConsoleError::NotConfigured(detail)
             | ConsoleError::Venue(detail)
             | ConsoleError::LocalStatus(detail)
-            | ConsoleError::HaltNotAdmitted(detail) => {
+            | ConsoleError::HaltNotAdmitted(detail)
+            | ConsoleError::Prerequisite(detail)
+            | ConsoleError::Conflict(detail)
+            | ConsoleError::Validation(detail)
+            | ConsoleError::Uncertain(detail)
+            | ConsoleError::Unavailable(detail) => {
                 write!(f, "{detail}")
             }
         }
     }
+}
+
+impl From<policy_setup::SetupError> for ConsoleError {
+    fn from(error: policy_setup::SetupError) -> Self {
+        use policy_setup::ErrorKind;
+        match error.kind {
+            ErrorKind::Prerequisite => Self::Prerequisite(error.detail),
+            ErrorKind::Conflict => Self::Conflict(error.detail),
+            ErrorKind::Validation => Self::Validation(error.detail),
+            ErrorKind::Uncertain => Self::Uncertain(error.detail),
+            ErrorKind::Unavailable => Self::Unavailable(error.detail),
+        }
+    }
+}
+
+#[tauri::command]
+fn policy_setup_status(runtime: State<'_, Runtime>) -> policy_setup::Status {
+    runtime.policy_setup_status()
+}
+
+#[tauri::command]
+fn review_policy_setup(
+    runtime: State<'_, Runtime>,
+    agent: String,
+    account: String,
+    edits: policy_setup::PolicyEdits,
+    empty_source_confirmed: bool,
+    writers_stopped: bool,
+) -> Result<policy_setup::Status, ConsoleError> {
+    runtime
+        .review_policy_setup(
+            agent,
+            account,
+            edits,
+            empty_source_confirmed,
+            writers_stopped,
+        )
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+fn persist_policy_setup(
+    runtime: State<'_, Runtime>,
+    review_id: u64,
+) -> Result<policy_setup::Status, ConsoleError> {
+    runtime.persist_policy_setup(review_id).map_err(Into::into)
+}
+
+#[tauri::command]
+fn discard_policy_setup(
+    runtime: State<'_, Runtime>,
+    review_id: u64,
+) -> Result<policy_setup::Status, ConsoleError> {
+    runtime.discard_policy_setup(review_id).map_err(Into::into)
 }
 
 impl From<RuntimeError> for ConsoleError {
@@ -442,6 +507,10 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            policy_setup_status,
+            review_policy_setup,
+            persist_policy_setup,
+            discard_policy_setup,
             account_state,
             operator_state,
             pilot_status,
