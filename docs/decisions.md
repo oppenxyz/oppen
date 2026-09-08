@@ -340,6 +340,28 @@ positions closed. Do not label single-account coverage as fleet-wide halt.
 No new dependency, alternate signer, second cleanup loop, release or activation
 path is introduced. See [desktop-operator-halt.md](specs/desktop-operator-halt.md).
 
+### Authenticated pilot consent (ES22)
+
+The supervised-testnet budget and spec items 3, 24-26 and 29 require operator
+consent distinct from hash-chain accounting. Use the existing registry-backed
+HMAC authority to authenticate new consent and explicitly reviewed legacy
+adoption. Preserve the original baseline, limits, all allocations, fills and
+permanent stops; opening never adopts or resets history. Add the V8 reader
+barrier without rewriting existing events. No new dependency or key creation.
+
+Desktop execution and the real MCP server example use a dedicated testnet-only
+`GuardrailEngine::new_supervised_alpha` constructor. Its immutable requirement
+applies to every order, including reduce-only, at reservation and final signing.
+The gateway obtains its submission journal from that engine's authority.
+The general-purpose library constructor remains explicitly outside supervised
+alpha guarantees; no UI setting or missing consent row can select it at runtime.
+This static construction was chosen over a new configurable policy mode because
+the alpha has only one permitted execution mode. Cleanup and fill ingestion must
+remain possible when consent is unusable. Keyless inspection reports consent
+authentication separately from accounting. See
+[pilot-consent-authority.md](specs/pilot-consent-authority.md); implementation and
+acceptance evidence remain in progress, not a live gate passed.
+
 ## 2026-09-07 · The console's own socket
 
 Item 34 asks for per-feed status, last-tick timestamps and a stale overlay. The

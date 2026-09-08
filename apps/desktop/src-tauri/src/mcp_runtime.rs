@@ -131,17 +131,23 @@ impl Prepared {
         {
             return Err("requested identity differs from the authorized route".into());
         }
-        let policy = Arc::new(PolicyJournal::new(registry));
+        let policy = Arc::new(PolicyJournal::new(registry.clone()));
         let current = policy.current().map_err(|error| error.to_string())?;
         if !current.state.guardrails.contains_key(&binding.agent) {
             return Err("verified policy does not contain the requested agent".into());
         }
         // Authorization is never inferred from flat venue state or pairings.
-        let pilot = PilotJournal::new(ledger.clone())
-            .state(binding.account)
+        let pilot = PilotJournal::new(registry)
+            .status(binding.account)
             .map_err(|error| error.to_string())?
             .ok_or("existing pilot authorization required")?;
-        if pilot.agent != binding.agent || pilot.account != binding.account || pilot.halt.is_some()
+        if pilot.agent != binding.agent
+            || pilot.account != binding.account
+            || pilot.halt.is_some()
+            || !matches!(
+                pilot.accounting,
+                oppen_core::ledger::PilotAccounting::Known { .. }
+            )
         {
             return Err("pilot must match the requested identity and have no halt".into());
         }
@@ -156,8 +162,10 @@ impl Prepared {
             );
         }
         // The private engine starts inhibited. No caller receives an activation capability.
-        let engine =
-            Arc::new(GuardrailEngine::new(policy, keys).map_err(|error| error.to_string())?);
+        let engine = Arc::new(
+            GuardrailEngine::new_supervised_alpha(policy, keys)
+                .map_err(|error| error.to_string())?,
+        );
         let feed = Arc::new(FeedSession::new());
         let alerts = Arc::new(
             AlertStore::open(dir.join("alerts-testnet.db")).map_err(|error| error.to_string())?,
@@ -966,7 +974,7 @@ mod tests {
                     at,
                 )
                 .unwrap();
-            let policy = PolicyJournal::new(registry);
+            let policy = PolicyJournal::new(registry.clone());
             let review =
                 LegacyPolicyReview::open(dir.path().join("legacy.db"), Network::Testnet, at)
                     .unwrap();
@@ -976,7 +984,7 @@ mod tests {
                 .insert(binding.agent.clone(), AgentGuardrails::default());
             policy.initialize(&review, state, at).unwrap();
             if pilot {
-                PilotJournal::new(ledger.clone())
+                PilotJournal::new(registry)
                     .authorize(binding.agent.clone(), binding.account, at)
                     .unwrap();
             }

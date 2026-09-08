@@ -1,6 +1,8 @@
 # Pilot Consent Authority Audit
 
-Safety follow-up, 2026-09-07. Implementation is pending. This is not an
+Safety follow-up, 2026-09-07. Implemented on `feat/authenticated-pilot-consent`;
+local workspace tests and independent working-diff review pass. Exact committed
+head review and CI remain gates. This is not an
 activation approval or a completed live gate. Traces to spec items 3, 24-26
 and 29, and the supervised-testnet requirement for explicit consent and
 non-resettable cumulative budgets.
@@ -55,7 +57,12 @@ must require applicable authenticated consent: absent, deleted, wrong-account,
 legacy or unverifiable consent cannot become an optional-pilot bypass. Before
 implementation, settle how this requirement is represented and enforced across
 all production constructors, without relying on a frontend flag or startup-only
-check. Keep registry-verified cancellation available when consent is unusable.
+check. ES22 resolves this with the testnet-only `new_supervised_alpha` constructor
+for desktop and the real server example, carrying an immutable requirement into
+both engine-derived reservations and final signing. General library construction
+is outside the supervised-alpha guarantee; the UI cannot select it. Preflight
+uses the same authenticated candidate-budget check in a read-only transaction.
+Keep registry-verified cancellation available when consent is unusable.
 
 Separate accounting inspection from authenticated authority. Keyless local
 inspection must state that consent authentication is unverified. Continue
@@ -81,6 +88,13 @@ be trusted. Never render unavailable accounting as zero usage.
   must verify and publish the committed head before success. Adoption must not
   release a kill, clear uncertainty, or acknowledge engine admission.
 
+Implementation uses a canonical, domain-separated HMAC envelope and a distinct
+`pilot_adopted` event. The opaque review is serializable for inspection but cannot
+be deserialized into authority. Reusing the exact review with a later timestamp
+is a publication retry, not a new baseline or consent timestamp. V8 upgrades
+preserve existing rows. Authenticated and keyless status retain a stable SQLite
+read transaction across chain verification and accounting projection.
+
 ## Acceptance Gates
 
 Synthetic regression evidence must cover forged one-row-lag consent rejection
@@ -96,3 +110,13 @@ exclusive account use, reconciled positions/orders/fills, the $25 gross exposure
 cap and 1x leverage, and explicit operator activation. Authenticating a local
 statement alone proves none of those venue conditions. Broad client onboarding
 follows this safety work; client choice never changes these requirements.
+
+Local evidence: 953 Rust tests pass with 15 live-gated tests ignored; 136 frontend
+tests and its build pass. Separate automated working-diff review found no
+blocking findings after the snapshot fix. A deterministic WAL-writer regression
+changes accounting after the chain walk: both status readers retain their
+original snapshot, and subsequent reads reject the damaged evidence. Preflight
+has actual-engine missing-consent and authenticated candidate-budget checks.
+The original end-to-end forged-tail reproduction remains unavailable due to
+the tooling restriction recorded above; helper-level invalid-MAC tests do not
+replace that evidence. No dedicated-account activity or live gate is claimed.

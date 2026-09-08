@@ -22,7 +22,7 @@ async fn authorize(runtime: &Runtime) {
     );
     // This is operator authority over the exclusive loopback account only.
     // Keep no journal handle alive across Runtime::shutdown's physical drop.
-    let state = PilotJournal::new(runtime.ledger.clone())
+    let state = PilotJournal::new(runtime.registry.clone())
         .authorize(AgentId::new("fixture-agent"), runtime.account, now_ms())
         .expect("authorize reconciled flat fixture");
     assert_eq!(state.executed_usd, Decimal::ZERO);
@@ -32,7 +32,7 @@ async fn authorize(runtime: &Runtime) {
 }
 
 fn state(runtime: &Runtime) -> PilotState {
-    PilotJournal::new(runtime.ledger.clone())
+    PilotJournal::new(runtime.registry.clone())
         .state(runtime.account)
         .expect("pilot replay")
         .expect("persisted authority")

@@ -600,6 +600,7 @@ impl EngineState {
 /// gateway and the workflow runner all hold the same instance, and a type
 /// parameter would leak into every one of their signatures.
 pub struct GuardrailEngine {
+    submissions: Option<crate::ledger::SubmissionJournal>,
     store: Arc<dyn GuardrailStore>,
     sink: Arc<dyn AuditSink>,
     /// Where the agent wallets live. Held by the engine rather than passed to
@@ -633,12 +634,48 @@ impl GuardrailEngine {
         keys: Arc<dyn KeyStore>,
     ) -> Result<Self, GuardrailError> {
         let network = authority.network();
-        Self::build(
+        let submissions = authority.submissions(false);
+        let mut engine = Self::build(
             Arc::new(SqliteGuardrailStore::new(authority.clone())),
             Arc::new(LedgerAuditSink::new(authority)),
             keys,
             network,
-        )
+        )?;
+        engine.submissions = Some(submissions);
+        Ok(engine)
+    }
+
+    /// Supervised alpha always requires authenticated pilot consent for orders,
+    /// including reduce-only orders. Missing consent never disables this check.
+    pub fn new_supervised_alpha(
+        authority: Arc<PolicyJournal>,
+        keys: Arc<dyn KeyStore>,
+    ) -> Result<Self, GuardrailError> {
+        let network = authority.network();
+        if network != Network::Testnet {
+            return Err(GuardrailError::InvalidConfig {
+                field: "network".into(),
+                detail: "supervised alpha requires testnet".into(),
+            });
+        }
+        let submissions = authority.submissions(true);
+        let mut engine = Self::build(
+            Arc::new(SqliteGuardrailStore::new(authority.clone())),
+            Arc::new(LedgerAuditSink::supervised(authority)),
+            keys,
+            network,
+        )?;
+        engine.submissions = Some(submissions);
+        Ok(engine)
+    }
+
+    /// Reservations inherit the exact authority and pilot requirement of signing.
+    pub fn submissions(&self) -> Result<crate::ledger::SubmissionJournal, GuardrailError> {
+        self.submissions
+            .clone()
+            .ok_or_else(|| GuardrailError::Policy {
+                detail: "synthetic engine has no durable submission authority".into(),
+            })
     }
 
     /// Explicit synthetic authority and persistence seams, never a production constructor.
@@ -690,6 +727,7 @@ impl GuardrailEngine {
             let _ = state.publish(version);
         }
         Ok(Self {
+            submissions: None,
             store,
             sink,
             keys,
@@ -1329,6 +1367,15 @@ impl GuardrailEngine {
         ) {
             Ok(cleared) => {
                 let clearance = cleared.clearance();
+                if let Some(journal) = &self.submissions
+                    && let Err(error) = journal.preflight(clearance)
+                {
+                    return Verdict {
+                        would_clear: false,
+                        utilization: Some(clearance.utilization.clone()),
+                        refusal: Some(error.into_refusal()),
+                    };
+                }
                 Verdict {
                     would_clear: true,
                     utilization: Some(clearance.utilization.clone()),

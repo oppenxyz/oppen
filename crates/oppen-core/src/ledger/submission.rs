@@ -16,6 +16,16 @@ use crate::guardrail::{Clearance, ClearedKind};
 
 type Result<T> = std::result::Result<T, SubmissionError>;
 
+#[cfg(test)]
+thread_local! {
+    static AFTER_VERIFIED_WALK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(super) fn after_verified_walk(hook: impl FnOnce() + 'static) {
+    AFTER_VERIFIED_WALK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum SubmissionError {
     #[error(transparent)]
@@ -49,7 +59,7 @@ impl From<serde_json::Error> for SubmissionError {
 }
 
 #[derive(Clone, Debug)]
-pub struct SubmissionJournal(Arc<Ledger>);
+pub struct SubmissionJournal(Arc<Ledger>, Option<(Arc<super::RegistryJournal>, bool)>);
 
 #[derive(Clone, Debug, Default)]
 pub struct SubmissionState {
@@ -148,7 +158,11 @@ fn resolve_key(seq: u64) -> String {
 
 impl SubmissionJournal {
     pub(super) fn new(ledger: Arc<Ledger>) -> Self {
-        Self(ledger)
+        Self(ledger, None)
+    }
+
+    pub(super) fn authenticated(registry: Arc<super::RegistryJournal>, required: bool) -> Self {
+        Self(registry.shared_ledger(), Some((registry, required)))
     }
 
     pub fn state(&self, account: Address) -> Result<SubmissionState> {
@@ -158,6 +172,22 @@ impl SubmissionJournal {
         let tx = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut replay = self.replay(&tx)?;
         Ok(replay.accounts.remove(&account).unwrap_or_default())
+    }
+
+    pub(crate) fn preflight(
+        &self,
+        clearance: &Clearance,
+    ) -> std::result::Result<(), super::PilotError> {
+        let mut guard = self.0.lock()?;
+        let tx = guard.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let account = clearance.route.binding.container;
+        if let Some((registry, required)) = &self.1 {
+            super::pilot::check_authenticated_admission(
+                registry, &tx, account, clearance, *required,
+            )
+        } else {
+            super::pilot::check_admission(&self.0, &tx, account, clearance)
+        }
     }
 
     pub fn begin(
@@ -228,7 +258,13 @@ impl SubmissionJournal {
         drop(rows);
         drop(statement);
         let (intent_seq, intent_hash) = intent.ok_or(SubmissionError::MissingIntent)?;
-        super::pilot::check_admission(&self.0, &tx, account, clearance)?;
+        if let Some((registry, required)) = &self.1 {
+            super::pilot::check_authenticated_admission(
+                registry, &tx, account, clearance, *required,
+            )?;
+        } else {
+            super::pilot::check_admission(&self.0, &tx, account, clearance)?;
+        }
         let start = Started {
             version: 1,
             account,
@@ -323,6 +359,10 @@ fn replay(ledger: &Ledger, connection: &Connection, verify_anchor: bool) -> Resu
         )));
     }
     let mut replay = Replay::default();
+    #[cfg(test)]
+    if let Some(hook) = AFTER_VERIFIED_WALK.with(|slot| slot.borrow_mut().take()) {
+        hook();
+    }
     // Never filter by account before parsing: a null or malformed payload
     // can conceal a pending reservation for any account.
     let mut statement = connection.prepare(&format!(

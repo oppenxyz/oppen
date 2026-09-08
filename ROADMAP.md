@@ -116,6 +116,16 @@ before expanding features:
    no automatic trust or reset. This is an open safety gate, not an unconditional
    signing-bypass claim. See
    [pilot-consent-authority.md](docs/specs/pilot-consent-authority.md).
+   ES22 is implemented on `feat/authenticated-pilot-consent`: authenticated new
+   consent and explicit legacy adoption, mandatory supervised-alpha consent at
+   reservation/final signing, read-only preflight checks and separately labelled
+   inspection trust. V8 preserves existing history; adoption never resets budgets
+   or releases stops. Local verification passes 953 Rust tests (15 live-gated
+   ignored), 136 frontend tests and the web build; separate automated working-diff
+   review found no blockers after the status-snapshot fix. Exact-head review and
+   CI remain gates. End-to-end forged-consent reproduction remains unavailable
+   under the documented tooling restriction. No operator activation or live gate
+   is claimed.
    No dedicated-account activity has been performed during this development.
 4. **Recovery:** PR #44 merged as `06fc0e3` after green CI and separate automated
    review. The durable submission journal has SQLite reopen, independent

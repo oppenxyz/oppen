@@ -165,7 +165,8 @@ CREATE INDEX events_submission_account
 // V5 also excludes readers that cannot enforce durable pairing revocation.
 // V6 requires authenticated registry authority at the signing boundary.
 // V7 requires authenticated policy and revision-bound runtime admission.
-const MIGRATIONS: &[&str] = &[V1, V2, V3, "", "", "", ""];
+// V8 requires authenticated pilot consent; legacy history is never auto-adopted.
+const MIGRATIONS: &[&str] = &[V1, V2, V3, "", "", "", "", ""];
 
 /// Bring the database up to the schema this build expects.
 ///

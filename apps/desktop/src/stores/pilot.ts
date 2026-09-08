@@ -72,7 +72,7 @@ export function createPilotMonitor(
     } catch (error) {
       if (current !== generation || network !== state.network) return;
       state.error = isConsoleError(error) ? error.detail : error instanceof Error ? error.message : String(error);
-      // Preserve verified evidence for this context; an IPC failure is not a resume.
+      // Preserve observed evidence for this context; an IPC failure is not a resume.
     } finally {
       reading = false;
       state.pending = false;
@@ -131,6 +131,15 @@ const METRICS: Record<PilotMetric, string> = {
   realized_loss: "Realized loss",
 };
 
+export function pilotAuthentication(status: Readonly<PilotStatus> | null): string {
+  switch (status?.authentication) {
+    case "verified": return "Consent authentication: verified";
+    case "unverified": return "Consent authentication: unverified";
+    case "legacy_review_required": return "Consent authentication: legacy review required";
+    default: return "Consent authentication: unavailable";
+  }
+}
+
 /** The banner describes evidence, never cancellation delivery or flat positions. */
 export function pilotNotice(reading: Readonly<PilotReading>): { title: string; detail: string } | null {
   const halt = reading.status?.halt;
@@ -147,7 +156,13 @@ export function pilotNotice(reading: Readonly<PilotReading>): { title: string; d
     return { title: "Pilot accounting unavailable", detail: reading.status.detail };
   }
   if (reading.error !== null) {
-    return { title: "Pilot status unavailable", detail: "Current local pilot status could not be verified." };
+    return { title: "Pilot status unavailable", detail: "Current local pilot status could not be read." };
+  }
+  if (reading.status?.authentication === "legacy_review_required") {
+    return { title: "Pilot consent review required", detail: "Legacy unsigned history requires explicit review; it does not establish authenticated consent." };
+  }
+  if (reading.status && reading.status.authentication !== "verified") {
+    return { title: "Pilot consent unverified", detail: "This local reading does not establish authenticated pilot consent." };
   }
   return null;
 }

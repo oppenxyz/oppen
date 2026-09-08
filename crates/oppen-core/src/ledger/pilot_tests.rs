@@ -11,8 +11,402 @@ use crate::ledger::{EventViews, SubmissionReceipt};
 
 const BASE: u64 = 1_800_000_000_000;
 
+// Only these legacy fixtures may create unsigned consent. Production exposes
+// the registry-backed journal; old cumulative histories remain migration input.
+struct LegacyPilotJournal(Arc<Ledger>);
+
+impl LegacyPilotJournal {
+    fn new(ledger: Arc<Ledger>) -> Self {
+        Self(ledger)
+    }
+
+    fn authorize(&self, agent: AgentId, account: Address, at_ms: u64) -> Result<PilotState> {
+        if self.0.network != Network::Testnet
+            || crate::keys::checked_agent_id(&agent).is_err()
+            || account == Address::ZERO
+        {
+            return Err(unavailable("invalid legacy fixture identity"));
+        }
+        let mut guard = self.0.lock()?;
+        let tx = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let history = history(&self.0, &tx, true)?;
+        if !history.authorities.is_empty() {
+            return Err(unavailable("pilot already authorized"));
+        }
+        check_baseline(&history, account, &agent)?;
+        let (seq, hash) = super::super::head(&tx)?;
+        let data = Authorized {
+            version: 1,
+            network: Network::Testnet,
+            agent,
+            account,
+            baseline_at_ms: at_ms,
+            baseline: Anchor { seq, hash },
+            order_limit_usd: Decimal::from(15),
+            executed_limit_usd: Decimal::from(150),
+            realized_loss_limit_usd: Decimal::from(5),
+        };
+        let payload = serde_json::to_value(&data)?;
+        let appended = super::super::append_keyed_in_tx(
+            &tx,
+            &NewEvent {
+                kind: EventKind::PilotAuthorized,
+                ts_ms: at_ms as i64,
+                agent_id: Some(data.agent.as_str()),
+                payload: &payload,
+                snapshot: None,
+            },
+            &format!("pilot_authorized:{account}"),
+        )?
+        .unwrap();
+        tx.commit()?;
+        self.0.note_head(&appended)?;
+        Ok(initial(&data))
+    }
+
+    fn state(&self, account: Address) -> Result<Option<PilotState>> {
+        let guard = self.0.lock()?;
+        let history = history(&self.0, &guard, true)?;
+        history
+            .authorities
+            .iter()
+            .find(|a| a.data.account == account)
+            .map(|a| project(&history, a))
+            .transpose()
+    }
+}
+
 fn account() -> Address {
     Address::from_bytes([1; 20])
+}
+
+fn authenticated_fixture() -> (
+    TempDir,
+    Arc<Ledger>,
+    Arc<super::super::RegistryJournal>,
+    PilotJournal,
+) {
+    let dir = TempDir::new().unwrap();
+    let ledger = Arc::new(Ledger::open(dir.path(), Network::Testnet).unwrap());
+    let registry = Arc::new(
+        super::super::RegistryJournal::open(
+            ledger.clone(),
+            Arc::new(crate::keys::HmacKey::from_bytes([31; 32])),
+        )
+        .unwrap(),
+    );
+    registry
+        .grant(audit_route(agent(), account(), BASE - 1).binding, BASE - 1)
+        .unwrap();
+    let journal = PilotJournal::new(registry.clone());
+    (dir, ledger, registry, journal)
+}
+
+#[test]
+fn consent_authentication_is_required_at_both_execution_checks_but_not_inspection() {
+    let (_dir, ledger, registry, journal) = authenticated_fixture();
+    let mut clearance = order(1, "1");
+    clearance.route = registry.route_for_agent(&agent()).unwrap();
+    {
+        let guard = ledger.lock().unwrap();
+        for required in [false, true] {
+            assert_eq!(
+                check_authenticated_admission(&registry, &guard, account(), &clearance, required)
+                    .is_err(),
+                required
+            );
+            assert_eq!(
+                check_authenticated_before_sign(&registry, &guard, &clearance, required).is_err(),
+                required
+            );
+        }
+    }
+    journal.authorize(agent(), account(), BASE).unwrap();
+    let signed = ledger.get_events(0, 100).unwrap().events.pop().unwrap();
+    let payload = signed.payload.unwrap();
+    assert_eq!(payload["envelope"]["version"], 2);
+    assert_eq!(
+        payload["envelope"]["operation"]["authorization"]["executed_limit_usd"],
+        "150"
+    );
+    assert_eq!(
+        status(&ledger, account()).unwrap().unwrap().authentication,
+        PilotAuthentication::Unverified
+    );
+    assert_eq!(
+        journal.status(account()).unwrap().unwrap().authentication,
+        PilotAuthentication::Verified
+    );
+    persist(&ledger, &clearance);
+    let submissions = super::super::SubmissionJournal::authenticated(registry.clone(), true);
+    let before = ledger.chain_head().unwrap();
+    submissions.preflight(&clearance).unwrap();
+    assert_eq!(ledger.chain_head().unwrap(), before);
+    submissions
+        .begin(account(), &clearance, 0, BASE + 2)
+        .unwrap();
+    let guard = ledger.lock().unwrap();
+    check_authenticated_before_sign(&registry, &guard, &clearance, true).unwrap();
+    let mut different = clearance.clone();
+    different.route.binding.wallet.generation += 1;
+    assert!(check_authenticated_before_sign(&registry, &guard, &different, true).is_err());
+    different.agent = AgentId::new("other");
+    assert!(check_authenticated_admission(&registry, &guard, account(), &different, true).is_err());
+}
+
+#[test]
+fn authenticated_preflight_preserves_exhausted_budget_without_writes() {
+    let (_dir, ledger, registry, journal) = authenticated_fixture();
+    journal.authorize(agent(), account(), BASE).unwrap();
+    let mut clearance = order(1, "1");
+    clearance.route = registry.route_for_agent(&agent()).unwrap();
+    begin(&ledger, &clearance);
+    record(&ledger, 1, &payload(1, 1, "1", "0", "5", BASE + 10));
+    let submissions = super::super::SubmissionJournal::authenticated(registry, true);
+    let before = ledger.chain_head().unwrap();
+    assert!(matches!(
+        submissions.preflight(&clearance),
+        Err(PilotError::Exhausted {
+            metric: PilotMetric::RealizedLoss,
+            ..
+        })
+    ));
+    assert_eq!(ledger.chain_head().unwrap(), before);
+    assert!(journal.state(account()).unwrap().unwrap().halt.is_some());
+}
+
+#[test]
+fn consent_rejects_invalid_identity_wrong_key_and_wrong_account_without_writes() {
+    let (_dir, ledger, _registry, journal) = authenticated_fixture();
+    let before = ledger.chain_head().unwrap();
+    for name in ["", "bad agent", "../agent", "nonascii-\u{00e9}"] {
+        assert!(
+            journal
+                .authorize(AgentId::new(name), account(), BASE)
+                .is_err()
+        );
+    }
+    assert!(
+        journal
+            .authorize(AgentId::new("a".repeat(65)), account(), BASE)
+            .is_err()
+    );
+    assert!(journal.authorize(agent(), Address::ZERO, BASE).is_err());
+    assert!(
+        journal
+            .authorize(agent(), Address::from_bytes([2; 20]), BASE)
+            .is_err()
+    );
+    assert!(
+        super::super::RegistryJournal::open(
+            ledger.clone(),
+            Arc::new(crate::keys::HmacKey::from_bytes([99; 32]))
+        )
+        .is_err()
+    );
+    assert_eq!(ledger.chain_head().unwrap(), before);
+}
+
+#[test]
+fn status_keeps_one_snapshot_when_a_raw_writer_changes_accounting_after_verification() {
+    for authenticated in [false, true] {
+        let (dir, ledger, _registry, journal) = authenticated_fixture();
+        journal.authorize(agent(), account(), BASE).unwrap();
+        begin(&ledger, &order(1, "1"));
+        let path = dir.path().join(crate::db_file_name(Network::Testnet));
+        super::super::submission::after_verified_walk(move || {
+            let raw = Connection::open(path).unwrap();
+            assert_eq!(
+                raw.execute(
+                    "UPDATE events SET payload = NULL WHERE kind = 'submission_started'",
+                    []
+                )
+                .unwrap(),
+                1
+            );
+        });
+        let result = if authenticated {
+            journal.status(account())
+        } else {
+            status(&ledger, account())
+        };
+        let observed = result.unwrap().unwrap();
+        assert!(
+            matches!(observed.accounting, PilotAccounting::Known { reserved_usd, .. } if reserved_usd == dec("10"))
+        );
+        assert_eq!(
+            observed.authentication,
+            if authenticated {
+                PilotAuthentication::Verified
+            } else {
+                PilotAuthentication::Unverified
+            }
+        );
+        assert!(
+            journal.status(account()).is_err(),
+            "a later snapshot must observe the damaged evidence"
+        );
+        assert!(status(&ledger, account()).is_err());
+        assert!(ledger.connection.lock().unwrap().is_autocommit());
+    }
+}
+
+#[test]
+fn legacy_adoption_preserves_baseline_fills_pending_cancel_allocation_and_stops() {
+    for scenario in ["pending", "canceled", "stopped"] {
+        let (dir, ledger, registry, journal) = authenticated_fixture();
+        let legacy = LegacyPilotJournal::new(ledger.clone());
+        legacy.authorize(agent(), account(), BASE).unwrap();
+        let receipt = begin(&ledger, &order(1, "1"));
+        if scenario != "pending" {
+            observed(&ledger, &receipt, 1, "canceled");
+        }
+        record(
+            &ledger,
+            1,
+            &payload(
+                1,
+                1,
+                "0.5",
+                "0",
+                if scenario == "stopped" { "5" } else { "0.01" },
+                BASE + 10,
+            ),
+        );
+        let original = legacy.state(account()).unwrap().unwrap();
+        assert_eq!(original.executed_usd, dec("5"));
+        assert_eq!(original.reserved_usd, dec("5"));
+        assert_eq!(
+            status(&ledger, account()).unwrap().unwrap().authentication,
+            PilotAuthentication::LegacyReviewRequired
+        );
+        assert!(journal.state(account()).is_err());
+        {
+            let guard = ledger.lock().unwrap();
+            for required in [false, true] {
+                assert!(
+                    check_authenticated_admission(
+                        &registry,
+                        &guard,
+                        account(),
+                        &order(2, "1"),
+                        required
+                    )
+                    .is_err()
+                );
+                assert!(
+                    check_authenticated_before_sign(&registry, &guard, &order(1, "1"), required)
+                        .is_err()
+                );
+            }
+        }
+        let rows = ledger.get_events(0, 100).unwrap().events;
+        let pending = EventViews::new(ledger.clone())
+            .submissions()
+            .state(account())
+            .unwrap()
+            .pending;
+        let review = journal.review_legacy(account()).unwrap();
+        let review_view = serde_json::to_value(&review).unwrap();
+        assert_eq!(review_view["state"]["executed_usd"], "5.0");
+        assert_eq!(review_view["state"]["account"], json!(account()));
+        assert_eq!(
+            review_view["head"]["seq"],
+            json!(ledger.chain_head().unwrap().seq)
+        );
+        assert_eq!(journal.adopt_legacy(&review, BASE + 20).unwrap(), original);
+        let adopted_head = ledger.chain_head().unwrap();
+        assert_eq!(journal.adopt_legacy(&review, BASE + 21).unwrap(), original);
+        assert_eq!(ledger.chain_head().unwrap(), adopted_head);
+        let after = ledger.get_events(0, 100).unwrap().events;
+        for (old, preserved) in rows.iter().zip(&after) {
+            assert_eq!(old.hash, preserved.hash);
+            assert_eq!(old.payload, preserved.payload);
+        }
+        assert_eq!(
+            EventViews::new(ledger.clone())
+                .submissions()
+                .state(account())
+                .unwrap()
+                .pending,
+            pending
+        );
+        assert_eq!(journal.state(account()).unwrap().unwrap(), original);
+        drop(journal);
+        drop(registry);
+        drop(legacy);
+        drop(ledger);
+        let ledger = Arc::new(Ledger::open(dir.path(), Network::Testnet).unwrap());
+        let registry = Arc::new(
+            super::super::RegistryJournal::open(
+                ledger.clone(),
+                Arc::new(crate::keys::HmacKey::from_bytes([31; 32])),
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            PilotJournal::new(registry)
+                .state(account())
+                .unwrap()
+                .unwrap(),
+            original
+        );
+        assert!(ledger.verify().unwrap().is_intact());
+    }
+}
+
+#[test]
+fn legacy_review_is_cas_bound_and_does_not_automatically_adopt_on_open() {
+    let (_dir, ledger, _registry, journal) = authenticated_fixture();
+    LegacyPilotJournal::new(ledger.clone())
+        .authorize(agent(), account(), BASE)
+        .unwrap();
+    let review = journal.review_legacy(account()).unwrap();
+    ledger
+        .append(&NewEvent {
+            kind: EventKind::OperatorAction,
+            ts_ms: (BASE + 1) as i64,
+            agent_id: None,
+            payload: &json!({"synthetic":true}),
+            snapshot: None,
+        })
+        .unwrap();
+    let before = ledger.chain_head().unwrap();
+    assert!(journal.adopt_legacy(&review, BASE + 2).is_err());
+    assert_eq!(ledger.chain_head().unwrap(), before);
+    assert!(journal.state(account()).is_err());
+    journal
+        .adopt_legacy(&journal.review_legacy(account()).unwrap(), BASE + 3)
+        .unwrap();
+    assert!(journal.authorize(agent(), account(), BASE + 4).is_err());
+}
+
+#[test]
+fn defensive_invalid_mac_is_rejected_without_changing_accounting_projection() {
+    let (_dir, ledger, registry, journal) = authenticated_fixture();
+    journal.authorize(agent(), account(), BASE).unwrap();
+    let mut guard = ledger.lock().unwrap();
+    let tx = guard.transaction().unwrap();
+    let mut history = history(&ledger, &tx, true).unwrap();
+    let authority = &mut history.authorities[0];
+    let payload = authority.event.payload.as_mut().unwrap();
+    payload["mac"] = json!("00".repeat(32));
+    // Unit-test the MAC verifier directly. This temporary malformed fixture is
+    // rolled back; no forged chain or replacement anchor is constructed.
+    tx.execute(
+        "UPDATE events SET payload = ?1 WHERE seq = ?2",
+        params![
+            super::super::hash::canonical_json(payload).unwrap(),
+            authority.seq
+        ],
+    )
+    .unwrap();
+    assert!(
+        matches!(authority::verify(&registry, &tx, &history), Err(PilotError::Unavailable { detail }) if detail.contains("MAC mismatch"))
+    );
+    let state = project(&history, &history.authorities[0]).unwrap();
+    assert_eq!(state.executed_usd, Decimal::ZERO);
+    tx.rollback().unwrap();
 }
 fn agent() -> AgentId {
     AgentId::new("synthetic-pilot")
@@ -20,10 +414,10 @@ fn agent() -> AgentId {
 fn dec(value: &str) -> Decimal {
     Decimal::from_str_exact(value).unwrap()
 }
-fn fixture() -> (TempDir, Arc<Ledger>, PilotJournal) {
+fn fixture() -> (TempDir, Arc<Ledger>, LegacyPilotJournal) {
     let dir = TempDir::new().unwrap();
     let ledger = Arc::new(Ledger::open(dir.path(), Network::Testnet).unwrap());
-    let journal = PilotJournal::new(ledger.clone());
+    let journal = LegacyPilotJournal::new(ledger.clone());
     (dir, ledger, journal)
 }
 
@@ -336,7 +730,7 @@ fn authorization_is_immutable_testnet_bound_and_excludes_old_rows() {
     );
     let mainnet = Arc::new(Ledger::open(dir.path(), Network::Mainnet).unwrap());
     assert!(
-        PilotJournal::new(mainnet)
+        LegacyPilotJournal::new(mainnet)
             .authorize(agent(), account(), BASE)
             .is_err()
     );
@@ -752,7 +1146,7 @@ fn duplicate_cloid_before_observed_is_durably_halted_even_when_correct() {
         drop(journal);
         drop(ledger);
         let ledger = Arc::new(Ledger::open(dir.path(), Network::Testnet).unwrap());
-        let journal = PilotJournal::new(ledger.clone());
+        let journal = LegacyPilotJournal::new(ledger.clone());
         let reopened = journal.state(account()).unwrap().unwrap();
         assert_eq!(reopened.halt, stopped.halt);
         assert_eq!(reopened.executed_usd, dec("10"));
@@ -1008,6 +1402,122 @@ impl crate::ledger::HeadAnchor for FailedPublication {
 }
 
 #[test]
+fn signed_consent_and_adoption_retry_publish_the_verified_head_without_reset() {
+    use std::sync::atomic::Ordering;
+    for adopting in [false, true] {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("publication.db");
+        let witnessed = Arc::new(std::sync::Mutex::new(None));
+        let fail = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let anchor = || {
+            Box::new(FailedPublication {
+                witnessed: witnessed.clone(),
+                fail: fail.clone(),
+            })
+        };
+        let ledger =
+            Arc::new(Ledger::open_anchored(&path, Network::Testnet, Some(anchor())).unwrap());
+        let registry = Arc::new(
+            super::super::RegistryJournal::open(
+                ledger.clone(),
+                Arc::new(crate::keys::HmacKey::from_bytes([31; 32])),
+            )
+            .unwrap(),
+        );
+        registry
+            .grant(audit_route(agent(), account(), BASE - 1).binding, BASE - 1)
+            .unwrap();
+        let journal = PilotJournal::new(registry.clone());
+        let review = if adopting {
+            LegacyPilotJournal::new(ledger.clone())
+                .authorize(agent(), account(), BASE)
+                .unwrap();
+            begin(&ledger, &order(1, "1"));
+            Some(journal.review_legacy(account()).unwrap())
+        } else {
+            None
+        };
+        let mutate = || match &review {
+            Some(review) => journal.adopt_legacy(review, BASE + 10),
+            None => journal.authorize(agent(), account(), BASE),
+        };
+        let before = ledger.chain_head().unwrap();
+        fail.store(true, Ordering::SeqCst);
+        assert!(mutate().is_err());
+        let committed = ledger.chain_head().unwrap();
+        assert_eq!(committed.seq, before.seq + 1);
+        assert_eq!(*witnessed.lock().unwrap(), Some(before.clone()));
+        let durable = journal.state(account()).unwrap().unwrap();
+        assert_eq!(
+            durable.reserved_usd,
+            if adopting { dec("10") } else { Decimal::ZERO }
+        );
+        assert!(
+            mutate().is_err(),
+            "continued anchor failure cannot return success"
+        );
+        assert_eq!(ledger.chain_head().unwrap(), committed);
+        fail.store(false, Ordering::SeqCst);
+        assert_eq!(mutate().unwrap(), durable);
+        assert_eq!(*witnessed.lock().unwrap(), Some(committed.clone()));
+        assert_eq!(ledger.chain_head().unwrap(), committed);
+        drop(journal);
+        drop(registry);
+        drop(ledger);
+        let ledger =
+            Arc::new(Ledger::open_anchored(&path, Network::Testnet, Some(anchor())).unwrap());
+        let registry = Arc::new(
+            super::super::RegistryJournal::open(
+                ledger.clone(),
+                Arc::new(crate::keys::HmacKey::from_bytes([31; 32])),
+            )
+            .unwrap(),
+        );
+        let journal = PilotJournal::new(registry);
+        assert_eq!(journal.state(account()).unwrap().unwrap(), durable);
+        {
+            let mut guard = ledger.lock().unwrap();
+            let tx = guard.transaction().unwrap();
+            tx.execute("DELETE FROM events WHERE seq > ?1", params![before.seq])
+                .unwrap();
+            tx.execute(
+                "UPDATE chain_head SET seq = ?1, hash = ?2 WHERE id = 0",
+                params![before.seq, before.hash],
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        assert!(
+            journal.state(account()).is_err(),
+            "successful publication must expose rollback"
+        );
+    }
+}
+
+#[test]
+fn signed_pilot_fill_projection_needs_no_key_owner_and_still_latches_stop() {
+    let (_dir, ledger, registry, journal) = authenticated_fixture();
+    journal.authorize(agent(), account(), BASE).unwrap();
+    begin(&ledger, &order(1, "1"));
+    drop(journal);
+    drop(registry);
+    record(&ledger, 1, &payload(1, 1, "1", "0", "5", BASE + 10));
+    let status = status(&ledger, account()).unwrap().unwrap();
+    assert_eq!(status.authentication, PilotAuthentication::Unverified);
+    assert!(matches!(
+        status.halt,
+        Some(PilotStop::Exhausted {
+            metric: PilotMetric::RealizedLoss,
+            ..
+        })
+    ));
+    assert!(
+        matches!(status.accounting, PilotAccounting::Known { executed_usd, reserved_usd, .. } if executed_usd == dec("10") && reserved_usd == Decimal::ZERO)
+    );
+    assert!(ledger.verify().unwrap().is_intact());
+}
+
+#[test]
 fn atomic_fill_and_halt_survive_reopen_with_precommit_anchor() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("crash.db");
@@ -1020,7 +1530,7 @@ fn atomic_fill_and_halt_survive_reopen_with_precommit_anchor() {
         })
     };
     let ledger = Arc::new(Ledger::open_anchored(&path, Network::Testnet, Some(anchor())).unwrap());
-    let journal = PilotJournal::new(ledger.clone());
+    let journal = LegacyPilotJournal::new(ledger.clone());
     journal.authorize(agent(), account(), BASE).unwrap();
     let clearance = order(1, "1");
     begin(&ledger, &clearance);
@@ -1055,7 +1565,7 @@ fn atomic_fill_and_halt_survive_reopen_with_precommit_anchor() {
         ledger.verify().unwrap().is_intact(),
         "embedded stop has the ordinary single-row crash window"
     );
-    let state = PilotJournal::new(ledger.clone())
+    let state = LegacyPilotJournal::new(ledger.clone())
         .state(account())
         .unwrap()
         .unwrap();
@@ -1085,7 +1595,7 @@ fn unconfigured_signing_permit_also_serializes_authorization() {
     let (done_tx, done_rx) = mpsc::channel();
     let worker = std::thread::spawn(move || {
         attempt_tx.send(()).unwrap();
-        let result = PilotJournal::new(other).authorize(agent(), account(), BASE);
+        let result = LegacyPilotJournal::new(other).authorize(agent(), account(), BASE);
         done_tx.send(result).unwrap();
     });
     attempt_rx.recv_timeout(Duration::from_secs(5)).unwrap();

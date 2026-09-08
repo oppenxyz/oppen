@@ -114,7 +114,7 @@ struct Runtime {
     ledger: Arc<Ledger>,
     app: Router,
     pairings: crate::server::Pairings,
-    registry: oppen_core::ledger::RegistryJournal,
+    registry: Arc<oppen_core::ledger::RegistryJournal>,
     token: String,
     session: String,
     account: Address,
@@ -169,8 +169,9 @@ impl Runtime {
             .unwrap(),
         );
         let hmac = Arc::new(oppen_core::keys::HmacKey::from_bytes([77; 32]));
-        let registry =
-            oppen_core::ledger::RegistryJournal::open(ledger.clone(), hmac.clone()).unwrap();
+        let registry = Arc::new(
+            oppen_core::ledger::RegistryJournal::open(ledger.clone(), hmac.clone()).unwrap(),
+        );
         if first_open {
             registry
                 .grant(
@@ -188,9 +189,7 @@ impl Runtime {
             .route_for_agent(&agent)
             .expect("restart must replay an existing active route");
         assert_eq!(route.binding.container, account);
-        let policy_journal = Arc::new(PolicyJournal::new(Arc::new(
-            oppen_core::ledger::RegistryJournal::open(ledger.clone(), hmac.clone()).unwrap(),
-        )));
+        let policy_journal = Arc::new(PolicyJournal::new(registry.clone()));
         if first_open && initialize_policy {
             let at = now_ms();
             let review =

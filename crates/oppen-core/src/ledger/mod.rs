@@ -78,7 +78,10 @@ use serde_json::Value;
 
 pub use anchor::{Anchor, FileAnchor, HeadAnchor};
 pub use pairing::{PairingBinding, PairingError, PairingId, PairingJournal, PairingRecord};
-pub use pilot::{PilotAccounting, PilotError, PilotJournal, PilotState, PilotStatus, PilotStop};
+pub use pilot::{
+    LegacyPilotReview, PilotAccounting, PilotAuthentication, PilotError, PilotJournal, PilotState,
+    PilotStatus, PilotStop,
+};
 pub use policy::{PolicyError, PolicyJournal, PolicyVersion};
 pub use registry::{AuthorizedRoute, RegistryBinding, RegistryError, RegistryJournal};
 pub use submission::{
@@ -318,6 +321,8 @@ pub enum EventKind {
     SubmissionResolved,
     /// Operator-confirmed testnet pilot identity and cumulative authority.
     PilotAuthorized,
+    /// Explicit authenticated adoption of original legacy pilot consent.
+    PilotAdopted,
     /// Irreversible exhaustion of this pilot's cumulative authority.
     PilotHalted,
     /// Authenticated operator-issued MCP credential identity, never its bearer.
@@ -369,6 +374,7 @@ impl EventKind {
             EventKind::SubmissionStarted => "submission_started",
             EventKind::SubmissionResolved => "submission_resolved",
             EventKind::PilotAuthorized => "pilot_authorized",
+            EventKind::PilotAdopted => "pilot_adopted",
             EventKind::PilotHalted => "pilot_halted",
             EventKind::PairingIssued => "pairing_issued",
             EventKind::PairingRevoked => "pairing_revoked",
@@ -402,6 +408,7 @@ impl std::str::FromStr for EventKind {
             "submission_started" => Ok(EventKind::SubmissionStarted),
             "submission_resolved" => Ok(EventKind::SubmissionResolved),
             "pilot_authorized" => Ok(EventKind::PilotAuthorized),
+            "pilot_adopted" => Ok(EventKind::PilotAdopted),
             "pilot_halted" => Ok(EventKind::PilotHalted),
             "pairing_issued" => Ok(EventKind::PairingIssued),
             "pairing_revoked" => Ok(EventKind::PairingRevoked),
@@ -926,7 +933,7 @@ impl Ledger {
             EventKind::SubmissionStarted | EventKind::SubmissionResolved => {
                 Err(LedgerError::UseSubmissionJournal)
             }
-            EventKind::PilotAuthorized | EventKind::PilotHalted => {
+            EventKind::PilotAuthorized | EventKind::PilotAdopted | EventKind::PilotHalted => {
                 Err(LedgerError::UsePilotJournal)
             }
             EventKind::PairingIssued | EventKind::PairingRevoked => {
@@ -1965,7 +1972,7 @@ impl EventViews {
         SubmissionJournal::new(self.0.clone())
     }
 
-    /// Verified operator safety status without authorization or reset capability.
+    /// Chain-checked accounting inspection, not authenticated operator consent.
     pub fn pilot_status(
         &self,
         account: oppen_hl::Address,
@@ -2356,11 +2363,22 @@ fn sub_account_from_row(row: &Row<'_>) -> Result<SubAccount> {
 /// - an operator mutation is [`EventKind::OperatorAction`].
 pub(crate) struct LedgerAuditSink {
     policy: Arc<PolicyJournal>,
+    pilot_required: bool,
 }
 
 impl LedgerAuditSink {
     pub(crate) fn new(policy: Arc<PolicyJournal>) -> Self {
-        Self { policy }
+        Self {
+            policy,
+            pilot_required: false,
+        }
+    }
+
+    pub(crate) fn supervised(policy: Arc<PolicyJournal>) -> Self {
+        Self {
+            policy,
+            pilot_required: true,
+        }
     }
 }
 
@@ -2444,7 +2462,8 @@ impl crate::guardrail::AuditSink for LedgerAuditSink {
                 });
             }
         }
-        pilot::check_before_sign(ledger, &permit, clearance).map_err(PilotError::into_refusal)?;
+        pilot::check_authenticated_before_sign(registry, &permit, clearance, self.pilot_required)
+            .map_err(PilotError::into_refusal)?;
         Ok(Box::new(permit))
     }
 

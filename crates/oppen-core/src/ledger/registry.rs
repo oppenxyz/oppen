@@ -361,6 +361,10 @@ impl RegistryJournal {
         &self.ledger
     }
 
+    pub(super) fn shared_ledger(&self) -> Arc<Ledger> {
+        self.ledger.clone()
+    }
+
     pub(super) fn authority_key(&self) -> &HmacKey {
         &self.key
     }
