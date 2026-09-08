@@ -2,6 +2,8 @@ use super::*;
 
 #[path = "kill_release_tests.rs"]
 mod kill_release_tests;
+#[path = "pilot_consent_tests.rs"]
+mod pilot_consent_tests;
 use crate::feed::{FeedSession, TestIngress};
 use crate::guardrail::{LegacyPolicyReview, MarginMode};
 use crate::keys::{HmacKey, MemoryKeyStore, SecretText};

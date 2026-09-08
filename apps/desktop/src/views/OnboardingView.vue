@@ -6,7 +6,7 @@ import SetupTracker from "../components/tour/SetupTracker.vue";
 import UiButton from "../components/ui/UiButton.vue";
 import { setView, shell } from "../stores/shell";
 import { startTour, TOUR } from "../stores/tour";
-import { openPolicySettings } from "../stores/settings";
+import { openPolicySettings, openPilotConsentSettings } from "../stores/settings";
 </script>
 
 <template>
@@ -29,6 +29,7 @@ import { openPolicySettings } from "../stores/settings";
         <UiButton @click="setView('builder')">Open MCP setup</UiButton>
         <p class="copy">Existing TESTNET registry and authentication key required for paused policy setup. Saving policy does not activate trading.</p>
         <UiButton @click="openPolicySettings">Set up paused policy</UiButton>
+        <UiButton @click="openPilotConsentSettings">Review initial pilot consent</UiButton>
       </PanelHousing>
       <SetupTracker />
 

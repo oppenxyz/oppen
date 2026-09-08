@@ -7,7 +7,8 @@ import PilotStatusBanner from "./components/shell/PilotStatusBanner.vue";
 import DesktopRuntimeBanner from "./components/shell/DesktopRuntimeBanner.vue";
 import AgentHaltBanner from "./components/shell/AgentHaltBanner.vue";
 import { supervision } from "./stores/supervision";
-import { policySetup } from "./stores/policy-setup";
+import { policySetup, policySetupOwnsContext } from "./stores/policy-setup";
+import { pilotConsent, consentOwnsContext } from "./stores/pilot-consent";
 import { activation, activationContext } from "./stores/activation";
 import { release, releaseContext } from "./stores/release";
 import TourSpotlight from "./components/tour/TourSpotlight.vue";
@@ -39,6 +40,10 @@ const VIEWS: Record<View, Component> = {
 };
 
 const current = computed(() => VIEWS[shell.view]);
+watch(() => ({ network: shell.network, blocked: policySetupOwnsContext(policySetup.state) ? "Paused policy setup owns the context."
+  : supervision.state.stopRequested || supervision.state.command || supervision.state.error || supervision.state.status?.phase !== "idle"
+    ? "A current idle MCP runtime is required before initial consent." : null }), context => pilotConsent.setContext(context), { immediate: true, flush: "sync" });
+watch(() => consentOwnsContext(pilotConsent.state), owned => supervision.setSetupBlocked(owned), { immediate: true, flush: "sync" });
 watch(() => activationContext(shell.network, supervision.state), context => activation.setContext(context), { immediate: true, flush: "sync" });
 watch(() => releaseContext(shell.network, supervision.state), context => release.setContext(context), { immediate: true, flush: "sync" });
 watch(() => !!release.state.command || ["reviewing", "review_ready", "confirming", "reconciling", "uncertain"].includes(release.state.status?.phase ?? ""),
@@ -51,6 +56,7 @@ onMounted(() => {
   startRuntimePolling();
   supervision.startPolling();
   policySetup.startPolling();
+  pilotConsent.startPolling();
   activation.startPolling();
   release.startPolling();
   // The socket, the rail poll and the staleness clock (items 31, 34). Started
@@ -67,6 +73,7 @@ onUnmounted(() => {
   stopRuntimePolling();
   supervision.stopPolling();
   policySetup.stopPolling();
+  pilotConsent.stopPolling();
   activation.stopPolling();
   release.stopPolling();
   stopMarketFeed();

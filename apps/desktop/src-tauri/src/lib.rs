@@ -6,6 +6,7 @@
 //! The MCP `get_state` tool reads the same [`oppen_core::state::assemble`], so
 //! the operator and the agent cannot be shown different accounts (A3).
 
+mod account_evidence;
 mod feed;
 mod local_reads;
 mod mcp_runtime;
@@ -13,6 +14,7 @@ mod operator_activation;
 mod operator_approvals;
 mod operator_halt;
 mod operator_release;
+mod pilot_consent;
 mod policy_setup;
 mod runtime;
 mod updates;
@@ -85,6 +87,44 @@ impl From<policy_setup::SetupError> for ConsoleError {
 #[tauri::command]
 fn policy_setup_status(runtime: State<'_, Runtime>) -> policy_setup::Status {
     runtime.policy_setup_status()
+}
+
+#[tauri::command]
+fn pilot_consent_status(runtime: State<'_, Runtime>) -> Option<pilot_consent::Status> {
+    runtime.pilot_consent_status()
+}
+#[tauri::command]
+fn review_pilot_consent(
+    runtime: State<'_, Runtime>,
+    agent: String,
+    account: String,
+) -> Result<pilot_consent::Status, pilot_consent::Error> {
+    runtime.review_pilot_consent(agent, account)
+}
+#[tauri::command]
+fn confirm_pilot_consent(
+    runtime: State<'_, Runtime>,
+    owner_id: String,
+    review_id: String,
+    attestations: pilot_consent::Attestations,
+) -> Result<pilot_consent::Status, pilot_consent::Error> {
+    runtime.confirm_pilot_consent(owner_id, review_id, attestations)
+}
+#[tauri::command]
+fn discard_pilot_consent(
+    runtime: State<'_, Runtime>,
+    owner_id: String,
+    review_id: String,
+) -> Result<pilot_consent::Status, pilot_consent::Error> {
+    runtime.discard_pilot_consent(owner_id, review_id)
+}
+#[tauri::command]
+fn reconcile_pilot_consent(
+    runtime: State<'_, Runtime>,
+    owner_id: String,
+    review_id: String,
+) -> Result<pilot_consent::Status, pilot_consent::Error> {
+    runtime.reconcile_pilot_consent(owner_id, review_id)
 }
 
 #[tauri::command]
@@ -695,6 +735,11 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             policy_setup_status,
+            pilot_consent_status,
+            review_pilot_consent,
+            confirm_pilot_consent,
+            discard_pilot_consent,
+            reconcile_pilot_consent,
             review_policy_setup,
             persist_policy_setup,
             discard_policy_setup,

@@ -82,8 +82,10 @@ use serde_json::Value;
 pub use anchor::{Anchor, FileAnchor, HeadAnchor};
 pub use pairing::{PairingBinding, PairingError, PairingId, PairingJournal, PairingRecord};
 pub use pilot::{
-    LegacyPilotReview, PilotAccounting, PilotAuthentication, PilotError, PilotJournal, PilotState,
-    PilotStatus, PilotStop,
+    LegacyPilotReview, PilotAccounting, PilotAuthentication, PilotConsentAttestation,
+    PilotConsentCorrelation, PilotConsentCoverage, PilotConsentDisplay, PilotConsentError,
+    PilotConsentEvidence, PilotConsentObservation, PilotConsentOutcome, PilotConsentReceipt,
+    PilotConsentReview, PilotError, PilotJournal, PilotState, PilotStatus, PilotStop,
 };
 pub use policy::{PolicyError, PolicyJournal, PolicyVersion};
 pub use registry::{AuthorizedRoute, RegistryBinding, RegistryError, RegistryJournal};
@@ -766,6 +768,7 @@ pub(crate) fn network_key(network: Network) -> &'static str {
 /// shareable at all. Every method blocks.
 #[derive(Debug)]
 pub struct Ledger {
+    identity: Arc<()>,
     connection: Mutex<Connection>,
     coordination_path: PathBuf,
     network: Network,
@@ -774,6 +777,9 @@ pub struct Ledger {
 }
 
 impl Ledger {
+    pub(crate) fn identity(&self) -> &Arc<()> {
+        &self.identity
+    }
     /// Open an existing ledger for the operator console without creating or
     /// migrating it. SQLite enforces read-only access; the normal coordinated
     /// page reader remains the single event source (spec #31, D6 and R4).
@@ -796,6 +802,7 @@ impl Ledger {
         coordination_path.push(".lock");
         Ok(Self {
             connection: Mutex::new(connection),
+            identity: Arc::new(()),
             coordination_path: PathBuf::from(coordination_path),
             network,
             genesis: hash::genesis_hash(network),
@@ -871,6 +878,7 @@ impl Ledger {
         configure(&connection)?;
         Ok(Self {
             connection: Mutex::new(connection),
+            identity: Arc::new(()),
             coordination_path,
             network,
             genesis,
@@ -930,6 +938,7 @@ impl Ledger {
         }
         Ok(Self {
             connection: Mutex::new(connection),
+            identity: Arc::new(()),
             coordination_path,
             network,
             genesis,

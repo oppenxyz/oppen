@@ -138,6 +138,8 @@ struct Inner {
     last_tick_ms: Option<u64>,
     reconciled: bool,
     failure: Option<String>,
+    initial_fill_walk: Option<crate::reconcile::FillWalkReceipt>,
+    ledger_identity: Option<Arc<()>>,
 }
 
 /// Runtime-only snapshot provenance. Invalidations replace the identity;
@@ -161,6 +163,15 @@ pub(crate) struct AdmissionGuard<'a> {
 }
 
 impl AdmissionGuard<'_> {
+    pub(crate) fn uses_ledger(&self, ledger: &crate::ledger::Ledger) -> bool {
+        self._held
+            .ledger_identity
+            .as_ref()
+            .is_some_and(|id| Arc::ptr_eq(id, ledger.identity()))
+    }
+    pub(crate) fn initial_fill_walk(&self) -> Option<&crate::reconcile::FillWalkReceipt> {
+        self._held.initial_fill_walk.as_ref()
+    }
     pub(crate) fn last_tick_ms(&self) -> Option<u64> {
         self._held.last_tick_ms
     }
@@ -196,6 +207,8 @@ impl FeedSession {
                 last_tick_ms: None,
                 reconciled: false,
                 failure: None,
+                initial_fill_walk: None,
+                ledger_identity: None,
             }),
         }
     }
@@ -266,6 +279,44 @@ impl FeedSession {
             return Err(crate::reconcile::ReconcileError::FeedIngressUnavailable);
         }
         inner.ingress = Some(ingress);
+        inner.initial_fill_walk = None;
+        Ok(())
+    }
+
+    pub(crate) fn record_fill_walk(
+        &self,
+        stamp: &FeedStamp,
+        receipt: crate::reconcile::FillWalkReceipt,
+    ) {
+        let mut inner = self.lock();
+        if stamp == &inner.stamp()
+            && receipt.initial_window
+            && inner.scope == Some((receipt.network, receipt.account))
+            && inner
+                .ledger_identity
+                .as_ref()
+                .is_some_and(|id| Arc::ptr_eq(id, &receipt.ledger_identity))
+            && inner.initial_fill_walk.is_none()
+        {
+            inner.initial_fill_walk = Some(receipt);
+        }
+    }
+
+    pub(crate) fn bind_ledger(
+        &self,
+        ledger: &crate::ledger::Ledger,
+    ) -> Result<(), crate::reconcile::ReconcileError> {
+        let mut inner = self.lock();
+        if inner
+            .ledger_identity
+            .as_ref()
+            .is_some_and(|id| !Arc::ptr_eq(id, ledger.identity()))
+        {
+            inner.reconciled = false;
+            inner.epoch = Arc::new(());
+            return Err(crate::reconcile::ReconcileError::FeedIngressUnavailable);
+        }
+        inner.ledger_identity = Some(ledger.identity().clone());
         Ok(())
     }
 

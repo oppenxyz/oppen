@@ -53,6 +53,7 @@ export function createSupervision(
   let rejectedHalt: { agent: string; account: string; owner: string; generation: number } | null = null;
   let starting = false;
   let stopping = false;
+  let setupBlocked = false;
   let haltToken: symbol | null = null;
   let haltFence: { owner: string; minimum: number } | null = null;
   const retiredOwners = new Set<string>();
@@ -136,6 +137,7 @@ export function createSupervision(
   }
 
   async function start(network: McpStatus["network"], agent: string, account: string): Promise<void> {
+    if (setupBlocked) { state.commandError = "Initial consent owns the setup context; supervision has not started."; return; }
     if (state.command !== null) return;
     state.commandError = supervisionInputError(network, agent, account);
     if (state.commandError !== null) return;
@@ -236,7 +238,8 @@ export function createSupervision(
   }
 
   return { state: readonly(state), refresh, startPolling, stopPolling, start, stop, halt, haltBlocker,
-    setReleaseActive: (active: boolean) => { state.releaseActive = active; } };
+    setReleaseActive: (active: boolean) => { state.releaseActive = active; },
+    setSetupBlocked: (blocked: boolean) => { setupBlocked = blocked; } };
 }
 
 export const supervision = createSupervision({ status: fetchMcpStatus, start: startMcp, stop: stopMcp, halt: haltMcp }, inTauri);

@@ -5,6 +5,7 @@ import {
 } from "../lib/bridge";
 import { shell } from "./shell";
 import { supervision } from "./supervision";
+import { pilotConsent, consentOwnsContext } from "./pilot-consent";
 
 function after(callback: () => void, ms: number): () => void {
   const timer = setTimeout(callback, ms);
@@ -200,6 +201,7 @@ export function createPolicySetup(
 export const policySetup = createPolicySetup(
   { status: fetchPolicySetupStatus, review: reviewPolicySetup, persist: persistPolicySetup, discard: discardPolicySetup },
   () => {
+    if (consentOwnsContext(pilotConsent.state)) return "Initial consent owns the setup context. Resolve or discard its idle review first.";
     if (shell.network !== "testnet") return "Paused policy setup is TESTNET only. The network is not switched automatically.";
     const mcp = supervision.state;
     if (mcp.stopRequested || mcp.command || mcp.error || mcp.status?.network !== "testnet" || mcp.status.phase !== "idle") {
