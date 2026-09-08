@@ -1402,3 +1402,9 @@ production dependency or new dependency version.
 | ID | Decision | Rationale |
 |---|---|---|
 | UI6 | Yellow only on changed digits in live numeric readouts; brief return to underlying ink. | Owner explicitly requested digit-level change highlighting as a general UX guide. The [design guide](design/README.md#live-numeric-changes) specifies comparison, timing and initial-read behavior. U3 candle geometry/directional colors remain intact. Runtime rollout is separate from recording this rule. |
+
+## 2026-09-08 · Durable dead-man supervision boundary
+
+| ID | Decision | Rationale |
+|---|---|---|
+| ES40 | Require a native operator-reviewed grant for account-bound arm/refresh operations through existing retained runtime ownership, core signing and authenticated ledger events. | The pure decision helper and protective-cancellation fallback do not establish durable accepted coverage. Preserve correlated accepted/rejected/unknown outcomes, distinguish possible firings from routine refreshes and expose uncertain quota. Automatic disarm is excluded pending distinct operator authority. See [dead-man supervision](specs/deadman-supervision.md); proposed contract, not implemented or live-accepted. No new signer, store, service or dependency. |
