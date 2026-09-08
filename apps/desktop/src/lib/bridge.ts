@@ -60,7 +60,7 @@ export interface AccountState {
 
 /** What the Rust side returns instead of a state. */
 export interface ConsoleError {
-  kind: "not_configured" | "venue" | "local_status";
+  kind: "not_configured" | "venue" | "local_status" | "halt_not_admitted";
   detail: string;
 }
 
@@ -69,6 +69,8 @@ export function isConsoleError(value: unknown): value is ConsoleError {
     typeof value === "object" &&
     value !== null &&
     "kind" in value &&
+    typeof value.kind === "string" &&
+    ["not_configured", "venue", "local_status", "halt_not_admitted"].includes(value.kind) &&
     typeof (value as ConsoleError).detail === "string"
   );
 }
@@ -342,6 +344,14 @@ export function fetchRuntimeStatus(): Promise<RuntimeStatus> {
 }
 
 export interface McpStatus {
+  halt: {
+    phase: "idle" | "persisting" | "persisted" | "uncertain";
+    cancellation: "not_requested" | "pending" | "retrying" | "acknowledged" | "unavailable";
+    requested_at_ms: number | null;
+    durable_revision: number | null;
+    error: string | null;
+    cancellation_error: string | null;
+  };
   phase: "idle" | "starting" | "listening" | "stopping" | "stopped" | "failed";
   network: "testnet" | "mainnet";
   agent: string | null;
@@ -361,6 +371,9 @@ export function startMcp(agent: string, account: string): Promise<McpStatus> {
   return invoke<McpStatus>("start_mcp", { agent, account });
 }
 export function stopMcp(): Promise<RuntimeStatus> { return invoke<RuntimeStatus>("stop_mcp"); }
+export function haltMcp(agent: string, account: string): Promise<McpStatus> {
+  return invoke<McpStatus>("halt_mcp", { agent, account });
+}
 
 /**
  * Point the socket at one symbol and interval.

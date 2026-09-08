@@ -385,6 +385,235 @@ fn place(cloid: &str, size: &str) -> Value {
 }
 
 #[tokio::test]
+async fn operator_halt_requested_sweep_retries_real_cancellation_without_closing_position() {
+    use crate::server::{BoundServer, SupervisionControl, SupervisionStatus};
+    use oppen_core::guardrail::KillReason;
+    use tokio_util::sync::CancellationToken;
+
+    async fn completed_after(control: &SupervisionControl, baseline: u64) -> SupervisionStatus {
+        let mut observer = control.status();
+        loop {
+            let status = observer.borrow_and_update().clone();
+            if status.completed_sequence > baseline {
+                return status;
+            }
+            observer.changed().await.expect("supervision still owned");
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let venue = Venue::start().await;
+    let runtime = Runtime::open(dir.path(), venue.port(), Arc::new(FixtureKeys::default())).await;
+    runtime.activate_orders().await;
+    let first = Cloid::from_bytes([111; 16]);
+    let second = Cloid::from_bytes([112; 16]);
+    for cloid in [&first, &second] {
+        let placed = runtime.call("place", place(cloid.as_str(), "0.12")).await;
+        assert_eq!(placed["status"], "resting", "{placed}");
+    }
+    venue.fill(first.as_str(), Decimal::new(5, 2));
+    runtime.reconcile().await;
+    let before = runtime
+        .gateway
+        .inner
+        .info
+        .clearinghouse_state(runtime.account)
+        .await
+        .unwrap();
+    assert_eq!(before.asset_positions.len(), 1);
+
+    // An earlier global stop gives the pre-request sweep genuine cancellation
+    // work. The new operator action below adds a durable agent-specific halt.
+    runtime
+        .gateway
+        .inner
+        .engine
+        .operator_engage_kill(KillScope::Global, KillReason::Operator, now_ms())
+        .unwrap();
+    venue.next_response(Behavior::Rejected);
+    venue.next_response(Behavior::Rejected);
+    let old_gate = venue.hold_info("frontendOpenOrders");
+    let bound = BoundServer::bind(0, &runtime.gateway, &runtime.pairings)
+        .await
+        .unwrap();
+    let control = bound.supervision_control();
+    let shutdown = CancellationToken::new();
+    let _shutdown_on_drop = shutdown.clone().drop_guard();
+    let mut serving = tokio::spawn(bound.serve(
+        runtime.gateway.clone(),
+        runtime.pairings.clone(),
+        shutdown.clone(),
+    ));
+    tokio::time::timeout(Duration::from_secs(5), old_gate.entered.notified())
+        .await
+        .unwrap();
+    let old = control.status().borrow().clone();
+    assert!(old.in_progress);
+    assert!(old.started_sequence > old.completed_sequence);
+    let agent = AgentId::new("fixture-agent");
+    runtime
+        .gateway
+        .inner
+        .engine
+        .operator_engage_kill(
+            KillScope::Agent {
+                agent: agent.clone(),
+            },
+            KillReason::Operator,
+            now_ms(),
+        )
+        .unwrap();
+    assert!(
+        runtime
+            .gateway
+            .inner
+            .engine
+            .paused_agents()
+            .contains(&agent)
+    );
+    let baseline = control.request_sweep();
+    assert_eq!(baseline, old.started_sequence);
+    let requested_gate = venue.hold_info("frontendOpenOrders");
+    old_gate.release.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), requested_gate.entered.notified())
+        .await
+        .unwrap();
+    let active = control.status().borrow().clone();
+    assert_eq!(
+        active.completed_sequence, baseline,
+        "old in-flight completion is not a receipt for the new halt"
+    );
+    assert!(active.started_sequence > baseline);
+    assert!(active.in_progress);
+    assert!(
+        active.last_error.is_some(),
+        "real rejected cancellation must remain visible"
+    );
+
+    // Dropping a timed-out observation cannot release the gated cancellation,
+    // advance completion, or manufacture success in a later observer.
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(20),
+            completed_after(&control, baseline)
+        )
+        .await
+        .is_err()
+    );
+    drop(control.status());
+    let retained = control.status().borrow().clone();
+    assert_eq!(retained.completed_sequence, baseline);
+    assert!(retained.in_progress);
+    assert_eq!(
+        runtime
+            .gateway
+            .inner
+            .info
+            .frontend_open_orders(runtime.account)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+
+    let retry_gate = venue.hold_info("frontendOpenOrders");
+    let retry_baseline = control.request_sweep();
+    assert_eq!(retry_baseline, active.started_sequence);
+    requested_gate.release.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), retry_gate.entered.notified())
+        .await
+        .unwrap();
+    let rejected = control.status().borrow().clone();
+    assert_eq!(rejected.completed_sequence, retry_baseline);
+    assert!(
+        rejected.completed_sequence > baseline,
+        "post-request failure is completion, not successful cancellation"
+    );
+    assert!(rejected.last_error.is_some());
+    assert_eq!(
+        runtime
+            .gateway
+            .inner
+            .info
+            .frontend_open_orders(runtime.account)
+            .await
+            .unwrap()
+            .len(),
+        2,
+        "failed cancellation retains both actual resting orders"
+    );
+    assert!(
+        runtime
+            .gateway
+            .runtime_cancellation_needed(&Binding {
+                agent: agent.clone(),
+                account: runtime.account
+            })
+            .await
+            .unwrap()
+    );
+    retry_gate.release.notify_one();
+    let success = tokio::time::timeout(
+        Duration::from_secs(5),
+        completed_after(&control, retry_baseline),
+    )
+    .await
+    .unwrap();
+    assert!(success.last_error.is_none(), "{success:?}");
+    assert!(success.completed_sequence > retry_baseline);
+    assert!(
+        runtime
+            .gateway
+            .inner
+            .info
+            .frontend_open_orders(runtime.account)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let after = runtime
+        .gateway
+        .inner
+        .info
+        .clearinghouse_state(runtime.account)
+        .await
+        .unwrap();
+    assert_eq!(
+        after.asset_positions, before.asset_positions,
+        "operator halt cancels resting orders, never closes the partial-fill position"
+    );
+    assert!(
+        runtime
+            .gateway
+            .inner
+            .engine
+            .paused_agents()
+            .contains(&agent)
+    );
+    let submissions = venue.submissions();
+    assert_eq!(
+        submissions.len(),
+        5,
+        "two orders and three actual cancel attempts"
+    );
+    for cancel in &submissions[2..] {
+        assert_eq!(cancel["action"]["type"], "cancel");
+        assert_eq!(cancel["action"]["cancels"].as_array().unwrap().len(), 2);
+        assert!(cancel["signature"].is_object());
+    }
+    assert!(runtime.ledger.verify().unwrap().is_intact());
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(5), &mut serving)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    drop(control);
+    runtime.shutdown().await;
+    venue.shutdown().await;
+}
+
+#[tokio::test]
 async fn real_mcp_signs_reconciles_partial_fill_cancels_and_closes() {
     let dir = tempfile::tempdir().unwrap();
     let venue = Venue::start().await;

@@ -1,5 +1,5 @@
 import { reactive, readonly } from "vue";
-import { fetchMcpStatus, inTauri, startMcp, stopMcp, type McpStatus, type RuntimeStatus } from "../lib/bridge";
+import { fetchMcpStatus, haltMcp, inTauri, isConsoleError, startMcp, stopMcp, type McpStatus, type RuntimeStatus } from "../lib/bridge";
 
 function detail(error: unknown): string {
   if (typeof error === "object" && error !== null && "detail" in error && typeof error.detail === "string") return error.detail;
@@ -24,7 +24,7 @@ export function supervisionInputError(network: McpStatus["network"], agent: stri
 
 /** Read-only polling never starts supervision. Explicit commands retain ownership across remounts. */
 export function createSupervision(
-  transport: { status: typeof fetchMcpStatus; start: typeof startMcp; stop: typeof stopMcp },
+  transport: { status: typeof fetchMcpStatus; start: typeof startMcp; stop: typeof stopMcp; halt: typeof haltMcp },
   available: () => boolean = () => true,
   schedule: typeof after = after,
 ) {
@@ -32,10 +32,13 @@ export function createSupervision(
     status: McpStatus | null; error: string | null; commandError: string | null;
     command: "start" | "stop" | null; reading: boolean; checkedAt: number | null;
     stopRequested: boolean; runtime: RuntimeStatus | null;
-  }>({ status: null, error: null, commandError: null, command: null, reading: false, checkedAt: null, stopRequested: false, runtime: null });
+    haltPending: boolean; haltRequested: boolean; haltNotAdmitted: boolean; haltError: string | null;
+  }>({ status: null, error: null, commandError: null, command: null, reading: false, checkedAt: null, stopRequested: false, runtime: null, haltPending: false, haltRequested: false, haltNotAdmitted: false, haltError: null });
   let active = false;
   let generation = 0;
   let version = 0;
+  let observations = 0;
+  let rejectedHalt: { agent: string; account: string } | null = null;
   let starting = false;
   let stopping = false;
   let cancelPoll: (() => void) | null = null;
@@ -55,8 +58,15 @@ export function createSupervision(
       const status = await transport.status();
       if (!active || owner !== generation || observed !== version || expired) return;
       state.status = status;
+      observations += 1;
       state.error = null;
       state.checkedAt = Date.now();
+      if (rejectedHalt !== null && !state.stopRequested && state.command !== "start"
+        && status.network === "testnet" && status.phase === "listening" && status.halt.phase === "idle"
+        && status.agent === rejectedHalt.agent && status.account === rejectedHalt.account) {
+        state.haltRequested = false;
+        rejectedHalt = null;
+      }
     } catch (error) {
       if (active && owner === generation && observed === version && !expired) state.error = detail(error);
     } finally {
@@ -139,10 +149,58 @@ export function createSupervision(
     finally { version += 1; stopping = false; state.command = starting ? "start" : null; void refresh(); }
   }
 
-  return { state: readonly(state), refresh, startPolling, stopPolling, start, stop };
+  function haltBlocker(network: McpStatus["network"]): string | null {
+    if (!available()) return "Agent halt is available only in the desktop app.";
+    if (network !== "testnet" || state.status?.network !== "testnet") return "Agent halt requires the bound TESTNET runtime.";
+    if (state.stopRequested || terminal(state.status)) return "Runtime admission is closed; agent halt is unavailable.";
+    if (state.command === "start") return "Runtime startup has not completed; agent halt is not yet available.";
+    if (state.status?.phase !== "listening" || !state.status.agent || !state.status.account) return "No listening runtime agent/account binding has been read.";
+    if (state.error !== null) return "Current runtime binding is unavailable; halt has not been submitted.";
+    if (state.haltPending || state.haltRequested || state.status.halt?.phase !== "idle") return "A halt has already been requested; inspect persistence and cancellation evidence.";
+    return null;
+  }
+
+  async function halt(network: McpStatus["network"], confirmed: { agent: string; account: string }): Promise<void> {
+    if (state.haltPending || state.haltRequested) return;
+    state.haltError = haltBlocker(network);
+    if (state.haltError !== null) return;
+    const binding = state.status!;
+    if (confirmed.agent !== binding.agent || confirmed.account !== binding.account) {
+      state.haltError = "The runtime binding changed. Confirm the current agent and account before halting.";
+      return;
+    }
+    state.haltPending = true;
+    state.haltRequested = true;
+    state.haltNotAdmitted = false;
+    rejectedHalt = null;
+    version += 1;
+    const observed = observations;
+    try {
+      const status = await transport.halt(binding.agent!, binding.account!);
+      // Admission replies can lag newer poll evidence, including a terminal stop.
+      if (observations === observed && !state.stopRequested && !terminal(state.status)
+        && state.status?.agent === binding.agent && state.status.account === binding.account
+        && status.agent === binding.agent && status.account === binding.account && status.network === "testnet") {
+        state.status = status;
+        state.checkedAt = Date.now();
+        version += 1;
+      }
+    } catch (error) {
+      state.haltError = detail(error);
+      if (isConsoleError(error) && error.kind === "halt_not_admitted") {
+        state.haltNotAdmitted = true;
+        rejectedHalt = { agent: binding.agent!, account: binding.account! };
+      }
+      // Only reads admitted after this rejection may unlock an explicit retry.
+      version += 1;
+    }
+    finally { state.haltPending = false; void refresh(); }
+  }
+
+  return { state: readonly(state), refresh, startPolling, stopPolling, start, stop, halt, haltBlocker };
 }
 
-export const supervision = createSupervision({ status: fetchMcpStatus, start: startMcp, stop: stopMcp }, inTauri);
+export const supervision = createSupervision({ status: fetchMcpStatus, start: startMcp, stop: stopMcp, halt: haltMcp }, inTauri);
 
 export const MCP_PHASES: Record<McpStatus["phase"], string> = {
   idle: "Not started", starting: "Starting supervision", listening: "Listening",
@@ -154,4 +212,25 @@ export function pauseSweepLabel(status: Readonly<McpStatus> | null): string {
   if (status.supervision_in_progress) return "In progress";
   if (status.supervision_error != null) return "Last attempt failed";
   return status.supervision_last_completed_ms == null ? "Not observed" : "Completed";
+}
+
+export function haltNotice(reading: {
+  status: Readonly<McpStatus> | null; haltPending: boolean; haltRequested: boolean; haltNotAdmitted?: boolean; haltError: string | null;
+}) {
+  const halt = reading.status?.halt;
+  if ((!halt || (halt.phase === "idle" && halt.cancellation === "not_requested"))
+    && !reading.haltPending && !reading.haltRequested && reading.haltError === null) return null;
+  const phases = {
+    idle: "Halt requested; persistence unconfirmed", persisting: "Halt persistence pending",
+    persisted: "Agent pause persisted", uncertain: "Halt durability uncertain",
+  };
+  const cancellations = {
+    not_requested: "Cancellation not requested", pending: "Cancellation pending", retrying: "Cancellation retrying",
+    acknowledged: "Cancellation acknowledged", unavailable: "Cancellation unavailable",
+  };
+  return {
+    title: halt?.phase === "idle" && reading.haltNotAdmitted ? "Halt not admitted" : halt?.phase === "idle" && !reading.haltRequested ? "Halt not submitted" : phases[halt?.phase ?? "idle"],
+    cancellation: reading.haltRequested && !reading.haltNotAdmitted && (!halt || halt.phase === "idle") ? "Cancellation unconfirmed" : cancellations[halt?.cancellation ?? "not_requested"],
+    revision: halt?.durable_revision ?? null,
+  };
 }

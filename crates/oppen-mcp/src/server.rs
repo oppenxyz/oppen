@@ -30,7 +30,7 @@ use rmcp::transport::streamable_http_server::{
 };
 use rmcp::{ErrorData, RoleServer, ServerHandler};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::sync::watch;
+use tokio::sync::{Notify, watch};
 use tokio_util::io::ReaderStream;
 use tokio_util::sync::CancellationToken;
 
@@ -223,14 +223,38 @@ pub struct BoundServer {
     address: SocketAddr,
     network: oppen_hl::Network,
     supervision: watch::Sender<SupervisionStatus>,
+    supervision_wake: Arc<Notify>,
 }
 
 /// Cached pause-sweep observation, not proof that the venue is flat or ready.
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct SupervisionStatus {
+    pub started_sequence: u64,
+    pub completed_sequence: u64,
     pub in_progress: bool,
     pub last_completed_ms: Option<u64>,
     pub last_error: Option<String>,
+}
+
+/// Native-only sweep wake and observation, not a cancellation receipt.
+#[derive(Clone)]
+pub struct SupervisionControl {
+    status: watch::Receiver<SupervisionStatus>,
+    wake: Arc<Notify>,
+}
+
+impl SupervisionControl {
+    /// Call after the durable halt. Only completion strictly above this baseline
+    /// can describe a subsequent sweep; its error must still be checked.
+    pub fn request_sweep(&self) -> u64 {
+        let baseline = self.status.borrow().started_sequence;
+        self.wake.notify_one();
+        baseline
+    }
+
+    pub fn status(&self) -> watch::Receiver<SupervisionStatus> {
+        self.status.clone()
+    }
 }
 
 impl BoundServer {
@@ -244,6 +268,7 @@ impl BoundServer {
             address,
             network: gateway.network(),
             supervision: watch::channel(SupervisionStatus::default()).0,
+            supervision_wake: Arc::new(Notify::new()),
         })
     }
 
@@ -253,6 +278,13 @@ impl BoundServer {
 
     pub fn supervision_status(&self) -> watch::Receiver<SupervisionStatus> {
         self.supervision.subscribe()
+    }
+
+    pub fn supervision_control(&self) -> SupervisionControl {
+        SupervisionControl {
+            status: self.supervision.subscribe(),
+            wake: self.supervision_wake.clone(),
+        }
     }
 
     pub async fn serve(
@@ -268,7 +300,15 @@ impl BoundServer {
             ));
         }
         validate_pairing_network(self.network, &pairings)?;
-        serve_bound(self.listener, gateway, pairings, shutdown, self.supervision).await
+        serve_bound(
+            self.listener,
+            gateway,
+            pairings,
+            shutdown,
+            self.supervision,
+            self.supervision_wake,
+        )
+        .await
     }
 }
 
@@ -301,6 +341,7 @@ async fn serve_bound(
     pairings: Pairings,
     shutdown: CancellationToken,
     supervision: watch::Sender<SupervisionStatus>,
+    supervision_wake: Arc<Notify>,
 ) -> std::io::Result<()> {
     let addr = listener.local_addr()?;
     tracing::info!(%addr, path = MCP_PATH, "MCP gateway listening on loopback");
@@ -321,26 +362,30 @@ async fn serve_bound(
         let mut interval = tokio::time::interval(Duration::from_secs(5));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
+            let sequence = tokio::select! {
+                biased;
+                () = enforcement_shutdown.cancelled() => break,
+                sequence = next_supervision(&mut interval, &supervision_wake, &supervision) => {
+                    let Some(sequence) = sequence else {
+                        tracing::error!("pause supervision sequence exhausted");
+                        break;
+                    };
+                    sequence
+                }
+            };
             tokio::select! {
                 biased;
                 () = enforcement_shutdown.cancelled() => break,
                 () = async {
-                    interval.tick().await;
-                    supervision.send_modify(|status| status.in_progress = true);
-                    let bindings = match enforcement_pairings.try_read() {
-                        Ok(store) => store.bindings(),
-                        Err(error) => {
-                            tracing::warn!(%error, "pause enforcement could not read pairings; will retry");
-                            finish_supervision(&supervision, Some("pairing authority unavailable; pause sweep will retry".into()));
-                            return;
-                        }
+                    let Some(bindings) = supervision_bindings(&enforcement_pairings, &supervision, sequence) else {
+                        return;
                     };
                     let tracker = ExecutionTracker::supervision(&enforcement_execution, enforcement_pairings.clone());
                     let result = enforcement_gateway.enforce_pauses(&bindings, tracker).await;
                     if let Err(error) = &result {
                         tracing::warn!(%error, "pause enforcement failed; will retry");
                     }
-                    finish_supervision(&supervision, result.err().map(|error| error.to_string()));
+                    finish_supervision(&supervision, sequence, result.err().map(|error| error.to_string()));
                 } => {}
             }
         }
@@ -366,8 +411,50 @@ async fn serve_bound(
     .await
 }
 
-fn finish_supervision(status: &watch::Sender<SupervisionStatus>, error: Option<String>) {
+async fn next_supervision(
+    interval: &mut tokio::time::Interval,
+    wake: &Notify,
+    status: &watch::Sender<SupervisionStatus>,
+) -> Option<u64> {
+    tokio::select! {
+        _ = interval.tick() => {},
+        () = wake.notified() => {},
+    }
+    // Only the supervisor writes sequences. Never wrap into an old receipt.
+    let sequence = status.borrow().started_sequence.checked_add(1)?;
     status.send_modify(|status| {
+        status.started_sequence = sequence;
+        status.in_progress = true;
+    });
+    Some(sequence)
+}
+
+fn supervision_bindings(
+    pairings: &Pairings,
+    status: &watch::Sender<SupervisionStatus>,
+    sequence: u64,
+) -> Option<Vec<crate::auth::Binding>> {
+    match pairings.try_read() {
+        Ok(store) => Some(store.bindings()),
+        Err(error) => {
+            tracing::warn!(%error, "pause enforcement could not read pairings; will retry");
+            finish_supervision(
+                status,
+                sequence,
+                Some("pairing authority unavailable; pause sweep will retry".into()),
+            );
+            None
+        }
+    }
+}
+
+fn finish_supervision(
+    status: &watch::Sender<SupervisionStatus>,
+    sequence: u64,
+    error: Option<String>,
+) {
+    status.send_modify(|status| {
+        status.completed_sequence = sequence;
         status.in_progress = false;
         status.last_completed_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -617,6 +704,138 @@ mod authority_tests {
     use oppen_core::guardrail::AgentId;
     use oppen_core::keys::HmacKey;
     use oppen_core::ledger::{Ledger, PairingJournal};
+
+    fn supervision_fixture() -> (watch::Sender<SupervisionStatus>, SupervisionControl) {
+        let (sender, status) = watch::channel(SupervisionStatus::default());
+        (
+            sender,
+            SupervisionControl {
+                status,
+                wake: Arc::new(Notify::new()),
+            },
+        )
+    }
+
+    fn distant_timer() -> tokio::time::Interval {
+        tokio::time::interval_at(
+            tokio::time::Instant::now() + Duration::from_secs(3600),
+            Duration::from_secs(5),
+        )
+    }
+
+    #[tokio::test]
+    async fn supervision_control_wakes_waiting_sweep_without_timer() {
+        let (status, control) = supervision_fixture();
+        let mut observer = control.status();
+        let mut timer = distant_timer();
+        let next = next_supervision(&mut timer, &control.wake, &status);
+        tokio::pin!(next);
+        tokio::select! {
+            biased;
+            _ = &mut next => panic!("timer must not admit a sweep yet"),
+            () = std::future::ready(()) => {},
+        }
+        assert_eq!(control.clone().request_sweep(), 0);
+        let sequence = tokio::time::timeout(Duration::from_secs(1), next)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(sequence, 1);
+        observer.changed().await.unwrap();
+        assert_eq!(observer.borrow().started_sequence, 1);
+        assert_eq!(observer.borrow().completed_sequence, 0);
+        assert!(observer.borrow().in_progress);
+        finish_supervision(&status, sequence, None);
+        assert_eq!(observer.borrow().completed_sequence, 1);
+        assert!(observer.borrow().last_completed_ms.is_some());
+        assert!(!observer.borrow().in_progress);
+    }
+
+    #[tokio::test]
+    async fn supervision_control_old_or_inflight_completion_cannot_satisfy_request() {
+        let (status, control) = supervision_fixture();
+        let mut timer = distant_timer();
+        control.request_sweep();
+        let old = next_supervision(&mut timer, &control.wake, &status)
+            .await
+            .unwrap();
+        finish_supervision(&status, old, None);
+        control.request_sweep();
+        let active = next_supervision(&mut timer, &control.wake, &status)
+            .await
+            .unwrap();
+        let baseline = control.request_sweep();
+        assert_eq!(baseline, active);
+        assert!(status.borrow().completed_sequence < baseline);
+        assert_eq!(control.clone().request_sweep(), baseline);
+        assert_eq!(status.borrow().started_sequence, active);
+        assert!(status.borrow().in_progress);
+        finish_supervision(&status, active, None);
+        assert_eq!(status.borrow().completed_sequence, baseline);
+
+        // Requests during the active sweep retain one permit, not one per call.
+        let subsequent = tokio::time::timeout(
+            Duration::from_secs(1),
+            next_supervision(&mut timer, &control.wake, &status),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(subsequent > baseline);
+        assert_eq!(status.borrow().completed_sequence, baseline);
+        finish_supervision(&status, subsequent, None);
+        assert!(status.borrow().completed_sequence > baseline);
+        tokio::select! {
+            biased;
+            _ = next_supervision(&mut timer, &control.wake, &status) => panic!("requests did not coalesce"),
+            () = std::future::ready(()) => {},
+        }
+    }
+
+    #[tokio::test]
+    async fn supervision_authority_failure_completes_sequence_with_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = Arc::new(
+            Ledger::open_at(&dir.path().join("ledger.db"), oppen_hl::Network::Testnet).unwrap(),
+        );
+        let pairings = Arc::new(RwLock::new(
+            TokenStore::open(
+                PairingJournal::open(ledger, Arc::new(HmacKey::from_bytes([42; 32]))).unwrap(),
+            )
+            .unwrap(),
+        ));
+        let (status, control) = supervision_fixture();
+        let mut timer = distant_timer();
+        let baseline = control.request_sweep();
+        let sequence = next_supervision(&mut timer, &control.wake, &status)
+            .await
+            .unwrap();
+        {
+            let _unavailable = pairings.write().unwrap();
+            assert!(supervision_bindings(&pairings, &status, sequence).is_none());
+        }
+        assert!(status.borrow().completed_sequence > baseline);
+        assert_eq!(status.borrow().started_sequence, sequence);
+        assert_eq!(status.borrow().completed_sequence, sequence);
+        assert!(!status.borrow().in_progress);
+        assert!(status.borrow().last_completed_ms.is_some());
+        assert!(status.borrow().last_error.is_some());
+
+        control.request_sweep();
+        let retry = next_supervision(&mut timer, &control.wake, &status)
+            .await
+            .unwrap();
+        assert!(
+            supervision_bindings(&pairings, &status, retry)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(status.borrow().completed_sequence, sequence);
+        assert!(status.borrow().last_error.is_some());
+        finish_supervision(&status, retry, None);
+        assert_eq!(status.borrow().completed_sequence, retry);
+        assert!(status.borrow().last_error.is_none());
+    }
 
     #[tokio::test]
     async fn supervisor_panic_closes_transport_but_waits_for_actual_work() {

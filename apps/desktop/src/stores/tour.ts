@@ -131,7 +131,7 @@ export const TOUR: readonly TourStep[] = [
     title: "The kill switch",
     body: "Stops an agent, or all of them, and cancels their resting orders. Risk-reducing actions still go through while it is engaged — it stops new exposure, it never traps you in a position.",
     placement: "left",
-    caveat: "The gateway halt control and per-container dead-man coverage are not connected to this console.",
+    caveat: "HALT AGENT targets the bound TESTNET runtime only. Persistence and cancellation are separate evidence; acknowledgments do not prove flat positions. Dead-man coverage is not read here.",
   },
   {
     // The status bar is shell furniture, on screen whatever view is open, so

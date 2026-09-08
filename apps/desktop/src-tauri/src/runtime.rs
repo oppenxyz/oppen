@@ -971,6 +971,34 @@ impl Runtime {
         status
     }
 
+    pub(crate) fn halt_mcp(
+        &self,
+        agent: String,
+        account: String,
+    ) -> Result<McpStatus, RuntimeError> {
+        let binding = Binding {
+            agent: AgentId::new(agent),
+            account: account
+                .parse()
+                .map_err(|error| RuntimeError::Failed(format!("invalid MCP account: {error}")))?,
+        };
+        let mut control = self.control();
+        Self::admit(&mut control, Network::Testnet)?;
+        if control.mcp_binding.as_ref() != Some(&binding) {
+            return Err(RuntimeError::ContextChanged);
+        }
+        if status_lock(&self.0.mcp_status).phase != McpPhase::Listening {
+            return Err(RuntimeError::Busy);
+        }
+        let owned = self.0.mcp.try_lock().map_err(|_| RuntimeError::Busy)?;
+        owned
+            .as_ref()
+            .ok_or(RuntimeError::Busy)?
+            .request_halt(&binding)
+            .map_err(RuntimeError::Failed)?;
+        Ok(status_lock(&self.0.mcp_status).clone())
+    }
+
     pub(crate) fn start_mcp(
         &self,
         agent: String,

@@ -54,8 +54,10 @@ export async function fetchRuntimeStatus(): Promise<RuntimeStatus> {
   };
 }
 
-const mcpScenario = new URLSearchParams(location.search).get("mcp") ?? "idle";
+const haltScenario = new URLSearchParams(location.search).get("halt");
+const mcpScenario = new URLSearchParams(location.search).get("mcp") ?? (haltScenario ? "listening" : "idle");
 let mcpStatus: McpStatus = {
+  halt: { phase: "idle", cancellation: "not_requested", requested_at_ms: null, durable_revision: null, error: null, cancellation_error: null },
   phase: mcpScenario === "listening" || mcpScenario === "sweep_error" ? "listening" : mcpScenario === "failed" ? "failed" : "idle",
   network: "testnet", agent: null, account: null, listener: null,
   reconciled: null, account_feeds_ready: null, orders_inhibited: true,
@@ -69,17 +71,40 @@ if (mcpScenario === "sweep_error") {
   mcpStatus.supervision_last_completed_ms = 1_788_998_400_000;
   mcpStatus.supervision_error = "UI fixture: pause cancellation failed; next sweep will retry. " + "retained-cancel-error/".repeat(20);
 }
-export async function fetchMcpStatus(): Promise<McpStatus> { return { ...mcpStatus }; }
+function copyMcpStatus(): McpStatus { return { ...mcpStatus, halt: { ...mcpStatus.halt } }; }
+export async function fetchMcpStatus(): Promise<McpStatus> { return copyMcpStatus(); }
 export async function startMcp(agent: string, requestedAccount: string): Promise<McpStatus> {
   if (stoppedRuntime) throw { detail: "UI fixture: runtime shutdown is terminal. Restart required." };
   if (mcpScenario === "failed" || requestedAccount !== account.address) throw { detail: "UI fixture: existing authorized pilot/account setup does not match. No setup was created." };
   mcpStatus = { ...mcpStatus, phase: "listening", agent, account: requestedAccount, listener: "127.0.0.1:7433", orders_inhibited: true };
-  return { ...mcpStatus };
+  return copyMcpStatus();
 }
 export async function stopMcp(): Promise<RuntimeStatus> {
   mcpStatus = { ...mcpStatus, phase: "stopped", listener: null, reconciled: null, account_feeds_ready: null, supervision_in_progress: false };
   stoppedRuntime = { phase: "stopped", binding: null, detail: "UI fixture: desktop tasks stopped. Restart required." };
   return { ...stoppedRuntime };
+}
+
+/** Local visual-test control only; no native or venue call. */
+export function setHaltFixture(phase: "persisting" | "persisted" | "uncertain" | "retrying" | "acknowledged"): void {
+  mcpStatus.halt = {
+    phase: phase === "retrying" || phase === "acknowledged" ? "persisted" : phase,
+    cancellation: phase === "retrying" ? "retrying" : phase === "acknowledged" ? "acknowledged" : "pending",
+    requested_at_ms: 1_788_998_400_000,
+    durable_revision: phase === "persisting" || phase === "uncertain" ? null : 42,
+    error: phase === "uncertain" ? "UI fixture: policy commit outcome is uncertain. " + "retained-authority-error/".repeat(16) : null,
+    cancellation_error: phase === "retrying" ? "UI fixture: cancellation failed; supervision will retry. " + "cancel-evidence/".repeat(16) : null,
+  };
+  mcpStatus.orders_inhibited = true;
+}
+if (haltScenario === "persisting" || haltScenario === "persisted" || haltScenario === "uncertain" || haltScenario === "retrying" || haltScenario === "acknowledged") setHaltFixture(haltScenario);
+
+export async function haltMcp(agent: string, requestedAccount: string): Promise<McpStatus> {
+  if (stoppedRuntime || mcpStatus.phase !== "listening" || agent !== mcpStatus.agent || requestedAccount !== mcpStatus.account) {
+    throw { detail: "UI fixture: no matching listening runtime binding." };
+  }
+  if (mcpStatus.halt.phase === "idle") setHaltFixture("persisting");
+  return copyMcpStatus();
 }
 
 export async function checkUpdate() { throw { kind: "unavailable", detail: "Updates are unavailable in the UI fixture." }; }

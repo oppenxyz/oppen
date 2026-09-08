@@ -97,6 +97,17 @@ before expanding features:
    cleared the failure-latch, quiescence and late-status fixes. Exact committed
    head review and CI remain PR gates; no live gate is claimed. See
    [desktop-mcp-runtime.md](docs/specs/desktop-mcp-runtime.md).
+   PR #58 now has green exact-head CI and separate automated review at
+   `9021e038`; the publication hold still prevents merging. Two CI-discovered
+   test-fixture races have dedicated regressions; the final native desktop
+   suite passes 49 tests. The bound-agent operator halt is implemented on
+   `feat/desktop-operator-halt` (ES21): durable kill persistence and correlated
+   cancellation evidence, distinct from stopping supervision or flattening.
+   The agent pause survives account reassignment; cleanup cannot redirect to
+   the replacement account. The full local workspace passes; native desktop
+   coverage has 56 tests and the frontend has 132. Independent automated
+   working-diff review found no blockers. Exact-head review and CI remain gates.
+   See [desktop-operator-halt.md](docs/specs/desktop-operator-halt.md).
    No dedicated-account activity has been performed during this development.
 4. **Recovery:** PR #44 merged as `06fc0e3` after green CI and separate automated
    review. The durable submission journal has SQLite reopen, independent

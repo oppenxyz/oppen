@@ -1,15 +1,31 @@
 <script setup lang="ts">
-import { computed } from "vue";
+import { computed, nextTick, ref } from "vue";
 import { formatLatency, formatUsd, NAV, setView, shell, feedLabel } from "../../stores/shell";
 import { progress } from "../../stores/tour";
 import UiButton from "../ui/UiButton.vue";
 import ApertureMark from "./ApertureMark.vue";
 import WordMark from "./WordMark.vue";
+import { supervision } from "../../stores/supervision";
 
 const venue = computed(() => feedLabel(shell.feeds.wsMarket));
 const latency = computed(() => formatLatency(shell.latencyMs));
 const equity = computed(() => formatUsd(shell.equityUsd));
 const network = computed(() => shell.network.toUpperCase());
+const haltBlocker = computed(() => supervision.haltBlocker(shell.network));
+const haltDialog = ref<HTMLDialogElement | null>(null);
+const haltIdentity = ref<{ agent: string; account: string } | null>(null);
+async function confirmHalt(): Promise<void> {
+  const status = supervision.state.status;
+  if (haltBlocker.value !== null || !status?.agent || !status.account) return;
+  haltIdentity.value = { agent: status.agent, account: status.account };
+  await nextTick();
+  haltDialog.value?.showModal();
+}
+async function submitHalt(): Promise<void> {
+  const identity = haltIdentity.value;
+  haltDialog.value?.close();
+  if (identity) await supervision.halt(shell.network, identity);
+}
 </script>
 
 <template>
@@ -55,10 +71,21 @@ const network = computed(() => shell.network.toUpperCase());
           {{ progress.done }}/{{ progress.total }}
         </span>
       </button>
-      <UiButton variant="hazard" size="sm" class="hdr__halt" disabled title="Gateway halt control is not connected to this console">
-        HALT ALL
+      <UiButton variant="hazard" size="sm" class="hdr__halt" :disabled="haltBlocker !== null" :title="haltBlocker ?? 'Confirm a halt for the bound TESTNET agent'" @click="confirmHalt">
+        HALT AGENT
       </UiButton>
     </div>
+    <dialog ref="haltDialog" class="halt-confirmation" aria-labelledby="halt-confirm-title" @close="haltIdentity = null">
+      <h2 id="halt-confirm-title">Halt bound TESTNET agent?</h2>
+      <dl v-if="haltIdentity"><dt>Agent</dt><dd>{{ haltIdentity.agent }}</dd><dt>Account</dt><dd>{{ haltIdentity.account }}</dd></dl>
+      <p>Pauses this agent identity, including later account assignments. Requests cancellation only for the supervised account shown. A changed registry route prevents cancellation confirmation.</p>
+      <p>Positions may remain open. Cancellation acknowledgments do not prove the venue is flat.</p>
+      <p>Supervision stays running. This does not resume orders or halt other agents.</p>
+      <div class="halt-confirmation__actions">
+        <UiButton autofocus @click="haltDialog?.close()">Keep unchanged</UiButton>
+        <UiButton variant="hazard" :disabled="haltBlocker !== null" @click="submitHalt">Halt this agent</UiButton>
+      </div>
+    </dialog>
   </header>
 </template>
 
@@ -165,6 +192,12 @@ const network = computed(() => shell.network.toUpperCase());
   font-size: var(--fs-label-lg);
   letter-spacing: var(--ls-chip);
 }
+.halt-confirmation { box-sizing: border-box; width: min(560px, calc(100vw - 32px)); margin: auto; padding: var(--s-5); border: 1px solid var(--hazard); background: var(--plate); color: var(--body); font: 400 var(--fs-copy) / 1.5 var(--font-sans); letter-spacing: 0; overflow-wrap: anywhere; }
+.halt-confirmation::backdrop { background: rgb(0 0 0 / 70%); }
+.halt-confirmation h2 { margin: 0 0 var(--s-3); color: var(--signal); font: 700 var(--fs-copy) / 1.5 var(--font-mono); }
+.halt-confirmation dd { margin: 0 0 var(--s-2); color: var(--signal); }
+.halt-confirmation p { margin-block: var(--s-3); }
+.halt-confirmation__actions { display: flex; flex-wrap: wrap; gap: var(--s-3); }
 @media (max-width: 1450px) {
   .hdr { display: grid; grid-template-columns: auto 1fr; height: auto; gap: 0 var(--s-4); }
   .hdr__brand, .hdr__nav { min-height: 40px; }

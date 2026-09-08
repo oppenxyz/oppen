@@ -328,6 +328,18 @@ features. This changes transport only, retaining the real gateway guards,
 pairing authority, pump and desktop owner; no live endpoint is used to prove
 local lifecycle behavior.
 
+### Desktop operator halt (ES21)
+
+Spec items 26, 32 and 34 require a real operator halt distinct from stopping the
+desktop runtime. Bind it to the existing supervised TESTNET agent/account and
+reuse the same engine, authenticated policy authority and periodic cancellation
+loop. Retain admitted work through dropped IPC and shutdown. Correlate cleanup
+with a sweep started after the persistence attempt, not an earlier success.
+Report durability and cancellation acknowledgments separately; neither proves
+positions closed. Do not label single-account coverage as fleet-wide halt.
+No new dependency, alternate signer, second cleanup loop, release or activation
+path is introduced. See [desktop-operator-halt.md](specs/desktop-operator-halt.md).
+
 ## 2026-09-07 · The console's own socket
 
 Item 34 asks for per-feed status, last-tick timestamps and a stale overlay. The
