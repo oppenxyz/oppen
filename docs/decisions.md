@@ -11,6 +11,16 @@ decisions" section until then.
 
 ---
 
+## 2026-09-08 · Desktop QA type boundary
+
+| # | Decision | Choice | Why, and what was rejected |
+|---|---|---|---|
+| QA1 | Check the actual fixture/test runtime | Pin development-only `@types/bun` to `1.2.19`, matching CI Bun; explicitly select Bun types for QA and Vite/browser types for the application; run QA typechecking in CI | QA tests import `bun:test` and `node:url`, but no runtime declarations were installed. Reject excluding tests, hand-written stubs or weakening strictness to hide unresolved modules. The lockfile includes Bun's transitive Node/React declaration packages; no runtime dependency or application API is added. |
+
+This implements the verification requirement for spec items 28 and 32, including
+the approval queue fixtures. Typings follow [Bun's documented TypeScript setup](https://bun.sh/docs/typescript).
+It does not alter release triggers, publication credentials or trading gates.
+
 ## 2026-09-07 · Execution audit repairs
 
 These repairs implement spec items 7, 15, 19, 24, 26 and D6; they do not

@@ -84,6 +84,32 @@ The native pricing implementation must preserve these ownership boundaries:
 
 These are implementation requirements, not an implemented native approval flow.
 
+Implementation trace after ES28:
+
+- `Gateway::reserve_reconciled`, `evaluation_context` and `submit` own the
+  existing reservation, fresh account reads and submission path. Native
+  confirmation must reuse them, not construct a second exchange/signing path.
+- `Clearance` is not the full executable action: order type/TIF, grouping and
+  builder are also part of `Action`. Retain and authenticate the full rounded
+  action, and link its commitment to the actual intent audit receipt. A receipt
+  hash or clearance-only comparison cannot prove displayed-action consent.
+- Review uses the freshly verified policy shown to the operator; confirmation
+  must match that same revision/hash, not silently adopt a subsequent policy.
+  The original proposal route remains fixed. Preparation consumes no proposal
+  and grants no signable clearance; confirmation claims exactly once.
+- The existing five-second `Gateway::decision` timeout retains its blocking
+  worker but returns to its caller. Native confirmation must retain the account
+  reservation through actual completion, including a timed-out or dropped IPC
+  waiter. Merely calling this wrapper from a detached gateway clone is not enough.
+- `ShutdownHandler`/`BoundServer` own actual server execution admission and
+  drain. Obtain native work from that owner and retain a live `SessionAuthority`
+  lease. `supports_binding` deliberately includes revoked records and cannot
+  grant execution. No originating pairing-token identity is currently stored
+  in proposals, so a live same-binding lease is not proof of originating token.
+
+These traced gaps are still implementation work. They do not authorize native
+approval execution, key reads or live activation.
+
 - Approve/approve and approve/reject races produce one disposition, never two
   executable clearances; restart and same-time ID generation cannot revive one.
 - Reassignment and retirement/regrant between mint, review, decision and final
