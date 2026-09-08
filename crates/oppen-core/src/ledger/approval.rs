@@ -14,8 +14,8 @@ use super::{
     Appended, AuthorizedRoute, Event, EventKind, Ledger, LedgerError, NewEvent, PolicyJournal,
 };
 use crate::guardrail::{
-    APPROVAL_TTL_MS, AgentId, Cleared, ClearedKind, MAX_REASON_BYTES, OrderIntent, OriginalRequest,
-    Proposal, Refusal,
+    APPROVAL_TTL_MS, AgentId, CancelIntent, Cleared, ClearedKind, MAX_REASON_BYTES, OrderIntent,
+    OriginalRequest, Proposal, ProposalIntent, Refusal,
 };
 
 type Result<T> = std::result::Result<T, ApprovalError>;
@@ -72,8 +72,16 @@ pub(crate) struct ReviewEvidence {
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(clippy::large_enum_variant)]
+#[serde(untagged)]
+pub(crate) enum ReviewCommitment {
+    Order(OrderReviewCommitment),
+    Cancel(CancelReviewCommitment),
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct ReviewCommitment {
+pub(crate) struct OrderReviewCommitment {
     proposal_root: Link,
     route: AuthorizedRoute,
     candidate: NormalizedIntent,
@@ -90,6 +98,19 @@ pub(crate) struct ReviewCommitment {
     sz: Decimal,
     #[serde(with = "rust_decimal::serde::str")]
     notional_usd: Decimal,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CancelReviewCommitment {
+    proposal_root: Link,
+    route: AuthorizedRoute,
+    candidate: CancelIntent,
+    action: Action,
+    policy: Link,
+    reviewed_at_ms: u64,
+    observed_at_ms: u64,
+    expires_at_ms: u64,
 }
 
 impl ReviewCommitment {
@@ -116,7 +137,7 @@ impl ReviewCommitment {
         {
             return Err(conflict("review authority changed during evaluation"));
         }
-        Ok(Self {
+        Ok(Self::Order(OrderReviewCommitment {
             proposal_root: evidence.root.clone(),
             route: evidence.proposal.route.clone(),
             candidate: NormalizedIntent::from_intent(candidate)?,
@@ -132,7 +153,43 @@ impl ReviewCommitment {
             px: *px,
             sz: *sz,
             notional_usd: *notional_usd,
-        })
+        }))
+    }
+
+    pub(crate) fn new_cancel(
+        evidence: &ReviewEvidence,
+        candidate: &CancelIntent,
+        action: Action,
+        clearance: &crate::guardrail::Clearance,
+        reviewed_at_ms: u64,
+        observed_at_ms: u64,
+    ) -> Result<Self> {
+        if !matches!(&clearance.kind, ClearedKind::DiscretionaryCancel { targets, .. } if targets == &candidate.targets)
+            || clearance.policy_revision != evidence.policy_revision
+            || clearance.route != evidence.proposal.route
+        {
+            return Err(conflict("cancellation review authority or targets changed"));
+        }
+        Ok(Self::Cancel(CancelReviewCommitment {
+            proposal_root: evidence.root.clone(),
+            route: clearance.route.clone(),
+            candidate: candidate.clone(),
+            action,
+            policy: Link {
+                seq: evidence.policy_revision,
+                hash: evidence.policy_hash.clone(),
+            },
+            reviewed_at_ms,
+            observed_at_ms,
+            expires_at_ms: evidence.proposal.expires_at_ms,
+        }))
+    }
+
+    fn action(&self) -> &Action {
+        match self {
+            Self::Order(review) => &review.action,
+            Self::Cancel(review) => &review.action,
+        }
     }
 
     fn receipt_digest(&self, receipt: &Link) -> Result<String> {
@@ -150,20 +207,32 @@ impl ReviewCommitment {
     }
 
     fn matches_payload(&self, payload: &serde_json::Value) -> Result<bool> {
+        let policy = match self {
+            Self::Order(review) => &review.policy,
+            Self::Cancel(review) => &review.policy,
+        };
+        if payload.get("policy_revision") != Some(&policy.seq.into())
+            || payload.get("approval_review_digest") != Some(&self.digest()?.into())
+        {
+            return Ok(false);
+        }
+        let Self::Order(review) = self else {
+            let Self::Cancel(review) = self else {
+                unreachable!()
+            };
+            return Ok(payload.pointer("/kind/cleared").and_then(|v| v.as_str())
+                == Some("discretionary_cancel")
+                && payload.pointer("/kind/targets")
+                    == Some(&serde_json::to_value(&review.candidate.targets)?));
+        };
         let expected = serde_json::json!({
-            "px": self.px, "sz": self.sz, "notional_usd": self.notional_usd,
+            "px": review.px, "sz": review.sz, "notional_usd": review.notional_usd,
         });
-        Ok(
-            payload.get("policy_revision") == Some(&self.policy.seq.into())
-                && payload.get("approval_review_digest") == Some(&self.digest()?.into())
-                && expected
-                    .as_object()
-                    .ok_or_else(|| unavailable("review economics missing"))?
-                    .iter()
-                    .all(|(key, value)| {
-                        payload.get("kind").and_then(|kind| kind.get(key)) == Some(value)
-                    }),
-        )
+        Ok(expected
+            .as_object()
+            .ok_or_else(|| unavailable("review economics missing"))?
+            .iter()
+            .all(|(key, value)| payload.get("kind").and_then(|kind| kind.get(key)) == Some(value)))
     }
 }
 
@@ -347,11 +416,74 @@ impl NormalizedIntent {
 #[serde(deny_unknown_fields)]
 struct Proposed {
     agent: AgentId,
-    intent: NormalizedIntent,
+    intent: StoredIntent,
     route: AuthorizedRoute,
     route_hash: String,
     policy: Link,
     expires_at_ms: u64,
+}
+
+// Untagged only on the durable boundary: legacy order bytes stay identical.
+// Each concrete body denies unknown fields; no absent/fabricated order values.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+#[allow(clippy::large_enum_variant)]
+enum StoredIntent {
+    Order(NormalizedIntent),
+    Cancel(CancelIntent),
+}
+
+impl StoredIntent {
+    fn validate(&self) -> Result<()> {
+        match self {
+            Self::Order(intent) => intent.validate(),
+            Self::Cancel(intent) => {
+                intent.validate().map_err(unavailable)?;
+                if intent.reason.trim().is_empty()
+                    || intent.reason.len() > MAX_REASON_BYTES
+                    || intent
+                        .reason
+                        .chars()
+                        .any(|c| c.is_control() && c != '\n' && c != '\t')
+                {
+                    return Err(unavailable("invalid cancellation reason"));
+                }
+                Ok(())
+            }
+        }
+    }
+    fn intent(&self) -> ProposalIntent {
+        match self {
+            Self::Order(i) => ProposalIntent::Order(i.intent()),
+            Self::Cancel(i) => ProposalIntent::Cancel(i.clone()),
+        }
+    }
+    fn reason(&self) -> &str {
+        match self {
+            Self::Order(i) => &i.reason,
+            Self::Cancel(i) => &i.reason,
+        }
+    }
+    fn same_identity(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Order(a), Self::Order(b)) => a.cloid == b.cloid,
+            (Self::Cancel(a), Self::Cancel(b)) => a == b,
+            _ => false,
+        }
+    }
+    fn same_request(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Order(a), Self::Order(b)) => a.same_request(b),
+            (Self::Cancel(a), Self::Cancel(b)) => a == b,
+            _ => false,
+        }
+    }
+    fn order(&self) -> Result<&NormalizedIntent> {
+        match self {
+            Self::Order(i) => Ok(i),
+            _ => Err(unavailable("order proposal required")),
+        }
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -505,6 +637,37 @@ impl ApprovalJournal {
         at_ms: u64,
         claim_seq: u64,
     ) -> Result<()> {
+        let ReviewCommitment::Order(review) = review else {
+            let ReviewCommitment::Cancel(review) = review else {
+                unreachable!()
+            };
+            review.candidate.validate().map_err(unavailable)?;
+            if !matches!(&entry.data.intent, StoredIntent::Cancel(intent) if intent == &review.candidate)
+                || review.proposal_root != entry.root
+                || review.route != entry.data.route
+                || review.reviewed_at_ms < entry.minted_at_ms
+                || review.reviewed_at_ms > at_ms
+                || review.observed_at_ms > review.reviewed_at_ms
+                || review.expires_at_ms != entry.data.expires_at_ms
+                || at_ms >= review.expires_at_ms
+                || review.policy.seq >= claim_seq
+                || review.action != review.candidate.action()
+            {
+                return Err(unavailable(
+                    "invalid cancellation review targets, action, lifetime or authority",
+                ));
+            }
+            let policy = row(connection, review.policy.seq)?;
+            if policy.hash != review.policy.hash
+                || !matches!(
+                    policy.kind,
+                    EventKind::PolicyInitialized | EventKind::PolicyReplaced
+                )
+            {
+                return Err(unavailable("cancellation review policy linkage mismatch"));
+            }
+            return Ok(());
+        };
         review.candidate.validate()?;
         if review.proposal_root != entry.root
             || review.route != entry.data.route
@@ -532,7 +695,7 @@ impl ApprovalJournal {
         {
             return Err(unavailable("review policy linkage mismatch"));
         }
-        let mut expected = entry.data.intent.clone();
+        let mut expected = entry.data.intent.order()?.clone();
         if let Some(original) = &mut expected.original
             && matches!(
                 original.kind,
@@ -624,10 +787,14 @@ impl ApprovalJournal {
                         return Err(unavailable("proposal cannot have a predecessor"));
                     }
                     self.validate_proposed(connection, &proposal, e.at_ms, event.seq)?;
-                    if key.as_deref() != Some(&mint_key(&proposal))
+                    if key.as_deref() != Some(&mint_key(&proposal, event.seq)?)
                         || entries.values().any(|entry| {
                             entry.data.route.binding.container == proposal.route.binding.container
-                                && entry.data.intent.cloid == proposal.intent.cloid
+                                && entry.data.intent.same_identity(&proposal.intent)
+                                && (matches!(proposal.intent, StoredIntent::Order(_))
+                                    || (entry.data.route == proposal.route
+                                        && matches!(entry.state, State::Pending)
+                                        && e.at_ms < entry.data.expires_at_ms))
                         })
                     {
                         return Err(unavailable("approval cloid reused or mint key mismatched"));
@@ -668,6 +835,13 @@ impl ApprovalJournal {
                             if matches!(entry.state, State::Pending)
                                 && e.at_ms < entry.data.expires_at_ms =>
                         {
+                            if review.is_none()
+                                && matches!(entry.data.intent, StoredIntent::Cancel(_))
+                            {
+                                return Err(unavailable(
+                                    "cancellation claim requires a retained review",
+                                ));
+                            }
                             if let Some(review) = &review {
                                 self.validate_review(
                                     connection, entry, review, e.at_ms, event.seq,
@@ -836,7 +1010,11 @@ impl ApprovalJournal {
     ) -> Result<Event> {
         let event = row(connection, link.seq)?;
         if event.hash != link.hash
-            || event.kind != EventKind::OrderIntent
+            || event.kind
+                != match &entry.data.intent {
+                    StoredIntent::Order(_) => EventKind::OrderIntent,
+                    StoredIntent::Cancel(_) => EventKind::AgentDecision,
+                }
             || link.seq <= entry.last.seq
             || link.seq >= disposition_seq
             || event.agent_id.as_deref() != Some(entry.data.agent.as_str())
@@ -850,20 +1028,29 @@ impl ApprovalJournal {
         let kind = payload
             .get("kind")
             .ok_or_else(|| unavailable("approved intent kind missing"))?;
-        if kind.get("cleared").and_then(|v| v.as_str()) != Some("order")
-            || payload.get("agent") != Some(&serde_json::to_value(&entry.data.agent)?)
+        if payload.get("agent") != Some(&serde_json::to_value(&entry.data.agent)?)
             || payload.get("route") != Some(&serde_json::to_value(&entry.data.route)?)
             || payload.get("network") != Some(&serde_json::to_value(self.ledger().network)?)
-            || payload.get("reason").and_then(|v| v.as_str())
-                != Some(entry.data.intent.reason.as_str())
-            || kind.get("cloid") != Some(&serde_json::to_value(&entry.data.intent.cloid)?)
-            || kind.get("symbol").and_then(|v| v.as_str())
-                != Some(entry.data.intent.symbol.as_str())
-            || kind.get("is_buy").and_then(|v| v.as_bool()) != Some(entry.data.intent.is_buy)
-            || kind.get("reduce_only").and_then(|v| v.as_bool())
-                != Some(entry.data.intent.reduce_only)
+            || payload.get("reason").and_then(|v| v.as_str()) != Some(entry.data.intent.reason())
         {
             return Err(unavailable("approved intent does not match proposal"));
+        }
+        let matches = match &entry.data.intent {
+            StoredIntent::Order(intent) => {
+                kind.get("cleared").and_then(|v| v.as_str()) == Some("order")
+                    && kind.get("cloid") == Some(&serde_json::to_value(&intent.cloid)?)
+                    && kind.get("symbol").and_then(|v| v.as_str()) == Some(intent.symbol.as_str())
+                    && kind.get("is_buy").and_then(|v| v.as_bool()) == Some(intent.is_buy)
+                    && kind.get("reduce_only").and_then(|v| v.as_bool()) == Some(intent.reduce_only)
+            }
+            StoredIntent::Cancel(intent) => {
+                entry.review.is_some()
+                    && kind.get("cleared").and_then(|v| v.as_str()) == Some("discretionary_cancel")
+                    && kind.get("targets") == Some(&serde_json::to_value(&intent.targets)?)
+            }
+        };
+        if !matches {
+            return Err(unavailable("approved action does not match typed proposal"));
         }
         if let Some(review) = &entry.review
             && !review.matches_payload(payload)?
@@ -904,8 +1091,7 @@ impl ApprovalJournal {
             .as_ref()
             .ok_or_else(|| unavailable("refused approval audit redacted"))?;
         if payload.get("refusal").and_then(|v| v.as_str()) != Some(detail)
-            || payload.get("reason").and_then(|v| v.as_str())
-                != Some(entry.data.intent.reason.as_str())
+            || payload.get("reason").and_then(|v| v.as_str()) != Some(entry.data.intent.reason())
             || payload.get("refusal_detail").is_none()
         {
             return Err(unavailable(
@@ -931,7 +1117,7 @@ impl ApprovalJournal {
         let seq = head.checked_add(1).ok_or(LedgerError::SeqOutOfRange)?;
         let kind = operation.kind();
         let key = match &operation {
-            Operation::Proposed { proposal } => mint_key(proposal),
+            Operation::Proposed { proposal } => mint_key(proposal, seq)?,
             _ => step_key(
                 kind,
                 entry
@@ -978,39 +1164,83 @@ impl ApprovalJournal {
     }
 
     pub(crate) fn mint(&self, candidate: Candidate) -> Result<Proposal> {
-        timestamp(candidate.at_ms)?;
-        let intent = NormalizedIntent::from_intent(&candidate.intent)?;
+        self.mint_intent(
+            candidate.agent,
+            StoredIntent::Order(NormalizedIntent::from_intent(&candidate.intent)?),
+            candidate.route,
+            candidate.policy_revision,
+            candidate.at_ms,
+        )
+    }
+
+    pub(crate) fn mint_cancel(
+        &self,
+        agent: AgentId,
+        intent: CancelIntent,
+        route: AuthorizedRoute,
+        policy_revision: u64,
+        at_ms: u64,
+    ) -> Result<Proposal> {
+        self.mint_intent(
+            agent,
+            StoredIntent::Cancel(intent),
+            route,
+            policy_revision,
+            at_ms,
+        )
+    }
+
+    fn mint_intent(
+        &self,
+        agent: AgentId,
+        intent: StoredIntent,
+        expected_route: AuthorizedRoute,
+        policy_revision: u64,
+        at_ms: u64,
+    ) -> Result<Proposal> {
+        timestamp(at_ms)?;
+        intent.validate()?;
         let mut guard = self.ledger().lock()?;
         let tx = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let entries = self.replay(&tx)?;
         let policy = self.0.current_in(&tx).map_err(unavailable)?;
+        if matches!(intent, StoredIntent::Cancel(_))
+            && entries.values().any(|entry| at_ms < entry.last_at_ms)
+        {
+            return Err(unavailable("approval clock moved backwards"));
+        }
         let route = self
             .0
             .registry()
-            .route_in(&tx, &candidate.agent)
+            .route_in(&tx, &agent)
             .map_err(unavailable)?;
-        if route != candidate.route
-            || policy.revision != candidate.policy_revision
-            || candidate.agent != route.binding.agent
+        if route != expected_route
+            || policy.revision != policy_revision
+            || agent != route.binding.agent
         {
             return Err(conflict("proposal route or policy changed"));
         }
         if let Some(existing) = entries.values().find(|e| {
             e.data.route.binding.container == route.binding.container
-                && e.data.intent.cloid == intent.cloid
+                && e.data.intent.same_identity(&intent)
+                && (matches!(intent, StoredIntent::Order(_))
+                    || (e.data.route == route
+                        && matches!(e.state, State::Pending)
+                        && at_ms < e.data.expires_at_ms))
         }) {
             if !existing.data.intent.same_request(&intent)
-                || existing.data.agent != candidate.agent
+                || existing.data.agent != agent
                 || existing.data.route != route
-                || existing.data.policy.seq != candidate.policy_revision
+                || (matches!(intent, StoredIntent::Order(_))
+                    && existing.data.policy.seq != policy_revision)
             {
                 return Err(conflict("cloid already names another proposal"));
             }
-            if candidate.at_ms < existing.minted_at_ms {
+            if at_ms < existing.minted_at_ms {
                 return Err(unavailable("approval clock moved backwards"));
             }
-            let pending = matches!(existing.state, State::Pending)
-                && candidate.at_ms < existing.data.expires_at_ms;
+            let pending =
+                matches!(existing.state, State::Pending) && at_ms < existing.data.expires_at_ms;
             let proposal = existing.proposal(self.ledger().network);
             self.publish(tx)?;
             return if pending {
@@ -1019,12 +1249,11 @@ impl ApprovalJournal {
                 Err(conflict("proposal already consumed or expired"))
             };
         }
-        let expires_at_ms = candidate
-            .at_ms
+        let expires_at_ms = at_ms
             .checked_add(APPROVAL_TTL_MS)
             .ok_or_else(|| unavailable("approval TTL overflow"))?;
         let data = Proposed {
-            agent: candidate.agent,
+            agent,
             intent,
             route_hash: row(&tx, route.binding_seq)?.hash,
             route,
@@ -1038,7 +1267,7 @@ impl ApprovalJournal {
         self.validate_proposed(
             &tx,
             &data,
-            candidate.at_ms,
+            at_ms,
             head.checked_add(1).ok_or(LedgerError::SeqOutOfRange)?,
         )?;
         let stored = data.clone();
@@ -1048,14 +1277,14 @@ impl ApprovalJournal {
             Operation::Proposed {
                 proposal: Box::new(data),
             },
-            candidate.at_ms,
+            at_ms,
         )?;
         Ok(Entry {
             data: stored,
             root: Link::appended(&appended),
             last: Link::appended(&appended),
-            minted_at_ms: candidate.at_ms,
-            last_at_ms: candidate.at_ms,
+            minted_at_ms: at_ms,
+            last_at_ms: at_ms,
             state: State::Pending,
             review: None,
         }
@@ -1164,6 +1393,9 @@ impl ApprovalJournal {
             )?;
             Some(Box::new(review))
         } else {
+            if matches!(entry.data.intent, StoredIntent::Cancel(_)) {
+                return Err(conflict("cancellation requires retained operator review"));
+            }
             None
         };
         let appended = self.append(tx, Some(entry), Operation::Claimed { review }, at_ms)?;
@@ -1237,14 +1469,20 @@ impl ApprovalJournal {
         let disposition = match outcome {
             Ok(cleared) => {
                 let clearance = cleared.clearance();
-                if !matches!(clearance.kind, ClearedKind::Order { .. })
-                    || clearance.route != entry.data.route
+                if !matches!(
+                    (&entry.data.intent, &clearance.kind),
+                    (StoredIntent::Order(_), ClearedKind::Order { .. })
+                        | (
+                            StoredIntent::Cancel(_),
+                            ClearedKind::DiscretionaryCancel { .. }
+                        )
+                ) || clearance.route != entry.data.route
                     || clearance.agent != entry.data.agent
                 {
                     return Err(conflict("approval clearance route or action differs"));
                 }
                 if let Some(review) = &entry.review
-                    && !cleared.matches_reviewed_action(&review.action)
+                    && !cleared.matches_reviewed_action(review.action())
                 {
                     return Err(conflict("clearance action differs from reviewed action"));
                 }
@@ -1263,7 +1501,7 @@ impl ApprovalJournal {
                 expected
                     .as_object_mut()
                     .ok_or_else(|| unavailable("clearance is not an object"))?
-                    .insert("reason".into(), entry.data.intent.reason.clone().into());
+                    .insert("reason".into(), entry.data.intent.reason().into());
                 if event.payload.as_ref() != Some(&expected) {
                     return Err(conflict(
                         "intent receipt payload differs from approved clearance",
@@ -1292,7 +1530,7 @@ impl ApprovalJournal {
                     &detail,
                     head.checked_add(1).ok_or(LedgerError::SeqOutOfRange)?,
                 )?;
-                let expected = serde_json::json!({"refusal": detail, "refusal_detail": refusal, "reason": entry.data.intent.reason});
+                let expected = serde_json::json!({"refusal": detail, "refusal_detail": refusal, "reason": entry.data.intent.reason()});
                 if event.payload.as_ref() != Some(&expected) {
                     return Err(conflict("refusal receipt differs from actual outcome"));
                 }
@@ -1320,12 +1558,20 @@ impl ApprovalJournal {
     }
 }
 
-fn mint_key(data: &Proposed) -> String {
-    format!(
+fn mint_key(data: &Proposed, seq: u64) -> Result<String> {
+    Ok(format!(
         "approval:{}:{}",
         data.route.binding.container,
-        data.intent.cloid.as_str()
-    )
+        match &data.intent {
+            StoredIntent::Order(intent) => intent.cloid.as_str().to_owned(),
+            StoredIntent::Cancel(intent) => format!(
+                "cancel:{seq}:{}",
+                super::hash::payload_hash(
+                    super::hash::canonical_json(&serde_json::to_value(intent)?)?.as_bytes()
+                )
+            ),
+        }
+    ))
 }
 fn step_key(kind: EventKind, seq: u64) -> String {
     format!("{}:{seq}", kind.as_str())

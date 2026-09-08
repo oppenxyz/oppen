@@ -446,19 +446,24 @@ export interface OriginalRequest {
   reference_at_ms: number;
 }
 
-export interface PendingApprovalView {
+interface PendingApprovalIdentity {
   id: string;
   agent: string;
   account: string;
-  symbol: string;
-  is_buy: boolean;
-  px: string;
-  sz: string;
-  reduce_only: boolean;
   reason: string;
   expires_at_ms: number;
-  original: OriginalRequest | null;
 }
+
+export interface CancelTarget {
+  symbol: string; asset_index: number; oid: number; cloid: string | null;
+  is_buy: boolean; limit_px: string; sz: string; orig_sz: string; timestamp: number;
+  order_type: string; reduce_only: boolean; is_trigger: boolean;
+  trigger_px: string | null; trigger_condition: string | null; is_position_tpsl: boolean;
+}
+export type PendingApprovalView = PendingApprovalIdentity & (
+  { kind: "order"; symbol: string; is_buy: boolean; px: string; sz: string; reduce_only: boolean; original: OriginalRequest | null }
+  | { kind: "cancel"; targets: CancelTarget[] }
+);
 
 export interface ApprovalDecision {
   proposal_id: string;
@@ -480,7 +485,8 @@ export interface ApprovalQueueStatus {
   confirmation: ApprovalConfirmation | null;
 }
 
-export interface ApprovalReviewDisplay {
+export interface OrderApprovalReviewDisplay {
+  kind: "order";
   proposal_id: string; agent: string; account: string; symbol: string;
   original: OriginalRequest | null; original_px: string; reference_px: string;
   reference_at_ms: number; drift_bps: string | null; asset_index: number;
@@ -490,6 +496,11 @@ export interface ApprovalReviewDisplay {
   builder: { b: string; f: number } | null; route: PolicySetupReview["route"];
   policy_revision: number; policy_hash: string; reviewed_at_ms: number; expires_at_ms: number;
 }
+export interface CancelApprovalReviewDisplay {
+  kind: "cancel"; proposal_id: string; agent: string; account: string; targets: CancelTarget[]; reason: string;
+  route: PolicySetupReview["route"]; policy_revision: number; policy_hash: string; reviewed_at_ms: number; expires_at_ms: number;
+}
+export type ApprovalReviewDisplay = OrderApprovalReviewDisplay | CancelApprovalReviewDisplay;
 export interface ApprovalPricingReview {
   id: string; owner_id: string; pairing_id: { network: "testnet" | "mainnet"; issued_seq: number };
   reason: string; display: ApprovalReviewDisplay;

@@ -417,7 +417,8 @@ async fn same_cloid_limit_retry_retains_original_approval_after_new_quote_observ
     let original = engine.pending_proposals(now_ms()).unwrap();
     assert_eq!(original.len(), 1);
     let observed_at = original[0]
-        .intent()
+        .order_intent()
+        .unwrap()
         .original
         .as_ref()
         .unwrap()

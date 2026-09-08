@@ -2,7 +2,9 @@
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import PanelHousing from "./housing/PanelHousing.vue";
 import UiButton from "./ui/UiButton.vue";
-import type { ApprovalReviewDisplay, OriginalRequest } from "../lib/bridge";
+import ApprovalCancelTargets from "./ApprovalCancelTargets.vue";
+import ApprovalConfirmationResult from "./ApprovalConfirmationResult.vue";
+import type { OrderApprovalReviewDisplay, OriginalRequest } from "../lib/bridge";
 import { approvals, approvalBinding, APPROVAL_DECISIONS, APPROVAL_PHASES } from "../stores/approvals";
 import { runtime } from "../stores/runtime";
 import { shell } from "../stores/shell";
@@ -22,6 +24,7 @@ onUnmounted(() => { approvals.stop(); if (clock !== null) clearInterval(clock); 
 const phase = computed(() => reading.error ? "Unavailable" : reading.status ? APPROVAL_PHASES[reading.status.phase] : "Not read");
 const empty = computed(() => reading.error === null && reading.status?.error === null
   && reading.status.phase === "ready" && reading.status.observed_at_ms !== null && reading.status.pending.length === 0);
+const executionInQueue = computed(() => reading.status?.pending.some(proposal => proposal.id === reading.execution?.proposal_id) ?? false);
 function date(at: number | null): string { return at === null ? "Not observed" : new Date(at).toLocaleString(); }
 function source(original: OriginalRequest | null): string {
   if (original === null) return "Unknown original request";
@@ -34,20 +37,13 @@ function source(original: OriginalRequest | null): string {
   }
 }
 function json(value: unknown): string { return JSON.stringify(value, null, 2); }
-function orderType(order: ApprovalReviewDisplay["order_type"]): string {
+function orderType(order: OrderApprovalReviewDisplay["order_type"]): string {
   if ("limit" in order) {
     const labels = { Alo: "post only", Ioc: "immediate or cancel", Gtc: "good till canceled" };
     return `${order.limit.tif} · ${labels[order.limit.tif]}`;
   }
   const trigger = order.trigger;
   return `${trigger.tpsl === "tp" ? "Take profit" : "Stop loss"} · ${trigger.isMarket ? "Market" : "Limit"} trigger ${trigger.triggerPx} USD`;
-}
-function executionLabel(value: unknown): string {
-  if (value !== null && typeof value === "object" && "status" in value && typeof value.status === "string") {
-    if (value.status === "rejected") return "Refused";
-    return `${value.status === "resting" || value.status === "filled" ? "Venue" : "Execution"} status: ${value.status}`;
-  }
-  return "Execution response";
 }
 </script>
 
@@ -80,18 +76,25 @@ function executionLabel(value: unknown): string {
         <p v-if="reading.status?.pending.length && (reading.error || reading.status.phase !== 'ready')">Last observed proposals; current queue unconfirmed.</p>
         <ol v-if="reading.status?.pending.length" class="approval-queue__rows" :aria-label="reading.error ? 'Last observed proposals; current queue unavailable' : 'Pending proposals'">
           <li v-for="proposal in reading.status.pending" :key="proposal.id">
-            <h3>{{ proposal.symbol }} · {{ proposal.is_buy ? 'Buy' : 'Sell' }}<span v-if="proposal.reduce_only"> · Reduce only</span></h3>
+            <h3 v-if="proposal.kind === 'order'">{{ proposal.symbol }} · {{ proposal.is_buy ? 'Buy' : 'Sell' }}<span v-if="proposal.reduce_only"> · Reduce only</span></h3>
+            <h3 v-else>Cancel {{ proposal.targets.length }} {{ proposal.targets.length === 1 ? 'order' : 'orders' }}</h3>
             <p class="approval-queue__id">{{ proposal.id }}</p>
             <dl>
-              <dt>Price · USD</dt><dd>{{ proposal.px }}</dd>
-              <dt>Size</dt><dd>{{ proposal.sz }}</dd>
+              <template v-if="proposal.kind === 'order'">
+                <dt>Price · USD</dt><dd>{{ proposal.px }}</dd>
+                <dt>Size</dt><dd>{{ proposal.sz }}</dd>
+              </template>
               <dt>Expires</dt><dd>{{ date(proposal.expires_at_ms) }}<span v-if="now >= proposal.expires_at_ms"> · Expired locally</span></dd>
             </dl>
-            <p>{{ source(proposal.original) }}</p>
-            <p v-if="proposal.original">Reference · {{ proposal.original.reference_px ?? 'Unknown' }} USD · {{ date(proposal.original.reference_at_ms) }}</p>
+            <template v-if="proposal.kind === 'order'">
+              <p>{{ source(proposal.original) }}</p>
+              <p v-if="proposal.original">Reference · {{ proposal.original.reference_px ?? 'Unknown' }} USD · {{ date(proposal.original.reference_at_ms) }}</p>
+            </template>
+            <ApprovalCancelTargets v-else :targets="proposal.targets" />
             <p class="approval-queue__reason">{{ proposal.reason }}</p>
-            <UiButton v-if="reading.status.review?.display.proposal_id !== proposal.id || !['review_ready', 'confirming'].includes(reading.status.phase)" size="sm" :disabled="now >= proposal.expires_at_ms || !approvals.canPrepare(proposal.id)" @click="approvals.prepare(proposal.id)">Review pricing</UiButton>
-            <section v-if="reading.status.review?.display.proposal_id === proposal.id" class="approval-queue__review" aria-label="Retained pricing review">
+            <UiButton v-if="reading.status.review?.display.proposal_id !== proposal.id || !['review_ready', 'confirming'].includes(reading.status.phase)" size="sm" :disabled="now >= proposal.expires_at_ms || !approvals.canPrepare(proposal.id)" @click="approvals.prepare(proposal.id)">{{ proposal.kind === 'cancel' ? 'Review cancellation' : 'Review pricing' }}</UiButton>
+            <section v-if="reading.status.review?.display.proposal_id === proposal.id" class="approval-queue__review" aria-label="Retained approval review">
+              <template v-if="reading.status.review.display.kind === 'order'">
               <h3>Exact candidate · {{ reading.status.review.display.symbol }} · {{ reading.status.review.display.is_buy ? 'Buy' : 'Sell' }}</h3>
               <p>{{ source(reading.status.review.display.original) }}</p>
               <dl>
@@ -100,35 +103,47 @@ function executionLabel(value: unknown): string {
                 <dt>Quote time</dt><dd>{{ date(reading.status.review.display.reference_at_ms) }}</dd>
                 <dt>Drift</dt><dd>{{ reading.status.review.display.drift_bps ?? 'Unknown' }} bp</dd>
               </dl>
+              </template>
+              <h3 v-else>Exact cancellation review</h3>
               <details><summary>Technical evidence · route and policy</summary><pre>{{ json(reading.status.review) }}</pre></details>
               <p class="approval-queue__reason">{{ reading.status.review.reason }}</p>
               <dl>
-                <dt>Builder</dt><dd>{{ reading.status.review.display.builder?.b ?? 'None' }}</dd>
-                <template v-if="reading.status.review.display.builder">
-                  <dt>Builder fee</dt><dd>{{ reading.status.review.display.builder.f }} tenths of a basis point</dd>
+                <template v-if="reading.status.review.display.kind === 'order'">
+                  <dt>Builder</dt><dd>{{ reading.status.review.display.builder?.b ?? 'None' }}</dd>
+                  <template v-if="reading.status.review.display.builder">
+                    <dt>Builder fee</dt><dd>{{ reading.status.review.display.builder.f }} tenths of a basis point</dd>
+                  </template>
                 </template>
                 <dt>Account</dt><dd>{{ reading.status.review.display.account }}</dd>
                 <dt>Pairing</dt><dd>{{ reading.status.review.pairing_id.network }} · {{ reading.status.review.pairing_id.issued_seq }}</dd>
                 <dt>Review expires</dt><dd>{{ date(reading.status.review.display.expires_at_ms) }}<span v-if="now >= reading.status.review.display.expires_at_ms"> · Expired</span></dd>
               </dl>
-              <div class="approval-queue__candidate" aria-label="Candidate to submit">
+              <div v-if="reading.status.review.display.kind === 'order'" class="approval-queue__candidate" aria-label="Candidate to submit">
                 <h3>{{ reading.status.review.display.symbol }} · {{ reading.status.review.display.is_buy ? 'Buy' : 'Sell' }}</h3>
                 <p>{{ reading.status.review.display.sz }} @ {{ reading.status.review.display.px }} USD</p>
                 <p>{{ reading.status.review.display.notional_usd }} USD notional · {{ reading.status.review.display.reduce_only ? 'Reduce only' : 'Not reduce only' }}</p>
                 <p>{{ orderType(reading.status.review.display.order_type) }}</p>
               </div>
+              <div v-else aria-label="Cancellation to submit">
+                <ApprovalCancelTargets :targets="reading.status.review.display.targets" />
+                <h3>Cancel exactly {{ reading.status.review.display.targets.length }} {{ reading.status.review.display.targets.length === 1 ? 'order' : 'orders' }}</h3>
+              </div>
               <div class="approval-queue__actions">
-                <UiButton size="sm" variant="hazard" :disabled="now >= reading.status.review.display.expires_at_ms || !approvals.canConfirm()" @click="approvals.confirm">Confirm and submit</UiButton>
+                <UiButton size="sm" variant="hazard" :disabled="now >= reading.status.review.display.expires_at_ms || !approvals.canConfirm()" @click="approvals.confirm">{{ reading.status.review.display.kind === 'cancel' ? 'Confirm cancellation' : 'Confirm and submit' }}</UiButton>
                 <UiButton size="sm" :disabled="!approvals.canDiscard()" @click="approvals.discard">Discard review</UiButton>
               </div>
             </section>
+            <ApprovalConfirmationResult v-if="reading.execution?.proposal_id === proposal.id" :confirmation="reading.execution" />
             <UiButton v-if="reading.confirmation?.proposal.id !== proposal.id" size="sm" :disabled="now >= proposal.expires_at_ms || !approvals.canReject(proposal.id)" @click="approvals.prepareReject(proposal.id)">Reject</UiButton>
             <section v-else-if="reading.confirmation" class="approval-queue__confirm" aria-label="Confirm proposal rejection">
               <h3>Reject proposal?</h3>
-              <p>{{ reading.confirmation.proposal.symbol }} · {{ reading.confirmation.proposal.is_buy ? 'Buy' : 'Sell' }} · {{ reading.confirmation.proposal.reduce_only ? 'Reduce only' : 'Order' }}</p>
+              <p v-if="reading.confirmation.proposal.kind === 'order'">{{ reading.confirmation.proposal.symbol }} · {{ reading.confirmation.proposal.is_buy ? 'Buy' : 'Sell' }} · {{ reading.confirmation.proposal.reduce_only ? 'Reduce only' : 'Order' }}</p>
+              <ApprovalCancelTargets v-else :targets="reading.confirmation.proposal.targets" />
               <dl>
-                <dt>Price · USD</dt><dd>{{ reading.confirmation.proposal.px }}</dd>
-                <dt>Size</dt><dd>{{ reading.confirmation.proposal.sz }}</dd>
+                <template v-if="reading.confirmation.proposal.kind === 'order'">
+                  <dt>Price · USD</dt><dd>{{ reading.confirmation.proposal.px }}</dd>
+                  <dt>Size</dt><dd>{{ reading.confirmation.proposal.sz }}</dd>
+                </template>
                 <dt>Agent</dt><dd>{{ reading.confirmation.proposal.agent }}</dd>
                 <dt>Account</dt><dd>{{ reading.confirmation.proposal.account }}</dd>
                 <dt>Proposal</dt><dd>{{ reading.confirmation.proposal.id }}</dd>
@@ -141,13 +156,7 @@ function executionLabel(value: unknown): string {
             </section>
           </li>
         </ol>
-        <section v-if="reading.execution" class="approval-queue__decision" role="status">
-          <h3>{{ reading.execution.result != null ? executionLabel(reading.execution.result) : reading.execution.error != null ? 'Confirmation error · execution unconfirmed' : 'Confirmation pending' }}</h3>
-          <p>{{ reading.execution.proposal_id }} · Review {{ reading.execution.review_id }}</p>
-          <p>{{ date(reading.execution.at_ms) }}</p>
-          <pre v-if="reading.execution.result != null">{{ json(reading.execution.result) }}</pre>
-          <pre v-if="reading.execution.error != null">{{ json(reading.execution.error) }}</pre>
-        </section>
+        <ApprovalConfirmationResult v-if="reading.execution && !executionInQueue" :confirmation="reading.execution" />
       </template>
     </div>
   </PanelHousing>

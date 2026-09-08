@@ -114,7 +114,7 @@ Every acting tool answers with one JSON object. `contract_version` first, then `
 | `resting` | On the book until it fills or is cancelled | `oid`, `cloid` |
 | `filled` | Crossed on arrival; `avg_px` is the venue's own | `oid`, `cloid`, `filled_sz`, `avg_px` |
 | `canceled` | A cancel or cancel-all landed | `requested`, `canceled`, `failed[]` |
-| `pending_approval` | Item 28: nothing signed, a human decides | `approval_id`, `symbol`, `notional_usd`, `expires_at_ms` |
+| `pending_approval` | Item 28: nothing signed, an operator decides | Orders: `approval_id`, `symbol`, `notional_usd`, `expires_at_ms`; cancellations: `approval_id`, `action: "cancel"`, `targets[]`, `expires_at_ms` |
 | `rejected` | A predicate refused before signing | `retryable`, `code`, and the code's own fields |
 
 A rejection is a **successful** tool call, not a protocol error. It is the expected outcome of asking for something outside a limit, and returning an error there invites the blind retry that is exactly the wrong response.
@@ -380,11 +380,33 @@ The guardrail check runs immediately before signing, in Rust, on the single path
 
 ### `cancel(oid? | cloid?, reason)`
 
-One resting order. Supply `oid` or `cloid`. Cancels are risk-reducing: they clear while the kill switch is engaged and they cost no order-rate token. An order that is already gone is reported as `canceled` with that cancel in `failed[]`, not as an error — the caller wanted it gone and it is gone.
+One resting order. Supply `oid` or `cloid`. In approval mode this retains the
+exact target for native operator review, including protective-order details;
+it does not sign or cancel on receipt. Cancellations cost no order-rate token.
+An order already absent from the initial read is reported as `canceled` with
+that cancel in `failed[]`, not as an acknowledgment from the venue.
 
 ### `cancel_all(symbol?, reason)`
 
-Every resting order, or every one on a symbol. Partial success is normal, so `failed[]` itemises what the venue would not take, paired positionally with what was sent. Nothing resting answers `canceled` with `requested: 0`.
+Every resting order, or every one on a symbol. Approval mode freezes the selected
+targets; approval cannot include an order created afterward. Native review and
+confirmation recheck the retained target evidence, route, policy and original
+expiry. Missing or changed targets require a fresh request/review, never a
+replacement target or an implicit subset. Approval-off cancellation still pins
+policy at final signing so enabling approval during a wait cannot be bypassed.
+
+Partial success is normal: `failed[]` itemises what the venue would not take,
+paired positionally with the submitted targets. Only a complete response of
+cancellation acknowledgments or per-target errors supplies those counts.
+Missing, extra or order-shaped statuses produce nonretryable
+`timeout_unknown_outcome`, not a guessed success. Nothing resting initially
+answers `canceled` with `requested: 0`.
+
+HALT/pause cleanup is an internal runtime path, not a client-selectable exemption.
+It remains immediate and retryable with registry-verified authority even if
+approval, policy or pilot evidence is unavailable. Ordinary agent reason strings
+cannot select it. Native cancellation confirmation errors retain proposal and
+target identity for reconciliation; a consumed review cannot be submitted twice.
 
 ### `close_position(symbol, reason)`
 

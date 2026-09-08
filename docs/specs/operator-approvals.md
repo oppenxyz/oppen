@@ -159,6 +159,35 @@ No activation, consent adoption, registry grant, pairing, key access, funding or
 publication is implied by this plan. Compatible and verified MCP clients must
 share these same server-side safeguards.
 
+## ES30 Cancellation Work
+
+`feat/cancellation-approval` extends the existing journal and native review to
+ordinary agent cancellation. Target identities and protective-order details are
+retained explicitly, not encoded as zero-value order intents. Approval-on
+requests queue; confirmation checks the same route, policy, original deadline
+and complete retained target evidence. Missing or changed targets refuse; new
+orders cannot enter a previous cancel-all review. Internal HALT/pause cleanup
+remains separate and immediate. Local verification passes 1,089 Rust tests
+(15 live-gated ignored), 174 frontend tests, build, QA typecheck and dependency
+checks. Separate automated working-diff review found no blocking issues; exact
+head review and CI remain gates. Synthetic browser checks cover protective
+targets, row-local partial/uncertain results and preservation after refresh.
+
+V12 extends the typed journal without changing historical order-event bytes.
+Stop all older writers before upgrading; already-open handles are not evicted
+by a reader barrier. Rollback requires compatible code and complete history,
+not lowering the schema version, discarding claims or restoring old budgets.
+No dedicated-account migration or venue acceptance is implied.
+
+**Activation gate: order provenance.** Authenticated container grants do not
+prove that every order on the account was opened by its agent. Existing
+discretionary cancellation can select manual/external orders; operator review
+alone does not satisfy D1's own-order rule. Add authenticated account/agent/order
+provenance and refuse unknown-origin discretionary targets, preserving separate
+explicit operator/emergency authority. Do not claim complete D1 isolation or
+full approval/alpha acceptance before that gate passes. Dead-man supervision
+also remains a separate unwired requirement.
+
 ## Durable Lifecycle Evidence
 
 ES25 installs authenticated proposal/claim/disposition authority in both

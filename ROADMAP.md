@@ -211,6 +211,19 @@ before expanding features:
    cancellation with a frozen reviewed target set; HALT/pause cleanup must remain
    immediate. Dead-man supervision is a separate unwired requirement, not an
    existing agent-accessible disarm tool.
+   ES30 is implemented locally on `feat/cancellation-approval`: typed discretionary
+   cancellation proposals and retained native target review through the same
+   gateway, with immediate internal HALT cleanup preserved. Workspace tests pass
+   (1,089 Rust, 15 live-gated ignored), along with 174 frontend tests, build, QA
+   typecheck and dependency-policy checks. Separate automated working-diff review
+   found no blocking issues; exact-head review and CI remain gates. Browser
+   fixtures verified protective target details, row-local partial/uncertain
+   feedback and retained uncertainty at 1280x800 and wide desktop sizes.
+   V12 preserves historical event bytes; older writers must stop before upgrade,
+   and rollback must preserve all V12 history without lowering schema or budgets.
+   D1 own-order provenance remains a
+   separate activation gate: account binding alone does not exclude manual
+   orders, and operator review does not establish that the agent opened them.
    No dedicated-account activity has been performed during this development.
 4. **Recovery:** PR #44 merged as `06fc0e3` after green CI and separate automated
    review. The durable submission journal has SQLite reopen, independent

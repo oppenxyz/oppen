@@ -5,7 +5,7 @@ const A = { agent: "alpha", account: `0x${"1".repeat(40)}` };
 const B = { agent: "beta", account: `0x${"2".repeat(40)}` };
 const NOW = 1000;
 const proposal = (binding = A) => ({
-  ...binding, id: "approval-testnet-7", symbol: "BTC", is_buy: true, px: "101.000000000001",
+  ...binding, kind: "order", id: "approval-testnet-7", symbol: "BTC", is_buy: true, px: "101.000000000001",
   sz: "0.10000000001", reduce_only: false, reason: "<img src=x onerror=alert(1)>", expires_at_ms: 100_000,
   original: { kind: { kind: "market", slippage_bps: "100" }, reference_px: "100", reference_at_ms: 999 },
 });
@@ -24,6 +24,46 @@ const review = () => ({ id: "review-1", owner_id: "owner-1", pairing_id: { netwo
     route: { network: "testnet", binding_seq: 2, binding: { agent: A.agent, container: A.account, vault_address: null,
       wallet: { generation: 1, address: B.account, approved_at_ms: 1, valid_until_ms: 200000 } } },
     policy_revision: 4, policy_hash: "abc", reviewed_at_ms: NOW, expires_at_ms: 100000 } });
+const cancelProposal = () => ({ ...A, kind: "cancel", id: "approval-testnet-cancel", reason: "<script>cancel protection</script>", expires_at_ms: 100000,
+  targets: [{ symbol: "BTC", asset_index: 0, oid: 42, cloid: "0x42", is_buy: false, limit_px: "100.001", sz: "0.12", orig_sz: "0.2",
+    timestamp: NOW - 1, order_type: "Stop Market", reduce_only: true, is_trigger: true, trigger_px: "100.1", trigger_condition: "<img src=x>", is_position_tpsl: true }] });
+const cancelReview = () => ({ ...review(), id: "cancel-review", reason: cancelProposal().reason,
+  display: { kind: "cancel", proposal_id: cancelProposal().id, ...A, targets: cancelProposal().targets, reason: cancelProposal().reason,
+    route: review().display.route, policy_revision: 4, policy_hash: "abc", reviewed_at_ms: NOW, expires_at_ms: 100000 } });
+
+test("cancellation retains exact targets in a mixed queue and submits only the review ID once", async () => {
+  const pending = [proposal(), cancelProposal()];
+  const held = cancelReview();
+  const hung = deferred();
+  const f = fixture({ status: async () => status(A, { pending }), prepare: async () => status(A, { pending, phase: "review_ready", review: held }), confirm: () => hung.promise });
+  await settle(); await f.store.prepare(cancelProposal().id);
+  expect(f.store.state.status.review.display.targets).toEqual(cancelProposal().targets);
+  expect(f.store.state.status.pending).toEqual(pending);
+  const confirming = f.store.confirm(); await f.store.confirm();
+  expect(f.calls.at(-1)).toEqual(["confirm", A.agent, A.account, "owner-1", "cancel-review"]);
+  f.fire(5000); expect(f.store.state.execution.error).not.toBeNull();
+  hung.resolve(status()); await confirming;
+  f.handlers.status = async () => status(A, { pending, phase: "unavailable", review: held, confirmation: {
+    review_id: held.id, proposal_id: cancelProposal().id, at_ms: NOW, result: null,
+    error: { data: { action: "cancel", code: "timeout_unknown_outcome", retryable: false, targets: held.display.targets } } } });
+  await f.store.readStatus();
+  expect(f.store.state.execution.error.data.targets).toEqual(held.display.targets);
+  f.store.stop(); f.store.setBinding(A); f.store.start(); await settle(); await f.store.confirm();
+  expect(f.calls.filter(call => call[0] === "confirm")).toHaveLength(1);
+  f.store.stop();
+});
+
+test("cancellation review kind and owner must match; recovery cannot admit another decision", async () => {
+  for (const changed of [{ kind: "order" }, { account: B.account }]) {
+    const held = cancelReview(); held.display = { ...held.display, ...changed };
+    const f = fixture({ status: async () => status(A, { pending: [cancelProposal()], phase: "review_ready", review: held }), confirm: async () => status() });
+    await settle(); expect(f.store.state.error).toContain("identity"); expect(f.store.canConfirm()).toBe(false); f.store.stop();
+  }
+  const f = fixture({ status: async () => status(A, { pending: [cancelProposal()], phase: "recovery_required", review: cancelReview() }), prepare: async () => status(), confirm: async () => status() });
+  await settle(); await f.store.prepare(cancelProposal().id); await f.store.confirm();
+  expect(f.calls.map(call => call[0])).toEqual(["status"]);
+  f.store.stop();
+});
 
 test("pricing preparation retains exact evidence and confirmation sends only owner and review ID once", async () => {
   const held = review();

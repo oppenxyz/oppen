@@ -15,7 +15,7 @@ fn prepare(f: &DurableFixture, id: &str, reference: Decimal) -> ApprovalReview {
 }
 
 fn confirm(f: &DurableFixture, review: ApprovalReview) -> Result<Cleared, Refusal> {
-    let reference = review.display().reference_px;
+    let reference = review.display().order().unwrap().reference_px;
     f.engine.operator_confirm_review(
         review,
         &asset("BTC", 2, 40),
@@ -60,11 +60,14 @@ fn review_prepare_is_nonconsuming_preserves_root_ttl_and_does_not_spend_rate_tok
         assert_eq!(review.proposal_id(), proposal.id());
         assert_eq!(review.agent(), proposal.agent());
         assert_eq!(review.account(), proposal.account());
-        assert_eq!(review.symbol(), "BTC");
-        assert_eq!(review.display().expires_at_ms, proposal.expires_at_ms());
-        assert!(review.display().original.is_none());
-        assert!(review.display().drift_bps.is_none());
-        let display = serde_json::to_value(review.display()).unwrap();
+        assert_eq!(review.symbol(), Some("BTC"));
+        assert_eq!(
+            review.display().order().unwrap().expires_at_ms,
+            proposal.expires_at_ms()
+        );
+        assert!(review.display().order().unwrap().original.is_none());
+        assert!(review.display().order().unwrap().drift_bps.is_none());
+        let display = serde_json::to_value(review.display().order().unwrap()).unwrap();
         assert_eq!(display["px"], "100");
         assert_eq!(display["sz"], "1");
         assert_eq!(display["notional_usd"], "100");
@@ -102,7 +105,7 @@ fn reviewed_confirmation_commits_actual_receipt_once_and_reopens_consumed() {
     let proposal = f.propose();
     let review = prepare(&f, proposal.id(), d("100"));
     let competing = prepare(&f, proposal.id(), d("100"));
-    let display = review.display().clone();
+    let display = review.display().order().unwrap().clone();
     let cleared = confirm(&f, review).unwrap();
     assert_eq!(cleared.clearance().route, display.route);
     assert_eq!(cleared.clearance().policy_revision, display.policy_revision);
@@ -163,7 +166,7 @@ fn review_reprices_market_but_never_infers_market_from_explicit_ioc_or_absent_or
         };
         let id = propose_order(&f, &order, &exposure(d("100000")));
         let review = prepare(&f, &id, d("110"));
-        let display = review.display();
+        let display = review.display().order().unwrap();
         assert_eq!(display.original, order.original);
         assert_eq!(display.original_px, d("101"));
         assert_eq!(
@@ -214,9 +217,9 @@ fn review_keeps_stop_trigger_tpsl_and_bound_price_fixed() {
     });
     let id = propose_order(&f, &order, &exposure(d("100000")));
     let review = prepare(&f, &id, d("110"));
-    assert_eq!(review.display().px, d("101"));
+    assert_eq!(review.display().order().unwrap().px, d("101"));
     assert!(
-        matches!(&review.display().order_type, OrderType::Trigger { is_market: true, trigger_px, tpsl: Tpsl::Sl } if trigger_px.as_str() == "100")
+        matches!(&review.display().order().unwrap().order_type, OrderType::Trigger { is_market: true, trigger_px, tpsl: Tpsl::Sl } if trigger_px.as_str() == "100")
     );
     assert!(confirm(&f, review).is_ok());
 }
@@ -255,9 +258,9 @@ fn review_close_preserves_signed_size_and_refuses_position_changes_before_claim(
                 NOW_MS,
             )
             .unwrap();
-        assert_eq!(review.display().px, d("108.9"));
-        assert_eq!(review.display().sz, d("1"));
-        assert!(!review.display().is_buy);
+        assert_eq!(review.display().order().unwrap().px, d("108.9"));
+        assert_eq!(review.display().order().unwrap().sz, d("1"));
+        assert!(!review.display().order().unwrap().is_buy);
         loaded
             .agent
             .positions
@@ -350,10 +353,13 @@ fn reviewed_policy_change_does_not_publish_a_clearance() {
         .unwrap()
         .max_order_usd = d("999999");
     let published = f.policy.replace(current.revision, next, NOW_MS).unwrap();
-    assert_ne!(published.revision, review.display().policy_revision);
+    assert_ne!(
+        published.revision,
+        review.display().order().unwrap().policy_revision
+    );
     assert_ne!(
         f.ledger.event(published.revision).unwrap().unwrap().hash,
-        review.display().policy_hash
+        review.display().order().unwrap().policy_hash
     );
     acknowledge(&f.engine);
     let head = f.ledger.chain_head().unwrap();

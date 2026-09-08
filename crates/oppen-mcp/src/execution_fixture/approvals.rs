@@ -7,8 +7,12 @@ use oppen_hl::wire::{OrderWire, WireFloat};
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
+#[path = "approvals/cancellations.rs"]
+mod cancellations;
+
 struct Serving {
     control: OperatorControl,
+    supervision: crate::server::SupervisionControl,
     stop: CancellationToken,
     task: Option<tokio::task::JoinHandle<std::io::Result<()>>>,
 }
@@ -19,6 +23,7 @@ impl Serving {
             .await
             .unwrap();
         let control = bound.operator_control();
+        let supervision = bound.supervision_control();
         let mut status = bound.supervision_status();
         let stop = CancellationToken::new();
         let task = tokio::spawn(bound.serve(
@@ -28,6 +33,7 @@ impl Serving {
         ));
         let serving = Self {
             control,
+            supervision,
             stop,
             task: Some(task),
         };
@@ -236,7 +242,10 @@ async fn native_prepare_is_non_executing_and_confirm_matches_display_once() {
         .prepare(&binding(&runtime), &id)
         .await
         .unwrap();
-    let display = review.display().clone();
+    let oppen_core::guardrail::ApprovalReviewDisplay::Order(display) = review.display().clone()
+    else {
+        panic!("expected order review");
+    };
     assert_eq!(display.proposal_id, id);
     assert_eq!(display.account, runtime.account);
     assert_eq!(display.agent, binding(&runtime).agent);
@@ -413,7 +422,10 @@ async fn signing_admission_wins_close_without_hiding_actual_submission_or_drain(
         .prepare(&binding(&runtime), &id)
         .await
         .unwrap();
-    let displayed = review.display().clone();
+    let oppen_core::guardrail::ApprovalReviewDisplay::Order(displayed) = review.display().clone()
+    else {
+        panic!("expected order review");
+    };
     let entered = Arc::new(tokio::sync::Notify::new());
     let (release, wait) = std::sync::mpsc::channel();
     *anchor.signing_wait.lock().unwrap() = Some((

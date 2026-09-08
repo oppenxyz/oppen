@@ -169,7 +169,8 @@ CREATE INDEX events_submission_account
 // V9 requires authenticated, one-shot approval lifecycle authority.
 // V10: older writers cannot preserve original request evidence in approvals.
 // V11: reviewed candidate commitments and their actual receipt binding.
-const MIGRATIONS: &[&str] = &[V1, V2, V3, "", "", "", "", "", "", "", ""];
+// V12: typed discretionary cancellation proposals and reviewed action receipts.
+const MIGRATIONS: &[&str] = &[V1, V2, V3, "", "", "", "", "", "", "", "", ""];
 
 pub(super) const CURRENT_VERSION: usize = MIGRATIONS.len();
 

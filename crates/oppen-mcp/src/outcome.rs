@@ -77,6 +77,14 @@ pub(crate) enum Outcome {
         expires_at_ms: u64,
     },
 
+    #[serde(rename = "pending_approval")]
+    PendingCancellationApproval {
+        action: &'static str,
+        approval_id: String,
+        expires_at_ms: u64,
+        targets: Vec<oppen_core::guardrail::CancelTarget>,
+    },
+
     /// A predicate refused before signing. Nothing reached the venue, no
     /// nonce was spent.
     Rejected {
@@ -180,6 +188,16 @@ pub(crate) fn refused(refusal: Refusal) -> Reply {
             symbol,
             notional_usd,
             expires_at_ms,
+        },
+        Refusal::CancellationApprovalRequired {
+            approval_id,
+            expires_at_ms,
+            targets,
+        } => Outcome::PendingCancellationApproval {
+            action: "cancel",
+            approval_id,
+            expires_at_ms,
+            targets,
         },
         other => {
             // Read the wait off a borrow before the refusal is moved into the

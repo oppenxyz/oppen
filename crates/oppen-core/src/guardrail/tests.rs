@@ -4632,7 +4632,7 @@ fn approval_is_the_last_check_and_is_not_charged_twice() {
     let pending = f.engine.pending_proposals(NOW_MS).unwrap();
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].id(), approval_id);
-    assert_eq!(pending[0].intent(), &order);
+    assert_eq!(pending[0].order_intent().unwrap(), &order);
 
     // The operator approves; the re-evaluation must not need a second token.
     assert!(
@@ -4685,8 +4685,14 @@ fn original_request_evidence_distinguishes_market_from_explicit_ioc() {
     }
     let pending = f.engine.pending_proposals(NOW_MS).unwrap();
     assert_eq!(pending.len(), 2);
-    assert_eq!(pending[0].intent().px, pending[1].intent().px);
-    assert_ne!(pending[0].intent().original, pending[1].intent().original);
+    assert_eq!(
+        pending[0].order_intent().unwrap().px,
+        pending[1].order_intent().unwrap().px
+    );
+    assert_ne!(
+        pending[0].order_intent().unwrap().original,
+        pending[1].order_intent().unwrap().original
+    );
 }
 
 #[test]

@@ -11,6 +11,31 @@ decisions" section until then.
 
 ---
 
+## 2026-09-08 · Discretionary cancellation approval
+
+ES30 implements spec item 28 for ordinary agent `cancel` and `cancel_all`.
+When approval is on, retain a typed cancellation proposal in the existing
+authenticated approval journal. Review the exact route, policy, original TTL,
+reason and frozen target identities, including protective orders. Confirmation
+is one-shot through the existing native owner, account queue and guarded signer;
+never expand an old cancel-all request to newly created orders. Changed target
+evidence requires a new review or an explicit already-gone outcome, not a
+replacement order or silently changed executable action. Cancellation results
+must distinguish acknowledged, partial, refused and uncertain from order fills.
+
+Runtime HALT/pause cleanup is a distinct non-agent path and remains immediate
+and retryable with registry-verified authority, including when policy, pilot or
+approval evidence cannot be read. Neither a reason string nor an agent-supplied
+flag can select this exemption. Approval-off cancellation preserves current
+behavior. Read-only MCP tools and local alerts are not exchange execution.
+
+Reuse retained native review, full-action commitments, durable claim/disposition
+and server admission/drain; no second event store or signer. Preserve existing
+approval event bytes and stop older writers at the new reader barrier. No live
+activity, consent/budget reset, credential read or publication is authorized.
+Dead-man supervision remains a separate requirement: no agent disarm tool is
+introduced and disarming is not justified by the generic cleanup exemption.
+
 ## 2026-09-08 · Retained native approval review
 
 ES29 implements spec items 18, 19, 28 and 32 using the existing gateway and

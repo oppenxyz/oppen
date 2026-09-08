@@ -42,7 +42,6 @@ use crate::keys::{AgentWallet, KeyStore, KeyStoreError};
 use crate::ledger::approval::{ApprovalJournal, Candidate, ReviewCommitment, ReviewEvidence};
 use crate::ledger::{AuthorizedRoute, LedgerAuditSink, PolicyJournal};
 
-use super::AgentId;
 use super::breaker::{self, BudgetScope, LossBudget, LossKind};
 use super::bucket::{BucketError, TokenBucket};
 use super::config::{
@@ -55,6 +54,7 @@ use super::snapshot::{AccountSnapshot, Exposure, MarketRef, MarketSnapshotRef};
 use super::store::{
     GuardrailStore, PersistedState, PolicyVersion, SqliteGuardrailStore, StoreError,
 };
+use super::{AgentId, CancelContext, CancelIntent, CancelTarget};
 
 /// One basis point is a ten-thousandth.
 const BPS: Decimal = Decimal::from_parts(10_000, 0, 0, false, 0);
@@ -110,9 +110,16 @@ pub struct OrderIntent {
 pub struct Proposal {
     pub(crate) id: String,
     pub(crate) agent: AgentId,
-    pub(crate) intent: OrderIntent,
+    pub(crate) intent: ProposalIntent,
     pub(crate) route: AuthorizedRoute,
     pub(crate) expires_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
+pub enum ProposalIntent {
+    Order(OrderIntent),
+    Cancel(CancelIntent),
 }
 
 impl Proposal {
@@ -134,8 +141,22 @@ impl Proposal {
     /// What the agent asked for. Item 28 re-prices at approval time, so the
     /// operator console shows this against the current market to display the
     /// drift.
-    pub fn intent(&self) -> &OrderIntent {
+    pub fn intent(&self) -> &ProposalIntent {
         &self.intent
+    }
+
+    pub fn order_intent(&self) -> Option<&OrderIntent> {
+        match &self.intent {
+            ProposalIntent::Order(intent) => Some(intent),
+            _ => None,
+        }
+    }
+
+    pub fn cancel_intent(&self) -> Option<&CancelIntent> {
+        match &self.intent {
+            ProposalIntent::Cancel(intent) => Some(intent),
+            _ => None,
+        }
     }
 
     /// Item 28's TTL, and the `expires_at` of the MCP `pending_approval`
@@ -163,7 +184,7 @@ impl Proposal {
 /// ```
 pub struct ApprovalReview {
     evidence: ReviewEvidence,
-    candidate: OrderIntent,
+    candidate: ProposalIntent,
     action: Action,
     commitment: ReviewCommitment,
     display: ApprovalReviewDisplay,
@@ -179,16 +200,19 @@ impl std::fmt::Debug for ApprovalReview {
 
 impl ApprovalReview {
     pub fn proposal_id(&self) -> &str {
-        &self.display.proposal_id
+        self.display.proposal_id()
     }
     pub fn agent(&self) -> &AgentId {
-        &self.display.agent
+        self.display.agent()
     }
     pub fn account(&self) -> Address {
-        self.display.account
+        self.display.account()
     }
-    pub fn symbol(&self) -> &str {
-        &self.display.symbol
+    pub fn symbol(&self) -> Option<&str> {
+        match &self.display {
+            ApprovalReviewDisplay::Order(display) => Some(&display.symbol),
+            _ => None,
+        }
     }
     pub fn display(&self) -> &ApprovalReviewDisplay {
         &self.display
@@ -196,7 +220,68 @@ impl ApprovalReview {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct ApprovalReviewDisplay {
+#[allow(clippy::large_enum_variant)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ApprovalReviewDisplay {
+    Order(OrderApprovalReviewDisplay),
+    Cancel(CancelApprovalReviewDisplay),
+}
+
+impl ApprovalReviewDisplay {
+    pub fn proposal_id(&self) -> &str {
+        match self {
+            Self::Order(d) => &d.proposal_id,
+            Self::Cancel(d) => &d.proposal_id,
+        }
+    }
+    pub fn agent(&self) -> &AgentId {
+        match self {
+            Self::Order(d) => &d.agent,
+            Self::Cancel(d) => &d.agent,
+        }
+    }
+    pub fn account(&self) -> Address {
+        match self {
+            Self::Order(d) => d.account,
+            Self::Cancel(d) => d.account,
+        }
+    }
+    pub fn expires_at_ms(&self) -> u64 {
+        match self {
+            Self::Order(d) => d.expires_at_ms,
+            Self::Cancel(d) => d.expires_at_ms,
+        }
+    }
+    pub fn order(&self) -> Option<&OrderApprovalReviewDisplay> {
+        match self {
+            Self::Order(d) => Some(d),
+            _ => None,
+        }
+    }
+    pub fn cancel(&self) -> Option<&CancelApprovalReviewDisplay> {
+        match self {
+            Self::Cancel(d) => Some(d),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CancelApprovalReviewDisplay {
+    pub proposal_id: String,
+    pub agent: AgentId,
+    pub account: Address,
+    pub targets: Vec<CancelTarget>,
+    pub reason: String,
+    pub route: AuthorizedRoute,
+    pub policy_revision: u64,
+    pub policy_hash: String,
+    pub reviewed_at_ms: u64,
+    pub expires_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct OrderApprovalReviewDisplay {
     pub proposal_id: String,
     pub agent: AgentId,
     pub account: Address,
@@ -326,6 +411,11 @@ pub enum ClearedKind {
     },
     /// Risk-reducing, so it clears while the kill switch is engaged.
     Cancel { count: usize },
+    /// Agent-requested cancellation, never the runtime cleanup exemption.
+    DiscretionaryCancel {
+        targets: Vec<CancelTarget>,
+        observed_at_ms: u64,
+    },
     /// The dead-man's switch (spec item 27). `None` disarms.
     ScheduleCancel { cancel_at_ms: Option<u64> },
 }
@@ -1343,8 +1433,10 @@ impl GuardrailEngine {
                 approval_id: id.to_owned(),
             })?;
         let proposal = &evidence.proposal;
-        let candidate =
-            super::request::review_candidate(&proposal.intent, asset, market, exposure)?;
+        let intent = proposal
+            .order_intent()
+            .ok_or_else(|| approval_refusal("order review requires an order proposal"))?;
+        let candidate = super::request::review_candidate(intent, asset, market, exposure)?;
         let evaluated = self.decide(
             &proposal.agent,
             &candidate,
@@ -1383,8 +1475,7 @@ impl GuardrailEngine {
         let [wire] = orders.as_slice() else {
             return Err(approval_refusal("review requires one order"));
         };
-        let drift_bps = proposal
-            .intent
+        let drift_bps = intent
             .original
             .as_ref()
             .and_then(|original| original.reference_px)
@@ -1398,13 +1489,13 @@ impl GuardrailEngine {
                 )
             })
             .transpose()?;
-        let display = ApprovalReviewDisplay {
+        let display = OrderApprovalReviewDisplay {
             proposal_id: proposal.id.clone(),
             agent: proposal.agent.clone(),
             account: proposal.account(),
-            symbol: proposal.intent.symbol.clone(),
-            original: proposal.intent.original.clone(),
-            original_px: proposal.intent.px,
+            symbol: intent.symbol.clone(),
+            original: intent.original.clone(),
+            original_px: intent.px,
             reference_px,
             reference_at_ms: market.as_of_ms,
             drift_bps,
@@ -1429,10 +1520,10 @@ impl GuardrailEngine {
         };
         Ok(ApprovalReview {
             evidence,
-            candidate,
+            candidate: ProposalIntent::Order(candidate),
             action: evaluated.action,
             commitment,
-            display,
+            display: ApprovalReviewDisplay::Order(display),
         })
     }
 
@@ -1446,17 +1537,29 @@ impl GuardrailEngine {
         exposure: &Exposure,
         now_ms: u64,
     ) -> Result<Cleared, Refusal> {
+        let ApprovalReview {
+            evidence,
+            candidate: ProposalIntent::Order(candidate),
+            action,
+            commitment,
+            display: ApprovalReviewDisplay::Order(display),
+        } = review
+        else {
+            return Err(approval_refusal(
+                "order confirmation requires an order review",
+            ));
+        };
         let journal = self.approvals.as_ref().ok_or_else(|| {
             approval_refusal("durable approval authority required for confirmation")
         })?;
-        if now_ms >= review.display.expires_at_ms {
+        if now_ms >= display.expires_at_ms {
             return Err(Unevaluable::ApprovalExpired {
-                expires_at_ms: review.display.expires_at_ms,
+                expires_at_ms: display.expires_at_ms,
                 now_ms,
             }
             .into());
         }
-        if now_ms < review.display.reviewed_at_ms {
+        if now_ms < display.reviewed_at_ms {
             return Err(Unevaluable::ApprovalReviewChanged {
                 detail: "review clock moved backwards".into(),
             }
@@ -1465,26 +1568,22 @@ impl GuardrailEngine {
         // A close never silently changes size or side. Check against the original
         // proposal, retaining the reviewed quote timestamp in the actual candidate.
         let refreshed = super::request::review_candidate(
-            &review.evidence.proposal.intent,
+            evidence
+                .proposal
+                .order_intent()
+                .ok_or_else(|| approval_refusal("order proposal required"))?,
             asset,
             market,
             exposure,
         )?;
         let mut comparable = refreshed;
-        comparable.original = review.candidate.original.clone();
-        if comparable != review.candidate {
+        comparable.original = candidate.original.clone();
+        if comparable != candidate {
             return Err(Unevaluable::ApprovalReviewChanged {
                 detail: "rounded candidate changed".into(),
             }
             .into());
         }
-        let ApprovalReview {
-            evidence,
-            candidate,
-            action,
-            commitment,
-            display,
-        } = review;
         let review_digest = commitment.digest().map_err(approval_refusal)?;
         let claim = journal
             .claim_review(evidence, commitment, now_ms)
@@ -1520,6 +1619,243 @@ impl GuardrailEngine {
             .finish(claim, &outcome, receipt.as_ref(), now_ms)
             .map_err(approval_refusal)?;
         outcome
+    }
+
+    /// Evaluates an agent-requested cancellation, never runtime cleanup.
+    pub fn evaluate_cancel(
+        &self,
+        agent: &AgentId,
+        intent: &CancelIntent,
+        context: &CancelContext,
+        now_ms: u64,
+    ) -> Result<Cleared, Refusal> {
+        let outcome = self.decide_discretionary_cancel(agent, intent, context, now_ms, None, false);
+        if !matches!(
+            &outcome,
+            Err(Refusal::Unevaluable(Unevaluable::ApprovalAuthority { .. }))
+        ) {
+            self.record(Some(agent), now_ms, &intent.reason, &outcome)?;
+        }
+        outcome
+    }
+
+    /// Retains exact observed targets without consuming the proposal or a rate token.
+    pub fn operator_prepare_cancel_proposal(
+        &self,
+        id: &str,
+        context: &CancelContext,
+        now_ms: u64,
+    ) -> Result<ApprovalReview, Refusal> {
+        let journal = self
+            .approvals
+            .as_ref()
+            .ok_or_else(|| approval_refusal("durable approval authority required"))?;
+        let evidence = journal
+            .prepare(id, now_ms)
+            .map_err(approval_refusal)?
+            .ok_or_else(|| Unevaluable::UnknownProposal {
+                approval_id: id.into(),
+            })?;
+        let proposal = &evidence.proposal;
+        let candidate = proposal
+            .cancel_intent()
+            .ok_or_else(|| approval_refusal("cancellation proposal required"))?
+            .clone();
+        let cleared = self.decide_discretionary_cancel(
+            proposal.agent(),
+            &candidate,
+            context,
+            now_ms,
+            Some(&proposal.route),
+            true,
+        )?;
+        let commitment = crate::ledger::approval::ReviewCommitment::new_cancel(
+            &evidence,
+            &candidate,
+            cleared.action.clone(),
+            &cleared.clearance,
+            now_ms,
+            context.observed_at_ms,
+        )
+        .map_err(approval_refusal)?;
+        let display = CancelApprovalReviewDisplay {
+            proposal_id: proposal.id().into(),
+            agent: proposal.agent().clone(),
+            account: proposal.account(),
+            targets: candidate.targets.clone(),
+            reason: candidate.reason.clone(),
+            route: proposal.route.clone(),
+            policy_revision: evidence.policy_revision,
+            policy_hash: evidence.policy_hash.clone(),
+            reviewed_at_ms: now_ms,
+            expires_at_ms: proposal.expires_at_ms(),
+        };
+        Ok(ApprovalReview {
+            evidence,
+            candidate: ProposalIntent::Cancel(candidate),
+            action: cleared.action,
+            commitment,
+            display: ApprovalReviewDisplay::Cancel(display),
+        })
+    }
+
+    /// Consumes one retained cancellation review; no target filtering or expansion.
+    pub fn operator_confirm_cancel_review(
+        &self,
+        review: ApprovalReview,
+        context: &CancelContext,
+        now_ms: u64,
+    ) -> Result<Cleared, Refusal> {
+        let ApprovalReview {
+            evidence,
+            candidate: ProposalIntent::Cancel(candidate),
+            action,
+            commitment,
+            display: ApprovalReviewDisplay::Cancel(display),
+        } = review
+        else {
+            return Err(approval_refusal(
+                "cancellation confirmation requires a cancellation review",
+            ));
+        };
+        if now_ms >= display.expires_at_ms {
+            return Err(Unevaluable::ApprovalExpired {
+                expires_at_ms: display.expires_at_ms,
+                now_ms,
+            }
+            .into());
+        }
+        if now_ms < display.reviewed_at_ms {
+            return Err(Unevaluable::ClockWentBackwards {
+                now_ms,
+                last_ms: display.reviewed_at_ms,
+            }
+            .into());
+        }
+        let journal = self
+            .approvals
+            .as_ref()
+            .ok_or_else(|| approval_refusal("durable approval authority required"))?;
+        let digest = commitment.digest().map_err(approval_refusal)?;
+        let claim = journal
+            .claim_review(evidence, commitment, now_ms)
+            .map_err(approval_refusal)?
+            .ok_or_else(|| Unevaluable::UnknownProposal {
+                approval_id: display.proposal_id.clone(),
+            })?;
+        let outcome = self
+            .decide_discretionary_cancel(
+                &display.agent,
+                &candidate,
+                context,
+                now_ms,
+                Some(&display.route),
+                false,
+            )
+            .and_then(|mut cleared| {
+                if cleared.action != action
+                    || cleared.clearance.policy_revision != display.policy_revision
+                {
+                    return Err(Unevaluable::ApprovalReviewChanged {
+                        detail: "cancellation action or policy changed".into(),
+                    }
+                    .into());
+                }
+                cleared.approval_deadline_ms = Some(display.expires_at_ms);
+                cleared.clearance.approval_review_digest = Some(digest);
+                Ok(cleared)
+            });
+        let receipt = self.record(Some(&display.agent), now_ms, &candidate.reason, &outcome)?;
+        journal
+            .finish(claim, &outcome, receipt.as_ref(), now_ms)
+            .map_err(approval_refusal)?;
+        outcome
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn decide_discretionary_cancel(
+        &self,
+        agent: &AgentId,
+        intent: &CancelIntent,
+        context: &CancelContext,
+        now_ms: u64,
+        reviewed_route: Option<&AuthorizedRoute>,
+        preparing: bool,
+    ) -> Result<Cleared, Refusal> {
+        check_reason(&intent.reason)?;
+        self.refresh_policy()
+            .map_err(|error| Unevaluable::PolicyAuthority {
+                detail: error.to_string(),
+            })?;
+        let route = self.decision_route(agent)?;
+        if reviewed_route.is_some_and(|expected| expected != &route) {
+            return Err(route_refusal("cancellation proposal route changed"));
+        }
+        let mut state = self.state();
+        let config =
+            state
+                .guardrails
+                .get(agent)
+                .cloned()
+                .ok_or_else(|| Unevaluable::UnknownAgent {
+                    agent: agent.clone(),
+                })?;
+        if let Err((field, detail)) = config.validate() {
+            return Err(Unevaluable::InvalidGuardrailConfig {
+                field: field.into(),
+                detail,
+            }
+            .into());
+        }
+        intent.check_context(
+            context,
+            route.binding.container,
+            config.freshness.max_account_age_ms,
+            now_ms,
+        )?;
+        let policy_revision = state.policy_revision;
+        if config.approval_required && reviewed_route.is_none() {
+            drop(state);
+            let journal = self.approvals.as_ref().ok_or_else(|| {
+                approval_refusal("durable cancellation approval authority required")
+            })?;
+            let proposal = journal
+                .mint_cancel(
+                    agent.clone(),
+                    intent.clone(),
+                    route,
+                    policy_revision,
+                    now_ms,
+                )
+                .map_err(approval_refusal)?;
+            return Err(Refusal::CancellationApprovalRequired {
+                approval_id: proposal.id().into(),
+                expires_at_ms: proposal.expires_at_ms(),
+                targets: intent.targets.clone(),
+            });
+        }
+        let remaining = if preparing {
+            Decimal::ZERO
+        } else {
+            draw_global_reserve(&mut state.global_bucket, now_ms)
+        };
+        Ok(Cleared::new(
+            intent.action(),
+            Clearance {
+                agent: agent.clone(),
+                network: self.network,
+                vault_address: route.binding.vault_address,
+                route,
+                policy_revision,
+                approval_review_digest: None,
+                evaluated_at_ms: now_ms,
+                kind: ClearedKind::DiscretionaryCancel {
+                    targets: intent.targets.clone(),
+                    observed_at_ms: context.observed_at_ms,
+                },
+                utilization: Utilization::none_with_global(remaining),
+            },
+        ))
     }
 
     /// Legacy direct approval of the retained normalized intent, without repricing
@@ -1567,10 +1903,13 @@ impl GuardrailEngine {
                     approval_id: approval_id.to_owned(),
                 })?
         };
+        let intent = proposal
+            .order_intent()
+            .ok_or_else(|| approval_refusal("direct approval requires an order proposal"))?;
         let outcome = self
             .decide(
                 &proposal.agent,
-                &proposal.intent,
+                intent,
                 asset,
                 market,
                 exposure,
@@ -1581,12 +1920,7 @@ impl GuardrailEngine {
                 cleared.approval_deadline_ms = Some(proposal.expires_at_ms);
                 cleared
             });
-        let receipt = self.record(
-            Some(&proposal.agent),
-            now_ms,
-            &proposal.intent.reason,
-            &outcome,
-        )?;
+        let receipt = self.record(Some(&proposal.agent), now_ms, &intent.reason, &outcome)?;
         if let (Some(journal), Some(Some(claim))) = (&self.approvals, claim) {
             if receipt.is_none() {
                 return Err(approval_refusal(
@@ -1802,7 +2136,10 @@ impl GuardrailEngine {
             Err(error) => error,
         };
         let blocks = match outcome {
-            Ok(cleared) => matches!(cleared.clearance().kind, ClearedKind::Order { .. }),
+            Ok(cleared) => matches!(
+                cleared.clearance().kind,
+                ClearedKind::Order { .. } | ClearedKind::DiscretionaryCancel { .. }
+            ),
             Err(_) => false,
         };
         if blocks {
@@ -2765,20 +3102,20 @@ impl PreSignCheck for PreSignGate<'_> {
         // Sample only after every potentially blocking admission dependency.
         let now_ms = (self.clock)();
         self.observed_at_ms.set(Some(now_ms));
+        if let Some(expires_at_ms) = self.approval_deadline_ms
+            && now_ms >= expires_at_ms
+        {
+            return Err(Unevaluable::ApprovalExpired {
+                expires_at_ms,
+                now_ms,
+            }
+            .into());
+        }
         // Exhaustive on purpose, and `ClearedKind` is `#[non_exhaustive]`
         // only outside this crate: a new kind cannot be added without an
         // answer here to "what does this clearance's age make untrue?".
         match &self.clearance.kind {
             ClearedKind::Order { .. } => {
-                if let Some(expires_at_ms) = self.approval_deadline_ms
-                    && now_ms >= expires_at_ms
-                {
-                    return Err(Unevaluable::ApprovalExpired {
-                        expires_at_ms,
-                        now_ms,
-                    }
-                    .into());
-                }
                 check_order_approval_window(&self.clearance.route, now_ms)?;
                 if self.clearance.policy_revision != state.policy_revision {
                     return Err(Unevaluable::PolicyChanged.into());
@@ -2801,6 +3138,27 @@ impl PreSignCheck for PreSignGate<'_> {
                 }
                 let age_ms = now_ms.saturating_sub(evaluated_at_ms);
                 let max_age_ms = config.freshness.max_market_age_ms;
+                if age_ms > max_age_ms {
+                    return Err(Unevaluable::StaleClearance { age_ms, max_age_ms }.into());
+                }
+            }
+            ClearedKind::DiscretionaryCancel { observed_at_ms, .. } => {
+                if self.clearance.policy_revision != state.policy_revision {
+                    return Err(Unevaluable::PolicyChanged.into());
+                }
+                let config =
+                    state
+                        .guardrails
+                        .get(agent)
+                        .ok_or_else(|| Unevaluable::UnknownAgent {
+                            agent: agent.clone(),
+                        })?;
+                let last_ms = self.clearance.evaluated_at_ms.max(*observed_at_ms);
+                if now_ms < last_ms {
+                    return Err(Unevaluable::ClockWentBackwards { now_ms, last_ms }.into());
+                }
+                let age_ms = now_ms - observed_at_ms;
+                let max_age_ms = config.freshness.max_account_age_ms;
                 if age_ms > max_age_ms {
                     return Err(Unevaluable::StaleClearance { age_ms, max_age_ms }.into());
                 }
@@ -2914,7 +3272,7 @@ impl EngineState {
             Proposal {
                 id: id.clone(),
                 agent: agent.clone(),
-                intent: intent.clone(),
+                intent: ProposalIntent::Order(intent.clone()),
                 route: route.clone(),
                 expires_at_ms: now_ms.saturating_add(APPROVAL_TTL_MS),
             },

@@ -261,14 +261,39 @@ async fn missing_policy_keeps_registry_cleanup_available_without_default_policy(
             json!({"cloid":cloid.as_str(), "reason":"policy unavailable cleanup"}),
         )
         .await;
-    assert_eq!(canceled["status"], "canceled", "{canceled}");
+    assert_eq!(canceled["status"], "rejected", "{canceled}");
+    assert_eq!(
+        canceled["refusal"]["unevaluable"], "policy_authority",
+        "{canceled}"
+    );
+    let cancel_all = runtime
+        .call("cancel_all", json!({"reason":"policy unavailable cleanup"}))
+        .await;
+    assert_eq!(cancel_all["status"], "rejected", "{cancel_all}");
+    assert_eq!(
+        cancel_all["refusal"]["unevaluable"], "policy_authority",
+        "{cancel_all}"
+    );
+    assert_eq!(venue.submissions().len(), 2);
+    assert_eq!(keys.read_heads.lock().unwrap().len(), reads);
     runtime
         .gateway
         .enforce_pauses(&[bound], runtime.tracker())
         .await
         .unwrap();
-    assert_eq!(venue.submissions().len(), 4);
-    assert_eq!(venue.submissions()[3]["action"]["type"], "cancel");
+    assert_eq!(venue.submissions().len(), 3);
+    assert_eq!(venue.submissions()[2]["action"]["type"], "cancel");
+    assert_eq!(
+        venue.submissions()[2]["action"]["cancels"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    for oid in [1, 2] {
+        let status = runtime.call("get_order_status", json!({"oid":oid})).await;
+        assert_eq!(status["status"], "canceled", "{status}");
+    }
     assert!(runtime.gateway.inner.engine.policy_observation().is_err());
     runtime.shutdown().await;
     venue.shutdown().await;
@@ -428,7 +453,39 @@ async fn corrupt_policy_preserves_account_reads_and_cleanup_after_refresh_failur
             json!({"oid":1, "reason":"corrupt policy cleanup"}),
         )
         .await;
-    assert_eq!(canceled["status"], "canceled", "{canceled}");
+    assert_eq!(canceled["status"], "rejected", "{canceled}");
+    assert_eq!(
+        canceled["refusal"]["unevaluable"], "policy_authority",
+        "{canceled}"
+    );
+    let cancel_all = runtime
+        .call("cancel_all", json!({"reason":"corrupt policy cleanup"}))
+        .await;
+    assert_eq!(cancel_all["status"], "rejected", "{cancel_all}");
+    assert_eq!(
+        cancel_all["refusal"]["unevaluable"], "policy_authority",
+        "{cancel_all}"
+    );
+    assert_eq!(venue.submissions().len(), 2);
+    assert_eq!(keys.read_heads.lock().unwrap().len(), reads);
+    // Runtime cleanup still signs and posts without usable policy. A venue
+    // rejection leaves both orders resting so restart must retry the work.
+    venue.next_response(Behavior::Rejected);
+    assert!(
+        runtime
+            .gateway
+            .enforce_pauses(
+                &[Binding {
+                    agent: agent.clone(),
+                    account: runtime.account,
+                }],
+                runtime.tracker()
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(venue.submissions().len(), 3);
+    assert_eq!(venue.submissions()[2]["action"]["type"], "cancel");
     runtime.shutdown().await;
 
     let runtime = Runtime::open(dir.path(), venue.port(), keys.clone()).await;
@@ -442,6 +499,17 @@ async fn corrupt_policy_preserves_account_reads_and_cleanup_after_refresh_failur
     );
     assert_eq!(account["policy_status"]["admission_inhibited"], true);
     assert!(account.get("balances").is_some());
+    let reads = keys.read_heads.lock().unwrap().len();
+    let cancel_all = runtime
+        .call("cancel_all", json!({"reason":"restarted policy cleanup"}))
+        .await;
+    assert_eq!(cancel_all["status"], "rejected", "{cancel_all}");
+    assert_eq!(
+        cancel_all["refusal"]["unevaluable"], "policy_authority",
+        "{cancel_all}"
+    );
+    assert_eq!(venue.submissions().len(), 3);
+    assert_eq!(keys.read_heads.lock().unwrap().len(), reads);
     runtime
         .gateway
         .enforce_pauses(
@@ -455,6 +523,17 @@ async fn corrupt_policy_preserves_account_reads_and_cleanup_after_refresh_failur
         .unwrap();
     assert_eq!(venue.submissions().len(), 4);
     assert_eq!(venue.submissions()[3]["action"]["type"], "cancel");
+    assert_eq!(
+        venue.submissions()[3]["action"]["cancels"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    for oid in [1, 2] {
+        let status = runtime.call("get_order_status", json!({"oid":oid})).await;
+        assert_eq!(status["status"], "canceled", "{status}");
+    }
     runtime.shutdown().await;
     venue.shutdown().await;
 }

@@ -23,8 +23,8 @@ use oppen_core::features::{
 };
 use oppen_core::feed::FeedSession;
 use oppen_core::guardrail::{
-    Cleared, FeedQuality, GuardrailEngine, MarketRef, OrderIntent, OriginalRequest,
-    RequestedOrderKind,
+    CancelContext, CancelIntent, CancelTarget, Cleared, FeedQuality, GuardrailEngine, MarketRef,
+    OrderIntent, OriginalRequest, RequestedOrderKind,
 };
 use oppen_core::journal::Journal;
 use oppen_core::ledger::{
@@ -963,8 +963,8 @@ impl Gateway {
     /// `cancel` — one resting order (`docs/spec.md` item 19).
     #[tool(
         description = "Cancel one resting order by oid or by the cloid place returned. Requires \
-                       a reason. Cancels are risk-reducing: they are cleared while the kill \
-                       switch is engaged and they cost no order-rate token."
+                       a reason. Approval mode retains the exact target for operator review; \
+                       runtime emergency cleanup remains independent."
     )]
     async fn cancel(
         &self,
@@ -976,8 +976,6 @@ impl Gateway {
         let bound = Self::bound(&ctx)?;
         let queue = self.execution_queue(bound.account);
         let _execution = queue.lock().await;
-        let now_ms = now_ms();
-
         self.require_route(&bound).await?;
 
         // Which resting order this names, and on which asset. The asset id is
@@ -988,6 +986,7 @@ impl Gateway {
             .frontend_open_orders(bound.account)
             .await
             .map_err(|e| ToolError::unavailable("orders", e))?;
+        let observed_at_ms = now_ms();
         let universe = self.universe().await?;
 
         let target = match (&params.oid, &params.cloid) {
@@ -1013,24 +1012,32 @@ impl Gateway {
             )
             .into_result());
         };
-        let asset = universe
-            .get(&order.coin)
-            .map_err(|e| ToolError::unavailable("universe", e))?;
-
         let agent = bound.agent.clone();
-        let asset_index = asset.index;
-        let oid = order.oid;
+        if orders
+            .iter()
+            .filter(|candidate| {
+                candidate.oid == order.oid || params.oid.is_none() && candidate.cloid == order.cloid
+            })
+            .count()
+            != 1
+        {
+            return Err(
+                ToolError::unavailable("cancellation target", "ambiguous order identity").into(),
+            );
+        }
+        let context = cancellation_context(
+            &bound,
+            std::slice::from_ref(order),
+            &universe,
+            observed_at_ms,
+        )?;
+        let intent = CancelIntent {
+            targets: context.targets.clone(),
+            reason: params.reason,
+        };
         let cleared = match self
             .decision(tracker, move |engine| {
-                engine.clear_cancel(
-                    &agent,
-                    vec![CancelWire {
-                        a: asset_index,
-                        o: oid,
-                    }],
-                    &params.reason,
-                    now_ms,
-                )
+                engine.evaluate_cancel(&agent, &intent, &context, self::now_ms())
             })
             .await?
         {
@@ -1047,7 +1054,7 @@ impl Gateway {
                 Some(order.oid),
                 order.cloid.as_ref().map(|c| c.as_str().to_owned()),
             )],
-        )
+        )?
         .into_result())
     }
 
@@ -1056,7 +1063,8 @@ impl Gateway {
     #[tool(
         description = "Cancel every resting order, or every one on a symbol. Requires a reason. \
                        Partial success is normal — an order that filled a moment ago cannot be \
-                       cancelled — so the result itemises what the venue would not take."
+                       cancelled — so the result itemises what the venue would not take. \
+                       Approval mode retains a frozen target set, never future orders."
     )]
     async fn cancel_all(
         &self,
@@ -1148,6 +1156,17 @@ impl Gateway {
             });
         }
 
+        let discretionary = if paused_only {
+            None
+        } else {
+            let context = cancellation_context(bound, &targets, &universe, now_ms)?;
+            let intent = CancelIntent {
+                targets: context.targets.clone(),
+                reason: params.reason.clone(),
+            };
+            Some((intent, context))
+        };
+
         let mut wires = Vec::with_capacity(targets.len());
         let mut named = Vec::with_capacity(targets.len());
         for order in &targets {
@@ -1167,8 +1186,11 @@ impl Gateway {
         let agent = bound.agent.clone();
         let reason = params.reason.clone();
         let cleared = match self
-            .decision(tracker, move |engine| {
-                engine.clear_cancel(&agent, wires, &reason, now_ms)
+            .decision(tracker, move |engine| match discretionary {
+                Some((intent, context)) => {
+                    engine.evaluate_cancel(&agent, &intent, &context, self::now_ms())
+                }
+                None => engine.clear_cancel(&agent, wires, &reason, now_ms),
             })
             .await?
         {
@@ -1193,7 +1215,7 @@ impl Gateway {
                 .iter()
                 .all(|status| matches!(status, Status::Success));
         Ok(CancelAllResult {
-            reply: cancel_outcome(response, named),
+            reply: cancel_outcome(response, named)?,
             complete,
         })
     }
@@ -2354,6 +2376,44 @@ impl Gateway {
     }
 }
 
+fn cancellation_context(
+    bound: &Binding,
+    orders: &[oppen_hl::types::OpenOrder],
+    universe: &Universe,
+    observed_at_ms: u64,
+) -> Result<CancelContext, ToolError> {
+    let targets = orders
+        .iter()
+        .map(|order| {
+            let asset = universe
+                .get(&order.coin)
+                .map_err(|error| ToolError::unavailable("cancellation asset", error))?;
+            Ok(CancelTarget {
+                symbol: order.coin.clone(),
+                asset_index: asset.index,
+                oid: order.oid,
+                cloid: order.cloid.clone(),
+                is_buy: order.side.is_buy(),
+                limit_px: order.limit_px,
+                sz: order.sz,
+                orig_sz: order.orig_sz,
+                timestamp: order.timestamp,
+                order_type: order.order_type.clone(),
+                reduce_only: order.reduce_only,
+                is_trigger: order.is_trigger,
+                trigger_px: order.trigger_px,
+                trigger_condition: order.trigger_condition.clone(),
+                is_position_tpsl: order.is_position_tpsl,
+            })
+        })
+        .collect::<Result<Vec<_>, ToolError>>()?;
+    Ok(CancelContext {
+        account: bound.account,
+        observed_at_ms,
+        targets,
+    })
+}
+
 async fn track_submission(
     cloid: Option<&Cloid>,
     durable: Option<(&SubmissionJournal, &SubmissionReceipt)>,
@@ -2505,8 +2565,28 @@ fn order_outcome(response: ExchangeResponse, cloid: Option<String>) -> Result<Re
 /// order it answers for.
 ///
 /// The venue returns statuses positionally, aligned with the cancels sent.
-fn cancel_outcome(response: ExchangeResponse, named: Vec<(Option<u64>, Option<String>)>) -> Reply {
+fn cancel_outcome(
+    response: ExchangeResponse,
+    named: Vec<(Option<u64>, Option<String>)>,
+) -> Result<Reply, ToolError> {
     let requested = named.len();
+    if response.statuses.len() != requested
+        || response
+            .statuses
+            .iter()
+            .any(|status| !matches!(status, Status::Success | Status::Error(_)))
+    {
+        return Err(ToolError::TimeoutUnknownOutcome {
+            cloid: if requested == 1 {
+                named[0].1.clone()
+            } else {
+                None
+            },
+            detail:
+                "cancellation response did not acknowledge every target with a cancellation status"
+                    .into(),
+        });
+    }
     let failed = response
         .statuses
         .into_iter()
@@ -2520,7 +2600,7 @@ fn cancel_outcome(response: ExchangeResponse, named: Vec<(Option<u64>, Option<St
             _ => None,
         })
         .collect();
-    outcome::canceled(requested, failed)
+    Ok(outcome::canceled(requested, failed))
 }
 
 /// Retain the requested semantics alongside the unchanged execution conversion.
@@ -2818,7 +2898,7 @@ mod tests {
                 (Some(3), None),
             ],
         );
-        let body = body(reply.into_result());
+        let body = body(reply.unwrap().into_result());
         assert!(body.contains(r#""requested":3,"canceled":2"#), "{body}");
         assert!(body.contains(r#""oid":2,"cloid":"0xcc""#), "{body}");
         assert!(!body.contains(r#""oid":1"#), "{body}");
@@ -2832,9 +2912,27 @@ mod tests {
             vec![(Some(1), None), (Some(2), None)],
         );
         assert_eq!(
-            body(reply.into_result()),
+            body(reply.unwrap().into_result()),
             r#"{"contract_version":0,"status":"canceled","requested":2,"canceled":2,"failed":[]}"#
         );
+    }
+
+    #[test]
+    fn incomplete_or_order_shaped_cancel_responses_are_unknown_not_success() {
+        for statuses in [
+            vec![],
+            vec![Status::Success, Status::Success],
+            vec![Status::Resting { oid: 7 }],
+        ] {
+            let error = cancel_outcome(response(statuses), vec![(Some(7), Some("0xcc".into()))])
+                .unwrap_err();
+            assert!(
+                matches!(&error, ToolError::TimeoutUnknownOutcome { cloid, .. }
+                if cloid.as_deref() == Some("0xcc"))
+            );
+            let error: ErrorData = error.into();
+            assert_eq!(error.data.unwrap()["retryable"], false);
+        }
     }
 
     fn test_asset(sz_decimals: u32) -> oppen_hl::meta::Asset {
@@ -4300,6 +4398,13 @@ mod tests {
             .engine
             .register_agent(&alpha.agent, now_ms())
             .unwrap();
+        let mut policy = gateway.inner.engine.guardrails(&alpha.agent).unwrap();
+        policy.approval_required = false;
+        gateway
+            .inner
+            .engine
+            .operator_set_guardrails(&alpha.agent, policy, now_ms())
+            .unwrap();
         let beta = Binding {
             account: Address::from_bytes([7; 20]),
             ..binding_for("beta")
@@ -4357,6 +4462,33 @@ mod tests {
         (orders, Universe::from_meta(&meta).expect("universe"))
     }
 
+    #[test]
+    fn cancellation_context_preserves_protective_target_evidence_as_string_money() {
+        let (mut orders, universe) = cancel_fixture();
+        let order = &mut orders[0];
+        order.reduce_only = true;
+        order.is_trigger = true;
+        order.is_position_tpsl = true;
+        order.trigger_px = Some("95.25".parse().unwrap());
+        order.trigger_condition = Some("Below <untrusted>".into());
+        order.order_type = "Stop Market".into();
+        order.cloid = Some(Cloid::from_bytes([19; 16]));
+        let bound = binding_for("alpha");
+        let context = cancellation_context(&bound, &orders, &universe, 1234).unwrap();
+        assert_eq!(context.account, bound.account);
+        assert_eq!(context.observed_at_ms, 1234);
+        let target = serde_json::to_value(&context.targets[0]).unwrap();
+        assert_eq!(target["oid"], 42);
+        assert_eq!(target["cloid"], orders[0].cloid.as_ref().unwrap().as_str());
+        assert_eq!(target["limit_px"], "100");
+        assert_eq!(target["sz"], "1");
+        assert_eq!(target["trigger_px"], "95.25");
+        assert_eq!(target["trigger_condition"], "Below <untrusted>");
+        assert_eq!(target["reduce_only"], true);
+        assert_eq!(target["is_trigger"], true);
+        assert_eq!(target["is_position_tpsl"], true);
+    }
+
     #[tokio::test]
     async fn a_resume_while_waiting_for_execution_skips_the_stale_pause_cancel() {
         let gateway = activated_gateway();
@@ -4392,6 +4524,13 @@ mod tests {
         let gateway = activated_gateway();
         let bound = binding_for("alpha");
         pause(&gateway, &bound);
+        let mut policy = gateway.inner.engine.guardrails(&bound.agent).unwrap();
+        policy.approval_required = false;
+        gateway
+            .inner
+            .engine
+            .operator_set_guardrails(&bound.agent, policy, now_ms())
+            .unwrap();
         let params = SymbolActionParams {
             symbol: None,
             reason: "cancel".into(),
@@ -4423,7 +4562,7 @@ mod tests {
                     submitted = true;
                     assert!(matches!(
                         cleared.clearance().kind,
-                        oppen_core::guardrail::ClearedKind::Cancel { count: 1 }
+                        oppen_core::guardrail::ClearedKind::DiscretionaryCancel { ref targets, .. } if targets.len() == 1
                     ));
                     async { Ok(response(vec![Status::Success])) }
                 },
