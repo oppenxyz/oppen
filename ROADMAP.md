@@ -300,6 +300,21 @@ before expanding features:
    and green CI remain required. This keeps the existing idle timeout (75 seconds
    by default); it does not claim detection of every shorter pause, post-admission
    pause or pump backlog, nor completion of the live sleep/wake gate.
+   ES34 on `fix/account-event-admission` is in progress: retain account-event
+   admission inhibition from parsed ingress through durable application, and
+   preserve receipt time across queue delays. The native feed's 13 focused tests
+   pass, including blocked application, pending-account evidence and clean
+   completion. The 12 ingress-wrapper tests and workspace all-target compile
+   check also pass. The queued-loss MCP regression now refuses a fresh order
+   before the pending fill is applied, with no additional signature, acceptance
+   record or order POST; pump drain and physical ledger release also pass.
+   Initial independent review identified continued-ingestion, closed-status
+   and admission-overtaking defects; a scoped source re-review found those
+   addressed. Full workspace validation passes: 1,175 Rust tests, with 15
+   live/keychain-gated tests ignored. All-target Clippy, formatting and offline
+   dependency checks pass. Aggregate automated review found no blockers;
+   exact-head review and green CI remain required. This is not a completed live
+   gate.
    No dedicated-account activity has been performed during this development.
 4. **Recovery:** PR #44 merged as `06fc0e3` after green CI and separate automated
    review. The durable submission journal has SQLite reopen, independent

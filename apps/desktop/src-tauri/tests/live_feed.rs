@@ -68,7 +68,7 @@ async fn every_channel_the_console_watches_delivers() {
         let Ok(Some(event)) = tokio::time::timeout_at(deadline, events.recv()).await else {
             break;
         };
-        match event {
+        match event.event() {
             WsEvent::ActiveAssetCtx { .. } => ctx += 1,
             WsEvent::Bbo { .. } => bbo += 1,
             WsEvent::L2Book(_) => book += 1,
@@ -80,12 +80,13 @@ async fn every_channel_the_console_watches_delivers() {
             // duplicate that costs the console nothing. A feed that is really
             // refused is caught below by having delivered no frames, which is
             // the observable behaviour rather than the venue's wording.
-            WsEvent::VenueError { message, .. } => venue_errors.push(message),
+            WsEvent::VenueError { message, .. } => venue_errors.push(message.clone()),
             WsEvent::SubscriptionQuarantined { subscription, .. } => {
                 panic!("the pool gave up on {}", subscription.key())
             }
             _ => {}
         }
+        event.acknowledge();
         if ctx > 0 && bbo > 0 && book > 0 && candle > 0 && trades > 0 {
             break;
         }
@@ -151,7 +152,7 @@ async fn candle_and_trade_cadence() {
             break;
         };
         let at = started.elapsed();
-        match event {
+        match event.event() {
             WsEvent::Candle(_) => {
                 candles += 1;
                 first_candle.get_or_insert(at);
@@ -163,6 +164,7 @@ async fn candle_and_trade_cadence() {
             }
             _ => {}
         }
+        event.acknowledge();
     }
 
     println!(

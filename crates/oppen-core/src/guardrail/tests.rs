@@ -5388,6 +5388,7 @@ fn a_clearance_is_signed_for_the_network_and_sub_account_it_was_evaluated_for() 
     );
     let mainnet_feed = Arc::new(crate::feed::FeedSession::new());
     mainnet_feed.bind(Network::Mainnet, other_vault).unwrap();
+    let _mainnet_ingress = crate::feed::test_ingress(&mainnet_feed);
     mainnet_feed.reconciled(&mainnet_feed.stamp(), NOW_MS);
     let mainnet = GuardrailEngine::from_parts(
         Arc::new(test_store()),

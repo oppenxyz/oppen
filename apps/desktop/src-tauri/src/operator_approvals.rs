@@ -767,7 +767,7 @@ impl ApprovalQueueControl {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::collections::{BTreeMap, HashMap};
     use std::sync::mpsc;
@@ -843,6 +843,7 @@ mod tests {
     }
 
     struct Fixture {
+        feeds: Mutex<Vec<LiveFeed>>,
         _dir: tempfile::TempDir,
         engine: Arc<GuardrailEngine>,
         beta_engine: Arc<GuardrailEngine>,
@@ -854,6 +855,73 @@ mod tests {
     }
 
     struct EmptyVenue;
+
+    pub(crate) struct LiveFeed {
+        sender: Option<oppen_hl::ws::EventSender>,
+        task: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl LiveFeed {
+        pub(crate) fn start(
+            feed: Arc<FeedSession>,
+            ledger: Arc<Ledger>,
+            account: Address,
+            alerts: Arc<oppen_core::alert::AlertStore>,
+            quotes: Arc<oppen_core::features::quotes::QuoteCache>,
+        ) -> Self {
+            let (sender, mut receiver) = oppen_hl::ws::event_channel(1);
+            let session = feed.clone();
+            let task = std::thread::spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(async {
+                        let pump = FeedPump::new(
+                            &session,
+                            &ledger,
+                            account,
+                            EmptyVenue,
+                            &alerts,
+                            &quotes,
+                            &EmptyVenue,
+                        )
+                        .unwrap();
+                        pump.run(&mut receiver).await;
+                        receiver.complete().unwrap();
+                    });
+            });
+            let live = Self {
+                sender: Some(sender),
+                task: Some(task),
+            };
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                let state = feed.state();
+                assert!(state.failure.is_none(), "{state:?}");
+                if state.reconciled {
+                    return live;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "feed startup timed out"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+
+    impl Drop for LiveFeed {
+        fn drop(&mut self) {
+            drop(self.sender.take());
+            if let Some(task) = self.task.take() {
+                let result = task.join();
+                if !std::thread::panicking() {
+                    result.unwrap();
+                }
+            }
+        }
+    }
 
     impl ReconcileSource for EmptyVenue {
         fn network(&self) -> Network {
@@ -975,6 +1043,7 @@ mod tests {
                 .unwrap();
             assert!(!Arc::ptr_eq(&engine.feed(), &beta_engine.feed()));
             Self {
+                feeds: Mutex::new(Vec::new()),
                 _dir: dir,
                 engine,
                 beta_engine,
@@ -995,38 +1064,17 @@ mod tests {
             };
             let feed = engine.feed();
             if !feed.state().reconciled {
-                // Use the real startup fold, including its durable gap closure.
-                std::thread::scope(|scope| {
-                    scope
-                        .spawn(|| {
-                            let alerts = oppen_core::alert::AlertStore::open(
-                                self._dir.path().join("alerts.db"),
-                            )
-                            .unwrap();
-                            let quotes = oppen_core::features::quotes::QuoteCache::new();
-                            tokio::runtime::Builder::new_current_thread()
-                                .enable_all()
-                                .build()
-                                .unwrap()
-                                .block_on(async {
-                                    let pump = FeedPump::new(
-                                        &feed,
-                                        &self.ledger,
-                                        binding.account,
-                                        EmptyVenue,
-                                        &alerts,
-                                        &quotes,
-                                        &EmptyVenue,
-                                    )
-                                    .unwrap();
-                                    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-                                    drop(tx);
-                                    pump.run(&mut rx).await;
-                                });
-                        })
-                        .join()
-                        .unwrap();
-                });
+                let live = LiveFeed::start(
+                    feed.clone(),
+                    self.ledger.clone(),
+                    binding.account,
+                    Arc::new(
+                        oppen_core::alert::AlertStore::open(self._dir.path().join("alerts.db"))
+                            .unwrap(),
+                    ),
+                    Arc::new(oppen_core::features::quotes::QuoteCache::new()),
+                );
+                self.feeds.lock().unwrap().push(live);
             }
             assert!(feed.state().reconciled);
             assert!(feed.state().failure.is_none());

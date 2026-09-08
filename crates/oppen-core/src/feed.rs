@@ -32,12 +32,42 @@
 
 pub mod pump;
 
+#[cfg(test)]
+#[must_use]
+pub(crate) struct TestIngress {
+    sender: Option<oppen_hl::ws::EventSender>,
+    receiver: Option<oppen_hl::ws::EventReceiver>,
+}
+
+#[cfg(test)]
+impl Drop for TestIngress {
+    fn drop(&mut self) {
+        self.sender.take();
+        if let Some(mut receiver) = self.receiver.take() {
+            // Abandon queued obligations on test failure; never acknowledge
+            // unprocessed work merely to make teardown look clean.
+            while receiver.try_recv().is_ok() {}
+            let _ = receiver.complete();
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_ingress(session: &FeedSession) -> TestIngress {
+    let (sender, receiver) = oppen_hl::ws::event_channel(16);
+    session.bind_ingress(receiver.monitor()).unwrap();
+    TestIngress {
+        sender: Some(sender),
+        receiver: Some(receiver),
+    }
+}
+
 /// Explicit ready-session fixture shared by constructor/snapshot helpers on
 /// one test thread. Production always begins unreconciled.
 #[cfg(test)]
 pub(crate) fn test_session(account: oppen_hl::Address) -> std::sync::Arc<FeedSession> {
     thread_local! {
-        static SESSIONS: std::cell::RefCell<std::collections::BTreeMap<String, Arc<FeedSession>>> = const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
+        static SESSIONS: std::cell::RefCell<std::collections::BTreeMap<String, (Arc<FeedSession>, TestIngress)>> = const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
     }
     SESSIONS.with(|sessions| {
         sessions
@@ -46,9 +76,11 @@ pub(crate) fn test_session(account: oppen_hl::Address) -> std::sync::Arc<FeedSes
             .or_insert_with(|| {
                 let session = Arc::new(FeedSession::new());
                 session.bind(oppen_hl::Network::Testnet, account).unwrap();
+                let ingress = test_ingress(&session);
                 session.reconciled(&session.stamp(), 0);
-                session
+                (session, ingress)
             })
+            .0
             .clone()
     })
 }
@@ -57,7 +89,9 @@ use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use oppen_hl::types::Fill;
-use oppen_hl::ws::{Subscription, WsEvent};
+use oppen_hl::ws::{
+    IngressAdmissionGuard, IngressMonitor, IngressObservation, Subscription, WsEvent,
+};
 use serde_json::json;
 
 use crate::ledger::{Ledger, NewFill};
@@ -98,7 +132,8 @@ pub enum Action {
 
 #[derive(Debug)]
 struct Inner {
-    epoch: FeedStamp,
+    epoch: Arc<()>,
+    ingress: Option<IngressMonitor>,
     scope: Option<(oppen_hl::Network, oppen_hl::Address)>,
     last_tick_ms: Option<u64>,
     reconciled: bool,
@@ -108,17 +143,30 @@ struct Inner {
 /// Runtime-only snapshot provenance. Invalidations replace the identity;
 /// retaining an old stamp cannot make it current again after reconciliation.
 #[derive(Debug, Clone)]
-pub struct FeedStamp(Arc<()>);
+pub struct FeedStamp {
+    epoch: Arc<()>,
+    ingress: Option<IngressObservation>,
+}
 
 impl PartialEq for FeedStamp {
     fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
+        Arc::ptr_eq(&self.epoch, &other.epoch) && self.ingress == other.ingress
     }
 }
 impl Eq for FeedStamp {}
 
 pub(crate) struct AdmissionGuard<'a> {
+    _ingress: IngressAdmissionGuard,
     _held: MutexGuard<'a, Inner>,
+}
+
+impl Inner {
+    fn stamp(&self) -> FeedStamp {
+        FeedStamp {
+            epoch: self.epoch.clone(),
+            ingress: self.ingress.as_ref().map(IngressMonitor::observation),
+        }
+    }
 }
 
 /// The live view of one network's feeds.
@@ -136,7 +184,8 @@ impl FeedSession {
     pub fn new() -> Self {
         FeedSession {
             inner: Mutex::new(Inner {
-                epoch: FeedStamp(Arc::new(())),
+                epoch: Arc::new(()),
+                ingress: None,
                 scope: None,
                 last_tick_ms: None,
                 reconciled: false,
@@ -147,16 +196,23 @@ impl FeedSession {
 
     pub fn state(&self) -> FeedState {
         let inner = self.lock();
+        let ingress = inner.ingress.as_ref().map(IngressMonitor::status);
         FeedState {
             last_tick_ms: inner.last_tick_ms,
-            reconciled: inner.reconciled,
-            failure: inner.failure.clone(),
+            reconciled: inner.reconciled
+                && ingress.as_ref().is_some_and(|status| {
+                    status.pending == 0 && status.failure.is_none() && !status.completed
+                }),
+            failure: inner
+                .failure
+                .clone()
+                .or_else(|| ingress.and_then(|status| status.failure)),
         }
     }
 
     /// Capture before gathering the account snapshot, never after its reads.
     pub fn stamp(&self) -> FeedStamp {
-        self.lock().epoch.clone()
+        self.lock().stamp()
     }
 
     pub(crate) fn bind(
@@ -174,10 +230,37 @@ impl FeedSession {
             None => {
                 inner.scope = Some(requested);
                 inner.reconciled = false;
-                inner.epoch = FeedStamp(Arc::new(()));
+                inner.epoch = Arc::new(());
                 Ok(())
             }
         }
+    }
+
+    /// Bind the exact receiver before startup work. A cleanly completed old
+    /// consumer is the only replaceable one; failed evidence is never reset.
+    pub(crate) fn bind_ingress(
+        &self,
+        ingress: IngressMonitor,
+    ) -> Result<(), crate::reconcile::ReconcileError> {
+        let mut inner = self.lock();
+        if inner
+            .ingress
+            .as_ref()
+            .is_some_and(|old| old.same_monitor(&ingress))
+        {
+            return Ok(());
+        }
+        inner.epoch = Arc::new(());
+        inner.reconciled = false;
+        if inner
+            .ingress
+            .as_ref()
+            .is_some_and(|old| !old.replacement_eligible())
+        {
+            return Err(crate::reconcile::ReconcileError::FeedIngressUnavailable);
+        }
+        inner.ingress = Some(ingress);
+        Ok(())
     }
 
     pub(crate) fn admit(
@@ -187,14 +270,27 @@ impl FeedSession {
         account: oppen_hl::Address,
     ) -> Result<AdmissionGuard<'_>, crate::guardrail::Refusal> {
         let inner = self.lock();
-        if stamp != Some(&inner.epoch)
+        if !stamp.is_some_and(|stamp| Arc::ptr_eq(&stamp.epoch, &inner.epoch))
             || inner.scope != Some((network, account))
             || !inner.reconciled
             || inner.failure.is_some()
         {
             return Err(crate::guardrail::Unevaluable::FeedAdmission.into());
         }
-        Ok(AdmissionGuard { _held: inner })
+        let ingress = inner
+            .ingress
+            .as_ref()
+            .ok_or(crate::guardrail::Unevaluable::FeedAdmission)?;
+        let observed = stamp
+            .and_then(|stamp| stamp.ingress.as_ref())
+            .ok_or(crate::guardrail::Unevaluable::FeedAdmission)?;
+        let guard = ingress
+            .admit(observed)
+            .map_err(|_| crate::guardrail::Unevaluable::FeedAdmission)?;
+        Ok(AdmissionGuard {
+            _ingress: guard,
+            _held: inner,
+        })
     }
 
     /// Record that a reconcile over the last gap has returned.
@@ -207,7 +303,7 @@ impl FeedSession {
     /// and nothing outside oppen-core drives the flag.
     pub(crate) fn reconciled(&self, stamp: &FeedStamp, at_ms: u64) {
         let mut inner = self.lock();
-        if stamp != &inner.epoch {
+        if stamp != &inner.stamp() {
             return;
         }
         inner.reconciled = inner.failure.is_none();
@@ -229,15 +325,15 @@ impl FeedSession {
     pub(crate) fn unreconciled(&self) -> FeedStamp {
         let mut inner = self.lock();
         inner.reconciled = false;
-        inner.epoch = FeedStamp(Arc::new(()));
-        inner.epoch.clone()
+        inner.epoch = Arc::new(());
+        inner.stamp()
     }
 
     /// Latch the first persistent failure without changing the freshness clock.
     /// There is deliberately no reset within this session's lifetime.
     pub(crate) fn record_failure(&self, detail: String) {
         let mut inner = self.lock();
-        inner.epoch = FeedStamp(Arc::new(()));
+        inner.epoch = Arc::new(());
         inner.failure.get_or_insert(detail);
         inner.reconciled = false;
     }
@@ -444,9 +540,217 @@ mod tests {
     const NOW: u64 = 1_756_000_000_000;
 
     #[test]
+    fn completed_ingress_refuses_even_after_successful_reconciliation() {
+        let session = FeedSession::new();
+        let account = account().parse().unwrap();
+        session.bind(Network::Testnet, account).unwrap();
+        let stream = test_ingress(&session);
+        session.reconciled(&session.stamp(), NOW);
+        let cleared_epoch = session.stamp();
+        assert!(session.state().reconciled);
+        drop(stream);
+        assert!(!session.state().reconciled);
+        assert!(
+            session
+                .admit(Some(&cleared_epoch), Network::Testnet, account)
+                .is_err()
+        );
+        session.reconciled(&session.stamp(), NOW + 1);
+        assert!(
+            !session.state().reconciled,
+            "reconciliation cannot reopen completed ingress"
+        );
+    }
+
+    #[tokio::test]
+    async fn ingress_replacement_requires_actual_clean_consumer_completion() {
+        let session = FeedSession::new();
+        session
+            .bind(Network::Testnet, account().parse().unwrap())
+            .unwrap();
+        let (old_sender, mut old_receiver) = oppen_hl::ws::event_channel(1);
+        session.bind_ingress(old_receiver.monitor()).unwrap();
+        session.reconciled(&session.stamp(), NOW);
+        let original = session.stamp();
+        let (next_sender, mut next_receiver) = oppen_hl::ws::event_channel(1);
+        assert!(
+            session.bind_ingress(next_receiver.monitor()).is_err(),
+            "zero pending does not prove the old consumer is gone"
+        );
+        drop(old_sender);
+        assert!(old_receiver.recv().await.is_none());
+        old_receiver.complete().unwrap();
+        session.bind_ingress(next_receiver.monitor()).unwrap();
+        assert!(!session.state().reconciled);
+        session.reconciled(&original, NOW + 1);
+        assert!(
+            !session.state().reconciled,
+            "a prior stream cannot reconcile its replacement"
+        );
+        session.reconciled(&session.stamp(), NOW + 2);
+        assert!(session.state().reconciled);
+        next_sender
+            .send(user_fills(false, vec![]), NOW + 3)
+            .await
+            .unwrap();
+        drop(next_receiver.recv().await.unwrap());
+        assert!(!session.state().reconciled);
+        assert!(session.state().failure.is_some());
+        drop(next_sender);
+        assert!(next_receiver.recv().await.is_none());
+        assert!(next_receiver.complete().is_err());
+        let (_, replacement) = oppen_hl::ws::event_channel(1);
+        assert!(
+            session.bind_ingress(replacement.monitor()).is_err(),
+            "replacement must not erase abandoned accounting"
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_and_active_fill_block_admission_until_durable_acknowledgment() {
+        let dir = TempDir::new().unwrap();
+        let ledger = Arc::new(ledger(&dir));
+        let session = Arc::new(FeedSession::new());
+        let account_address = account().parse().unwrap();
+        session.bind(Network::Testnet, account_address).unwrap();
+        let (sender, mut receiver) = oppen_hl::ws::event_channel(1);
+        session.bind_ingress(receiver.monitor()).unwrap();
+        session.reconciled(&session.stamp(), NOW);
+        let before_ingress = session.stamp();
+        let received_at = NOW + 100;
+        sender
+            .send(user_fills(false, vec![fill(991, NOW)]), received_at)
+            .await
+            .unwrap();
+        assert!(
+            !session.state().reconciled,
+            "queued accounting is not caught up"
+        );
+        assert!(
+            session
+                .admit(Some(&before_ingress), Network::Testnet, account_address)
+                .is_err()
+        );
+        let current = session.stamp();
+        assert!(
+            session
+                .admit(Some(&current), Network::Testnet, account_address)
+                .is_err()
+        );
+        let envelope = receiver.recv().await.unwrap();
+        let mut lock_path = dir
+            .path()
+            .join(crate::db_file_name(Network::Testnet))
+            .into_os_string();
+        lock_path.push(".lock");
+        let held = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .open(lock_path)
+            .unwrap();
+        held.lock().unwrap();
+        let applying = {
+            let session = session.clone();
+            let ledger = ledger.clone();
+            tokio::task::spawn_blocking(move || {
+                session
+                    .apply(
+                        &ledger,
+                        account(),
+                        envelope.event(),
+                        envelope.received_at_ms(),
+                    )
+                    .unwrap();
+                envelope.acknowledge();
+            })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while session.state().last_tick_ms != Some(received_at) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            !applying.is_finished(),
+            "durable write is held, not merely queued"
+        );
+        assert!(!session.state().reconciled);
+        assert!(
+            session
+                .admit(Some(&current), Network::Testnet, account_address)
+                .is_err()
+        );
+        held.unlock().unwrap();
+        applying.await.unwrap();
+        assert_eq!(session.state().last_tick_ms, Some(received_at));
+        assert!(session.state().reconciled);
+        assert!(
+            session
+                .admit(Some(&before_ingress), Network::Testnet, account_address)
+                .is_err()
+        );
+        assert!(
+            session
+                .admit(Some(&session.stamp()), Network::Testnet, account_address)
+                .is_ok()
+        );
+        assert_eq!(
+            ledger
+                .events_of_kind(crate::ledger::EventKind::Fill)
+                .unwrap()
+                .len(),
+            1
+        );
+        drop(sender);
+        assert!(receiver.recv().await.is_none());
+        receiver.complete().unwrap();
+    }
+
+    #[tokio::test]
+    async fn reconciliation_matches_ingress_without_waiting_for_its_own_receipt() {
+        let session = FeedSession::new();
+        session
+            .bind(Network::Testnet, account().parse().unwrap())
+            .unwrap();
+        let (sender, mut receiver) = oppen_hl::ws::event_channel(2);
+        session.bind_ingress(receiver.monitor()).unwrap();
+        sender.send(disconnected(NOW), NOW).await.unwrap();
+        let own = receiver.recv().await.unwrap();
+        let walk = session.unreconciled();
+        session.reconciled(&walk, NOW);
+        assert!(
+            !session.state().reconciled,
+            "own receipt still prevents admission"
+        );
+        own.acknowledge();
+        assert!(
+            session.state().reconciled,
+            "completion did not deadlock on its own receipt"
+        );
+        let stale_walk = session.unreconciled();
+        sender
+            .send(user_fills(false, vec![]), NOW + 1)
+            .await
+            .unwrap();
+        session.reconciled(&stale_walk, NOW + 2);
+        receiver.recv().await.unwrap().acknowledge();
+        assert!(
+            !session.state().reconciled,
+            "new ingress invalidates the prior walk"
+        );
+        session.reconciled(&session.stamp(), NOW + 3);
+        assert!(session.state().reconciled);
+        drop(sender);
+        assert!(receiver.recv().await.is_none());
+        receiver.complete().unwrap();
+    }
+
+    #[test]
     fn admission_rejects_foreign_scope_session_and_stale_reconciliation_completion() {
         let account = account().parse().unwrap();
         let session = FeedSession::new();
+        let _session_ingress = test_ingress(&session);
         session.bind(Network::Testnet, account).unwrap();
         let initial = session.stamp();
         session.reconciled(&initial, NOW);
@@ -469,6 +773,7 @@ mod tests {
         );
         assert!(session.bind(Network::Testnet, foreign_account).is_err());
         let foreign = FeedSession::new();
+        let _foreign_ingress = test_ingress(&foreign);
         foreign.bind(Network::Testnet, account).unwrap();
         foreign.reconciled(&foreign.stamp(), NOW);
         assert!(
@@ -591,6 +896,7 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let ledger = ledger(&dir);
         let session = FeedSession::new();
+        let _session_ingress = test_ingress(&session);
 
         session
             .apply(
@@ -647,6 +953,7 @@ mod tests {
     #[test]
     fn a_fresh_session_is_unreconciled_and_has_never_ticked() {
         let session = FeedSession::new();
+        let _session_ingress = test_ingress(&session);
         assert_eq!(
             session.state(),
             FeedState {
@@ -665,6 +972,7 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let ledger = ledger(&dir);
         let session = FeedSession::new();
+        let _session_ingress = test_ingress(&session);
         session.reconciled(&session.stamp(), NOW);
         assert!(session.state().reconciled);
 
@@ -702,6 +1010,7 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let ledger = ledger(&dir);
         let session = FeedSession::new();
+        let _session_ingress = test_ingress(&session);
 
         session
             .apply(&ledger, account(), &bbo(NOW), NOW)
@@ -721,6 +1030,7 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let ledger = ledger(&dir);
         let session = FeedSession::new();
+        let _session_ingress = test_ingress(&session);
 
         session
             .apply(&ledger, account(), &bbo(NOW + 10_000), NOW)
@@ -738,6 +1048,7 @@ mod tests {
     #[test]
     fn a_completed_reconcile_counts_as_a_tick() {
         let session = FeedSession::new();
+        let _session_ingress = test_ingress(&session);
         session.reconciled(&session.stamp(), NOW);
         assert_eq!(session.state().last_tick_ms, Some(NOW));
     }
@@ -747,6 +1058,7 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let ledger = ledger(&dir);
         let session = FeedSession::new();
+        let _session_ingress = test_ingress(&session);
         session.reconciled(&session.stamp(), NOW);
         session.record_failure("fill was not persisted".into());
         assert_eq!(session.state().last_tick_ms, Some(NOW));
@@ -765,6 +1077,7 @@ mod tests {
         assert_eq!(failed.last_tick_ms, Some(NOW + 2));
 
         let fresh = FeedSession::new();
+        let _fresh_ingress = test_ingress(&fresh);
         assert_eq!(fresh.state().failure, None);
         assert_eq!(fresh.state().last_tick_ms, None);
         fresh.reconciled(&fresh.stamp(), NOW + 3);

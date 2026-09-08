@@ -29,9 +29,8 @@ use oppen_core::ledger::Ledger;
 use oppen_core::market::{BookLevel, MarketRow};
 use oppen_hl::Network;
 use oppen_hl::types::Level;
-use oppen_hl::ws::{Subscription, WsEvent, WsPool, WsPoolConfig};
+use oppen_hl::ws::{EventReceiver, Subscription, WsEvent, WsPool, WsPoolConfig};
 use tauri::{AppHandle, Emitter, Manager};
-use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 /// The single channel the console listens on.
@@ -210,56 +209,57 @@ impl ConsoleFeed {
         let loop_account = account.unwrap_or_default();
         let failure = Arc::new(Mutex::new(None));
         let loop_failure = failure.clone();
-        let event_task = spawn_event_consumer(events, failure.clone(), move |event| {
-            // One blocking consumer preserves application order and owns every
-            // ledger write through completion, without occupying an async worker.
-            let apply_error = loop_session
-                .apply(&ledger, &loop_account, &event, now_ms())
-                .err()
-                .map(|error| format!("feed ledger application failed: {error}"));
-            if let Some(error) = &apply_error {
-                remember_failure(&loop_failure, error.clone());
-            }
-            let last_tick_ms = loop_session.state().last_tick_ms;
-            let mut update = translate(&event, last_tick_ms);
-            if let Some(error) = failure_detail(&loop_failure) {
-                match &mut update {
-                    Some(FeedUpdate::Status { detail, .. }) => {
-                        *detail = Some(match detail.take() {
-                            Some(status) => format!("{error}; {status}"),
-                            None => error,
-                        });
-                    }
-                    _ if apply_error.is_some() => {
-                        handle
-                            .emit(
-                                CHANNEL,
-                                FeedEnvelope::new(
-                                    network,
-                                    &generation,
-                                    FeedUpdate::Status {
-                                        last_tick_ms,
-                                        connected: false,
-                                        detail: Some(error),
-                                    },
-                                    &loop_failure,
-                                ),
-                            )
-                            .map_err(|error| format!("feed event emission failed: {error}"))?;
-                    }
-                    _ => {}
+        let event_task =
+            spawn_event_consumer(events, failure.clone(), move |event, received_at_ms| {
+                // One blocking consumer preserves application order and owns every
+                // ledger write through completion, without occupying an async worker.
+                let apply_error = loop_session
+                    .apply(&ledger, &loop_account, event, received_at_ms)
+                    .err()
+                    .map(|error| format!("feed ledger application failed: {error}"));
+                if let Some(error) = &apply_error {
+                    remember_failure(&loop_failure, error.clone());
                 }
-            }
-            if let Some(update) = update {
-                handle
-                    .emit(
-                        CHANNEL,
-                        FeedEnvelope::new(network, &generation, update, &loop_failure),
-                    )
-                    .map_err(|error| format!("feed event emission failed: {error}"))?;
-            }
-            apply_error.map_or(Ok(()), Err)
-        });
+                let last_tick_ms = loop_session.state().last_tick_ms;
+                let mut update = translate(event, last_tick_ms);
+                if let Some(error) = failure_detail(&loop_failure) {
+                    match &mut update {
+                        Some(FeedUpdate::Status { detail, .. }) => {
+                            *detail = Some(match detail.take() {
+                                Some(status) => format!("{error}; {status}"),
+                                None => error,
+                            });
+                        }
+                        _ if apply_error.is_some() => {
+                            handle
+                                .emit(
+                                    CHANNEL,
+                                    FeedEnvelope::new(
+                                        network,
+                                        &generation,
+                                        FeedUpdate::Status {
+                                            last_tick_ms,
+                                            connected: false,
+                                            detail: Some(error),
+                                        },
+                                        &loop_failure,
+                                    ),
+                                )
+                                .map_err(|error| format!("feed event emission failed: {error}"))?;
+                        }
+                        _ => {}
+                    }
+                }
+                if let Some(update) = update {
+                    handle
+                        .emit(
+                            CHANNEL,
+                            FeedEnvelope::new(network, &generation, update, &loop_failure),
+                        )
+                        .map_err(|error| format!("feed event emission failed: {error}"))?;
+                }
+                apply_error.map_or(Ok(()), Err)
+            });
         // Nothing below can return an ownerless construction error. Partial
         // subscriptions are retained as degraded work and drained by Runtime.
         if let Some(user) = user {
@@ -409,15 +409,19 @@ fn remember_failure(failure: &Mutex<Option<String>>, error: String) {
 }
 
 fn spawn_event_consumer(
-    mut events: mpsc::Receiver<WsEvent>,
+    mut events: EventReceiver,
     failure: Arc<Mutex<Option<String>>>,
-    mut apply: impl FnMut(WsEvent) -> Result<(), String> + Send + 'static,
+    mut apply: impl FnMut(&WsEvent, u64) -> Result<(), String> + Send + 'static,
 ) -> JoinHandle<Result<(), String>> {
     tokio::task::spawn_blocking(move || {
-        while let Some(event) = events.blocking_recv() {
-            if let Err(error) = apply(event) {
-                remember_failure(&failure, error);
+        while let Some(frame) = events.blocking_recv() {
+            match apply(frame.event(), frame.received_at_ms()) {
+                Ok(()) => frame.acknowledge(),
+                Err(error) => remember_failure(&failure, error),
             }
+        }
+        if let Err(error) = events.complete() {
+            remember_failure(&failure, format!("feed ingress completion failed: {error}"));
         }
         failure_detail(&failure).map_or(Ok(()), Err)
     })
@@ -538,13 +542,6 @@ fn translate(event: &WsEvent, last_tick_ms: Option<u64>) -> Option<FeedUpdate> {
     }
 }
 
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_millis() as u64)
-        .unwrap_or(0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -618,7 +615,7 @@ mod tests {
         // An unsubscribed pool starts no connection and needs no venue.
         let (pool, events) = WsPool::new(WsPoolConfig::default()).unwrap();
         let failure = Arc::new(Mutex::new(None));
-        let task = spawn_event_consumer(events, failure.clone(), |_| Ok(()));
+        let task = spawn_event_consumer(events, failure.clone(), |_, _| Ok(()));
         let mut feed = owned_test_feed(Some(pool), task, failure);
         assert!(feed.serves(Network::Testnet));
         tokio::time::timeout(std::time::Duration::from_secs(2), feed.shutdown_and_drain())
@@ -634,14 +631,14 @@ mod tests {
 
     #[tokio::test]
     async fn dropped_drain_waiter_retains_blocking_work_and_queue_order() {
-        let (tx, events) = mpsc::channel(4);
+        let (tx, events) = oppen_hl::ws::event_channel(4);
         let (started, started_rx) = tokio::sync::oneshot::channel();
         let mut started = Some(started);
         let (release, gate) = std::sync::mpsc::channel();
         let applied = Arc::new(Mutex::new(Vec::new()));
         let observed = applied.clone();
         let failure = Arc::new(Mutex::new(None));
-        let task = spawn_event_consumer(events, failure.clone(), move |event| {
+        let task = spawn_event_consumer(events, failure.clone(), move |event, received_at_ms| {
             let WsEvent::Bbo { venue_time_ms, .. } = event else {
                 unreachable!()
             };
@@ -650,12 +647,13 @@ mod tests {
                 gate.recv_timeout(std::time::Duration::from_secs(5))
                     .unwrap();
             }
-            observed.lock().unwrap().push(venue_time_ms);
+            assert_eq!(*venue_time_ms, received_at_ms);
+            observed.lock().unwrap().push(*venue_time_ms);
             Ok(())
         });
         let mut feed = owned_test_feed(None, task, failure);
-        tx.send(tick(1)).await.unwrap();
-        tx.send(tick(2)).await.unwrap();
+        tx.send(tick(1), 1).await.unwrap();
+        tx.send(tick(2), 2).await.unwrap();
         drop(tx);
         started_rx.await.unwrap();
         // A current-thread runtime still runs this timer while the fold blocks.
@@ -680,36 +678,99 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn application_failure_remains_degraded_but_does_not_discard_queue() {
-        let (tx, events) = mpsc::channel(4);
+    async fn account_receipt_stays_pending_until_native_application_completes() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = Ledger::open_at(&dir.path().join("ledger.db"), Network::Testnet).unwrap();
+        let session = Arc::new(FeedSession::new());
+        let applied_session = session.clone();
+        let account: oppen_hl::Address = "0x0000000000000000000000000000000000000001"
+            .parse()
+            .unwrap();
+        let (tx, events) = oppen_hl::ws::event_channel(1);
+        let monitor = events.monitor();
+        let (started, started_rx) = tokio::sync::oneshot::channel();
+        let mut started = Some(started);
+        let (release, gate) = std::sync::mpsc::channel();
+        let failure = Arc::new(Mutex::new(None));
+        let task = spawn_event_consumer(events, failure.clone(), move |event, received_at_ms| {
+            started.take().unwrap().send(()).unwrap();
+            gate.recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            applied_session
+                .apply(&ledger, &account.to_string(), event, received_at_ms)
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        });
+        let mut feed = owned_test_feed(None, task, failure);
+        tx.send(
+            WsEvent::OrderUpdates {
+                user: account,
+                updates: Vec::new(),
+            },
+            123,
+        )
+        .await
+        .unwrap();
+        drop(tx);
+        started_rx.await.unwrap();
+        assert_eq!(monitor.status().pending, 1);
+        assert!(monitor.admit(&monitor.observation()).is_err());
+        assert_eq!(session.state().last_tick_ms, None);
+        release.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), feed.shutdown_and_drain())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(session.state().last_tick_ms, Some(123));
+        assert_eq!(monitor.status().pending, 0);
+        assert!(monitor.status().failure.is_none());
+        assert!(monitor.replacement_eligible());
+        assert!(monitor.admit(&monitor.observation()).is_err());
+    }
+
+    #[tokio::test]
+    async fn application_failure_remains_degraded_but_keeps_later_ingress() {
+        let (tx, events) = oppen_hl::ws::event_channel(4);
+        let monitor = events.monitor();
         let failure = Arc::new(Mutex::new(None));
         let applied = Arc::new(Mutex::new(Vec::new()));
         let observed = applied.clone();
         let envelopes = Arc::new(Mutex::new(Vec::new()));
         let emitted = envelopes.clone();
         let loop_failure = failure.clone();
-        let task = spawn_event_consumer(events, failure.clone(), move |event| {
+        let task = spawn_event_consumer(events, failure.clone(), move |event, _| {
             emitted.lock().unwrap().push(FeedEnvelope::new(
                 Network::Testnet,
                 "1",
-                translate(&event, None).unwrap(),
+                translate(event, None).unwrap(),
                 &loop_failure,
             ));
             let WsEvent::Bbo { venue_time_ms, .. } = event else {
                 unreachable!()
             };
-            observed.lock().unwrap().push(venue_time_ms);
-            if venue_time_ms == 1 {
+            observed.lock().unwrap().push(*venue_time_ms);
+            if *venue_time_ms == 1 {
                 Err("synthetic ledger write failure".into())
             } else {
                 Ok(())
             }
         });
         let mut feed = owned_test_feed(None, task, failure);
-        tx.send(tick(1)).await.unwrap();
-        tx.send(tick(2)).await.unwrap();
+        tx.send(tick(1), 1).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while monitor.status().failure.is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let later_delivery = tx.send(tick(2), 2).await;
         drop(tx);
         let first = feed.shutdown_and_drain().await.unwrap_err();
+        assert!(
+            later_delivery.is_ok(),
+            "failed admission must not stop accounting"
+        );
         assert!(first.contains("ledger write failure"));
         assert_eq!(feed.failure(), Some(first.clone()));
         assert_eq!(feed.shutdown_and_drain().await.unwrap_err(), first);
@@ -724,13 +785,13 @@ mod tests {
 
     #[tokio::test]
     async fn consumer_panic_is_a_factual_drain_failure_not_stopped_success() {
-        let (tx, events) = mpsc::channel(1);
+        let (tx, events) = oppen_hl::ws::event_channel(1);
         let failure = Arc::new(Mutex::new(None));
-        let task = spawn_event_consumer(events, failure.clone(), |_| {
+        let task = spawn_event_consumer(events, failure.clone(), |_, _| {
             panic!("synthetic consumer panic")
         });
         let mut feed = owned_test_feed(None, task, failure);
-        tx.send(tick(1)).await.unwrap();
+        tx.send(tick(1), 1).await.unwrap();
         drop(tx);
         let error = feed.shutdown_and_drain().await.unwrap_err();
         assert!(error.contains("feed event task failed"));

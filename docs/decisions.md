@@ -11,6 +11,35 @@ decisions" section until then.
 
 ---
 
+## 2026-09-08 · Account ingress remains pending through durable application
+
+ES34 addresses spec items 9, 24, 25 and 34. A parsed account fill can wait in
+the bounded event queue, or behind alert/ledger work after dequeue, while a
+fresh order reads accounting that does not include it. ES32's processed-event
+stamp and ES33's socket silence check do not cover this interval.
+
+Register account work synchronously before awaiting queue capacity. Bind the
+receiver's process-local monitor to the exact engine feed, and invalidate its
+opaque observation at ingress. Each non-cloneable envelope owns an obligation
+until durable application and required state updates succeed. Dequeue alone
+does not acknowledge it. Pending work prevents final Rust order admission;
+acknowledgment must not revive a pre-ingress clearance. Abandoned work, failed
+delivery or partial application fails closed, without an in-session reset.
+
+Retain the original receipt timestamp through consumption. A delayed consumer
+must not report an old event as newly received. Reconciliation completion must
+match the ingress generation it observed without waiting on its own event's
+acknowledgment. Replacement requires actual clean consumer completion, not just
+an empty queue. A closed stream cannot authorize new orders.
+
+Use the existing bounded stream and ledger, not a second durable event store.
+Keep existing cleanup authority independent. Preserve producer quiescence,
+producer completion and queued-event drain. This does not observe data still
+outside the parser, prove a live sleep/wake gate, recover lost order responses,
+reset pilot budgets or authorize account activity. Synthetic lifecycle regressions
+and the full Rust workspace pass on `fix/account-event-admission`; exact-head
+review, green CI and the live gates remain separate requirements.
+
 ## 2026-09-08 · Buffered frames cannot erase expired silence
 
 ES33 addresses spec items 9 and 34 at the WebSocket receive boundary. The
