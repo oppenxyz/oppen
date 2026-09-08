@@ -253,7 +253,7 @@ describe("explicit TESTNET supervision", () => {
       await f.monitor.halt("testnet", { agent: "alpha", account: ACCOUNT });
       expect(f.halts.length).toBe(1);
       const stop = f.monitor.stop();
-      f.stops[0]!.resolve({ phase: "stopped", binding: null, detail: null, channel_health: null, chart_failure: null });
+      f.stops[0]!.resolve({ phase: "stopped", binding: null, detail: null, channel_health: null, account_failure: null, selected_failure: null });
       await stop;
       expect(f.monitor.state.haltRequested).toBe(true);
       expect(f.monitor.state.runtime?.phase).toBe("stopped");
@@ -355,7 +355,7 @@ describe("explicit TESTNET supervision", () => {
       await settle();
       expect(f.monitor.state.haltRequested).toBe(true);
       const stop = f.monitor.stop();
-      f.stops[0]!.resolve({ phase: "stopped", binding: null, detail: null, channel_health: null, chart_failure: null });
+      f.stops[0]!.resolve({ phase: "stopped", binding: null, detail: null, channel_health: null, account_failure: null, selected_failure: null });
       await stop;
       f.reads[2]!.resolve(LISTENING);
       await settle();
@@ -377,7 +377,7 @@ describe("explicit TESTNET supervision", () => {
       await halt;
       expect(f.monitor.state.status).toEqual(LISTENING);
       expect(f.monitor.state.command).toBe("stop");
-      f.stops[0]!.resolve({ phase: "stopped", binding: null, detail: null, channel_health: null, chart_failure: null });
+      f.stops[0]!.resolve({ phase: "stopped", binding: null, detail: null, channel_health: null, account_failure: null, selected_failure: null });
       await stop;
       expect(f.monitor.state.runtime?.phase).toBe("stopped");
     } finally { f.monitor.stopPolling(); }
@@ -499,7 +499,7 @@ describe("explicit TESTNET supervision", () => {
       await start;
       expect(f.monitor.state.command).toBe("stop");
       expect(f.monitor.state.status?.phase).toBe("idle");
-      f.stops[0]!.resolve({ phase: "stopped", binding: null, detail: null, channel_health: null, chart_failure: null });
+      f.stops[0]!.resolve({ phase: "stopped", binding: null, detail: null, channel_health: null, account_failure: null, selected_failure: null });
       await stop;
       await f.monitor.start("testnet", "alpha", ACCOUNT);
       expect(f.starts.length).toBe(1);

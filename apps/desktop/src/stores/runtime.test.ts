@@ -1,8 +1,10 @@
-import { createSSRApp, toRaw } from "vue";
+import { createSSRApp, reactive, toRaw } from "vue";
 import { renderToString } from "vue/server-renderer";
 import type { ChartBinding, ChartProjection, RuntimeStatus } from "../lib/bridge";
-import { createRuntimeMonitor, runtimeNotice } from "./runtime";
-import { createChartObservations } from "./market";
+import { createRuntimeMonitor, runtimeNotice, observeRuntimeStatus } from "./runtime";
+import { createChartObservations, createMarketFeed } from "./market";
+import { accountObservation, bindAccountObservation, receiveAccountStatus, shell } from "./shell";
+import type { WatchMarketReply } from "../lib/bridge";
 import { createMarketHealth } from "./market-health";
 import { channelHealthFixture } from "../../qa/channel-health";
 
@@ -15,11 +17,11 @@ declare const describe: (name: string, body: () => void) => void;
 declare const it: (name: string, body: () => void | Promise<void>) => void;
 declare const expect: (actual: unknown) => Assertions & { not: Assertions };
 
-const RUNNING: RuntimeStatus = { phase: "running", binding: null, detail: null, channel_health: null, chart_failure: null };
+const RUNNING: RuntimeStatus = { phase: "running", binding: null, detail: null, channel_health: null, account_failure: null, selected_failure: null };
 const STOPPING: RuntimeStatus = {
   phase: "stopping", binding: { network: "testnet", generation: "9007199254740993" },
   detail: "Waiting for retained desktop work to drain.",
-  channel_health: null, chart_failure: null,
+  channel_health: null, account_failure: null, selected_failure: null,
 };
 
 function deferred<T>() {
@@ -59,6 +61,43 @@ function fixture(observe: (status: RuntimeStatus) => void = () => {}) {
 }
 
 describe("desktop runtime polling", () => {
+  it("recovers a missed bound account failure before the first watch acknowledges, without allowing event ownership or regression", async () => {
+    const prior = { ...toRaw(accountObservation) };
+    Object.assign(reactive(toRaw(accountObservation)), { binding: null, failure: null, detail: null });
+    const binding = { network: shell.network, generation: "100" };
+    const watch = deferred<WatchMarketReply>();
+    const selected = createMarketFeed(() => ({ network: shell.network, coin: "BTC", interval: "1h" }),
+      { watch: () => watch.promise, listen: async () => () => {} },
+      { update: () => {}, invalidate: () => {}, failure: () => {}, error: () => {},
+        chartBinding: bindAccountObservation, accountBinding: () => accountObservation.binding, account: receiveAccountStatus });
+    const f = fixture(observeRuntimeStatus);
+    try {
+      await selected.start();
+      receiveAccountStatus({ scope: "account", binding, update: { kind: "status", connected: false, detail: null, last_tick_ms: null }, failure: "Unestablished event" });
+      expect(accountObservation.binding).toBe(null);
+      expect(accountObservation.failure).toBe(null);
+      f.monitor.start();
+      const failure = { binding, detail: "Account consumer failed before watch completion" };
+      f.requests[0]!.resolve({ ...STOPPING, binding: null, account_failure: failure }); await settle();
+      expect(accountObservation.binding).toEqual(binding);
+      expect(accountObservation.failure).toEqual(failure);
+      watch.reject(new Error("Selected watch rejected")); await settle();
+      expect(accountObservation.failure).toEqual(failure);
+      const newer = { ...binding, generation: "101" };
+      bindAccountObservation(newer);
+      f.fire(1000); f.requests[1]!.resolve({ ...STOPPING, binding: null, account_failure: failure }); await settle();
+      expect(accountObservation.binding).toEqual(newer);
+      expect(accountObservation.failure).toBe(null);
+      f.fire(1000); f.requests[2]!.resolve({ ...STOPPING, binding: null, account_failure: {
+        binding: { network: shell.network === "testnet" ? "mainnet" : "testnet", generation: "102" }, detail: "Foreign failure",
+      } }); await settle();
+      expect(accountObservation.binding).toEqual(newer);
+      expect(accountObservation.failure).toBe(null);
+    } finally {
+      selected.stop(); f.monitor.stop(); watch.reject(new Error("Fixture stopped")); await settle();
+      Object.assign(reactive(toRaw(accountObservation)), prior);
+    }
+  });
   it("successful null polls cannot renew channel health and stale remount replies cannot restore it", async () => {
     const binding: ChartBinding = { network: "testnet", generation: "1", selection_id: "1", symbol: "BTC", interval: "1h" };
     let clock = 0;
@@ -93,17 +132,17 @@ describe("desktop runtime polling", () => {
     });
     const chart = createChartObservations(async () => projection(binding, "1"));
     chart.bind(binding); chart.accept(projection(binding, "1"));
-    const f = fixture(status => { if (status.chart_failure) chart.fail(status.chart_failure); });
+    const f = fixture(status => { if (status.selected_failure) chart.fail(status.selected_failure); });
     try {
       f.monitor.start();
       const replacement = { ...binding, selection_id: "11" };
       chart.invalidate(true); chart.bind(replacement); chart.accept(projection(replacement, "1"));
-      f.requests[0]!.resolve({ ...RUNNING, chart_failure: { binding, detail: "Old consumer failed" } });
+      f.requests[0]!.resolve({ ...RUNNING, selected_failure: { binding, detail: "Old consumer failed" } });
       await settle();
       expect(chart.state.failure).toBe(null);
       expect(chart.state.retained).toBe(false);
       f.fire(1000);
-      f.requests[1]!.resolve({ ...RUNNING, chart_failure: { binding: replacement, detail: "Consumer terminated" } });
+      f.requests[1]!.resolve({ ...RUNNING, selected_failure: { binding: replacement, detail: "Consumer terminated" } });
       await settle();
       expect(chart.state.failure?.detail).toBe("Consumer terminated");
       expect(chart.state.retained).toBe(true);
@@ -128,7 +167,7 @@ describe("desktop runtime polling", () => {
     const f = fixture(status => delivered.push(status));
     try {
       f.monitor.start(); f.monitor.stop(); f.monitor.start();
-      f.requests[0]!.resolve({ ...RUNNING, chart_failure: {
+      f.requests[0]!.resolve({ ...RUNNING, selected_failure: {
         binding: { network: "testnet", generation: "1", selection_id: "1", symbol: "BTC", interval: "1h" }, detail: "Retired read",
       } });
       await settle();

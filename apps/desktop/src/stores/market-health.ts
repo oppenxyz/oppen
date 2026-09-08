@@ -40,14 +40,13 @@ export function createMarketHealth(now = () => performance.now(), schedule = aft
     if (!snapshot || !state.binding || !sameBinding(snapshot.binding, state.binding)
       || !/^\d+$/.test(snapshot.revision) || snapshot.rows.length !== MARKET_CHANNELS.length
       || snapshot.rows.some((row, i) => row.channel !== MARKET_CHANNELS[i]
-        || row.owner !== (i < 3 ? "console" : "chart"))) return false;
+        || row.owner !== "selected")) return false;
     const prior = state.snapshot;
     if (prior && sameBinding(prior.binding, snapshot.binding) && BigInt(snapshot.revision) <= BigInt(prior.revision)) return false;
     // A later registry sample cannot erase terminal failure or known channel loss.
-    const sameConsole = prior?.binding.network === snapshot.binding.network && prior.binding.generation === snapshot.binding.generation;
+    const sameOwner = prior !== null && sameBinding(prior.binding, snapshot.binding);
     const rows = snapshot.rows.map((row, i) => {
       const previous = prior?.rows[i];
-      const sameOwner = sameConsole && (row.owner === "console" || prior?.binding.selection_id === snapshot.binding.selection_id);
       return sameOwner && previous ? { ...row, consumer_failure: previous.consumer_failure ?? row.consumer_failure,
         last_loss: row.last_loss ?? (sameBinding(prior!.binding, snapshot.binding) ? previous.last_loss : null) } : row;
     });

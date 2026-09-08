@@ -3,8 +3,12 @@
 Trace: spec 9, 11, 31, 34; AGENTS invariants 1, 3, 7. This extends
 `console-channel-health.md` and `live-chart-observations.md`. It does not expand
 subscriptions, enable execution, replace a ledger or authorize live activity.
-Status: independent automated design review found no blocking gaps; local
-implementation is next, not installed/live acceptance.
+Status: implemented locally; resumed workspace verification passed 1,298 Rust
+tests (including 132 native tests), with 15 live/environment tests ignored, plus
+246 frontend tests, strict workspace lint, formatting, build and QA types.
+Cached/offline dependency checks and three release-script tests also passed.
+Earlier mock browser checks and independent design/implementation source reviews
+passed. Exact-head review, remote CI, installed and live acceptance remain pending.
 
 ## Evidence and failure boundary
 

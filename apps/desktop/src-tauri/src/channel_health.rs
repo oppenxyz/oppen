@@ -9,8 +9,7 @@ use crate::chart_transport::ChartBinding;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Owner {
-    Console,
-    Chart,
+    Selected,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -33,10 +32,7 @@ const CHANNELS: [Channel; 5] = [
 
 impl Channel {
     fn owner(self) -> Owner {
-        match self {
-            Self::Trades | Self::Candles => Owner::Chart,
-            _ => Owner::Console,
-        }
+        Owner::Selected
     }
     fn subscription(self, binding: &ChartBinding) -> Subscription {
         let coin = binding.symbol.clone();
@@ -346,8 +342,7 @@ impl Clock {
     pub(crate) fn project(
         &mut self,
         binding: ChartBinding,
-        console: PoolObservation,
-        chart: PoolObservation,
+        selected: PoolObservation,
         at: u64,
     ) -> Option<Snapshot> {
         self.revision = self.revision.checked_add(1)?;
@@ -356,11 +351,7 @@ impl Clock {
         let rows = CHANNELS
             .into_iter()
             .map(|channel| {
-                let pool = if channel.owner() == Owner::Console {
-                    &console
-                } else {
-                    &chart
-                };
+                let pool = &selected;
                 let expected = channel.subscription(&binding);
                 let health = pool
                     .health
@@ -399,34 +390,16 @@ impl Clock {
                 }
             })
             .collect::<Vec<_>>();
-        let mut diagnostics = console
-            .records
-            .recent
-            .into_iter()
-            .chain(chart.records.recent)
-            .collect::<Vec<_>>();
-        diagnostics.sort_by_key(|diagnostic| diagnostic.received_at_ms);
-        let displaced = diagnostics.len().saturating_sub(16);
-        diagnostics.drain(..displaced);
+        let diagnostics = selected.records.recent.into_iter().collect::<Vec<_>>();
         Some(Snapshot {
-            pool_last_losses: console
-                .records
-                .pool_loss
-                .into_iter()
-                .chain(chart.records.pool_loss)
-                .flatten()
-                .collect(),
+            pool_last_losses: selected.records.pool_loss.into_iter().flatten().collect(),
             binding,
             revision: self.revision.to_string(),
             observed_at_ms: at,
             clock_uncertain: rollback || rows.iter().any(|row| row.clock_uncertain),
             rows,
             diagnostics,
-            omitted_diagnostics: console
-                .records
-                .omitted
-                .saturating_add(chart.records.omitted)
-                .saturating_add(displaced as u64),
+            omitted_diagnostics: selected.records.omitted,
         })
     }
 }
@@ -478,14 +451,12 @@ mod tests {
                     health(Channel::Bbo, &binding, Some(7_000), Some(2_000)),
                     health(Channel::Depth, &binding, Some(1_000), Some(15_000)),
                 ],
-                Owner::Console,
+                Owner::Selected,
                 None,
                 10_000,
             )
             .unwrap();
-        let result = clock
-            .project(binding.clone(), sample, PoolObservation::missing(), 10_000)
-            .unwrap();
+        let result = clock.project(binding.clone(), sample, 10_000).unwrap();
         assert_eq!(
             result
                 .rows
@@ -504,28 +475,18 @@ mod tests {
         let after_capture = records
             .sample(
                 vec![health(Channel::Bbo, &binding, Some(10_001), Some(2_000))],
-                Owner::Console,
+                Owner::Selected,
                 None,
                 10_000,
             )
             .unwrap();
         let result = clock
-            .project(
-                binding.clone(),
-                after_capture,
-                PoolObservation::missing(),
-                10_002,
-            )
+            .project(binding.clone(), after_capture, 10_002)
             .unwrap();
         assert!(!result.clock_uncertain);
         assert_eq!(result.rows[1].age_ms, Some(1));
         let rollback = clock
-            .project(
-                binding,
-                PoolObservation::missing(),
-                PoolObservation::missing(),
-                9_999,
-            )
+            .project(binding, PoolObservation::missing(), 9_999)
             .unwrap();
         assert!(rollback.clock_uncertain);
         assert!(
@@ -544,7 +505,7 @@ mod tests {
         let b = binding("ETH", "2");
         diagnostics.select(&[Channel::Bbo.subscription(&a)]);
         diagnostics.record(
-            Owner::Console,
+            Owner::Selected,
             &WsEvent::Disconnected(Box::new(Disconnected {
                 connection: ConnectionId::new(0),
                 at_ms: 10,
@@ -556,7 +517,7 @@ mod tests {
             10,
         );
         diagnostics.record(
-            Owner::Console,
+            Owner::Selected,
             &WsEvent::MessageDropped {
                 connection: ConnectionId::new(0),
                 channel: "bbo".into(),
@@ -566,7 +527,7 @@ mod tests {
         );
         for at in 12..42 {
             diagnostics.record(
-                Owner::Console,
+                Owner::Selected,
                 &WsEvent::VenueError {
                     connection: ConnectionId::new(0),
                     message: "x".repeat(600),
@@ -577,7 +538,7 @@ mod tests {
         let held = diagnostics.0.lock().unwrap();
         assert!(
             diagnostics
-                .sample(Vec::new(), Owner::Console, None, 42)
+                .sample(Vec::new(), Owner::Selected, None, 42)
                 .is_none()
         );
         drop(held);
@@ -585,14 +546,12 @@ mod tests {
         let sample = diagnostics
             .sample(
                 vec![health(Channel::Bbo, &b, Some(42), Some(2_000))],
-                Owner::Console,
+                Owner::Selected,
                 Some("terminal consumer failure"),
                 42,
             )
             .unwrap();
-        let result = clock
-            .project(b, sample, PoolObservation::missing(), 42)
-            .unwrap();
+        let result = clock.project(b, sample, 42).unwrap();
         assert!(result.rows[1].last_loss.is_none());
         assert_eq!(result.pool_last_losses.len(), 1);
         assert_eq!(result.diagnostics.len(), 16);
@@ -606,14 +565,12 @@ mod tests {
         let sample = diagnostics
             .sample(
                 vec![health(Channel::Bbo, &a, Some(43), Some(2_000))],
-                Owner::Console,
+                Owner::Selected,
                 None,
                 43,
             )
             .unwrap();
-        let result = clock
-            .project(binding("BTC", "3"), sample, PoolObservation::missing(), 43)
-            .unwrap();
+        let result = clock.project(binding("BTC", "3"), sample, 43).unwrap();
         assert_eq!(
             result.rows[1].last_loss.as_ref().unwrap().detail,
             "lost BTC"
@@ -644,7 +601,6 @@ mod tests {
         let before = clock
             .project(
                 binding.clone(),
-                PoolObservation::missing(),
                 transport.channel_health(&binding, crate::now_ms()).unwrap(),
                 crate::now_ms(),
             )
@@ -654,12 +610,7 @@ mod tests {
             loop {
                 if let Some(chart) = transport.channel_health(&binding, crate::now_ms()) {
                     let snapshot = clock
-                        .project(
-                            binding.clone(),
-                            PoolObservation::missing(),
-                            chart,
-                            crate::now_ms(),
-                        )
+                        .project(binding.clone(), chart, crate::now_ms())
                         .unwrap();
                     if snapshot.rows[3].acked && snapshot.rows[4].acked {
                         break snapshot;
@@ -681,12 +632,7 @@ mod tests {
             loop {
                 if let Some(chart) = transport.channel_health(&binding, crate::now_ms()) {
                     let snapshot = clock
-                        .project(
-                            binding.clone(),
-                            PoolObservation::missing(),
-                            chart,
-                            crate::now_ms(),
-                        )
+                        .project(binding.clone(), chart, crate::now_ms())
                         .unwrap();
                     if !snapshot.pool_last_losses.is_empty() {
                         break snapshot;
@@ -712,7 +658,7 @@ mod tests {
         records.select(&[Channel::Bbo.subscription(&eth)]);
         for (selection, reason) in [(&eth, "ETH loss"), (&btc, "late BTC loss")] {
             records.record(
-                Owner::Console,
+                Owner::Selected,
                 &WsEvent::Disconnected(Box::new(Disconnected {
                     connection: ConnectionId::new(0),
                     at_ms: 10,
@@ -726,7 +672,7 @@ mod tests {
         }
         for at in 11..40 {
             records.record(
-                Owner::Console,
+                Owner::Selected,
                 &WsEvent::VenueError {
                     connection: ConnectionId::new(0),
                     message: "other warning".into(),
@@ -737,14 +683,12 @@ mod tests {
         let sample = records
             .sample(
                 vec![health(Channel::Bbo, &eth, Some(40), Some(2_000))],
-                Owner::Console,
+                Owner::Selected,
                 Some("sticky terminal"),
                 40,
             )
             .unwrap();
-        let snapshot = Clock::default()
-            .project(eth, sample, PoolObservation::missing(), 40)
-            .unwrap();
+        let snapshot = Clock::default().project(eth, sample, 40).unwrap();
         assert_eq!(
             snapshot.rows[1].last_loss.as_ref().unwrap().detail,
             "ETH loss"
@@ -759,14 +703,12 @@ mod tests {
         let sample = records
             .sample(
                 vec![health(Channel::Bbo, &btc, Some(40), Some(2_000))],
-                Owner::Console,
+                Owner::Selected,
                 None,
                 40,
             )
             .unwrap();
-        let snapshot = Clock::default()
-            .project(btc, sample, PoolObservation::missing(), 40)
-            .unwrap();
+        let snapshot = Clock::default().project(btc, sample, 40).unwrap();
         assert!(snapshot.rows[1].last_loss.is_none());
         assert_eq!(
             snapshot.rows[1].consumer_failure.as_deref(),
@@ -791,7 +733,7 @@ mod tests {
                     .unwrap();
                 let mut socket = tungstenite::accept(stream).unwrap();
                 let mut subscriptions = 0;
-                while subscriptions < 2 {
+                while subscriptions < 5 {
                     if let Message::Text(text) = socket.read().unwrap() {
                         let request: serde_json::Value = serde_json::from_str(&text).unwrap();
                         if request["method"] == "subscribe" {
@@ -824,12 +766,7 @@ mod tests {
             );
             let sample = transport.channel_health(&binding, crate::now_ms()).unwrap();
             let snapshot = clock
-                .project(
-                    binding.clone(),
-                    PoolObservation::missing(),
-                    sample,
-                    crate::now_ms(),
-                )
+                .project(binding.clone(), sample, crate::now_ms())
                 .unwrap();
             assert!(snapshot.rows[3].subscribed);
             assert!(!snapshot.rows[3].acked);
@@ -840,15 +777,10 @@ mod tests {
             loop {
                 if let Some(sample) = transport.channel_health(&binding, crate::now_ms()) {
                     let snapshot = clock
-                        .project(
-                            binding.clone(),
-                            PoolObservation::missing(),
-                            sample,
-                            crate::now_ms(),
-                        )
+                        .project(binding.clone(), sample, crate::now_ms())
                         .unwrap();
-                    if snapshot.rows[4].quarantined
-                        && snapshot.rows[4]
+                    if snapshot.rows[0].quarantined
+                        && snapshot.rows[0]
                             .last_loss
                             .as_ref()
                             .is_some_and(|loss| loss.kind == Kind::Quarantine)
@@ -866,7 +798,7 @@ mod tests {
         let quarantined = quarantined.unwrap();
         assert!(!quarantined.rows[3].acked);
         assert!(!quarantined.rows[3].quarantined);
-        assert!(quarantined.rows[4].quarantined);
+        assert!(quarantined.rows[0].quarantined);
         assert!(
             quarantined
                 .diagnostics

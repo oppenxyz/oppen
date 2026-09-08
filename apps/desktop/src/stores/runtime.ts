@@ -1,7 +1,8 @@
 import { reactive, readonly } from "vue";
 import { fetchRuntimeStatus, inTauri, isConsoleError, type RuntimeStatus } from "../lib/bridge";
-import { reportChartFailure } from "./market";
+import { reportSelectedFailure } from "./market";
 import { marketHealth } from "./market-health";
+import { bindAccountObservation, reportAccountFailure } from "./shell";
 
 interface RuntimeReading {
   status: RuntimeStatus | null;
@@ -103,11 +104,18 @@ export function createRuntimeMonitor(
   return { state: readonly(state), start, stop, refresh };
 }
 
-const monitor = createRuntimeMonitor(fetchRuntimeStatus, after, status => {
-  if (status.chart_failure) reportChartFailure(status.chart_failure);
+/** Only an accepted runtime read may establish an owner from its cached failure. */
+export function observeRuntimeStatus(status: RuntimeStatus): void {
+  if (status.binding) bindAccountObservation(status.binding);
+  if (status.account_failure) {
+    bindAccountObservation(status.account_failure.binding);
+    reportAccountFailure(status.account_failure);
+  }
+  if (status.selected_failure) reportSelectedFailure(status.selected_failure);
   if (status.phase !== "running") marketHealth.historical("Runtime " + status.phase);
   else marketHealth.accept(status.channel_health);
-}, detail => marketHealth.historical(detail));
+}
+const monitor = createRuntimeMonitor(fetchRuntimeStatus, after, observeRuntimeStatus, detail => marketHealth.historical(detail));
 export const runtime = monitor.state;
 
 export function startRuntimePolling(): void {

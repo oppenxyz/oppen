@@ -37,6 +37,88 @@ pub(crate) struct WatchBinding {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn account_observation_getter_binds_account_network_and_captures_before_asof() {
+        let runtime = Runtime::new(PathBuf::new());
+        let account = "0x0000000000000000000000000000000000000001"
+            .parse()
+            .unwrap();
+        let foreign = "0x0000000000000000000000000000000000000002"
+            .parse()
+            .unwrap();
+        *runtime.0.feed.lock().await = Some(OwnedFeed::Desktop(ConsoleFeed::observation_fixture(
+            account, 100,
+        )));
+        assert_eq!(runtime.last_tick_ms(Network::Mainnet, account), None);
+        assert_eq!(runtime.last_tick_ms(Network::Testnet, foreign), None);
+        assert_eq!(
+            runtime.account_observation_at(Network::Testnet, account, || 99),
+            (None, 99)
+        );
+        assert_eq!(runtime.last_tick_ms(Network::Testnet, account), Some(100));
+        let captured = runtime.account_observation_at(Network::Testnet, account, || {
+            // A later successful application between capture and as-of cannot
+            // be read back into this REST result as a future observation.
+            *runtime.0.feed.try_lock().unwrap() = Some(OwnedFeed::Desktop(
+                ConsoleFeed::observation_fixture(account, 200),
+            ));
+            150
+        });
+        assert_eq!(captured, (Some(100), 150));
+        assert_eq!(
+            runtime.account_observation_at(Network::Testnet, account, || 200),
+            (Some(200), 200)
+        );
+        runtime.shutdown().await.unwrap();
+    }
+    #[test]
+    fn account_failure_publication_is_fenced_by_actual_installed_owner() {
+        let runtime = Runtime::new(PathBuf::new());
+        let old = FeedBinding {
+            network: Network::Testnet,
+            generation: "1".into(),
+        };
+        let new = FeedBinding {
+            network: Network::Testnet,
+            generation: "2".into(),
+        };
+        let failure = |binding: &FeedBinding, detail: &str| crate::feed::AccountFailure {
+            binding: binding.clone(),
+            detail: detail.into(),
+        };
+        let mut control = runtime.control();
+        control.install_account_binding(old.clone());
+        control.record_account_failure(Some(failure(&old, "old failure")));
+        control.install_account_binding(old.clone());
+        assert_eq!(
+            control.account_failure.as_ref().unwrap().detail,
+            "old failure"
+        );
+        // A previously sampled failure arrives after a replacement is installed.
+        let late = failure(&old, "late old failure");
+        control.install_account_binding(new.clone());
+        control.record_account_failure(Some(late));
+        assert!(control.account_failure.is_none());
+        drop(control);
+        runtime.fail_bound("late old terminal sample".into(), Some(&old));
+        let mut control = runtime.control();
+        assert!(!control.terminal);
+        control.record_account_failure(Some(failure(&new, "new failure")));
+        assert_eq!(control.account_failure.as_ref().unwrap().binding, new);
+        assert_eq!(
+            control.account_failure.as_ref().unwrap().detail,
+            "new failure"
+        );
+        // Terminal UI invalidation must not erase the actual owner's diagnosis.
+        control.terminal = true;
+        control.binding = None;
+        control.record_account_failure(Some(failure(&old, "late terminal failure")));
+        assert_eq!(
+            control.account_failure.as_ref().unwrap().detail,
+            "new failure"
+        );
+    }
+
     use std::sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc,
@@ -873,7 +955,6 @@ mod tests {
             .project(
                 first.chart.clone(),
                 PoolObservation::missing(),
-                PoolObservation::missing(),
                 crate::now_ms(),
             )
             .unwrap();
@@ -889,12 +970,7 @@ mod tests {
         );
         let second = replacement.await.unwrap().unwrap();
         let captured = Clock::default()
-            .project(
-                second.chart,
-                PoolObservation::missing(),
-                PoolObservation::missing(),
-                crate::now_ms(),
-            )
+            .project(second.chart, PoolObservation::missing(), crate::now_ms())
             .unwrap();
         runtime.begin_stop();
         assert!(
@@ -946,7 +1022,7 @@ mod tests {
             loop {
                 let status = runtime.status();
                 assert_eq!(status.phase, RuntimePhase::Running);
-                if let Some(failure) = status.chart_failure {
+                if let Some(failure) = status.selected_failure {
                     break failure;
                 }
                 tokio::task::yield_now().await;
@@ -974,7 +1050,7 @@ mod tests {
             .unwrap();
         assert_eq!(retry.feed, first.feed);
         assert_eq!(driver.starts.load(Ordering::SeqCst), 1);
-        assert!(runtime.status().chart_failure.is_none());
+        assert!(runtime.status().selected_failure.is_none());
         let invalid = watch(&runtime, &driver, Network::Testnet, None, "")
             .await
             .unwrap();
@@ -1541,8 +1617,9 @@ pub(crate) enum RuntimePhase {
 
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct RuntimeStatus {
+    pub account_failure: Option<crate::feed::AccountFailure>,
     pub channel_health: Option<crate::channel_health::Snapshot>,
-    pub chart_failure: Option<crate::chart_transport::ChartFailure>,
+    pub selected_failure: Option<crate::chart_transport::ChartFailure>,
     pub phase: RuntimePhase,
     pub binding: Option<FeedBinding>,
     pub detail: Option<String>,
@@ -1604,9 +1681,16 @@ enum OwnedFeed {
 }
 
 impl OwnedFeed {
-    fn chart_failure(&self) -> Option<crate::chart_transport::ChartFailure> {
+    fn account_failure(&self) -> Option<crate::feed::AccountFailure> {
         match self {
-            Self::Desktop(feed) => feed.chart_failure(),
+            Self::Desktop(feed) => feed.account_failure(),
+            #[cfg(test)]
+            Self::Controlled(_) => None,
+        }
+    }
+    fn selected_failure(&self) -> Option<crate::chart_transport::ChartFailure> {
+        match self {
+            Self::Desktop(feed) => feed.selected_failure(),
             #[cfg(test)]
             Self::Controlled(feed) => feed
                 .chart
@@ -1614,6 +1698,7 @@ impl OwnedFeed {
                 .and_then(crate::chart_transport::ChartTransport::failure),
         }
     }
+    #[cfg(test)]
     fn failure(&self) -> Option<String> {
         match self {
             Self::Desktop(feed) => feed.failure(),
@@ -1622,9 +1707,10 @@ impl OwnedFeed {
         }
     }
 
+    #[cfg(test)]
     fn watch(&self, coin: &str, interval: &str) -> Result<(), String> {
         match self {
-            Self::Desktop(feed) => feed.watch(coin, interval),
+            Self::Desktop(_) => Ok(()),
             #[cfg(test)]
             Self::Controlled(feed) => feed.watch(coin, interval),
         }
@@ -1638,9 +1724,12 @@ impl OwnedFeed {
         }
     }
 
-    fn last_tick_ms(&self, network: Network) -> Option<u64> {
+    fn last_tick_ms(&self, network: Network, account: oppen_hl::Address) -> Option<u64> {
         match self {
-            Self::Desktop(feed) => feed.serves(network).then(|| feed.last_tick_ms()).flatten(),
+            Self::Desktop(feed) => feed
+                .serves(network)
+                .then(|| feed.last_tick_ms(account))
+                .flatten(),
             #[cfg(test)]
             Self::Controlled(_) => None,
         }
@@ -1655,6 +1744,9 @@ struct PendingWatch {
 }
 
 struct Control {
+    // Actual installed account owner, retained through terminal drain.
+    account_binding: Option<FeedBinding>,
+    account_failure: Option<crate::feed::AccountFailure>,
     phase: RuntimePhase,
     terminal: bool,
     detail: Option<String>,
@@ -1689,6 +1781,21 @@ enum TerminalMode {
 }
 
 impl Control {
+    fn install_account_binding(&mut self, binding: FeedBinding) {
+        if self.account_binding.as_ref() != Some(&binding) {
+            self.account_failure = None;
+            self.account_binding = Some(binding);
+        }
+    }
+
+    fn record_account_failure(&mut self, failure: Option<crate::feed::AccountFailure>) {
+        if let Some(failure) = failure
+            && self.account_binding.as_ref() == Some(&failure.binding)
+        {
+            self.account_failure.get_or_insert(failure);
+        }
+    }
+
     fn setup_busy(&self) -> bool {
         if self
             .pilot_consent
@@ -1769,6 +1876,8 @@ impl Runtime {
             health_clock: Mutex::new(crate::channel_health::Clock::default()),
             data_dir,
             control: Mutex::new(Control {
+                account_binding: None,
+                account_failure: None,
                 phase: RuntimePhase::Running,
                 terminal: false,
                 detail: None,
@@ -1916,6 +2025,9 @@ impl Runtime {
                 Some(feed) => feed.shutdown_and_drain().await,
                 None => Ok(()),
             };
+            runtime
+                .control()
+                .record_account_failure(feed.as_ref().and_then(OwnedFeed::account_failure));
             *feed = None;
             drop(feed);
             if let Err(detail) = &result {
@@ -2232,28 +2344,44 @@ impl Runtime {
         channel_health: Option<crate::channel_health::Snapshot>,
     ) -> RuntimeStatus {
         self.mcp_status();
-        // Chart transport health is not account or execution feed health.
-        let chart_failure = self
+        let account_failure = self
             .0
             .feed
             .try_lock()
             .ok()
-            .and_then(|feed| feed.as_ref().and_then(OwnedFeed::chart_failure));
+            .and_then(|feed| feed.as_ref().and_then(OwnedFeed::account_failure));
+        // Chart transport health is not account or execution feed health.
+        let selected_failure = self
+            .0
+            .feed
+            .try_lock()
+            .ok()
+            .and_then(|feed| feed.as_ref().and_then(OwnedFeed::selected_failure));
+        #[cfg(test)]
         let failure = self
             .0
             .feed
             .try_lock()
             .ok()
-            .and_then(|feed| feed.as_ref().and_then(OwnedFeed::failure));
+            .and_then(|feed| match feed.as_ref()? {
+                OwnedFeed::Controlled(feed) => feed.failure(),
+                OwnedFeed::Desktop(_) => None,
+            });
+        #[cfg(test)]
         if let Some(detail) = failure {
             self.fail(detail);
         }
-        let control = self.control();
+        if let Some(failure) = &account_failure {
+            self.fail_bound(failure.detail.clone(), Some(&failure.binding));
+        }
+        let mut control = self.control();
+        control.record_account_failure(account_failure);
         RuntimeStatus {
+            account_failure: control.account_failure.clone(),
             channel_health: channel_health.filter(|snapshot| {
                 !control.terminal && control.chart_binding.as_ref() == Some(&snapshot.binding)
             }),
-            chart_failure: chart_failure
+            selected_failure: selected_failure
                 .filter(|failure| control.chart_binding.as_ref() == Some(&failure.binding))
                 .or_else(|| {
                     control.chart_owner.as_ref().and_then(|owner| {
@@ -2287,7 +2415,7 @@ impl Runtime {
             control.chart_binding.clone()?
         };
         let at = crate::now_ms();
-        let (console, chart) = {
+        let selected = {
             let feed = self.0.feed.try_lock().ok()?;
             match feed.as_ref()? {
                 OwnedFeed::Desktop(feed) => feed.channel_health(&binding, at)?,
@@ -2303,7 +2431,7 @@ impl Runtime {
             .health_clock
             .try_lock()
             .ok()?
-            .project(binding, console, chart, crate::now_ms())
+            .project(binding, selected, crate::now_ms())
     }
 
     /// Cached only: this path never opens authority or touches the keychain.
@@ -2909,6 +3037,7 @@ impl Runtime {
             if !self.replace_chart(feed, pending, &binding).await? {
                 return Ok(None);
             }
+            #[cfg(test)]
             feed.watch(&pending.selection.coin, &pending.selection.interval)
                 .map_err(RuntimeError::Failed)?;
             return Ok(Some(binding));
@@ -2933,6 +3062,8 @@ impl Runtime {
             Some(feed) => feed.shutdown_and_drain().await.err(),
             None => None,
         };
+        self.control()
+            .record_account_failure(slot.as_ref().and_then(OwnedFeed::account_failure));
         *slot = None;
         if let Some(reads) = reads {
             reads.drain().await;
@@ -2984,6 +3115,7 @@ impl Runtime {
         {
             let mut control = self.control();
             // Retain the actual context even if a newer watch arrived during start.
+            control.install_account_binding(binding.clone());
             control.selection = Some(pending.selection.clone());
             control.binding = Some(binding.clone());
             if control.terminal || control.request_serial != pending.serial {
@@ -2994,6 +3126,7 @@ impl Runtime {
         if !self.replace_chart(feed, pending, &binding).await? {
             return Ok(None);
         }
+        #[cfg(test)]
         feed.watch(&pending.selection.coin, &pending.selection.interval)
             .map_err(RuntimeError::Failed)?;
         Ok(Some(binding))
@@ -3045,6 +3178,16 @@ impl Runtime {
                     owner.binding.clone(),
                     owner.failure.clone(),
                     move |binding, event, received| {
+                        if owner.accepts(binding)
+                            && let Some(event) = event
+                        {
+                            let failure = owner
+                                .failure
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .clone();
+                            ConsoleFeed::emit_selected(&app, binding, event, failure)?;
+                        }
                         if let Some(projection) = owner.observe(binding, event, received)
                             && emitted_revision.as_ref() != Some(&projection.chart.revision)
                         {
@@ -3077,7 +3220,14 @@ impl Runtime {
     }
 
     fn fail(&self, detail: String) {
+        self.fail_bound(detail, None);
+    }
+
+    fn fail_bound(&self, detail: String, binding: Option<&FeedBinding>) {
         let mut control = self.control();
+        if binding.is_some() && control.account_binding.as_ref() != binding {
+            return;
+        }
         control.terminal = true;
         if matches!(
             control.phase,
@@ -3229,6 +3379,9 @@ impl Runtime {
             {
                 runtime.fail(error);
             }
+            runtime
+                .control()
+                .record_account_failure(slot.as_ref().and_then(OwnedFeed::account_failure));
             *slot = None;
             drop(slot);
             reads.drain().await;
@@ -3278,8 +3431,19 @@ impl Runtime {
         }
     }
 
-    pub(crate) fn last_tick_ms(&self, network: Network) -> Option<u64> {
+    pub(crate) fn last_tick_ms(&self, network: Network, account: oppen_hl::Address) -> Option<u64> {
         let feed = self.0.feed.try_lock().ok()?;
-        feed.as_ref()?.last_tick_ms(network)
+        feed.as_ref()?.last_tick_ms(network, account)
+    }
+
+    pub(crate) fn account_observation_at(
+        &self,
+        network: Network,
+        account: oppen_hl::Address,
+        clock: impl FnOnce() -> u64,
+    ) -> (Option<u64>, u64) {
+        let observed = self.last_tick_ms(network, account);
+        let as_of = clock();
+        (observed.filter(|observed| *observed <= as_of), as_of)
     }
 }

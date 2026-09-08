@@ -12,7 +12,7 @@
  * runs unchanged under `bun test` and keeps `vue-tsc --noEmit` green.
  */
 
-import { reactive } from "vue";
+import { reactive, ref } from "vue";
 import type { FeedBinding, FeedEnvelope, FeedUpdate, MarketSnapshot } from "../lib/bridge";
 import { createMarketFeed, createQuotes, quoteSpread, parseBar } from "./market";
 
@@ -55,6 +55,8 @@ function feedFixture() {
   const listeners: Array<{ emit: (event: FeedEnvelope) => void; ready: ReturnType<typeof deferred<() => void>>; cleaned: number }> = [];
   const updates: FeedUpdate[] = [];
   const failures: Array<string | undefined> = [];
+  const accounts: Extract<FeedEnvelope, { scope: "account" }>[] = [];
+  const accountOwner = ref<FeedBinding | null>(null);
   let healthy = false;
   let error: string | null = null;
   const controller = createMarketFeed(
@@ -76,7 +78,9 @@ function feedFixture() {
       invalidate: () => { healthy = false; },
       failure: () => { healthy = false; },
       error: (detail) => { error = detail; },
-      chartBinding: () => {},
+      chartBinding: binding => { accountOwner.value = { network: binding.network, generation: binding.generation }; },
+      account: envelope => { accounts.push(envelope); },
+      accountBinding: () => accountOwner.value,
       update: (update, failure) => {
         healthy = failure === undefined && (update.kind !== "status" || update.connected);
         updates.push(update);
@@ -89,12 +93,62 @@ function feedFixture() {
     listener.ready.resolve(() => { listener.cleaned += 1; });
   }
   function emit(generation: string, network: FeedBinding["network"] = "testnet", index = 0, update: FeedUpdate = { kind: "status", connected: true }): void {
-    listeners[index]!.emit({ network, generation, update });
+    listeners[index]!.emit({ scope: "selected", binding: binding(generation, network), update });
   }
-  return { scope, calls, listeners, updates, failures, controller, listen, emit, get healthy() { return healthy; }, get error() { return error; } };
+  function binding(generation: string, network = scope.network) { return { network, generation, selection_id: String(calls.length), symbol: scope.coin, interval: scope.interval }; }
+  return { scope, calls, listeners, updates, failures, accounts, accountOwner, controller, listen, emit, binding, get healthy() { return healthy; }, get error() { return error; } };
 }
 
 describe("scoped market feed ownership", () => {
+  it("rejects retired BTC quotes, context, depth, status and failure before every mutation after BTC ETH BTC", async () => {
+    const f = feedFixture();
+    try {
+      const started = f.controller.start(); f.listen(0); await started;
+      f.calls[0]!.reply.resolve({ network: "testnet", generation: "1" }); await settle();
+      const first = f.binding("1");
+      const payloads: FeedUpdate[] = [
+        { kind: "bbo", coin: "BTC", at_ms: 100, bid: { px: "10", sz: "1", n: 1 }, ask: { px: "11", sz: "1", n: 1 } },
+        { kind: "ctx", at_ms: 100, row: { symbol: "BTC", mark_px: "10", funding_1h_bps: "0", open_interest: "1", day_volume_usd: "1", has_book: true } },
+        { kind: "book", coin: "BTC", at_ms: 100, bids: [], asks: [] },
+        { kind: "status", connected: false, detail: "Old selection disconnected" },
+      ];
+      f.scope.coin = "ETH"; f.calls[1]!.reply.resolve({ network: "testnet", generation: "1" }); await settle();
+      f.scope.coin = "BTC";
+      for (const update of payloads) f.listeners[0]!.emit({ scope: "selected", binding: first, update, failure: "Old consumer failed" });
+      expect(f.updates.length).toBe(0);
+      f.calls[2]!.reply.resolve({ network: "testnet", generation: "1" }); await settle();
+      for (const update of payloads) f.listeners[0]!.emit({ scope: "selected", binding: first, update, failure: "Old consumer failed" });
+      // Runtime payloads from mixed artifacts must fail closed too.
+      f.listeners[0]!.emit({ network: "testnet", generation: "1", update: payloads[0] } as unknown as FeedEnvelope);
+      expect(f.updates.length).toBe(0); expect(f.failures.length).toBe(0);
+      for (const update of payloads) f.emit("1", "testnet", 0, update);
+      expect(f.updates).toEqual(payloads); expect(f.failures).toEqual([undefined, undefined, undefined, undefined]);
+      const returned = f.binding("1"); f.scope.interval = "5m";
+      f.calls[3]!.reply.resolve({ network: "testnet", generation: "1" }); await settle();
+      f.scope.interval = "1h"; f.calls[4]!.reply.resolve({ network: "testnet", generation: "1" }); await settle();
+      f.listeners[0]!.emit({ scope: "selected", binding: returned, update: payloads[0]!, failure: "Old interval failed" });
+      expect(f.updates.length).toBe(4);
+      f.emit("1", "testnet", 0, payloads[0]); expect(f.updates.length).toBe(5);
+    } finally { f.controller.stop(); }
+  });
+
+  it("delivers exact account status during pending selection without touching selected state", async () => {
+    const f = feedFixture();
+    try {
+      f.accountOwner.value = { network: "testnet", generation: "1" };
+      const started = f.controller.start(); f.listen(0); await started;
+      const account: FeedEnvelope = { scope: "account", binding: { network: "testnet", generation: "1" },
+        update: { kind: "status", connected: false, last_tick_ms: null, detail: null }, failure: "Account ledger failed" };
+      f.listeners[0]!.emit(account); expect(f.accounts.length).toBe(1); expect(f.updates.length).toBe(0);
+      f.calls[0]!.reply.resolve({ network: "testnet", generation: "1" }); await settle();
+      f.emit("1"); expect(f.healthy).toBe(true);
+      f.listeners[0]!.emit(account); expect(f.healthy).toBe(true); expect(f.failures).toEqual([undefined]);
+      f.scope.coin = "ETH"; f.listeners[0]!.emit(account); expect(f.accounts.length).toBe(3);
+      f.listeners[0]!.emit({ ...account, binding: { network: "testnet", generation: "0" } });
+      f.listeners[0]!.emit({ ...account, update: { kind: "book", coin: "ETH", at_ms: 1, bids: [], asks: [] } } as unknown as FeedEnvelope);
+      expect(f.accounts.length).toBe(3); expect(f.updates.length).toBe(1);
+    } finally { f.controller.stop(); }
+  });
   it("filters chart selection incarnations even when the market feed generation is reused", async () => {
     const f = feedFixture();
     const chart = (selection_id: string, interval = "1h"): FeedUpdate => ({ kind: "chart", projection: {
@@ -119,7 +173,7 @@ describe("scoped market feed ownership", () => {
     } finally { f.controller.stop(); }
   });
 
-  it("keeps the first owner failure through later payloads and same-owner watches until a new binding", async () => {
+  it("keeps the first selected failure until a new selection even when feed generation is reused", async () => {
     const f = feedFixture();
     try {
       const started = f.controller.start();
@@ -128,20 +182,20 @@ describe("scoped market feed ownership", () => {
       f.calls[0]!.reply.resolve({ network: "testnet", generation: "9007199254740993" });
       await settle();
       const payload: FeedUpdate = { kind: "book", coin: "BTC", at_ms: 100, bids: [], asks: [] };
-      f.listeners[0]!.emit({ network: "testnet", generation: "9007199254740993", update: payload, failure: "ledger append failed" });
+      f.listeners[0]!.emit({ scope: "selected", binding: f.binding("9007199254740993"), update: payload, failure: "selected consumer failed" });
       expect(f.updates[0]).toEqual(payload);
       expect(f.healthy).toBe(false);
       f.emit("9007199254740993", "testnet", 0, payload);
       f.emit("9007199254740993");
-      f.listeners[0]!.emit({ network: "testnet", generation: "9007199254740993", update: payload, failure: "later failure" });
-      expect(f.failures).toEqual(Array(4).fill("ledger append failed"));
+      f.listeners[0]!.emit({ scope: "selected", binding: f.binding("9007199254740993"), update: payload, failure: "later failure" });
+      expect(f.failures).toEqual(Array(4).fill("selected consumer failed"));
       expect(f.healthy).toBe(false);
       f.scope.interval = "5m";
       f.calls[1]!.reply.resolve({ network: "testnet", generation: "9007199254740993" });
       await settle();
       f.emit("9007199254740993");
-      expect(f.healthy).toBe(false);
-      expect(f.failures[4]).toBe("ledger append failed");
+      expect(f.healthy).toBe(true);
+      expect(f.failures[4]).toBe(undefined);
       f.scope.network = "mainnet";
       f.calls[2]!.reply.resolve({ network: "mainnet", generation: "9007199254740994" });
       await settle();
@@ -184,7 +238,7 @@ describe("scoped market feed ownership", () => {
     } finally { f.controller.stop(); }
   });
 
-  it("discards off-selection payloads without discarding an accepted owner's failure", async () => {
+  it("rejects off-selection payloads before latching their failure", async () => {
     const f = feedFixture();
     try {
       const started = f.controller.start();
@@ -195,14 +249,14 @@ describe("scoped market feed ownership", () => {
       f.emit("50");
       expect(f.healthy).toBe(true);
       f.listeners[0]!.emit({
-        network: "testnet", generation: "50", failure: "owner ledger failed",
+        scope: "selected", binding: f.binding("50"), failure: "retired selected failure",
         update: { kind: "book", coin: "ETH", at_ms: 100, bids: [], asks: [] },
       });
       expect(f.updates.length).toBe(1);
-      expect(f.healthy).toBe(false);
+      expect(f.healthy).toBe(true);
       f.emit("50");
-      expect(f.failures[1]).toBe("owner ledger failed");
-      expect(f.healthy).toBe(false);
+      expect(f.failures[1]).toBe(undefined);
+      expect(f.healthy).toBe(true);
     } finally { f.controller.stop(); }
   });
 

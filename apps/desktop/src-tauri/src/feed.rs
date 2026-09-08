@@ -1,25 +1,11 @@
-//! The console's live socket (`docs/spec.md` items 31, 32 and 34).
+//! Native account observations and separately bound selected-market delivery.
 //!
-//! Item 34 asks for per-feed status and last-tick timestamps, and the console
-//! could answer neither: `account_state` reported `last_tick_ms: None` because
-//! nothing here ran a socket, so the staleness overlay was permanently stuck on
-//! "never connected" and every number on screen was a REST read taken once at
-//! mount. This is the socket that makes those answers true.
-//!
-//! **The fold is [`oppen_core::feed::FeedSession`]'s, not this module's.** The
-//! session already knows what a tick means and what a drop means; the console
-//! adds one thing to it — the payloads themselves have to reach the operator's
-//! screen, which the MCP path never needed. So the loop here does two things
-//! per event and no more: hand it to the session, then emit what the panels
-//! draw. Anything that decides something belongs in the core.
-//!
-//! **The pump is deliberately not used.** [`oppen_core::feed::pump::FeedPump`]
-//! owns the reconcile retry, the alert feeds and the quote leases — all three
-//! are the agent gateway's concerns, and its `run` loop owns the event stream
-//! it would have to share. The console needs freshness and payloads, which is
-//! `FeedSession::apply` plus this loop. When the console grows an order path it
-//! will need the pump's `reconciled` flag too, and that is the point to move
-//! this onto the pump rather than now.
+//! The account owner applies matching account events through `FeedSession` and
+//! retains ledger gaps across selection changes. Its observation clock advances
+//! only after successful matching-account application, never from public traffic
+//! or connection status. This is display evidence, not execution admission.
+//! All five selected public channels belong to the separately drained transport;
+//! none are applied to this account session. MCP retains its own guard pump.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -43,24 +29,97 @@ use tokio::task::JoinHandle;
 const CHANNEL: &str = "feed://update";
 
 #[derive(Debug, Clone, serde::Serialize)]
-pub(crate) struct FeedEnvelope {
-    pub network: Network,
-    pub generation: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub failure: Option<String>,
-    pub update: FeedUpdate,
+#[serde(tag = "scope", rename_all = "snake_case")]
+pub(crate) enum FeedEnvelope {
+    Selected {
+        binding: ChartBinding,
+        update: Box<FeedUpdate>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        failure: Option<String>,
+    },
+    Account {
+        binding: crate::runtime::FeedBinding,
+        update: AccountStatus,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        failure: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum AccountStatus {
+    Status {
+        last_tick_ms: Option<u64>,
+        connected: bool,
+        detail: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct AccountFailure {
+    pub binding: crate::runtime::FeedBinding,
+    pub detail: String,
+}
+
+struct AccountObservation {
+    account: Option<oppen_hl::Address>,
+    last: Mutex<Option<u64>>,
+}
+
+impl AccountObservation {
+    fn apply(
+        &self,
+        session: &FeedSession,
+        ledger: &Ledger,
+        event: &WsEvent,
+        at: u64,
+    ) -> Result<(), String> {
+        let user = match event {
+            WsEvent::UserFills { user, .. } | WsEvent::OrderUpdates { user, .. } => Some(*user),
+            WsEvent::ActiveAssetCtx { .. }
+            | WsEvent::Bbo { .. }
+            | WsEvent::L2Book(_)
+            | WsEvent::Trades { .. }
+            | WsEvent::Candle(_) => return Ok(()),
+            _ => None,
+        };
+        if user.is_some() && user != self.account {
+            return Err("foreign account event refused before ledger application".into());
+        }
+        session
+            .apply(
+                ledger,
+                &self
+                    .account
+                    .map(|account| account.to_string())
+                    .unwrap_or_default(),
+                event,
+                at,
+            )
+            .map_err(|error| format!("feed ledger application failed: {error}"))?;
+        if user.is_some() {
+            let mut last = self.last.lock().unwrap_or_else(|p| p.into_inner());
+            *last = Some(last.map_or(at, |last| last.max(at)));
+        }
+        Ok(())
+    }
+    fn last(&self) -> Option<u64> {
+        *self.last.try_lock().ok()?
+    }
 }
 
 impl FeedEnvelope {
     fn new(
         network: Network,
         generation: &str,
-        update: FeedUpdate,
+        update: AccountStatus,
         failure: &Mutex<Option<String>>,
     ) -> Self {
-        Self {
-            network,
-            generation: generation.to_owned(),
+        Self::Account {
+            binding: crate::runtime::FeedBinding {
+                network,
+                generation: generation.to_owned(),
+            },
             failure: failure_detail(failure),
             update,
         }
@@ -131,19 +190,73 @@ fn level(from: &Level) -> BookLevel {
 /// One network's live feeds, and the subscriptions the console is holding.
 pub(crate) struct ConsoleFeed {
     network: Network,
-    session: Arc<FeedSession>,
+    generation: String,
+    observation: Arc<AccountObservation>,
     pool: Option<WsPool>,
     event_task: Option<JoinHandle<Result<(), String>>>,
     failure: Arc<Mutex<Option<String>>>,
+    shutdown_failure: Option<String>,
     drained: Option<Result<(), String>>,
     chart: Option<ChartTransport>,
-    diagnostics: Arc<crate::channel_health::Diagnostics>,
-    /// What the operator is looking at. Swapped whole on every selection, so
-    /// the console never holds a feed for a symbol it stopped drawing.
-    watching: Mutex<Vec<Subscription>>,
 }
 
 impl ConsoleFeed {
+    #[cfg(test)]
+    pub(crate) fn observation_fixture(account: oppen_hl::Address, at: u64) -> Self {
+        Self {
+            network: Network::Testnet,
+            generation: "1".into(),
+            observation: Arc::new(AccountObservation {
+                account: Some(account),
+                last: Mutex::new(Some(at)),
+            }),
+            pool: None,
+            event_task: None,
+            failure: Arc::new(Mutex::new(None)),
+            shutdown_failure: None,
+            drained: Some(Ok(())),
+            chart: None,
+        }
+    }
+    pub(crate) fn selected_envelope(
+        binding: &ChartBinding,
+        event: &WsEvent,
+        failure: Option<String>,
+    ) -> Option<FeedEnvelope> {
+        let matching = match event {
+            WsEvent::ActiveAssetCtx { coin, .. } | WsEvent::Bbo { coin, .. } => {
+                coin == &binding.symbol
+            }
+            WsEvent::L2Book(book) => book.coin == binding.symbol,
+            WsEvent::Disconnected(_)
+            | WsEvent::Reconnected(_)
+            | WsEvent::MessageDropped { .. }
+            | WsEvent::VenueError { .. }
+            | WsEvent::SubscriptionQuarantined { .. } => true,
+            _ => false,
+        };
+        if matching && let Some(update) = translate(event, None) {
+            Some(FeedEnvelope::Selected {
+                binding: binding.clone(),
+                update: Box::new(update),
+                failure,
+            })
+        } else {
+            None
+        }
+    }
+    pub(crate) fn emit_selected(
+        app: &AppHandle,
+        binding: &ChartBinding,
+        event: &WsEvent,
+        failure: Option<String>,
+    ) -> Result<(), String> {
+        if let Some(envelope) = Self::selected_envelope(binding, event, failure) {
+            app.emit(CHANNEL, envelope)
+                .map_err(|error| format!("selected emission: {error}"))?;
+        }
+        Ok(())
+    }
     pub(crate) fn emit_chart(
         app: &AppHandle,
         binding: &ChartBinding,
@@ -151,13 +264,12 @@ impl ConsoleFeed {
     ) -> Result<(), String> {
         app.emit(
             CHANNEL,
-            FeedEnvelope {
-                network: binding.network,
-                generation: binding.generation.clone(),
+            FeedEnvelope::Selected {
+                binding: binding.clone(),
                 failure: None,
-                update: FeedUpdate::Chart {
+                update: Box::new(FeedUpdate::Chart {
                     projection: Box::new(projection),
-                },
+                }),
             },
         )
         .map_err(|error| format!("chart emission: {error}"))
@@ -187,6 +299,10 @@ impl ConsoleFeed {
                 .map_err(|e| format!("ledger: {e}"))?,
         );
         let session = Arc::new(FeedSession::new());
+        let observation = Arc::new(AccountObservation {
+            account: user,
+            last: Mutex::new(None),
+        });
         let (pool, events) = WsPool::new(WsPoolConfig {
             network,
             ..WsPoolConfig::default()
@@ -195,32 +311,25 @@ impl ConsoleFeed {
 
         let handle = app.clone();
         let loop_session = Arc::clone(&session);
-        let loop_account = account.unwrap_or_default();
+        let loop_observation = observation.clone();
+        let event_generation = generation.clone();
         let failure = Arc::new(Mutex::new(None));
-        let diagnostics = Arc::new(crate::channel_health::Diagnostics::default());
-        let loop_diagnostics = diagnostics.clone();
         let loop_failure = failure.clone();
         let event_task =
             spawn_event_consumer(events, failure.clone(), move |event, received_at_ms| {
-                loop_diagnostics.record(
-                    crate::channel_health::Owner::Console,
-                    event,
-                    received_at_ms,
-                );
                 // One blocking consumer preserves application order and owns every
                 // ledger write through completion, without occupying an async worker.
-                let apply_error = loop_session
-                    .apply(&ledger, &loop_account, event, received_at_ms)
-                    .err()
-                    .map(|error| format!("feed ledger application failed: {error}"));
+                let apply_error = loop_observation
+                    .apply(&loop_session, &ledger, event, received_at_ms)
+                    .err();
                 if let Some(error) = &apply_error {
                     remember_failure(&loop_failure, error.clone());
                 }
-                let last_tick_ms = loop_session.state().last_tick_ms;
-                let mut update = translate(event, last_tick_ms);
+                let last_tick_ms = loop_observation.last();
+                let mut update = account_status(event, last_tick_ms);
                 if let Some(error) = failure_detail(&loop_failure) {
                     match &mut update {
-                        Some(FeedUpdate::Status { detail, .. }) => {
+                        Some(AccountStatus::Status { detail, .. }) => {
                             *detail = Some(match detail.take() {
                                 Some(status) => format!("{error}; {status}"),
                                 None => error,
@@ -232,8 +341,8 @@ impl ConsoleFeed {
                                     CHANNEL,
                                     FeedEnvelope::new(
                                         network,
-                                        &generation,
-                                        FeedUpdate::Status {
+                                        &event_generation,
+                                        AccountStatus::Status {
                                             last_tick_ms,
                                             connected: false,
                                             detail: Some(error),
@@ -250,7 +359,7 @@ impl ConsoleFeed {
                     handle
                         .emit(
                             CHANNEL,
-                            FeedEnvelope::new(network, &generation, update, &loop_failure),
+                            FeedEnvelope::new(network, &event_generation, update, &loop_failure),
                         )
                         .map_err(|error| format!("feed event emission failed: {error}"))?;
                 }
@@ -270,14 +379,14 @@ impl ConsoleFeed {
         }
         Ok(Self {
             network,
-            session,
+            generation,
+            observation,
             pool: Some(pool),
             event_task: Some(event_task),
             failure,
+            shutdown_failure: None,
             drained: None,
             chart: None,
-            diagnostics,
-            watching: Mutex::new(Vec::new()),
         })
     }
 
@@ -289,7 +398,7 @@ impl ConsoleFeed {
             return result.clone();
         }
         if let Err(error) = self.retire_chart().await {
-            remember_failure(&self.failure, error);
+            self.shutdown_failure.get_or_insert(error);
         }
         if let Some(pool) = &self.pool
             && let Err(error) = pool.shutdown_and_drain().await
@@ -309,7 +418,11 @@ impl ConsoleFeed {
             }
         }
         self.event_task = None;
-        let result = self.failure().map_or(Ok(()), Err);
+        let result = self
+            .shutdown_failure
+            .clone()
+            .or_else(|| self.failure())
+            .map_or(Ok(()), Err);
         self.drained = Some(result.clone());
         result
     }
@@ -331,60 +444,21 @@ impl ConsoleFeed {
     }
 
     /// The freshness `account_state` reports (item 34).
-    pub(crate) fn last_tick_ms(&self) -> Option<u64> {
-        self.session.state().last_tick_ms
+    pub(crate) fn last_tick_ms(&self, account: oppen_hl::Address) -> Option<u64> {
+        if self.observation.account != Some(account) {
+            return None;
+        }
+        self.observation.last()
     }
 
-    /// Point the socket at the symbol the operator selected.
-    ///
-    /// Context, BBO and book stay on the common feed. Trades and candles belong
-    /// to a separately drained chart transport incarnation. Everything held for the previous symbol is given
-    /// back in the same pass — a console that accumulated subscriptions as the
-    /// operator browsed would walk into the venue's per-IP ceiling.
-    pub(crate) fn watch(&self, coin: &str, _interval: &str) -> Result<(), String> {
-        let pool = self.pool.as_ref().ok_or("feed is stopping")?;
-        let wanted = vec![
-            Subscription::ActiveAssetCtx { coin: coin.into() },
-            Subscription::Bbo { coin: coin.into() },
-            Subscription::L2Book { coin: coin.into() },
-        ];
-        self.diagnostics.select(&wanted);
-        let mut held = self.watching.lock().map_err(|_| "feed lock poisoned")?;
-        // Recorded as each one is taken, never assumed. Returning early on a
-        // refusal without writing down what already succeeded would leak those
-        // subscriptions permanently: nothing else knows the pool is holding
-        // them, so nothing would ever give them back.
-        let mut refused = None;
-        for sub in &wanted {
-            if held.contains(sub) {
-                continue;
-            }
-            match pool.subscribe(sub.clone()) {
-                Ok(()) => held.push(sub.clone()),
-                Err(error) => {
-                    refused = Some(format!("{}: {error}", sub.key()));
-                    remember_failure(&self.failure, format!("feed subscription failed: {error}"));
-                    break;
-                }
-            }
-        }
-        // Released after the new ones are asked for, so switching symbols does
-        // not leave the console with no feed at all if a subscribe is refused —
-        // and released even when one was, because the symbol the operator left
-        // is not coming back on screen either way.
-        held.retain(|sub| {
-            if wanted.contains(sub) {
-                return true;
-            }
-            if let Err(error) = pool.unsubscribe(sub) {
-                remember_failure(&self.failure, format!("feed unsubscribe failed: {error}"));
-            }
-            false
-        });
-        match refused {
-            Some(error) => Err(error),
-            None => Ok(()),
-        }
+    pub(crate) fn account_failure(&self) -> Option<AccountFailure> {
+        self.failure().map(|detail| AccountFailure {
+            binding: crate::runtime::FeedBinding {
+                network: self.network,
+                generation: self.generation.clone(),
+            },
+            detail,
+        })
     }
 
     pub(crate) async fn retire_chart(&mut self) -> Result<(), String> {
@@ -411,7 +485,7 @@ impl ConsoleFeed {
         Ok(())
     }
 
-    pub(crate) fn chart_failure(&self) -> Option<crate::chart_transport::ChartFailure> {
+    pub(crate) fn selected_failure(&self) -> Option<crate::chart_transport::ChartFailure> {
         self.chart.as_ref().and_then(ChartTransport::failure)
     }
 
@@ -419,33 +493,11 @@ impl ConsoleFeed {
         &self,
         binding: &ChartBinding,
         at: u64,
-    ) -> Option<(
-        crate::channel_health::PoolObservation,
-        crate::channel_health::PoolObservation,
-    )> {
-        let health = match &self.pool {
-            Some(pool) => pool.try_health()?,
-            None => Vec::new(),
-        };
-        let failure = self.failure.try_lock().ok()?.clone().or_else(|| {
-            (self.drained.is_none()
-                && self
-                    .event_task
-                    .as_ref()
-                    .is_some_and(JoinHandle::is_finished))
-            .then(|| "console consumer terminated before shutdown".into())
-        });
-        let console = self.diagnostics.sample(
-            health,
-            crate::channel_health::Owner::Console,
-            failure.as_deref(),
-            at,
-        )?;
-        let chart = match &self.chart {
+    ) -> Option<crate::channel_health::PoolObservation> {
+        Some(match &self.chart {
             Some(chart) => chart.channel_health(binding, at)?,
             None => crate::channel_health::PoolObservation::missing(),
-        };
-        Some((console, chart))
+        })
     }
 }
 
@@ -564,10 +616,244 @@ fn translate(event: &WsEvent, last_tick_ms: Option<u64>) -> Option<FeedUpdate> {
     }
 }
 
+fn account_status(event: &WsEvent, last_tick_ms: Option<u64>) -> Option<AccountStatus> {
+    match translate(event, last_tick_ms) {
+        Some(FeedUpdate::Status {
+            last_tick_ms,
+            connected,
+            detail,
+        }) => Some(AccountStatus::Status {
+            last_tick_ms,
+            connected,
+            detail,
+        }),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use oppen_hl::types::{AssetCtx, Candle, L2Book};
+
+    fn account_fill(user: oppen_hl::Address, tid: u64) -> WsEvent {
+        WsEvent::UserFills {
+            user,
+            is_snapshot: false,
+            fills: vec![
+                serde_json::from_value(serde_json::json!({
+                    "coin":"BTC", "px":"100", "sz":"0.1", "side":"B", "time":100,
+                    "startPosition":"0", "dir":"Open Long", "closedPnl":"0", "hash":"synthetic",
+                    "oid":1, "crossed":true, "fee":"0.01", "feeToken":"USDC", "tid":tid
+                }))
+                .unwrap(),
+            ],
+        }
+    }
+
+    #[test]
+    fn account_observation_ignores_public_refuses_foreign_and_preserves_durable_history() {
+        use oppen_hl::ws::{ConnectionId, Disconnected, GapWindow, Reconnected};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.db");
+        let ledger = Ledger::open_at(&path, Network::Testnet).unwrap();
+        // Existing public-feed gaps remain historical evidence after migration.
+        ledger
+            .open_gap(
+                &Subscription::Bbo { coin: "BTC".into() }.key(),
+                1,
+                Some("historical public gap"),
+            )
+            .unwrap();
+        let account: oppen_hl::Address = "0x0000000000000000000000000000000000000001"
+            .parse()
+            .unwrap();
+        let foreign: oppen_hl::Address = "0x0000000000000000000000000000000000000002"
+            .parse()
+            .unwrap();
+        let observation = AccountObservation {
+            account: Some(account),
+            last: Mutex::new(None),
+        };
+        let session = FeedSession::new();
+        let ctx = serde_json::from_value(serde_json::json!({"funding":"0","openInterest":"1","prevDayPx":"100","dayNtlVlm":"1","premium":"0","oraclePx":"100","markPx":"100","midPx":"100","impactPxs":["99","101"],"dayBaseVlm":"1"})).unwrap();
+        for event in [
+            tick(100),
+            WsEvent::ActiveAssetCtx { coin: "BTC".into(), ctx, received_at_ms: 100 },
+            WsEvent::L2Book(serde_json::from_value(serde_json::json!({"coin":"BTC","time":100,"levels":[[],[]]})).unwrap()),
+            WsEvent::Trades { coin: "BTC".into(), trades: vec![] },
+            WsEvent::Candle(serde_json::from_value(serde_json::json!({"t":0,"T":59999,"s":"BTC","i":"1m","o":"100","c":"100","h":"100","l":"100","v":"1","n":1})).unwrap()),
+        ] {
+            observation.apply(&session, &ledger, &event, 100).unwrap();
+        }
+        assert_eq!(session.state().last_tick_ms, None);
+        assert_eq!(observation.last(), None);
+        let head = ledger.chain_head().unwrap();
+        assert!(
+            observation
+                .apply(&session, &ledger, &account_fill(foreign, 1), 110)
+                .is_err()
+        );
+        let unconfigured = AccountObservation {
+            account: None,
+            last: Mutex::new(None),
+        };
+        assert!(
+            unconfigured
+                .apply(&session, &ledger, &account_fill(account, 2), 111)
+                .is_err()
+        );
+        assert_eq!(ledger.chain_head().unwrap(), head);
+        assert_eq!(session.state().last_tick_ms, None);
+        for (at, event) in [
+            (
+                120,
+                WsEvent::UserFills {
+                    user: account,
+                    is_snapshot: true,
+                    fills: vec![],
+                },
+            ),
+            (
+                130,
+                WsEvent::OrderUpdates {
+                    user: account,
+                    updates: vec![],
+                },
+            ),
+            (140, account_fill(account, 3)),
+        ] {
+            observation.apply(&session, &ledger, &event, at).unwrap();
+            assert_eq!(observation.last(), Some(at));
+        }
+        let subscriptions = vec![Subscription::UserFills { user: account }];
+        observation
+            .apply(
+                &session,
+                &ledger,
+                &WsEvent::Disconnected(Box::new(Disconnected {
+                    connection: ConnectionId::new(0),
+                    at_ms: 150,
+                    last_message_ms: Some(140),
+                    subscriptions: subscriptions.clone(),
+                    unacked: vec![],
+                    reason: "synthetic gap".into(),
+                })),
+                150,
+            )
+            .unwrap();
+        observation
+            .apply(
+                &session,
+                &ledger,
+                &WsEvent::Reconnected(Box::new(Reconnected {
+                    connection: ConnectionId::new(0),
+                    at_ms: 160,
+                    gap: GapWindow {
+                        start_ms: 140,
+                        end_ms: 160,
+                    },
+                    resubscribed: subscriptions,
+                    attempts: 1,
+                })),
+                160,
+            )
+            .unwrap();
+        assert_eq!(observation.last(), Some(140));
+        let rows = serde_json::to_value(ledger.get_events(0, 100).unwrap()).unwrap();
+        let gaps = ledger.unreconciled_gaps().unwrap();
+        assert_eq!(gaps.len(), 2);
+        assert!(gaps.iter().any(|gap| gap.closed_ts_ms == Some(160)));
+        assert!(
+            gaps.iter()
+                .any(|gap| gap.opened_ts_ms == 1 && gap.closed_ts_ms.is_none())
+        );
+        drop(ledger);
+        let reopened = Ledger::open_at(&path, Network::Testnet).unwrap();
+        assert_eq!(
+            serde_json::to_value(reopened.get_events(0, 100).unwrap()).unwrap(),
+            rows
+        );
+        assert_eq!(reopened.unreconciled_gaps().unwrap(), gaps);
+    }
+
+    type PublicationGate = (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<bool>);
+
+    #[derive(Debug)]
+    struct ApplicationAnchor {
+        file: oppen_core::ledger::FileAnchor,
+        gate: Arc<Mutex<Option<PublicationGate>>>,
+    }
+
+    impl oppen_core::ledger::HeadAnchor for ApplicationAnchor {
+        fn load(&self) -> oppen_core::ledger::Result<Option<oppen_core::ledger::Anchor>> {
+            self.file.load()
+        }
+        fn store(&self, anchor: &oppen_core::ledger::Anchor) -> oppen_core::ledger::Result<()> {
+            let gate = self.gate.lock().unwrap().take();
+            if let Some((entered, release)) = gate {
+                entered.send(()).unwrap();
+                if release
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap()
+                {
+                    return Err(std::io::Error::other("synthetic publication failure").into());
+                }
+            }
+            self.file.store(anchor)
+        }
+    }
+
+    #[test]
+    fn account_observation_waits_actual_ledger_publication_and_does_not_advance_on_failure() {
+        for fail in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("ledger.db");
+            let gate = Arc::new(Mutex::new(None));
+            let ledger = Ledger::open_anchored(
+                &path,
+                Network::Testnet,
+                Some(Box::new(ApplicationAnchor {
+                    file: oppen_core::ledger::FileAnchor::beside(&path),
+                    gate: gate.clone(),
+                })),
+            )
+            .unwrap();
+            let account = "0x0000000000000000000000000000000000000001"
+                .parse()
+                .unwrap();
+            let observation = Arc::new(AccountObservation {
+                account: Some(account),
+                last: Mutex::new(Some(10)),
+            });
+            let (entered, blocked) = std::sync::mpsc::channel();
+            let (release, wait) = std::sync::mpsc::channel();
+            *gate.lock().unwrap() = Some((entered, wait));
+            let owned = observation.clone();
+            let task = std::thread::spawn(move || {
+                owned.apply(&FeedSession::new(), &ledger, &account_fill(account, 4), 200)
+            });
+            let started = blocked.recv_timeout(std::time::Duration::from_secs(3));
+            let during = observation.last();
+            release.send(fail).unwrap();
+            let result = task.join().unwrap();
+            started.unwrap();
+            assert_eq!(during, Some(10));
+            assert_eq!(result.is_err(), fail);
+            assert_eq!(observation.last(), Some(if fail { 10 } else { 200 }));
+            let reopened = Ledger::open_at(&path, Network::Testnet).unwrap();
+            assert_eq!(
+                reopened
+                    .get_events(0, 100)
+                    .unwrap()
+                    .events
+                    .iter()
+                    .filter(|row| row.kind == oppen_core::ledger::EventKind::Fill)
+                    .count(),
+                1
+            );
+        }
+    }
 
     fn owned_test_feed(
         pool: Option<WsPool>,
@@ -576,14 +862,17 @@ mod tests {
     ) -> ConsoleFeed {
         ConsoleFeed {
             network: Network::Testnet,
-            session: Arc::new(FeedSession::new()),
+            generation: "1".into(),
+            observation: Arc::new(AccountObservation {
+                account: None,
+                last: Mutex::new(None),
+            }),
             pool,
             event_task: Some(event_task),
             failure,
+            shutdown_failure: None,
             drained: None,
             chart: None,
-            diagnostics: Arc::new(crate::channel_health::Diagnostics::default()),
-            watching: Mutex::new(Vec::new()),
         }
     }
 
@@ -598,16 +887,28 @@ mod tests {
 
     #[test]
     fn envelope_preserves_update_and_distinguishes_return_to_same_network() {
-        let envelope = |generation: &str| FeedEnvelope {
-            network: Network::Testnet,
-            generation: generation.to_owned(),
+        let envelope = |generation: &str| FeedEnvelope::Selected {
+            binding: ChartBinding {
+                network: Network::Testnet,
+                generation: generation.into(),
+                selection_id: generation.into(),
+                symbol: "BTC".into(),
+                interval: "1m".into(),
+            },
             failure: None,
-            update: translate(&tick(7), Some(7)).unwrap(),
+            update: Box::new(translate(&tick(7), Some(7)).unwrap()),
         };
         let first = serde_json::to_value(envelope("1")).unwrap();
         let returned = serde_json::to_value(envelope("3")).unwrap();
-        assert_eq!(first["network"], serde_json::json!(Network::Testnet));
-        assert_ne!(first["generation"], returned["generation"]);
+        assert_eq!(
+            first["binding"]["network"],
+            serde_json::json!(Network::Testnet)
+        );
+        assert_eq!(first["scope"], "selected");
+        assert_ne!(
+            first["binding"]["generation"],
+            returned["binding"]["generation"]
+        );
         assert_eq!(first["update"], returned["update"]);
         assert_eq!(first["update"]["kind"], "bbo");
         assert_eq!(first["update"]["at_ms"], 7);
@@ -622,20 +923,25 @@ mod tests {
             None,
         )
         .unwrap();
-        let envelope = FeedEnvelope::new(
-            Network::Testnet,
-            "7",
-            FeedUpdate::Chart {
+        let envelope = FeedEnvelope::Selected {
+            binding: ChartBinding {
+                network: Network::Testnet,
+                generation: "7".into(),
+                selection_id: "11".into(),
+                symbol: "BTC".into(),
+                interval: "1m".into(),
+            },
+            update: Box::new(FeedUpdate::Chart {
                 projection: Box::new(crate::chart_transport::Projection {
                     selection_id: "11".into(),
                     chart: chart.projection(0),
                 }),
-            },
-            &Mutex::new(None),
-        );
+            }),
+            failure: None,
+        };
         let wire = serde_json::to_value(envelope).unwrap();
-        assert_eq!(wire["network"], "testnet");
-        assert_eq!(wire["generation"], "7");
+        assert_eq!(wire["binding"]["network"], "testnet");
+        assert_eq!(wire["binding"]["generation"], "7");
         assert_eq!(wire["update"]["kind"], "chart");
         let projection = &wire["update"]["projection"];
         assert_eq!(projection["selection_id"], "11");
@@ -651,7 +957,7 @@ mod tests {
     #[test]
     fn envelope_failure_is_latched_work_failure_not_normal_disconnect() {
         let failure = Mutex::new(None);
-        let status = || FeedUpdate::Status {
+        let status = || AccountStatus::Status {
             last_tick_ms: Some(7),
             connected: false,
             detail: Some("normal socket disconnect".into()),
@@ -683,8 +989,92 @@ mod tests {
         assert!(feed.event_task.is_none());
         assert!(feed.pool.is_none());
         assert!(feed.failure().is_none());
-        assert!(feed.watch("BTC", "1m").is_err());
         feed.shutdown_and_drain().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn selected_shutdown_error_survives_dropped_account_drain_without_false_account_failure()
+    {
+        use crate::chart_transport::tests::Socket;
+        for account_fails in [false, true] {
+            let socket = Socket::start();
+            let selected = ChartBinding {
+                network: Network::Testnet,
+                generation: "1".into(),
+                selection_id: "1".into(),
+                symbol: "BTC".into(),
+                interval: "1m".into(),
+            };
+            let (pool, receiver) = WsPool::loopback_fixture(socket.port).unwrap();
+            let chart = ChartTransport::from_pool(
+                selected,
+                pool,
+                receiver,
+                Arc::new(Mutex::new(None)),
+                |_, _, _| Err("synthetic selected emission failure".into()),
+            );
+            let (sender, events) = oppen_hl::ws::event_channel(1);
+            let (entered, entered_rx) = tokio::sync::oneshot::channel();
+            let mut entered = Some(entered);
+            let (release, wait) = std::sync::mpsc::channel();
+            let failure = Arc::new(Mutex::new(None));
+            let consumer = spawn_event_consumer(events, failure.clone(), move |_, _| {
+                let _ = entered.take().unwrap().send(());
+                wait.recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+                if account_fails {
+                    Err("synthetic account application failure".into())
+                } else {
+                    Ok(())
+                }
+            });
+            let mut feed = owned_test_feed(None, consumer, failure);
+            feed.chart = Some(chart);
+            sender.send(tick(1), 1).await.unwrap();
+            entered_rx.await.unwrap();
+            drop(sender);
+            let failed = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                while feed.selected_failure().is_none() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await;
+            let pending = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                loop {
+                    let mut drain = Box::pin(feed.shutdown_and_drain());
+                    let polled = std::future::poll_fn(|cx| {
+                        std::task::Poll::Ready(std::future::Future::poll(drain.as_mut(), cx))
+                    })
+                    .await;
+                    drop(drain);
+                    if polled.is_ready() {
+                        break false;
+                    }
+                    if feed.chart.is_none() {
+                        break true;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await;
+            let selected_retired = feed.chart.is_none();
+            let before_account_failure = feed.account_failure();
+            let premature_complete = feed.drained.is_some();
+            release.send(()).unwrap();
+            let result = feed.shutdown_and_drain().await;
+            socket.task.await.unwrap();
+            failed.unwrap();
+            assert!(pending.unwrap() && selected_retired && !premature_complete);
+            assert!(before_account_failure.is_none());
+            let error = result.unwrap_err();
+            assert!(error.contains("synthetic selected emission failure"));
+            assert_eq!(feed.shutdown_and_drain().await.unwrap_err(), error);
+            assert_eq!(feed.account_failure().is_some(), account_fails);
+            if let Some(failure) = feed.account_failure() {
+                assert_eq!(failure.detail, "synthetic account application failure");
+                assert_eq!(failure.binding.generation, "1");
+            }
+        }
     }
 
     #[tokio::test]
@@ -744,6 +1134,11 @@ mod tests {
         let account: oppen_hl::Address = "0x0000000000000000000000000000000000000001"
             .parse()
             .unwrap();
+        let observation = Arc::new(AccountObservation {
+            account: Some(account),
+            last: Mutex::new(None),
+        });
+        let applied_observation = observation.clone();
         let (tx, events) = oppen_hl::ws::event_channel(1);
         let monitor = events.monitor();
         let (started, started_rx) = tokio::sync::oneshot::channel();
@@ -754,10 +1149,7 @@ mod tests {
             started.take().unwrap().send(()).unwrap();
             gate.recv_timeout(std::time::Duration::from_secs(5))
                 .unwrap();
-            applied_session
-                .apply(&ledger, &account.to_string(), event, received_at_ms)
-                .map(|_| ())
-                .map_err(|error| error.to_string())
+            applied_observation.apply(&applied_session, &ledger, event, received_at_ms)
         });
         let mut feed = owned_test_feed(None, task, failure);
         tx.send(
@@ -774,12 +1166,14 @@ mod tests {
         assert_eq!(monitor.status().pending, 1);
         assert!(monitor.admit(&monitor.observation()).is_err());
         assert_eq!(session.state().last_tick_ms, None);
+        assert_eq!(observation.last(), None);
         release.send(()).unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(2), feed.shutdown_and_drain())
             .await
             .unwrap()
             .unwrap();
         assert_eq!(session.state().last_tick_ms, Some(123));
+        assert_eq!(observation.last(), Some(123));
         assert_eq!(monitor.status().pending, 0);
         assert!(monitor.status().failure.is_none());
         assert!(monitor.replacement_eligible());
@@ -800,7 +1194,11 @@ mod tests {
             emitted.lock().unwrap().push(FeedEnvelope::new(
                 Network::Testnet,
                 "1",
-                translate(event, None).unwrap(),
+                AccountStatus::Status {
+                    last_tick_ms: None,
+                    connected: true,
+                    detail: None,
+                },
                 &loop_failure,
             ));
             let WsEvent::Bbo { venue_time_ms, .. } = event else {
@@ -834,9 +1232,15 @@ mod tests {
         assert_eq!(feed.shutdown_and_drain().await.unwrap_err(), first);
         assert_eq!(*applied.lock().unwrap(), vec![1, 2]);
         let envelopes = envelopes.lock().unwrap();
-        assert!(envelopes[0].failure.is_none());
+        assert!(
+            serde_json::to_value(&envelopes[0])
+                .unwrap()
+                .get("failure")
+                .is_none()
+        );
         let later = serde_json::to_value(&envelopes[1]).unwrap();
-        assert_eq!(later["update"]["kind"], "bbo");
+        assert_eq!(later["scope"], "account");
+        assert_eq!(later["update"]["kind"], "status");
         assert_eq!(later["failure"], "synthetic ledger write failure");
         assert!(feed.event_task.is_none());
     }

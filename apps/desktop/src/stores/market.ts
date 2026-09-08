@@ -27,14 +27,14 @@ import {
   type BookLevel,
   type ChartBar,
   type ChartBinding,
-  type ChartFailure,
+  type SelectedFailure,
   type ChartProjection,
   type FeedBinding,
   type FeedUpdate,
   type MarketRow,
   type MarketSnapshot,
 } from "../lib/bridge";
-import { shell } from "./shell";
+import { shell, bindAccountObservation, receiveAccountStatus, accountObservation } from "./shell";
 import { marketHealth } from "./market-health";
 
 /** Bar intervals the chart offers. Native on the venue, so nothing resamples. */
@@ -130,7 +130,7 @@ function sameChartBinding(a: ChartBinding, b: ChartBinding): boolean {
 export function createChartObservations(read: typeof fetchChartSeries) {
   const chart = reactive<{
     binding: ChartBinding | null; projection: ChartProjection | null; data: ChartData | null;
-    error: string | null; retained: boolean; failure: ChartFailure | null;
+    error: string | null; retained: boolean; failure: SelectedFailure | null;
   }>({ binding: null, projection: null, data: null, error: null, retained: true, failure: null });
   let epoch = 0, request = 0;
   let projectionBinding: ChartBinding | null = null;
@@ -146,7 +146,7 @@ export function createChartObservations(read: typeof fetchChartSeries) {
     if (chart.failure && !sameChartBinding(chart.failure.binding, binding)) chart.failure = null;
     chart.binding = { ...binding };
   }
-  function fail(failure: ChartFailure): void {
+  function fail(failure: SelectedFailure): void {
     if (!chart.binding || !sameChartBinding(chart.binding, failure.binding)) return;
     chart.failure ??= { binding: { ...failure.binding }, detail: failure.detail };
     chart.retained = true;
@@ -191,7 +191,10 @@ export function createChartObservations(read: typeof fetchChartSeries) {
 
 const chartState = createChartObservations(fetchChartSeries);
 export const chartObservation = chartState.state;
-export function reportChartFailure(failure: ChartFailure): void { chartState.fail(failure); }
+export function reportSelectedFailure(failure: SelectedFailure): void {
+  if (!chartObservation.binding || !sameChartBinding(chartObservation.binding, failure.binding)) return;
+  chartState.fail(failure); quoteState.invalidate();
+}
 
 interface QuoteClock {
   source: "bbo" | "book" | "rest";
@@ -448,13 +451,15 @@ export function createMarketFeed(
     failure: (detail: string) => void;
     error: (detail: string | null) => void;
     chartBinding: (binding: ChartBinding) => void;
+    account: (envelope: Extract<import("../lib/bridge").FeedEnvelope, { scope: "account" }>) => void;
+    accountBinding: () => FeedBinding | null;
   },
 ) {
   let active = false;
   let lifecycle = 0;
   let desired: FeedScope | null = null;
   let accepted: { binding: FeedBinding; chart: ChartBinding; request: FeedScope } | null = null;
-  let failedOwner: (FeedBinding & { failure: string }) | null = null;
+  let failedOwner: (ChartBinding & { failure: string }) | null = null;
   let running: Promise<void> | null = null;
   let completed: FeedScope | null = null;
   let unlisten: (() => void) | null = null;
@@ -484,7 +489,7 @@ export function createMarketFeed(
           }
           accepted = { binding, chart: reply.chart, request };
           callbacks.chartBinding(reply.chart);
-          if (failedOwner?.network !== binding.network || failedOwner.generation !== binding.generation) failedOwner = null;
+          if (failedOwner && !sameChartBinding(failedOwner, reply.chart)) failedOwner = null;
           callbacks.error(null);
         }
       } catch (error) {
@@ -519,17 +524,24 @@ export function createMarketFeed(
     unwatch = watch(scope, () => { void request(); }, { flush: "sync", immediate: true });
     try {
       const cleanup = await transport.listen((envelope) => {
-        if (!active || owner !== lifecycle || accepted === null || accepted.request !== desired) return;
-        if (envelope.network !== accepted.binding.network || envelope.generation !== accepted.binding.generation) return;
-        const update = envelope.update;
-        if (envelope.failure !== undefined && failedOwner === null) {
-          failedOwner = { ...accepted.binding, failure: envelope.failure };
-          callbacks.failure(failedOwner.failure);
+        if (!active || owner !== lifecycle || !envelope?.binding) return;
+        if (envelope.scope === "account") {
+          const accountOwner = callbacks.accountBinding();
+          if (envelope.update.kind === "status" && accountOwner && envelope.binding.network === scope().network
+            && envelope.binding.network === accountOwner.network && envelope.binding.generation === accountOwner.generation) callbacks.account(envelope);
+          return;
         }
+        if (envelope.scope !== "selected" || accepted === null || accepted.request !== desired
+          || !sameChartBinding(envelope.binding, accepted.chart)) return;
+        const update = envelope.update;
         if (update.kind === "ctx" && update.row.symbol !== desired?.coin) return;
         if ("coin" in update && update.coin !== desired?.coin) return;
         if (update.kind === "chart" && (update.projection.symbol !== desired?.coin || update.projection.interval !== desired?.interval
           || update.projection.selection_id !== accepted.chart.selection_id)) return;
+        if (envelope.failure !== undefined && failedOwner === null) {
+          failedOwner = { ...accepted.chart, failure: envelope.failure };
+          callbacks.failure(failedOwner.failure);
+        }
         callbacks.update(update, failedOwner?.failure);
       });
       if (!active || owner !== lifecycle) cleanup();
@@ -556,7 +568,7 @@ export function createMarketFeed(
 /** Selected-owner delivery. Chart projections have their own observation clock. */
 export function receiveSelectedFeed(update: FeedUpdate, failure?: string): void {
   applyFeed(update);
-  if (failure !== undefined) { quoteState.invalidate(); chartState.retain(); }
+  if (failure !== undefined || chartObservation.failure) { quoteState.invalidate(); chartState.retain(); }
 }
 
 let watchError: string | null = null;
@@ -565,8 +577,12 @@ const liveFeed = createMarketFeed(
   { watch: watchMarket, listen: onFeedUpdate },
   {
     invalidate: () => { quoteState.invalidate(); chartState.invalidate(); marketHealth.invalidate(); },
-    failure: () => { quoteState.invalidate(); chartState.retain(); },
-    chartBinding: (binding) => { chartState.bind(binding); marketHealth.bind(binding); },
+    failure: detail => {
+      if (chartObservation.binding) reportSelectedFailure({ binding: chartObservation.binding, detail });
+    },
+    chartBinding: (binding) => { chartState.bind(binding); marketHealth.bind(binding); bindAccountObservation(binding); },
+    account: receiveAccountStatus,
+    accountBinding: () => accountObservation.binding,
     error: (detail) => {
       if (detail !== null || state.error === watchError) state.error = detail;
       watchError = detail;

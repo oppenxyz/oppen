@@ -1,4 +1,4 @@
-//! A chart selection owns its wire incarnation, independently of account feeds.
+//! Selected public transport with a chart reducer, independent of account feeds.
 
 use std::sync::{Arc, Mutex};
 
@@ -23,6 +23,14 @@ pub(crate) struct ChartOwner {
 }
 
 impl ChartOwner {
+    pub(crate) fn accepts(&self, binding: &ChartBinding) -> bool {
+        binding == &self.binding
+            && self
+                .state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_some()
+    }
     pub(crate) fn new(binding: ChartBinding) -> Result<Self, String> {
         let interval = Interval::parse(&binding.interval).map_err(|error| error.to_string())?;
         let chart = LiveChart::new(binding.symbol.clone(), interval, None)
@@ -58,6 +66,19 @@ impl ChartOwner {
                     if candle.s == binding.symbol && candle.i == binding.interval =>
                 {
                     chart.observe_candle(candle, received)
+                }
+                WsEvent::MessageDropped { channel, .. }
+                    if matches!(channel.as_str(), "bbo" | "activeAssetCtx" | "l2Book") =>
+                {
+                    return None;
+                }
+                WsEvent::SubscriptionQuarantined { subscription, .. }
+                    if !matches!(subscription,
+                        Subscription::Trades { coin } if coin == &binding.symbol)
+                        && !matches!(subscription,
+                            Subscription::Candle { coin, interval } if coin == &binding.symbol && interval == &binding.interval) =>
+                {
+                    return None;
                 }
                 WsEvent::Disconnected(_)
                 | WsEvent::Reconnected(_)
@@ -166,6 +187,15 @@ impl ChartTransport {
         let task_failure = failure.clone();
         let diagnostics = Arc::new(crate::channel_health::Diagnostics::default());
         diagnostics.select(&[
+            Subscription::ActiveAssetCtx {
+                coin: binding.symbol.clone(),
+            },
+            Subscription::Bbo {
+                coin: binding.symbol.clone(),
+            },
+            Subscription::L2Book {
+                coin: binding.symbol.clone(),
+            },
             Subscription::Trades {
                 coin: binding.symbol.clone(),
             },
@@ -186,7 +216,7 @@ impl ChartTransport {
                         biased;
                         frame = events.recv() => {
                             let Some(frame) = frame else { break; };
-                            task_diagnostics.record(crate::channel_health::Owner::Chart, frame.event(), frame.received_at_ms());
+                            task_diagnostics.record(crate::channel_health::Owner::Selected, frame.event(), frame.received_at_ms());
                             match apply(&producer_binding, Some(frame.event()), frame.received_at_ms()) {
                                 Ok(()) => frame.acknowledge(),
                                 Err(error) => remember(&task_failure, error),
@@ -211,6 +241,15 @@ impl ChartTransport {
         });
         // Once spawned, every partial subscription and error remains owned until drain.
         for subscription in [
+            Subscription::ActiveAssetCtx {
+                coin: binding.symbol.clone(),
+            },
+            Subscription::Bbo {
+                coin: binding.symbol.clone(),
+            },
+            Subscription::L2Book {
+                coin: binding.symbol.clone(),
+            },
             Subscription::Trades {
                 coin: binding.symbol.clone(),
             },
@@ -268,7 +307,7 @@ impl ChartTransport {
         });
         self.diagnostics.sample(
             health,
-            crate::channel_health::Owner::Chart,
+            crate::channel_health::Owner::Selected,
             failure.as_deref(),
             at,
         )
@@ -328,12 +367,72 @@ pub(crate) mod tests {
         }
     }
 
+    #[test]
+    fn quote_channel_losses_do_not_interrupt_or_refresh_chart_observations() {
+        let selected = binding("1", "BTC");
+        let owner = ChartOwner::new(selected.clone()).unwrap();
+        let at = crate::now_ms();
+        let trade = serde_json::from_value(print("BTC", 1, "100")).unwrap();
+        owner
+            .observe(
+                &selected,
+                Some(&WsEvent::Trades {
+                    coin: "BTC".into(),
+                    trades: vec![trade],
+                }),
+                at,
+            )
+            .unwrap();
+        let snapshot = || {
+            serde_json::to_value(owner.state.lock().unwrap().as_mut().unwrap().projection(at))
+                .unwrap()
+        };
+        let before = snapshot();
+        for (channel, subscription) in [
+            ("bbo", Subscription::Bbo { coin: "BTC".into() }),
+            (
+                "activeAssetCtx",
+                Subscription::ActiveAssetCtx { coin: "BTC".into() },
+            ),
+            ("l2Book", Subscription::L2Book { coin: "BTC".into() }),
+        ] {
+            for event in [
+                WsEvent::MessageDropped {
+                    connection: oppen_hl::ws::ConnectionId::new(0),
+                    channel: channel.into(),
+                    reason: "synthetic parse loss".into(),
+                },
+                WsEvent::SubscriptionQuarantined {
+                    connection: oppen_hl::ws::ConnectionId::new(0),
+                    subscription,
+                    strikes: 3,
+                },
+            ] {
+                assert!(owner.observe(&selected, Some(&event), at + 1).is_none());
+                assert_eq!(snapshot(), before);
+            }
+        }
+        let loss = WsEvent::MessageDropped {
+            connection: oppen_hl::ws::ConnectionId::new(0),
+            channel: "trades".into(),
+            reason: "synthetic trade loss".into(),
+        };
+        assert!(owner.observe(&selected, Some(&loss), at).is_some());
+        let after = snapshot();
+        assert_ne!(after, before);
+        assert_eq!(
+            after["last_observation_received_at_ms"],
+            before["last_observation_received_at_ms"]
+        );
+    }
+
     pub(crate) fn print(symbol: &str, tid: u64, price: &str) -> serde_json::Value {
         serde_json::json!({"coin":symbol,"side":"B","px":price,"sz":"1","time":crate::now_ms(),"hash":"fixture","tid":tid})
     }
 
     pub(crate) struct Socket {
         pub(crate) port: u16,
+        subscriptions: Arc<Mutex<Vec<serde_json::Value>>>,
         send: mpsc::Sender<(String, tokio::sync::oneshot::Sender<()>)>,
         pub(crate) task: JoinHandle<()>,
     }
@@ -343,6 +442,8 @@ pub(crate) mod tests {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let port = listener.local_addr().unwrap().port();
             let (send, commands) = mpsc::channel::<(String, tokio::sync::oneshot::Sender<()>)>();
+            let subscriptions = Arc::new(Mutex::new(Vec::new()));
+            let recorded = subscriptions.clone();
             let task = tokio::task::spawn_blocking(move || {
                 let (stream, _) = listener.accept().unwrap();
                 stream
@@ -361,7 +462,15 @@ pub(crate) mod tests {
                         Ok(Message::Text(text)) => {
                             let request: serde_json::Value = serde_json::from_str(&text).unwrap();
                             if request["method"] == "subscribe" {
-                                socket.send(Message::Text(serde_json::json!({"channel":"subscriptionResponse","data":request}).to_string())).unwrap();
+                                recorded
+                                    .lock()
+                                    .unwrap()
+                                    .push(request["subscription"].clone());
+                                match socket.send(Message::Text(serde_json::json!({"channel":"subscriptionResponse","data":request}).to_string())) {
+                                    Ok(()) => {},
+                                    Err(tungstenite::Error::Io(error)) if matches!(error.kind(), std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset) => break,
+                                    Err(error) => panic!("fixture ACK write: {error}"),
+                                }
                             }
                         }
                         Ok(Message::Close(_)) | Err(tungstenite::Error::ConnectionClosed) => break,
@@ -387,7 +496,12 @@ pub(crate) mod tests {
                     }
                 }
             });
-            Self { port, send, task }
+            Self {
+                port,
+                subscriptions,
+                send,
+                task,
+            }
         }
 
         pub(crate) async fn trades(&self, prints: Vec<serde_json::Value>) {
@@ -402,6 +516,119 @@ pub(crate) mod tests {
                 .await
                 .unwrap()
                 .unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn selected_socket_quotes_keep_producer_binding_across_held_delivery_and_a_b_a() {
+        use crate::feed::ConsoleFeed;
+        for channel in ["bbo", "activeAssetCtx", "l2Book"] {
+            let mut delivered = Vec::new();
+            for (selection, symbol) in [("1", "BTC"), ("2", "ETH"), ("3", "BTC")] {
+                let socket = Socket::start();
+                let selected = binding(selection, symbol);
+                let owner = Arc::new(ChartOwner::new(selected.clone()).unwrap());
+                let (pool, receiver) = WsPool::loopback_fixture(socket.port).unwrap();
+                let (entered, entered_rx) = tokio::sync::oneshot::channel();
+                let mut entered = Some(entered);
+                let (release, wait) = mpsc::channel();
+                let (send, mut receive) = tokio::sync::mpsc::unbounded_channel();
+                let mut transport = ChartTransport::from_pool(
+                    selected.clone(),
+                    pool,
+                    receiver,
+                    owner.failure.clone(),
+                    move |captured, event, _| {
+                        if let Some(event) = event
+                            && matches!(
+                                event,
+                                WsEvent::Bbo { .. }
+                                    | WsEvent::ActiveAssetCtx { .. }
+                                    | WsEvent::L2Book(_)
+                            )
+                            && let Some(envelope) =
+                                ConsoleFeed::selected_envelope(captured, event, None)
+                        {
+                            if let Some(entered) = entered.take() {
+                                let _ = entered.send(());
+                                wait.recv_timeout(Duration::from_secs(5)).unwrap();
+                            }
+                            let _ = send.send(serde_json::to_value(envelope).unwrap());
+                        }
+                        Ok(())
+                    },
+                );
+                let acked = tokio::time::timeout(Duration::from_secs(3), async {
+                    let mut clock = crate::channel_health::Clock::default();
+                    loop {
+                        if let Some(sample) = transport.channel_health(&selected, crate::now_ms())
+                            && clock
+                                .project(selected.clone(), sample, crate::now_ms())
+                                .is_some_and(|snapshot| {
+                                    snapshot.rows.iter().all(|row| row.subscribed && row.acked)
+                                })
+                        {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await;
+                let frame = match channel {
+                    "bbo" => {
+                        serde_json::json!({"channel":"bbo","data":{"coin":symbol,"time":100,"bbo":[{"px":"100","sz":"1","n":1},null]}})
+                    }
+                    "activeAssetCtx" => {
+                        serde_json::json!({"channel":"activeAssetCtx","data":{"coin":symbol,"ctx":{"funding":"0","openInterest":"1","prevDayPx":"100","dayNtlVlm":"1","premium":"0","oraclePx":"100","markPx":"100","midPx":"100","impactPxs":["99","101"],"dayBaseVlm":"1"}}})
+                    }
+                    _ => {
+                        serde_json::json!({"channel":"l2Book","data":{"coin":symbol,"time":100,"levels":[[{"px":"100","sz":"1","n":1}],[]]}})
+                    }
+                };
+                socket.frame(frame.to_string()).await;
+                let entered = tokio::time::timeout(Duration::from_secs(3), entered_rx).await;
+                owner.retire();
+                let mut drain = Box::pin(transport.shutdown_and_drain());
+                let retained = tokio::time::timeout(Duration::from_millis(30), &mut drain)
+                    .await
+                    .is_err();
+                drop(drain);
+                let _ = release.send(());
+                let drained = transport.shutdown_and_drain().await;
+                socket.task.await.unwrap();
+                acked.unwrap();
+                entered.unwrap().unwrap();
+                drained.unwrap();
+                assert!(
+                    retained,
+                    "actual delivery remains owned after a dropped drain waiter"
+                );
+                let subscriptions = socket.subscriptions.lock().unwrap().clone();
+                let mut kinds: Vec<_> = subscriptions
+                    .iter()
+                    .map(|sub| sub["type"].as_str().unwrap())
+                    .collect();
+                kinds.sort();
+                kinds.dedup();
+                assert_eq!(
+                    kinds,
+                    ["activeAssetCtx", "bbo", "candle", "l2Book", "trades"]
+                );
+                assert!(subscriptions.iter().all(|sub| sub["coin"] == symbol));
+                let envelope = receive.recv().await.unwrap();
+                assert_eq!(envelope["scope"], "selected");
+                assert_eq!(
+                    envelope["binding"],
+                    serde_json::to_value(&selected).unwrap()
+                );
+                assert!(owner.observe(&selected, None, 100).is_none());
+                delivered.push(envelope);
+            }
+            assert_eq!(
+                delivered[0]["binding"]["symbol"],
+                delivered[2]["binding"]["symbol"]
+            );
+            assert_ne!(delivered[0]["binding"], delivered[2]["binding"]);
         }
     }
 
@@ -679,12 +906,7 @@ pub(crate) mod tests {
             .channel_health(&owner.binding, crate::now_ms())
             .unwrap();
         let health = crate::channel_health::Clock::default()
-            .project(
-                owner.binding.clone(),
-                crate::channel_health::PoolObservation::missing(),
-                health,
-                crate::now_ms(),
-            )
+            .project(owner.binding.clone(), health, crate::now_ms())
             .unwrap();
         assert!(health.rows[3].consumer_failure.is_some());
         assert!(health.rows[4].consumer_failure.is_some());

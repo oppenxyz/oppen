@@ -51,7 +51,7 @@ test("chart projection renders retained bars beside errors with independent trad
     Object.assign(toRaw(chartObservation), toRaw(fixture.state));
     const stopped = await renderToString(createSSRApp(Trade));
     expect(stopped).toContain('data-chart="consumer-error"');
-    expect(stopped).toContain("Chart consumer stopped");
+    expect(stopped).toContain("Selected market consumer stopped");
     expect(stopped).toContain("&lt;script&gt;consumer terminated&lt;/script&gt;");
     expect(stopped).not.toContain("<script>consumer terminated</script>");
     expect(stopped).toContain("Last candle close 101");

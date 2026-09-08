@@ -19,16 +19,16 @@ test("channel readout separates connected age exhaustion, escaped failure and re
     expect(quiet).toContain("Age budget exceeded");
     expect(quiet).toContain("Event-driven");
     const evicted = channelHealthFixture(binding, "2");
-    evicted.pool_last_losses = [{ owner: "console", connection_id: "17", subscription_key: null, channel: null,
+    evicted.pool_last_losses = [{ owner: "selected", connection_id: "17", subscription_key: null, channel: null,
       kind: "parse_loss", received_at_ms: 1788998300000, detail: "<script>Malformed connection frame</script>" }];
-    evicted.diagnostics = Array.from({ length: 16 }, (_, index) => ({ owner: "console", connection_id: "17",
+    evicted.diagnostics = Array.from({ length: 16 }, (_, index) => ({ owner: "selected", connection_id: "17",
       subscription_key: null, channel: null, kind: "reconnect", received_at_ms: 1788998400000 + index, detail: "Reconnected" }));
     evicted.omitted_diagnostics = 1;
     marketHealth.accept(evicted);
     const retainedLoss = await renderToString(createSSRApp(Panel));
     expect(retainedLoss).toContain("Channels · Acknowledged");
     expect(retainedLoss).toContain("Retained pool losses 1");
-    expect(retainedLoss).toContain("Retained pool loss · console / 17 · Connection-scoped · Transport · parse_loss");
+    expect(retainedLoss).toContain("Retained pool loss · selected / 17 · Connection-scoped · Transport · parse_loss");
     expect(retainedLoss).toContain("&lt;script&gt;Malformed connection frame&lt;/script&gt;");
     expect(retainedLoss).not.toContain("<script>Malformed connection frame</script>");
     expect(evicted.rows.every(row => row.last_loss === null)).toBe(true);

@@ -4,7 +4,7 @@
  * fields to Tauri commands; the shapes stay.
  */
 
-import { reactive, readonly, watchEffect } from "vue";
+import { computed, reactive, readonly, watchEffect } from "vue";
 import { marketHealth, marketChannels, marketTransport } from "./market-health";
 import { pilotConsent, consentOwnsContext } from "./pilot-consent";
 import {
@@ -13,6 +13,9 @@ import {
   inTauri,
   isConsoleError,
   type AccountState,
+  type FeedBinding,
+  type AccountFailure,
+  type FeedEnvelope,
   type KeychainStatus,
 } from "../lib/bridge";
 
@@ -60,6 +63,36 @@ const state = reactive<ShellState>({
 });
 
 export const shell = readonly(state);
+const accountStream = reactive<{ binding: FeedBinding | null; failure: AccountFailure | null; detail: string | null }>({ binding: null, failure: null, detail: null });
+export const accountObservation = readonly(accountStream);
+export const currentAccountFailure = computed(() => {
+  const failure = accountStream.failure, binding = accountStream.binding;
+  return failure && binding && binding.network === state.network && failure.binding.network === binding.network
+    && failure.binding.generation === binding.generation ? failure : null;
+});
+export function bindAccountObservation(binding: FeedBinding): void {
+  if (binding.network !== state.network || !/^\d+$/.test(binding.generation)) return;
+  const prior = accountStream.binding;
+  if (prior && BigInt(binding.generation) <= BigInt(prior.generation)) return;
+  accountStream.binding = { ...binding }; accountStream.failure = null; accountStream.detail = null;
+}
+export function reportAccountFailure(failure: AccountFailure): void {
+  if (failure.binding.network !== state.network || failure.binding.network !== accountStream.binding?.network
+    || failure.binding.generation !== accountStream.binding.generation) return;
+  accountStream.failure ??= { binding: { ...failure.binding }, detail: failure.detail };
+}
+export function receiveAccountStatus(envelope: Extract<FeedEnvelope, { scope: "account" }>): void {
+  if (envelope.binding.network !== state.network || envelope.binding.network !== accountStream.binding?.network
+    || envelope.binding.generation !== accountStream.binding.generation || envelope.update.kind !== "status") return;
+  if (envelope.failure !== undefined) reportAccountFailure({ binding: envelope.binding, detail: envelope.failure });
+  accountStream.detail = envelope.update.detail ?? null;
+}
+export function accountObservationLabel(): string {
+  if (currentAccountFailure.value) return "Consumer failed";
+  if (state.accountError) return "Last read unavailable";
+  if (!state.account || state.account.feed_age_ms === null) return "Observation unavailable";
+  return `${state.account.feed === "stale" ? "Stale observation · " : ""}${state.account.feed_age_ms} ms at last read`;
+}
 watchEffect(() => {
   state.feeds.wsMarket = !marketHealth.state.snapshot ? "unknown" : !marketHealth.state.current ? "stale"
     : marketTransport.value === "Disconnected" ? "down" : marketChannels.value === "Acknowledged" ? "ok" : "stale";

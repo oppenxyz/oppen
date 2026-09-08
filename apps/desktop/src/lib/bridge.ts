@@ -362,13 +362,13 @@ export interface ChartBinding extends FeedBinding {
   interval: string;
 }
 
-export interface ChartFailure {
+export interface SelectedFailure {
   binding: ChartBinding;
   detail: string;
 }
 
 export type MarketChannel = "context" | "bbo" | "depth" | "trades" | "candles";
-export type ChannelOwner = "console" | "chart";
+export type ChannelOwner = "selected";
 export interface ChannelHealthDiagnostic {
   subscription_key: string | null;
   owner: ChannelOwner;
@@ -462,15 +462,17 @@ export interface FeedBinding {
   generation: string;
 }
 
-export interface FeedEnvelope extends FeedBinding {
-  update: FeedUpdate;
-  failure?: string;
-}
+export type FeedEnvelope =
+  | { scope: "selected"; binding: ChartBinding; update: FeedUpdate; failure?: string }
+  | { scope: "account"; binding: FeedBinding; update: { kind: "status"; last_tick_ms: number | null; connected: boolean; detail: string | null }; failure?: string };
+
+export interface AccountFailure { binding: FeedBinding; detail: string }
 
 /** Cached desktop task lifecycle only; not execution or reconciliation readiness. */
 export interface RuntimeStatus {
+  account_failure: AccountFailure | null;
   channel_health: ChannelHealthSnapshot | null;
-  chart_failure: ChartFailure | null;
+  selected_failure: SelectedFailure | null;
   phase: "running" | "replacing" | "stopping" | "stopped" | "stopped_with_error";
   binding: FeedBinding | null;
   detail: string | null;
