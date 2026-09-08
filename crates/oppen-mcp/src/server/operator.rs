@@ -1,16 +1,16 @@
 //! Native work shares the listener's admission and execution drain.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLockReadGuard};
 
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
-use crate::auth::{Binding, SessionAuthority, TokenStore};
+use crate::auth::{Binding, SessionAuthority};
 use crate::outcome::ToolError;
 use crate::tools::Gateway;
 
-use super::{ExecutionOwner, ExecutionTracker, Pairings};
+use super::{ExecutionOwner, ExecutionTracker, Pairings, SigningAdmission};
 
 pub(super) struct OperatorOwner {
     gateway: Gateway,
@@ -38,14 +38,11 @@ pub struct OperatorControl {
     pub(super) owner: Arc<OperatorOwner>,
 }
 
+#[derive(Clone)]
 pub(crate) struct OperatorWork {
     owner: Arc<OperatorOwner>,
     pub(crate) authority: SessionAuthority,
     pub(crate) tracker: ExecutionTracker,
-}
-
-pub(crate) struct SigningAdmission<'a> {
-    _pairings: RwLockReadGuard<'a, TokenStore>,
 }
 
 /// Retains the selected pairing and the core-created candidate, never signing authority.
@@ -209,7 +206,7 @@ impl OperatorControl {
         };
         let tracker = ExecutionTracker {
             _execution: execution,
-            _owner: ExecutionOwner::Session {
+            _owner: ExecutionOwner::Native {
                 _authority: authority.clone(),
             },
         };

@@ -351,15 +351,10 @@ async fn post_lookup_decisions_keep_runtime_ownership_until_drain_without_backgr
                 .is_err(),
             "serve returned before decision drained"
         );
-        if tool != "supervision" {
-            timeout(Duration::from_secs(1), async {
-                while pairings.strong_count() != 0 {
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .expect("transport registry still alive");
-        }
+        assert!(
+            pairings.strong_count() > 0,
+            "actual {tool} worker must retain pairing authority until drain"
+        );
         let hmac = Arc::new(oppen_core::keys::HmacKey::from_bytes([77; 32]));
         assert!(matches!(
             PairingJournal::open(ledger.clone(), hmac.clone()),
@@ -374,6 +369,13 @@ async fn post_lookup_decisions_keep_runtime_ownership_until_drain_without_backgr
             .unwrap()
             .unwrap();
         assert_eq!(gateway.inner.decision_worker.available_permits(), 1);
+        timeout(Duration::from_secs(1), async {
+            while pairings.strong_count() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("drained work or idle transport retained the pairing store");
         assert_eq!(
             venue.submissions().len(),
             submissions,

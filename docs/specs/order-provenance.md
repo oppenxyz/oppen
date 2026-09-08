@@ -44,12 +44,34 @@ wallet signature alone cannot prove passage through Oppen's guarded submission.
   release exposure. Legitimate interrupted submissions need a usable recovery
   path, not a permanent blanket cancellation refusal.
 
-## Open Decisions Before Code
+## Implementation Status
 
-1. Define the opaque signer/journal handoff and lock ordering. Publish after
+ES31a validates direct exchange response kind and cardinality. ES31b's working
+branch adds V13 authenticated `submission_signed` and `submission_accepted`
+envelopes in the existing ledger. An opaque capability binds guarded signing to
+one engine and reservation; uncertain signed publication withholds transport.
+The ledger stores a domain-separated canonical request digest, not a replayable
+signature. A validated direct response links its OID to that signed receipt;
+accepted publication uncertainty remains non-retryable and retains liability.
+
+Production MCP reservation and submission run on bounded retained blocking
+workers, retaining account guards and actual session/operator authority. Account
+locking precedes submission-slot acquisition. Final observational authorization
+checks run after ledger waits, before signing and initial HTTP dispatch admission.
+These local checks do not prove socket delivery or venue acceptance. Evidence
+replay reuses one verified chain walk, rather than replaying for each signed row.
+
+This does not yet enforce discretionary cancellation ownership or recover
+ownership after a lost response. Signed-only evidence is not acceptance; no
+historical adoption, reconstructed transport capability, re-signing or resend is
+provided. Synthetic tests and automated review are not live acceptance evidence.
+
+## Decision Status
+
+1. Implemented locally in ES31b: opaque signer/journal handoff and lock ordering. Publish after
    crypto without recursively acquiring a signing read permit, and prevent
    request exposure on uncertain publication. Reuse the single signer.
-2. Specify exactly which direct response shapes establish OID linkage. The
+2. Implemented locally in ES31a/b: direct response shapes establishing OID linkage. The
    documented resting response supplies an OID, not a CLOID; correlate it to the
    exact submitted action and validate response cardinality and type.
 3. Establish sufficient restart-reconciliation evidence. A query by CLOID and

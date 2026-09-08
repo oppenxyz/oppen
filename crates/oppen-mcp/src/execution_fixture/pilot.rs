@@ -341,7 +341,10 @@ async fn ordinary_resume_during_cancel_reads_cannot_clear_a_pilot_stop() {
             },
             |cleared| async {
                 assert!(queue.try_lock().is_err());
-                runtime.gateway.submit(cleared, None, &bound, None).await
+                runtime
+                    .gateway
+                    .submit(cleared, None, &bound, None, None)
+                    .await
             },
         ));
         assert!(matches!(

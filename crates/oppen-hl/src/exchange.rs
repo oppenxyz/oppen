@@ -262,6 +262,7 @@ impl ExchangeResponse {
 pub struct ExchangeClient {
     http: Client,
     url: String,
+    network: Network,
 }
 
 impl ExchangeClient {
@@ -274,6 +275,7 @@ impl ExchangeClient {
                 .redirect(reqwest::redirect::Policy::none())
                 .build()?,
             url: format!("http://127.0.0.1:{port}/exchange"),
+            network: Network::Testnet,
         })
     }
 
@@ -285,7 +287,13 @@ impl ExchangeClient {
         ExchangeClient {
             http,
             url: format!("{}/exchange", network.api_url()),
+            network,
         }
+    }
+
+    /// Network selected when this transport was constructed.
+    pub fn network(&self) -> Network {
+        self.network
     }
 
     /// Posts an already-signed request. A non-2xx status, a `status: "err"`
@@ -351,6 +359,15 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transport_retains_its_selected_network() {
+        for network in [Network::Testnet, Network::Mainnet] {
+            let exchange = ExchangeClient::new(network).unwrap();
+            assert_eq!(exchange.network(), network);
+            assert_eq!(exchange.url, format!("{}/exchange", network.api_url()));
+        }
+    }
 
     #[tokio::test]
     async fn requests_cannot_hold_an_execution_lock_forever() {

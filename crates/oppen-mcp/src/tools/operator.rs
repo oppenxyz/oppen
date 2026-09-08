@@ -152,7 +152,14 @@ impl Gateway {
             Err(refusal) => return Ok(outcome::refused(refusal)),
         };
         let response = match self
-            .submit_authorized(cleared, Some(&cloid), binding, Some(&permit), Some(work))
+            .submit_authorized(
+                cleared,
+                Some(&cloid),
+                binding,
+                Some(permit),
+                Some(work),
+                None,
+            )
             .await
         {
             Ok(response) => response,
@@ -211,7 +218,7 @@ impl Gateway {
             Err(refusal) => return Ok(outcome::refused(refusal)),
         };
         let response = match self
-            .submit_authorized(cleared, None, binding, None, Some(work))
+            .submit_authorized(cleared, None, binding, None, Some(work), None)
             .await
         {
             Ok(response) => response,

@@ -6,6 +6,9 @@ mod approval_review_tests;
 #[path = "cancellation_approval_tests.rs"]
 mod cancellation_approval_tests;
 
+#[path = "submission_evidence_tests.rs"]
+mod submission_evidence_tests;
+
 use std::path::Path;
 use std::sync::atomic::AtomicU64;
 
