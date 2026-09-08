@@ -60,7 +60,7 @@ export interface AccountState {
 
 /** What the Rust side returns instead of a state. */
 export interface ConsoleError {
-  kind: "not_configured" | "venue" | "local_status" | "halt_not_admitted";
+  kind: "not_configured" | "venue" | "local_status" | "halt_not_admitted" | "prerequisite" | "conflict" | "validation" | "uncertain" | "unavailable";
   detail: string;
 }
 
@@ -70,7 +70,7 @@ export function isConsoleError(value: unknown): value is ConsoleError {
     value !== null &&
     "kind" in value &&
     typeof value.kind === "string" &&
-    ["not_configured", "venue", "local_status", "halt_not_admitted"].includes(value.kind) &&
+    ["not_configured", "venue", "local_status", "halt_not_admitted", "prerequisite", "conflict", "validation", "uncertain", "unavailable"].includes(value.kind) &&
     typeof (value as ConsoleError).detail === "string"
   );
 }
@@ -113,6 +113,64 @@ export interface StoredPolicy {
   guardrails: Record<string, AgentPolicy>;
   account_limits: { max_daily_loss_usd: string | null; max_drawdown_usd: string | null };
   kill: { global: { engaged_at_ms: number; reason: unknown } | null; agents: Record<string, { engaged_at_ms: number; reason: unknown }> };
+}
+
+/** Complete native review snapshots are display-only, never mutation inputs. */
+export interface ReviewedAgentPolicy extends AgentPolicy {
+  freshness: { max_market_age_ms: number; max_account_age_ms: number };
+  max_mark_divergence_bps: string;
+  mark_divergence_window_ms: number;
+}
+export interface ReviewedPolicy extends Omit<StoredPolicy, "guardrails"> {
+  guardrails: Record<string, ReviewedAgentPolicy>;
+}
+export interface PolicySetupEdits {
+  symbols: string[];
+  max_order_usd: string;
+  max_position_usd: string;
+  max_open_exposure_usd: string;
+  max_leverage: number;
+  approval_required: boolean;
+}
+export interface PolicySetupReview {
+  id: number;
+  agent: string;
+  account: string;
+  route: {
+    network: "testnet" | "mainnet";
+    binding_seq: number;
+    binding: {
+      agent: string; container: string; vault_address: string | null;
+      wallet: { generation: number; address: string; approved_at_ms: number; valid_until_ms: number };
+    };
+  };
+  before: ReviewedPolicy | null;
+  proposed: ReviewedPolicy;
+  expected_revision: number | null;
+  legacy: {
+    source: string; network: "testnet" | "mainnet"; observed_at_ms: number;
+    fingerprint: string; file_present: boolean;
+    schema: { kind: string; name: string; table: string; sql: string | null }[];
+    tables: { name: string; columns: string[]; rows: unknown[][] }[];
+  } | null;
+}
+export interface PolicySetupStatus {
+  phase: "idle" | "reviewing" | "review_ready" | "persisting" | "saved" | "failed" | "uncertain" | "recovery_required" | "stopped";
+  review: PolicySetupReview | null;
+  receipt_revision: number | null;
+  error: { kind: "prerequisite" | "conflict" | "validation" | "uncertain" | "unavailable"; detail: string } | null;
+}
+export async function fetchPolicySetupStatus(): Promise<PolicySetupStatus> {
+  return invoke<PolicySetupStatus>("policy_setup_status");
+}
+export async function reviewPolicySetup(agent: string, account: string, edits: PolicySetupEdits, emptySourceConfirmed: boolean, writersStopped: boolean): Promise<PolicySetupStatus> {
+  return invoke<PolicySetupStatus>("review_policy_setup", { agent, account, edits, emptySourceConfirmed, writersStopped });
+}
+export async function persistPolicySetup(reviewId: number): Promise<PolicySetupStatus> {
+  return invoke<PolicySetupStatus>("persist_policy_setup", { reviewId });
+}
+export async function discardPolicySetup(reviewId: number): Promise<PolicySetupStatus> {
+  return invoke<PolicySetupStatus>("discard_policy_setup", { reviewId });
 }
 export interface OperatorRead {
   network: "testnet" | "mainnet";

@@ -4,6 +4,8 @@ import EmptyState from "../components/housing/EmptyState.vue";
 import PanelHousing from "../components/housing/PanelHousing.vue";
 import ReadoutRows from "../components/housing/ReadoutRows.vue";
 import UiButton from "../components/ui/UiButton.vue";
+import PolicySetupPanel from "../components/PolicySetupPanel.vue";
+import { policySetup, policySetupOwnsContext } from "../stores/policy-setup";
 import { setNetwork, shell, refreshKeychain, type Network } from "../stores/shell";
 import { decimal } from "../lib/display";
 import { operator, recordedAgents, storedPolicy, policySourceLabel, refreshOperator } from "../stores/operator";
@@ -16,9 +18,10 @@ const supervisionAgent = ref("");
 const supervisionAccount = ref("");
 const confirmStop = ref(false);
 const mcp = supervision.state;
+const policyOwned = computed(() => policySetupOwnsContext(policySetup.state));
 const inputError = computed(() => supervisionInputError(shell.network, supervisionAgent.value, supervisionAccount.value));
 const canStart = computed(() => inTauri() && inputError.value === null && mcp.command === null && !mcp.stopRequested
-  && mcp.error === null && mcp.status?.phase === 'idle');
+  && mcp.error === null && mcp.status?.phase === 'idle' && !policyOwned.value);
 const mcpRows = computed(() => [
   { k: "Supervision", v: mcp.status ? MCP_PHASES[mcp.status.phase] : "Not read" },
   { k: "Network", v: mcp.status?.network.toUpperCase() ?? "Unknown" },
@@ -40,6 +43,7 @@ const networkError = ref("");
 const networkChoices = ref<HTMLElement | null>(null);
 const networkConfirmation = ref<HTMLElement | null>(null);
 async function chooseNetwork(network: Network): Promise<void> {
+  if (policyOwned.value) { networkError.value = "Finish the owned policy review before changing network."; return; }
   networkError.value = "";
   pendingNetwork.value = network;
   await nextTick();
@@ -51,6 +55,7 @@ async function cancelNetwork(): Promise<void> {
   networkChoices.value?.querySelector<HTMLButtonElement>("button:not(:disabled)")?.focus();
 }
 function switchNetwork(): void {
+  if (policyOwned.value) { networkError.value = "Finish the owned policy review before changing network."; return; }
   if (!pendingNetwork.value) return;
   try { setNetwork(pendingNetwork.value); }
   catch { networkError.value = "Network preference could not be saved. Current network is unchanged."; }
@@ -84,6 +89,7 @@ const local = computed(() => [
           <p v-if="operator.error || operator.policyError" class="copy" role="status">{{ operator.error ?? operator.policyError }}</p>
           <p class="copy">{{ operator.policyReadMs ? `Last successful policy read: ${new Date(operator.policyReadMs).toLocaleString()}.` : 'Policy has not been read.' }} {{ operator.policy && (operator.error || operator.policyError) ? 'Showing that saved reading after a failed refresh.' : '' }}</p>
           <UiButton @click="refreshOperator" :disabled="operator.reading">Refresh stored policy</UiButton>
+          <PolicySetupPanel />
         </template>
         <template v-else-if="section === 'Keys & venues'">
           <p class="copy">Agent signing keys stay in the OS keychain. The console reads reachability only; private keys never enter the interface.</p>
@@ -91,8 +97,9 @@ const local = computed(() => [
           <UiButton @click="refreshKeychain">Recheck keychain</UiButton>
           <p v-if="shell.keychain?.detail" class="copy">{{ shell.keychain.detail }}</p>
           <fieldset ref="networkChoices" class="network"><legend>Network · saved on this device</legend>
-            <UiButton v-for="network in (['testnet', 'mainnet'] as const)" :key="network" :disabled="shell.network === network" @click="chooseNetwork(network)">{{ network }}</UiButton>
+            <UiButton v-for="network in (['testnet', 'mainnet'] as const)" :key="network" :disabled="shell.network === network || policyOwned" @click="chooseNetwork(network)">{{ network }}</UiButton>
           </fieldset>
+          <p v-if="policyOwned" class="copy" role="status">Policy review owns the TESTNET context. Finish or discard an idle review before switching networks.</p>
           <div v-if="pendingNetwork" ref="networkConfirmation" class="confirmation" @keydown.esc.stop.prevent="cancelNetwork" role="group" aria-label="Confirm network change">
             <p>Switch to {{ pendingNetwork.toUpperCase() }} and reload the console? {{ pendingNetwork === 'mainnet' ? 'Mainnet uses real funds.' : 'Testnet uses test funds.' }} The network choice persists after restart.</p>
             <UiButton @click="cancelNetwork">Keep {{ shell.network }}</UiButton>
@@ -116,6 +123,7 @@ const local = computed(() => [
         </template>
         <template v-else-if="section === 'MCP server'">
           <h2 class="supervision-title">TESTNET supervision</h2>
+          <p v-if="policyOwned" class="copy supervision-warning" role="status">Policy setup owns the runtime context. Supervision cannot start during review or persistence.</p>
           <ReadoutRows size="md" :rows="mcpRows" />
           <p v-if="mcp.status?.detail" class="copy supervision-warning" role="status">{{ mcp.status.detail }}</p>
           <p v-if="mcp.status?.phase === 'failed'" class="copy supervision-warning" role="status">Startup failure closed runtime admission. Resolve the reported blocker and restart the app; supervision cannot be retried in this runtime.</p>
@@ -123,7 +131,7 @@ const local = computed(() => [
           <p v-if="mcp.error" class="copy supervision-warning" role="status">Status unavailable: {{ mcp.error }} {{ mcp.checkedAt ? `Last observed ${new Date(mcp.checkedAt).toLocaleTimeString()}.` : '' }}</p>
           <p class="copy">Start supervision reads the existing authority key in Rust and may enforce existing pauses and cancel resting orders under the existing authorized pilot. Positions may remain open. A listening connection is not trading activation.</p>
           <p class="copy">Uses existing TESTNET pilot authorization, registry, policy and pairing records. The account must exactly match the configured TESTNET account. This action does not create setup, authorize a pilot, acknowledge policy or switch networks.</p>
-          <form class="supervision-form" @submit.prevent="supervision.start(shell.network, supervisionAgent, supervisionAccount)">
+          <form class="supervision-form" @submit.prevent="canStart && supervision.start(shell.network, supervisionAgent, supervisionAccount)">
             <label>Agent ID
               <input v-model="supervisionAgent" list="supervision-agents" autocomplete="off" :disabled="mcp.command !== null || mcp.stopRequested" />
             </label>

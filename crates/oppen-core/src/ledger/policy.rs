@@ -26,6 +26,8 @@ pub enum PolicyError {
     MigrationRequired,
     #[error("stale policy revision: expected {expected}, current {actual}")]
     StaleRevision { expected: u64, actual: u64 },
+    #[error("reviewed policy setup route changed")]
+    RouteChanged,
     #[error("policy authority unavailable: {detail}")]
     Unavailable { detail: String },
 }
@@ -232,6 +234,27 @@ impl PolicyJournal {
         next: PersistedState,
         at_ms: u64,
     ) -> Result<PolicyVersion> {
+        self.initialize_checked(review, next, at_ms, None)
+    }
+
+    /// Setup review and commit must refer to the same live registry route.
+    pub fn initialize_for_route(
+        &self,
+        review: &LegacyPolicyReview,
+        next: PersistedState,
+        at_ms: u64,
+        route: &super::AuthorizedRoute,
+    ) -> Result<PolicyVersion> {
+        self.initialize_checked(review, next, at_ms, Some(route))
+    }
+
+    fn initialize_checked(
+        &self,
+        review: &LegacyPolicyReview,
+        next: PersistedState,
+        at_ms: u64,
+        route: Option<&super::AuthorizedRoute>,
+    ) -> Result<PolicyVersion> {
         validate_state(&next, at_ms)?;
         require_paused(&next)?;
         validate_review(
@@ -242,6 +265,7 @@ impl PolicyJournal {
         )?;
         let mut guard = self.registry.ledger().lock()?;
         let tx = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        self.check_setup_route(&tx, route)?;
         if let Some(current) = self.replay(&tx)? {
             if matches!(&current.operation, Operation::PolicyInitialized { review: recorded, .. } if recorded == review.evidence())
                 && current.version.state == next
@@ -281,9 +305,30 @@ impl PolicyJournal {
         next: PersistedState,
         at_ms: u64,
     ) -> Result<PolicyVersion> {
+        self.replace_checked(expected_revision, next, at_ms, None)
+    }
+
+    pub fn replace_for_route(
+        &self,
+        expected_revision: u64,
+        next: PersistedState,
+        at_ms: u64,
+        route: &super::AuthorizedRoute,
+    ) -> Result<PolicyVersion> {
+        self.replace_checked(expected_revision, next, at_ms, Some(route))
+    }
+
+    fn replace_checked(
+        &self,
+        expected_revision: u64,
+        next: PersistedState,
+        at_ms: u64,
+        route: Option<&super::AuthorizedRoute>,
+    ) -> Result<PolicyVersion> {
         validate_state(&next, at_ms)?;
         let mut guard = self.registry.ledger().lock()?;
         let tx = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        self.check_setup_route(&tx, route)?;
         let current = self.replay(&tx)?.ok_or(PolicyError::MigrationRequired)?;
         let exact_retry = matches!(current.operation, Operation::PolicyReplaced)
             && current
@@ -308,6 +353,23 @@ impl PolicyJournal {
             next,
             at_ms,
         )
+    }
+
+    fn check_setup_route(
+        &self,
+        connection: &Connection,
+        expected: Option<&super::AuthorizedRoute>,
+    ) -> Result<()> {
+        if let Some(expected) = expected {
+            let current = self
+                .registry
+                .optional_route_in(connection, &expected.binding.agent)
+                .map_err(|error| unavailable(error.to_string()))?;
+            if current.as_ref() != Some(expected) {
+                return Err(PolicyError::RouteChanged);
+            }
+        }
+        Ok(())
     }
 
     fn append(

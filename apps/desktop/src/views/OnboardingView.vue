@@ -6,6 +6,7 @@ import SetupTracker from "../components/tour/SetupTracker.vue";
 import UiButton from "../components/ui/UiButton.vue";
 import { setView, shell } from "../stores/shell";
 import { startTour, TOUR } from "../stores/tour";
+import { openPolicySettings } from "../stores/settings";
 </script>
 
 <template>
@@ -26,6 +27,8 @@ import { startTour, TOUR } from "../stores/tour";
       <PanelHousing inset label="Next step">
         <p class="copy">{{ shell.account ? 'Continue with the external MCP setup. Agent registration and approvals are not yet available in this console.' : 'Connect an account to read balances and positions. Public market data is available without one.' }}</p>
         <UiButton @click="setView('builder')">Open MCP setup</UiButton>
+        <p class="copy">Existing TESTNET registry and authentication key required for paused policy setup. Saving policy does not activate trading.</p>
+        <UiButton @click="openPolicySettings">Set up paused policy</UiButton>
       </PanelHousing>
       <SetupTracker />
 

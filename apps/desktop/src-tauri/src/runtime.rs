@@ -13,6 +13,10 @@ use tokio_util::sync::CancellationToken;
 use crate::feed::ConsoleFeed;
 use crate::local_reads::{LocalReads, ReadKind};
 use crate::mcp_runtime::{McpPhase, McpStatus, OwnedMcp, SharedStatus, status_lock};
+use crate::policy_setup::{
+    ErrorKind as SetupErrorKind, Phase as SetupPhase, PolicyEdits, PreparedReview, SetupError,
+    Status as SetupStatus,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct FeedBinding {
@@ -139,6 +143,408 @@ mod tests {
     fn runtime() -> Runtime {
         // No filesystem access, application handle, keychain or network.
         Runtime::new(PathBuf::from("/unused-desktop-owner-fixture"))
+    }
+
+    async fn setup_phase(runtime: &Runtime, expected: SetupPhase) -> SetupStatus {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let status = runtime.policy_setup_status();
+                if status.phase == expected {
+                    break status;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap()
+    }
+
+    fn setup_runtime() -> Runtime {
+        let runtime = runtime();
+        runtime.control().network = Some(Network::Testnet);
+        runtime
+    }
+
+    #[tokio::test]
+    async fn policy_setup_review_excludes_mcp_context_and_duplicate_work_without_ipc_waiter() {
+        use crate::policy_setup::tests::Fixture;
+        let fixture = Arc::new(Fixture::new());
+        let runtime = setup_runtime();
+        let (release, wait) = mpsc::channel();
+        let retained = fixture.clone();
+        let initial = runtime
+            .launch_policy_review(Fixture::account(), move |id| {
+                wait.recv_timeout(Duration::from_secs(5)).unwrap();
+                Ok(retained.review(id))
+            })
+            .unwrap();
+        assert_eq!(initial.phase, SetupPhase::Reviewing);
+        drop(initial);
+        assert!(
+            runtime
+                .launch_policy_review(Fixture::account(), |_| panic!("duplicate work"))
+                .is_err()
+        );
+        assert!(
+            runtime
+                .launch_mcp(
+                    Fixture::agent().to_string(),
+                    Fixture::account().to_string(),
+                    |_, _, _, _| async { panic!("setup excludes MCP") }
+                )
+                .is_err()
+        );
+        let (driver, _) = Driver::new();
+        assert!(
+            runtime
+                .submit_watch(
+                    FeedSource::Controlled(driver),
+                    Selection {
+                        network: Network::Mainnet,
+                        account: None,
+                        coin: "ETH".into(),
+                        interval: "1m".into()
+                    }
+                )
+                .is_err()
+        );
+        release.send(()).unwrap();
+        let reviewed = setup_phase(&runtime, SetupPhase::ReviewReady).await;
+        let id = reviewed.review.unwrap().id;
+        assert!(runtime.persist_policy_setup(id + 1).is_err());
+        let before = fixture.ledger.chain_head().unwrap();
+        assert_eq!(
+            runtime.persist_policy_setup(id).unwrap().phase,
+            SetupPhase::Persisting
+        );
+        let saved = setup_phase(&runtime, SetupPhase::Saved).await;
+        assert_eq!(saved.receipt_revision, Some(before.seq + 1));
+        assert!(!runtime.control().setup_busy());
+        let retained = fixture.clone();
+        runtime
+            .launch_policy_review(Fixture::account(), move |id| Ok(retained.review(id)))
+            .unwrap();
+        let next = setup_phase(&runtime, SetupPhase::ReviewReady).await;
+        assert!(next.review.as_ref().unwrap().id > id);
+        runtime
+            .discard_policy_setup(next.review.unwrap().id)
+            .unwrap();
+        assert_eq!(runtime.policy_setup_status().phase, SetupPhase::Idle);
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn policy_setup_uncertainty_retains_exact_operation_for_explicit_retry() {
+        use crate::policy_setup::tests::Fixture;
+        let fixture = Arc::new(Fixture::new());
+        let runtime = setup_runtime();
+        let retained = fixture.clone();
+        runtime
+            .launch_policy_review(Fixture::account(), move |id| Ok(retained.review(id)))
+            .unwrap();
+        let id = setup_phase(&runtime, SetupPhase::ReviewReady)
+            .await
+            .review
+            .unwrap()
+            .id;
+        fixture.anchor.fail.store(true, Ordering::SeqCst);
+        runtime.persist_policy_setup(id).unwrap();
+        let uncertain = setup_phase(&runtime, SetupPhase::Uncertain).await;
+        assert_eq!(uncertain.error.unwrap().kind, SetupErrorKind::Uncertain);
+        assert!(runtime.control().setup_busy());
+        let committed = fixture.ledger.chain_head().unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(runtime.policy_setup_status().phase, SetupPhase::Uncertain);
+        assert_eq!(fixture.ledger.chain_head().unwrap(), committed);
+        fixture.anchor.fail.store(false, Ordering::SeqCst);
+        runtime.persist_policy_setup(id).unwrap();
+        assert_eq!(
+            setup_phase(&runtime, SetupPhase::Saved)
+                .await
+                .receipt_revision,
+            Some(committed.seq)
+        );
+        assert_eq!(fixture.ledger.chain_head().unwrap(), committed);
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn policy_setup_shutdown_waits_for_actual_publication_and_never_reopens_admission() {
+        use crate::policy_setup::tests::Fixture;
+        let fixture = Arc::new(Fixture::new());
+        let runtime = setup_runtime();
+        let retained = fixture.clone();
+        runtime
+            .launch_policy_review(Fixture::account(), move |id| Ok(retained.review(id)))
+            .unwrap();
+        let id = setup_phase(&runtime, SetupPhase::ReviewReady)
+            .await
+            .review
+            .unwrap()
+            .id;
+        let (entered, release) = fixture.anchor.block();
+        runtime.persist_policy_setup(id).unwrap();
+        tauri::async_runtime::spawn_blocking(move || {
+            entered.recv_timeout(Duration::from_secs(5)).unwrap()
+        })
+        .await
+        .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), runtime.shutdown())
+                .await
+                .is_err()
+        );
+        assert!(runtime.persist_policy_setup(id).is_err());
+        assert!(
+            runtime
+                .launch_policy_review(Fixture::account(), |_| panic!("terminal work"))
+                .is_err()
+        );
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), runtime.shutdown())
+            .await
+            .unwrap()
+            .unwrap();
+        let status = runtime.policy_setup_status();
+        assert_eq!(status.phase, SetupPhase::Stopped);
+        assert!(status.receipt_revision.is_some());
+        assert!(status.error.is_none());
+        assert!(runtime.control().setup_review.is_none());
+    }
+
+    #[tokio::test]
+    async fn policy_setup_update_discards_idle_review_without_persistence() {
+        use crate::policy_setup::tests::Fixture;
+        let fixture = Arc::new(Fixture::new());
+        let runtime = setup_runtime();
+        let retained = fixture.clone();
+        runtime
+            .launch_policy_review(Fixture::account(), move |id| Ok(retained.review(id)))
+            .unwrap();
+        let id = setup_phase(&runtime, SetupPhase::ReviewReady)
+            .await
+            .review
+            .unwrap()
+            .id;
+        let before = fixture.ledger.chain_head().unwrap();
+        let update = runtime.begin_update().unwrap();
+        assert!(runtime.persist_policy_setup(id).is_err());
+        update.shutdown().await.unwrap();
+        assert_eq!(fixture.ledger.chain_head().unwrap(), before);
+        assert!(runtime.control().setup_review.is_none());
+        assert_eq!(runtime.policy_setup_status().phase, SetupPhase::Stopped);
+    }
+
+    #[tokio::test]
+    async fn policy_setup_late_review_completion_is_drained_not_published_after_stop() {
+        use crate::policy_setup::tests::Fixture;
+        let fixture = Arc::new(Fixture::new());
+        let runtime = setup_runtime();
+        let before = fixture.ledger.chain_head().unwrap();
+        let (release, wait) = mpsc::channel();
+        let retained = fixture.clone();
+        runtime
+            .launch_policy_review(Fixture::account(), move |id| {
+                wait.recv_timeout(Duration::from_secs(5)).unwrap();
+                Ok(retained.review(id))
+            })
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), runtime.shutdown())
+                .await
+                .is_err()
+        );
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), runtime.shutdown())
+            .await
+            .unwrap()
+            .unwrap();
+        let status = runtime.policy_setup_status();
+        assert_eq!(status.phase, SetupPhase::Stopped);
+        assert!(status.review.is_none());
+        assert!(status.receipt_revision.is_none());
+        assert!(runtime.control().setup_review.is_none());
+        assert_eq!(fixture.ledger.chain_head().unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn policy_setup_conflicting_retry_does_not_erase_prior_uncertainty() {
+        use crate::policy_setup::tests::Fixture;
+        let fixture = Arc::new(Fixture::new());
+        let runtime = setup_runtime();
+        let retained = fixture.clone();
+        runtime
+            .launch_policy_review(Fixture::account(), move |id| Ok(retained.review(id)))
+            .unwrap();
+        let review = setup_phase(&runtime, SetupPhase::ReviewReady)
+            .await
+            .review
+            .unwrap();
+        fixture.anchor.fail.store(true, Ordering::SeqCst);
+        runtime.persist_policy_setup(review.id).unwrap();
+        setup_phase(&runtime, SetupPhase::Uncertain).await;
+        fixture.anchor.fail.store(false, Ordering::SeqCst);
+        fixture.registry.retire(&review.route, 101).unwrap();
+        let head = fixture.ledger.chain_head().unwrap();
+        runtime.persist_policy_setup(review.id).unwrap();
+        let result = setup_phase(&runtime, SetupPhase::Uncertain).await;
+        assert_eq!(result.error.unwrap().kind, SetupErrorKind::Uncertain);
+        assert!(runtime.control().setup_review.is_some());
+        assert_eq!(fixture.ledger.chain_head().unwrap(), head);
+        assert!(runtime.discard_policy_setup(review.id).is_err());
+        assert!(runtime.control().setup_busy());
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn policy_setup_post_commit_panic_retains_review_and_requires_recovery() {
+        use crate::policy_setup::tests::Fixture;
+        use oppen_core::keys::HmacKey;
+        use oppen_core::ledger::{Ledger, PolicyJournal, RegistryJournal};
+        let fixture = Arc::new(Fixture::new());
+        let runtime = setup_runtime();
+        let retained = fixture.clone();
+        runtime
+            .launch_policy_review(Fixture::account(), move |id| Ok(retained.review(id)))
+            .unwrap();
+        let review = setup_phase(&runtime, SetupPhase::ReviewReady)
+            .await
+            .review
+            .unwrap();
+        let before = fixture.ledger.chain_head().unwrap();
+        fixture.anchor.panic.store(true, Ordering::SeqCst);
+        runtime.persist_policy_setup(review.id).unwrap();
+        let recovery = setup_phase(&runtime, SetupPhase::RecoveryRequired).await;
+        assert_eq!(recovery.error.unwrap().kind, SetupErrorKind::Uncertain);
+        assert!(runtime.control().setup_review.is_some());
+        assert!(runtime.discard_policy_setup(review.id).is_err());
+        assert!(
+            runtime
+                .launch_policy_review(Fixture::account(), |_| panic!(
+                    "uncertain operation cannot be replaced"
+                ))
+                .is_err()
+        );
+        // The panic happened after COMMIT while the ledger mutex was held.
+        // Its poison must not be bypassed merely to make retry look successful.
+        let reopened =
+            Arc::new(Ledger::open_existing(fixture.dir.path(), Network::Testnet).unwrap());
+        let committed = reopened.chain_head().unwrap();
+        assert_eq!(committed.seq, before.seq + 1);
+        let registry = Arc::new(
+            RegistryJournal::open(reopened.clone(), Arc::new(HmacKey::from_bytes([11; 32])))
+                .unwrap(),
+        );
+        assert_eq!(
+            PolicyJournal::new(registry).current().unwrap().state,
+            review.proposed
+        );
+        assert!(runtime.persist_policy_setup(review.id).is_err());
+        assert!(
+            runtime
+                .launch_mcp(
+                    Fixture::agent().to_string(),
+                    Fixture::account().to_string(),
+                    |_, _, _, _| async { panic!("recovery excludes MCP") }
+                )
+                .is_err()
+        );
+        let (driver, _) = Driver::new();
+        assert!(
+            runtime
+                .submit_watch(
+                    FeedSource::Controlled(driver),
+                    Selection {
+                        network: Network::Mainnet,
+                        account: None,
+                        coin: "ETH".into(),
+                        interval: "1m".into()
+                    }
+                )
+                .is_err()
+        );
+        assert_eq!(
+            runtime.policy_setup_status().phase,
+            SetupPhase::RecoveryRequired
+        );
+        assert!(runtime.control().setup_review.is_some());
+        assert_eq!(reopened.chain_head().unwrap(), committed);
+        tokio::time::timeout(Duration::from_secs(5), runtime.shutdown())
+            .await
+            .unwrap()
+            .unwrap();
+        let stopped = runtime.policy_setup_status();
+        assert_eq!(stopped.phase, SetupPhase::Stopped);
+        assert_eq!(stopped.error.unwrap().kind, SetupErrorKind::Uncertain);
+        assert!(runtime.control().setup_review.is_none());
+    }
+
+    #[tokio::test]
+    async fn policy_setup_prerequisites_fail_before_worker_and_failed_review_releases_slot() {
+        use crate::policy_setup::tests::{Fixture, edits};
+        let runtime = runtime();
+        assert!(
+            runtime
+                .launch_policy_review(Fixture::account(), |_| panic!("missing context"))
+                .is_err()
+        );
+        runtime.control().network = Some(Network::Mainnet);
+        assert!(
+            runtime
+                .launch_policy_review(Fixture::account(), |_| panic!("mainnet"))
+                .is_err()
+        );
+        runtime.control().network = Some(Network::Testnet);
+        runtime.control().mcp_binding = Some(Binding {
+            agent: Fixture::agent(),
+            account: Fixture::account(),
+        });
+        assert!(
+            runtime
+                .launch_policy_review(Fixture::account(), |_| panic!("MCP owned"))
+                .is_err()
+        );
+        runtime.control().mcp_binding = None;
+        for agent in ["", "a/b", "a b"] {
+            assert!(
+                runtime
+                    .review_policy_setup(
+                        agent.into(),
+                        Fixture::account().to_string(),
+                        edits(),
+                        true,
+                        true
+                    )
+                    .is_err()
+            );
+        }
+        assert!(
+            runtime
+                .review_policy_setup(
+                    Fixture::agent().to_string(),
+                    Fixture::account().to_string(),
+                    edits(),
+                    true,
+                    false
+                )
+                .is_err()
+        );
+        runtime
+            .launch_policy_review(Fixture::account(), |_| {
+                Err(SetupError::new(
+                    SetupErrorKind::Prerequisite,
+                    "controlled missing authority",
+                ))
+            })
+            .unwrap();
+        setup_phase(&runtime, SetupPhase::Failed).await;
+        assert!(!runtime.control().setup_busy());
+        runtime
+            .launch_policy_review(Fixture::account(), |_| panic!("controlled review panic"))
+            .unwrap();
+        let failed = setup_phase(&runtime, SetupPhase::Failed).await;
+        assert_eq!(failed.error.unwrap().kind, SetupErrorKind::Unavailable);
+        runtime.shutdown().await.unwrap();
     }
 
     fn watch(
@@ -827,6 +1233,10 @@ struct Control {
     exit_task: Option<tauri::async_runtime::JoinHandle<()>>,
     mcp_binding: Option<Binding>,
     mcp_worker: Option<tauri::async_runtime::JoinHandle<()>>,
+    setup: SetupStatus,
+    setup_review: Option<PreparedReview>,
+    setup_worker: Option<tauri::async_runtime::JoinHandle<()>>,
+    setup_serial: u64,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -836,6 +1246,17 @@ enum TerminalMode {
 }
 
 impl Control {
+    fn setup_busy(&self) -> bool {
+        matches!(
+            self.setup.phase,
+            SetupPhase::Reviewing
+                | SetupPhase::ReviewReady
+                | SetupPhase::Persisting
+                | SetupPhase::Uncertain
+                | SetupPhase::RecoveryRequired
+        )
+    }
+
     fn claim_exit(&mut self) -> bool {
         if self.terminal_mode == Some(TerminalMode::Update) || self.exit_task.is_some() {
             return false;
@@ -914,6 +1335,10 @@ impl Runtime {
                 exit_task: None,
                 mcp_binding: None,
                 mcp_worker: None,
+                setup: SetupStatus::default(),
+                setup_review: None,
+                setup_worker: None,
+                setup_serial: 0,
             }),
             feed: AsyncMutex::new(None),
             changed: Notify::new(),
@@ -936,6 +1361,269 @@ impl Runtime {
 
     pub(crate) fn data_dir(&self) -> &std::path::Path {
         &self.0.data_dir
+    }
+
+    /// Cached only; polling never opens the ledger or loads credentials.
+    pub(crate) fn policy_setup_status(&self) -> SetupStatus {
+        self.control().setup.clone()
+    }
+
+    pub(crate) fn review_policy_setup(
+        &self,
+        agent: String,
+        account: String,
+        edits: PolicyEdits,
+        empty_source_confirmed: bool,
+        writers_stopped: bool,
+    ) -> Result<SetupStatus, SetupError> {
+        edits.validate()?;
+        let agent = AgentId::new(agent);
+        let account = account.parse().map_err(|error| {
+            SetupError::new(
+                SetupErrorKind::Validation,
+                format!("invalid account: {error}"),
+            )
+        })?;
+        crate::policy_setup::validate_request(agent.as_str(), account, writers_stopped)?;
+        let dir = self.0.data_dir.clone();
+        self.launch_policy_review(account, move |id| {
+            PreparedReview::open(
+                &dir,
+                id,
+                agent,
+                account,
+                edits,
+                empty_source_confirmed,
+                writers_stopped,
+            )
+        })
+    }
+
+    fn setup_admit(control: &Control) -> Result<(), SetupError> {
+        if control.terminal || control.phase != RuntimePhase::Running {
+            return Err(SetupError::conflict(
+                "desktop runtime is stopping or replacing its context",
+            ));
+        }
+        if control.network != Some(Network::Testnet) {
+            return Err(SetupError::conflict(
+                "select the testnet context before policy setup",
+            ));
+        }
+        if control.mcp_binding.is_some() || control.worker_running || control.desired.is_some() {
+            return Err(SetupError::conflict(
+                "MCP ownership or context replacement excludes policy setup",
+            ));
+        }
+        Ok(())
+    }
+
+    fn launch_policy_review<F>(
+        &self,
+        account: oppen_hl::Address,
+        prepare: F,
+    ) -> Result<SetupStatus, SetupError>
+    where
+        F: FnOnce(u64) -> Result<PreparedReview, SetupError> + Send + 'static,
+    {
+        self.status();
+        let mut control = self.control();
+        Self::setup_admit(&control)?;
+        if control.setup_busy() {
+            return Err(SetupError::conflict(
+                "discard the existing policy review first",
+            ));
+        }
+        if control.selection.as_ref().is_some_and(|selection| {
+            selection.network != Network::Testnet
+                || selection
+                    .account
+                    .as_deref()
+                    .and_then(|value| value.parse().ok())
+                    != Some(account)
+        }) {
+            return Err(SetupError::conflict(
+                "policy account differs from the selected context",
+            ));
+        }
+        control.setup_serial = control
+            .setup_serial
+            .checked_add(1)
+            .ok_or_else(|| SetupError::conflict("policy review IDs exhausted"))?;
+        let id = control.setup_serial;
+        control.setup = SetupStatus {
+            phase: SetupPhase::Reviewing,
+            ..SetupStatus::default()
+        };
+        let initial = control.setup.clone();
+        let previous = control.setup_worker.take();
+        let runtime = self.clone();
+        control.setup_worker = Some(tauri::async_runtime::spawn(async move {
+            if let Some(previous) = previous {
+                let _ = previous.await;
+            }
+            let result = tauri::async_runtime::spawn_blocking(move || prepare(id))
+                .await
+                .map_err(|error| {
+                    SetupError::new(
+                        SetupErrorKind::Unavailable,
+                        format!("policy review worker: {error}"),
+                    )
+                })
+                .and_then(|result| result);
+            let mut control = runtime.control();
+            let mut discard = None;
+            match result {
+                Ok(review) if !control.terminal => {
+                    control.setup.review = Some(review.view.clone());
+                    control.setup.phase = SetupPhase::ReviewReady;
+                    control.setup_review = Some(review);
+                }
+                Ok(review) => {
+                    discard = Some(review);
+                    control.setup.phase = SetupPhase::Stopped;
+                }
+                Err(error) => {
+                    control.setup.phase = if control.terminal {
+                        SetupPhase::Stopped
+                    } else {
+                        SetupPhase::Failed
+                    };
+                    control.setup.error = Some(error);
+                }
+            }
+            drop(control);
+            // Closing retained SQLite reviews is outside the owner mutex.
+            drop(discard);
+            runtime.0.changed.notify_waiters();
+        }));
+        Ok(initial)
+    }
+
+    pub(crate) fn persist_policy_setup(&self, review_id: u64) -> Result<SetupStatus, SetupError> {
+        self.status();
+        let mut control = self.control();
+        Self::setup_admit(&control)?;
+        if !matches!(
+            control.setup.phase,
+            SetupPhase::ReviewReady | SetupPhase::Uncertain
+        ) || control.setup.review.as_ref().map(|review| review.id) != Some(review_id)
+        {
+            return Err(SetupError::conflict(
+                "policy review is stale or not ready to persist",
+            ));
+        }
+        let review = control
+            .setup_review
+            .take()
+            .ok_or_else(|| SetupError::conflict("retained policy operation is unavailable"))?;
+        let retrying_uncertain = control.setup.phase == SetupPhase::Uncertain;
+        control.setup.phase = SetupPhase::Persisting;
+        control.setup.error = None;
+        let initial = control.setup.clone();
+        let previous = control.setup_worker.take();
+        let runtime = self.clone();
+        control.setup_worker = Some(tauri::async_runtime::spawn(async move {
+            if let Some(previous) = previous {
+                let _ = previous.await;
+            }
+            let result = tauri::async_runtime::spawn_blocking(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| review.persist()))
+                    .map_err(|_| SetupError::new(SetupErrorKind::Uncertain,
+                        "policy persistence panicked; durable outcome unknown; operator recovery required"));
+                (review, result)
+            })
+            .await;
+            let mut control = runtime.control();
+            let mut discard = None;
+            match result {
+                Ok((review, Ok(Ok(revision)))) => {
+                    control.setup.receipt_revision = Some(revision);
+                    control.setup.phase = SetupPhase::Saved;
+                    discard = Some(review);
+                }
+                Ok((review, Ok(Err(error)))) => {
+                    let error = if retrying_uncertain && error.kind != SetupErrorKind::Uncertain {
+                        SetupError::new(
+                            SetupErrorKind::Uncertain,
+                            format!(
+                                "exact retry refused: {}; the earlier publication outcome remains uncertain",
+                                error.detail
+                            ),
+                        )
+                    } else {
+                        error
+                    };
+                    control.setup.phase = if error.kind == SetupErrorKind::Uncertain {
+                        SetupPhase::Uncertain
+                    } else {
+                        SetupPhase::Failed
+                    };
+                    control.setup.error = Some(error);
+                    if control.terminal || control.setup.phase != SetupPhase::Uncertain {
+                        discard = Some(review);
+                    } else {
+                        control.setup_review = Some(review);
+                    }
+                }
+                Ok((review, Err(error))) => {
+                    control.setup.phase = SetupPhase::RecoveryRequired;
+                    control.setup.error = Some(error);
+                    if control.terminal {
+                        discard = Some(review);
+                    } else {
+                        control.setup_review = Some(review);
+                    }
+                }
+                Err(error) => {
+                    control.setup.phase = SetupPhase::RecoveryRequired;
+                    control.setup.error = Some(SetupError::new(
+                        SetupErrorKind::Uncertain,
+                        format!(
+                            "policy persistence worker: {error}; durable outcome unknown; operator recovery required"
+                        ),
+                    ));
+                }
+            }
+            if control.terminal {
+                control.setup.phase = SetupPhase::Stopped;
+            }
+            drop(control);
+            drop(discard);
+            runtime.0.changed.notify_waiters();
+        }));
+        Ok(initial)
+    }
+
+    pub(crate) fn discard_policy_setup(&self, review_id: u64) -> Result<SetupStatus, SetupError> {
+        let mut control = self.control();
+        Self::setup_admit(&control)?;
+        if matches!(
+            control.setup.phase,
+            SetupPhase::Reviewing
+                | SetupPhase::Persisting
+                | SetupPhase::Uncertain
+                | SetupPhase::RecoveryRequired
+        ) || control.setup.review.as_ref().map(|review| review.id) != Some(review_id)
+        {
+            return Err(SetupError::conflict(
+                "policy review is stale, still running, or has an unresolved durable outcome",
+            ));
+        }
+        let review = control.setup_review.take();
+        control.setup = SetupStatus::default();
+        let status = control.setup.clone();
+        let previous = control.setup_worker.take();
+        let runtime = self.clone();
+        control.setup_worker = Some(tauri::async_runtime::spawn(async move {
+            if let Some(previous) = previous {
+                let _ = previous.await;
+            }
+            if let Err(error) = tauri::async_runtime::spawn_blocking(move || drop(review)).await {
+                runtime.fail(format!("policy review cleanup: {error}"));
+            }
+        }));
+        Ok(status)
     }
 
     pub(crate) fn status(&self) -> RuntimeStatus {
@@ -1030,7 +1718,7 @@ impl Runtime {
         let (reply, observing) = oneshot::channel();
         let mut control = self.control();
         Self::admit(&mut control, Network::Testnet)?;
-        if control.mcp_binding.is_some() {
+        if control.mcp_binding.is_some() || control.setup_busy() {
             return Err(RuntimeError::Busy);
         }
         if control.selection.as_ref().is_some_and(|selection| {
@@ -1155,6 +1843,9 @@ impl Runtime {
         let mut control = self.control();
         if control.terminal {
             return Err(RuntimeError::Stopping);
+        }
+        if control.setup_busy() {
+            return Err(RuntimeError::Busy);
         }
         if control.mcp_binding.as_ref().is_some_and(|binding| {
             selection.network != Network::Testnet
@@ -1453,8 +2144,26 @@ impl Runtime {
         }
         let worker = control.worker.take();
         let mcp_worker = control.mcp_worker.take();
+        let setup_worker = control.setup_worker.take();
+        let setup_review = control.setup_review.take();
+        if !matches!(
+            control.setup.phase,
+            SetupPhase::Reviewing | SetupPhase::Persisting
+        ) {
+            control.setup.phase = SetupPhase::Stopped;
+        }
         let runtime = self.clone();
         control.drain = Some(tauri::async_runtime::spawn(async move {
+            if let Err(error) =
+                tauri::async_runtime::spawn_blocking(move || drop(setup_review)).await
+            {
+                runtime.fail(format!("policy review cleanup: {error}"));
+            }
+            if let Some(worker) = setup_worker
+                && let Err(error) = worker.await
+            {
+                runtime.fail(format!("policy setup owner join: {error}"));
+            }
             if let Some(worker) = mcp_worker
                 && let Err(error) = worker.await
             {

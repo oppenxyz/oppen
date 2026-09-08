@@ -362,6 +362,27 @@ authentication separately from accounting. See
 [pilot-consent-authority.md](specs/pilot-consent-authority.md); implementation and
 acceptance evidence remain in progress, not a live gate passed.
 
+### Paused operator policy setup (ES23)
+
+Spec items 4, 24, 26 and 32 require an operator workflow, not file editing.
+Provide TESTNET-only review and explicit persistence of a globally paused policy
+using existing ledger, HMAC and authenticated registry authority. Rust retains
+the complete candidate and source evidence; the UI submits selected edits and
+commits an opaque review ID, never a replacement snapshot. Preserve unrelated
+policies, account limits, unedited risk settings and all existing stops.
+Refuse an already authenticated globally-unpaused policy in this setup-only flow.
+Legacy initialization requires an explicit stopped-writer assertion, retained
+strict source inspection and fresh fingerprint recheck; missing source must be
+explicitly acknowledged, malformed or unrecognized source must not become empty.
+
+One runtime-owned setup operation excludes MCP startup and context replacement,
+survives dropped IPC, and drains admitted writes before quit/update completion.
+Keep uncertain publication distinct from failure-before-write; retry only the
+same retained operation explicitly. No new keys, registry grants, pairing, pilot
+consent, stop release, activation, venue actions or dependency is introduced.
+Completion of this slice means verified paused policy persistence, not trading
+readiness. Account provisioning and activation remain separate onboarding gates.
+
 ## 2026-09-07 · The console's own socket
 
 Item 34 asks for per-feed status, last-tick timestamps and a stale overlay. The

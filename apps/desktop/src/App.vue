@@ -7,6 +7,7 @@ import PilotStatusBanner from "./components/shell/PilotStatusBanner.vue";
 import DesktopRuntimeBanner from "./components/shell/DesktopRuntimeBanner.vue";
 import AgentHaltBanner from "./components/shell/AgentHaltBanner.vue";
 import { supervision } from "./stores/supervision";
+import { policySetup } from "./stores/policy-setup";
 import TourSpotlight from "./components/tour/TourSpotlight.vue";
 import {
   refreshKeychain,
@@ -43,6 +44,7 @@ onMounted(() => {
   startPilotPolling();
   startRuntimePolling();
   supervision.startPolling();
+  policySetup.startPolling();
   // The socket, the rail poll and the staleness clock (items 31, 34). Started
   // here rather than in TradeView: the status bar reads the feed from every
   // view, so it must not stop when the operator opens Agents.
@@ -56,6 +58,7 @@ onUnmounted(() => {
   stopPilotPolling();
   stopRuntimePolling();
   supervision.stopPolling();
+  policySetup.stopPolling();
   stopMarketFeed();
 });
 </script>

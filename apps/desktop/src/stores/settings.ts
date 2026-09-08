@@ -8,3 +8,8 @@ export function openMcpSettings(): void {
   settingsSection.value = "MCP server";
   setView("settings");
 }
+
+export function openPolicySettings(): void {
+  settingsSection.value = "Permissions & limits";
+  setView("settings");
+}
