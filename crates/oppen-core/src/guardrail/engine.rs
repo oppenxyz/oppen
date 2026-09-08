@@ -108,6 +108,7 @@ pub struct Proposal {
     id: String,
     agent: AgentId,
     intent: OrderIntent,
+    route: AuthorizedRoute,
     expires_at_ms: u64,
 }
 
@@ -1243,7 +1244,7 @@ impl GuardrailEngine {
             market,
             exposure,
             now_ms,
-            Mode::Approved,
+            Mode::Approved(&proposal.route),
         );
         self.record(
             Some(&proposal.agent),
@@ -1473,7 +1474,7 @@ impl GuardrailEngine {
         market: &MarketRef,
         exposure: &Exposure,
         now_ms: u64,
-        mode: Mode,
+        mode: Mode<'_>,
     ) -> Result<Cleared, Refusal> {
         check_reason(&intent.reason)?;
         self.refresh_policy()
@@ -1481,6 +1482,11 @@ impl GuardrailEngine {
                 detail: error.to_string(),
             })?;
         let route = self.decision_route(agent)?;
+        if let Mode::Approved(expected) = mode
+            && expected != &route
+        {
+            return Err(route_refusal("proposal route changed since evaluation"));
+        }
         check_order_approval_window(&route, now_ms)?;
         if exposure.account != route.binding.container {
             return Err(route_refusal(
@@ -1856,7 +1862,7 @@ impl GuardrailEngine {
             // it only advances the bucket to the clock it would reach on the
             // next call either way — so a preflight leaves the agent's budget
             // exactly where it found it.
-            Mode::Approved | Mode::Preflight => bucket.refill(now_ms),
+            Mode::Approved(_) | Mode::Preflight => bucket.refill(now_ms),
             Mode::Fresh => bucket.try_take(now_ms),
         };
         spend.map_err(|e| bucket_refusal(e, rate, now_ms))?;
@@ -1893,7 +1899,7 @@ impl GuardrailEngine {
             });
         }
         if config.approval_required && mode == Mode::Fresh {
-            let approval_id = state.mint_proposal(agent, intent, now_ms);
+            let approval_id = state.mint_proposal(agent, intent, &route, now_ms);
             let expires_at_ms = now_ms.saturating_add(APPROVAL_TTL_MS);
             return Err(Refusal::ApprovalRequired {
                 symbol: intent.symbol.clone(),
@@ -2451,9 +2457,9 @@ pub enum SignClearedError {
 /// of the guardrails would be a second copy of them to keep in step, and
 /// `AGENTS.md` invariant 1 exists to stop exactly that.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Mode {
+enum Mode<'a> {
     Fresh,
-    Approved,
+    Approved(&'a AuthorizedRoute),
     Preflight,
 }
 
@@ -2465,7 +2471,13 @@ impl EngineState {
     /// [`GuardrailEngine::operator_approve_proposal`] accepts it. The
     /// sequence number makes two proposals minted in the same millisecond
     /// distinct.
-    fn mint_proposal(&mut self, agent: &AgentId, intent: &OrderIntent, now_ms: u64) -> String {
+    fn mint_proposal(
+        &mut self,
+        agent: &AgentId,
+        intent: &OrderIntent,
+        route: &AuthorizedRoute,
+        now_ms: u64,
+    ) -> String {
         self.sweep_proposals(now_ms);
         self.proposal_seq = self.proposal_seq.saturating_add(1);
         let id = format!("{}-{now_ms}-{}", agent.as_str(), self.proposal_seq);
@@ -2475,6 +2487,7 @@ impl EngineState {
                 id: id.clone(),
                 agent: agent.clone(),
                 intent: intent.clone(),
+                route: route.clone(),
                 expires_at_ms: now_ms.saturating_add(APPROVAL_TTL_MS),
             },
         );
@@ -2503,7 +2516,7 @@ impl Utilization {
 fn spend_global(
     bucket: &mut TokenBucket,
     budget: GlobalRateBudget,
-    mode: Mode,
+    mode: Mode<'_>,
     now_ms: u64,
 ) -> Result<Decimal, Refusal> {
     let reserve = Decimal::from(budget.reserve);
@@ -2518,7 +2531,7 @@ fn spend_global(
     })?;
     // An approved proposal already spent its request when it was minted, and a
     // preflight sends none at all.
-    if mode == Mode::Approved || mode == Mode::Preflight {
+    if matches!(mode, Mode::Approved(_) | Mode::Preflight) {
         return Ok(bucket.tokens());
     }
     // The reserve is checked before the take, so a refused order never draws

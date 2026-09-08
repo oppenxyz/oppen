@@ -140,6 +140,16 @@ before expanding features:
    `a8ae379`; publication was skipped and the merge hold remains. A follow-up
    on `fix/mcp-existing-authority` applies its existing-only ledger opener to
    MCP startup too: the prior startup path could adopt a missing anchor.
+   PR #63 has green exact-head CI and independent automated review at
+   `bf47746`; publication was skipped and the merge hold remains.
+   Operator approval work follows: first exact proposal route binding (ES24),
+   then authenticated durable lifecycle, native-owned execution and pricing
+   review. The current in-memory queue and best-effort rejection audit are not
+   completion evidence. See [operator-approvals.md](docs/specs/operator-approvals.md).
+   ES24 route binding is implemented on `fix/approval-route-binding`; synthetic
+   replacement-account clearance reproduced before the fix now refuses, and
+   the full workspace passes 981 Rust tests (15 live-gated ignored). Durable
+   lifecycle, original-request repricing and operator UI remain open.
    No dedicated-account activity has been performed during this development.
 4. **Recovery:** PR #44 merged as `06fc0e3` after green CI and separate automated
    review. The durable submission journal has SQLite reopen, independent

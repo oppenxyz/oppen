@@ -383,6 +383,22 @@ consent, stop release, activation, venue actions or dependency is introduced.
 Completion of this slice means verified paused policy persistence, not trading
 readiness. Account provisioning and activation remain separate onboarding gates.
 
+### Approval proposal identity (ES24)
+
+Spec items 18, 19, 28 and 32 require approvals to refer to the request and
+account the operator reviewed. Retain the complete authenticated registry route
+when an order proposal is minted. Approved evaluation compares that route to
+the same fresh route used to construct its clearance; an agent name alone is
+not identity across retirement, reassignment or signer rotation. A mismatch is
+a typed refusal and consumes the old proposal, not a request to rebase it.
+Final signing still independently verifies the live route and every guard.
+
+This prerequisite does not expose desktop approval controls, add a second
+signer, or make the in-memory queue durable. Durable lifecycle, pricing review,
+operator-only gateway execution and recovery acceptance are tracked in
+[operator-approvals.md](specs/operator-approvals.md). No dependency or live
+authorization is introduced.
+
 ## 2026-09-07 · The console's own socket
 
 Item 34 asks for per-feed status, last-tick timestamps and a stale overlay. The
