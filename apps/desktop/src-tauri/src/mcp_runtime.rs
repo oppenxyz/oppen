@@ -757,6 +757,104 @@ mod tests {
         }).await.expect("bounded loopback MCP response")
     }
 
+    fn rpc_reply(bytes: &str) -> serde_json::Value {
+        serde_json::from_str(
+            bytes
+                .lines()
+                .filter_map(|line| line.strip_prefix("data: "))
+                // rmcp sends an empty SSE priming event before the RPC result.
+                .find(|data| !data.trim().is_empty())
+                .unwrap_or(bytes.trim()),
+        )
+        .unwrap_or_else(|error| panic!("actual JSON-RPC response: {error}; bytes={bytes:?}"))
+    }
+
+    fn predecision_busy(reply: &serde_json::Value) -> bool {
+        reply.get("result").is_none()
+            && ["registry reader busy", "decision worker busy"]
+                .iter()
+                .any(|what| {
+                    reply["error"]
+                        == serde_json::json!({
+                            "code": -32603,
+                            "message": format!("{what} is unavailable: no permits available"),
+                            "data": {"contract_version":0,"code":"unavailable","retryable":true,
+                                "detail":"no permits available","cloid":null}
+                        })
+                })
+    }
+
+    async fn retry_predecision_busy<F, Fut>(mut request: F) -> serde_json::Value
+    where
+        F: FnMut(usize) -> Fut,
+        Fut: std::future::Future<Output = serde_json::Value>,
+    {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            for attempt in 0..64 {
+                let reply = request(attempt).await;
+                if !predecision_busy(&reply) {
+                    return reply;
+                }
+                // These exact refusals occur before evaluate/sign/submit, not
+                // after an ambiguous HTTP exchange. Never retry other errors.
+                assert!(
+                    attempt < 63,
+                    "predecision contention retry budget exhausted: {reply}"
+                );
+                tokio::task::yield_now().await;
+            }
+            unreachable!("last busy response exhausts the retry budget")
+        })
+        .await
+        .expect("predecision contention deadline exceeded")
+    }
+
+    #[tokio::test]
+    async fn fixture_retries_only_exact_predecision_busy_responses() {
+        use serde_json::json;
+        let busy = |what: &str| {
+            json!({"error":{
+                "code":-32603,"message":format!("{what} is unavailable: no permits available"),
+                "data":{"contract_version":0,"code":"unavailable","retryable":true,"detail":"no permits available","cloid":null}
+            }})
+        };
+        let final_reply = json!({"result":{"status":"rejected"}});
+        let responses = [
+            busy("registry reader busy"),
+            busy("decision worker busy"),
+            final_reply.clone(),
+        ];
+        let calls = std::cell::Cell::new(0);
+        let result = retry_predecision_busy(|attempt| {
+            calls.set(calls.get() + 1);
+            std::future::ready(responses[attempt].clone())
+        })
+        .await;
+        assert_eq!(result, final_reply);
+        assert_eq!(calls.get(), 3);
+
+        let mut unsafe_replies = vec![busy("registry read timeout"), busy("other unavailable")];
+        let mut ambiguous = busy("registry reader busy");
+        ambiguous["error"]["data"]["code"] = json!("timeout_unknown_outcome");
+        unsafe_replies.push(ambiguous);
+        let mut nonretryable = busy("registry reader busy");
+        nonretryable["error"]["data"]["retryable"] = json!(false);
+        unsafe_replies.push(nonretryable);
+        let mut cloid = busy("registry reader busy");
+        cloid["error"]["data"]["cloid"] = json!("0x77777777777777777777777777777777");
+        unsafe_replies.push(cloid);
+        for reply in unsafe_replies {
+            calls.set(0);
+            let observed = retry_predecision_busy(|_| {
+                calls.set(calls.get() + 1);
+                std::future::ready(reply.clone())
+            })
+            .await;
+            assert_eq!(observed, reply);
+            assert_eq!(calls.get(), 1);
+        }
+    }
+
     impl Fixture {
         fn binding() -> Binding {
             Binding {
@@ -997,7 +1095,9 @@ mod tests {
             "params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"desktop-owner-fixture","version":"0"}}
         })).await;
         assert_eq!(code, 200);
-        assert!(body.contains("protocolVersion"));
+        let initialized = rpc_reply(&body);
+        assert!(initialized.get("error").is_none(), "{initialized}");
+        assert_eq!(initialized["result"]["protocolVersion"], "2025-06-18");
         let session = session.unwrap();
         assert_eq!(
             rpc(
@@ -1016,25 +1116,30 @@ mod tests {
             "jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_events","arguments":{}}
         })).await;
         assert_eq!(code, 200);
-        assert!(body.contains("contract_version"), "{body}");
+        let events_rpc = rpc_reply(&body);
+        assert!(events_rpc.get("error").is_none(), "{events_rpc}");
+        let page: serde_json::Value =
+            serde_json::from_str(events_rpc["result"]["content"][0]["text"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(page["contract_version"], 0);
+        assert!(page["events"].is_array());
         let before = evidence.chain_head().unwrap().seq;
-        let (code, _, bytes) = rpc(&address, token, Some(&session), serde_json::json!({
-            "jsonrpc":"2.0","id":3,"method":"tools/call","params":{
+        let rpc_reply = retry_predecision_busy(|attempt| {
+            let address = &address;
+            let session = &session;
+            async move {
+                let (code, _, bytes) = rpc(address, token, Some(session), serde_json::json!({
+            "jsonrpc":"2.0","id":3 + attempt,"method":"tools/call","params":{
                 "name":"place","arguments":{"symbol":"TEST","is_buy":true,"size":"0.15",
                     "order_type":"limit","limit_px":"100","reason":"fixture must remain inhibited",
                     "cloid":"0x77777777777777777777777777777777"}
             }
         })).await;
-        assert_eq!(code, 200);
-        let rpc_reply: serde_json::Value = serde_json::from_str(
-            bytes
-                .lines()
-                // rmcp sends an empty SSE priming event before the RPC result.
-                .filter_map(|line| line.strip_prefix("data: "))
-                .find(|data| !data.trim().is_empty())
-                .unwrap_or(bytes.trim()),
-        )
-        .unwrap_or_else(|error| panic!("actual JSON-RPC response: {error}; bytes={bytes:?}"));
+                assert_eq!(code, 200);
+                rpc_reply(&bytes)
+            }
+        })
+        .await;
         assert!(rpc_reply.get("error").is_none(), "{rpc_reply}");
         let reply: serde_json::Value =
             serde_json::from_str(rpc_reply["result"]["content"][0]["text"].as_str().unwrap())
