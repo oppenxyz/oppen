@@ -11,6 +11,29 @@ decisions" section until then.
 
 ---
 
+## 2026-09-08 · Buffered frames cannot erase expired silence
+
+ES33 addresses spec items 9 and 34 at the WebSocket receive boundary. The
+existing biased selection can receive queued text before the ping timer checks
+idle duration. Checking only in that timer allows the text handler to overwrite
+the last-received timestamp and conceal the expired interval.
+
+Check the configured idle limit after the selected text reaches the handler,
+under the same registry lock as the timestamp update. Expired text must neither
+refresh connection/subscription clocks nor reach consumers. Return through the
+existing disconnect/reconnect path, preserving the previous last-message time
+as the gap anchor. This applies equally to market data, pong and unknown-channel
+text. Moving timer priority or checking only before awaiting the socket would
+not protect a session suspended while awaiting its next frame.
+
+Keep the existing idle policy, including its strict greater-than boundary and
+75-second default. This is expired-silence detection, not a new OS sleep callback,
+proof that every shorter pause is detected, or a completed live sleep/wake gate.
+The reconciliation pump must still catch up durable fills; a market tick cannot
+restore its readiness, and an exhausted cumulative pilot budget remains latched.
+No new transport configuration API, dependency, service, credential access or
+live activity is authorized by this fix.
+
 ## 2026-09-08 · Feed-bound order admission
 
 ES32 addresses spec items 9, 24 and 34: a processed disconnect must invalidate

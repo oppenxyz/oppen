@@ -28,6 +28,242 @@ fn assert_pending(runtime: &Runtime, cloid: &Cloid) {
     assert!(evidence(runtime, EventKind::SubmissionResolved).is_empty());
 }
 
+/// Lifecycle events are injected here; the HL socket regression owns detection
+/// of silence before a buffered frame. This test owns the downstream recovery.
+#[tokio::test]
+async fn persistent_pump_recovers_gap_loss_before_reopening_order_admission() {
+    use oppen_core::guardrail::PilotMetric;
+    use oppen_core::ledger::{PilotJournal, PilotStop};
+    use oppen_hl::ws::{ConnectionId, Disconnected, GapWindow, Reconnected, WsEvent};
+    use tokio::sync::{mpsc, oneshot};
+    use tokio::time::timeout;
+
+    let dir = tempfile::tempdir().unwrap();
+    let venue = Venue::start().await;
+    let keys = Arc::new(FixtureKeys::default());
+    let runtime = Arc::new(Runtime::open(dir.path(), venue.port(), keys.clone()).await);
+    let startup = venue.hold_info("userFillsByTime");
+    let (events, mut receiver) = mpsc::channel(8);
+    let (quiesce, quiescing) = oneshot::channel();
+    let (producers_done, producers) = oneshot::channel();
+    let pumping = runtime.clone();
+    let pump = tokio::spawn(async move {
+        let inner = &pumping.gateway.inner;
+        FeedPump::new(
+            &inner.feed,
+            &pumping.ledger,
+            pumping.account,
+            HttpSource(InfoClient::loopback_fixture(pumping.port).unwrap()),
+            &inner.alerts,
+            &inner.quotes,
+            &NoSocket,
+        )
+        .unwrap()
+        .run_until_shutdown(&mut receiver, quiescing, producers)
+        .await;
+    });
+    timeout(Duration::from_secs(3), startup.entered.notified())
+        .await
+        .unwrap();
+    startup.release.notify_one();
+    timeout(Duration::from_secs(3), async {
+        while !runtime.gateway.inner.feed.state().reconciled {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("persistent pump startup did not reconcile");
+    // No Runtime::activate_orders/reconcile: neither may start a second pump
+    // whose startup walk could accidentally supply the outage recovery proof.
+    runtime
+        .gateway
+        .inner
+        .engine
+        .operator_release_kill(&KillScope::Global, now_ms())
+        .unwrap();
+    runtime.acknowledge_policy();
+    PilotJournal::new(runtime.registry.clone())
+        .authorize(AgentId::new("fixture-agent"), runtime.account, now_ms())
+        .unwrap();
+    let cloid = Cloid::from_bytes([184; 16]);
+    let placed = runtime.call("place", place(cloid.as_str(), "0.15")).await;
+    assert_eq!(placed["status"], "resting", "{placed}");
+    let bound = Binding {
+        agent: AgentId::new("fixture-agent"),
+        account: runtime.account,
+    };
+    // Settle the initial observed resting receipt before the outage, so a
+    // later order's reservation cannot substitute for the pump's catch-up.
+    drop(runtime.gateway.reserve_submission(&bound).await.unwrap());
+    let signed_before = evidence(&runtime, EventKind::SubmissionSigned);
+    let accepted_before = evidence(&runtime, EventKind::SubmissionAccepted);
+    let posts_before = venue.submissions();
+    let subscription = Subscription::UserFills {
+        user: runtime.account,
+    };
+    let dropped_at = now_ms();
+    events
+        .send(WsEvent::Disconnected(Box::new(Disconnected {
+            connection: ConnectionId::new(0),
+            at_ms: dropped_at,
+            last_message_ms: Some(dropped_at),
+            subscriptions: vec![subscription.clone()],
+            unacked: Vec::new(),
+            reason: "synthetic buffered-frame silence".into(),
+        })))
+        .await
+        .unwrap();
+    let tick_at = dropped_at + 1;
+    events
+        .send(WsEvent::Bbo {
+            coin: "TEST".into(),
+            venue_time_ms: tick_at,
+            bid: None,
+            ask: None,
+        })
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(3), async {
+        while runtime.gateway.inner.feed.state().last_tick_ms != Some(tick_at) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("pump did not process the buffered market tick");
+    let after_tick = runtime.gateway.inner.feed.state();
+    let open = runtime.ledger.unreconciled_gaps().unwrap();
+    venue.fill_with_fee(cloid.as_str(), Decimal::new(5, 2), Decimal::from(5));
+    let fills_before_recovery = evidence(&runtime, EventKind::Fill);
+    let during_gap = runtime
+        .call(
+            "place",
+            place(Cloid::from_bytes([185; 16]).as_str(), "0.10"),
+        )
+        .await;
+
+    let recovery = venue.hold_info("userFillsByTime");
+    let resumed_at = now_ms().max(tick_at);
+    events
+        .send(WsEvent::Reconnected(Box::new(Reconnected {
+            connection: ConnectionId::new(0),
+            at_ms: resumed_at,
+            gap: GapWindow {
+                start_ms: dropped_at,
+                end_ms: resumed_at,
+            },
+            resubscribed: vec![subscription.clone()],
+            attempts: 1,
+        })))
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(3), recovery.entered.notified())
+        .await
+        .unwrap();
+    let during_recovery_state = runtime.gateway.inner.feed.state();
+    let closed = runtime.ledger.unreconciled_gaps().unwrap();
+    let during_recovery = runtime
+        .call(
+            "place",
+            place(Cloid::from_bytes([186; 16]).as_str(), "0.10"),
+        )
+        .await;
+    let posts_during_recovery = venue.submissions();
+    recovery.release.notify_one();
+    timeout(Duration::from_secs(3), async {
+        while !runtime.gateway.inner.feed.state().reconciled {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("persistent pump did not finish gap recovery");
+    let recovered = PilotJournal::new(runtime.registry.clone())
+        .state(runtime.account)
+        .unwrap()
+        .unwrap();
+    let fills = evidence(&runtime, EventKind::Fill);
+    let outstanding = runtime.ledger.unreconciled_gaps().unwrap();
+    let after_recovery = runtime
+        .call(
+            "place",
+            place(Cloid::from_bytes([187; 16]).as_str(), "0.10"),
+        )
+        .await;
+    let halted = PilotJournal::new(runtime.registry.clone())
+        .state(runtime.account)
+        .unwrap()
+        .unwrap();
+    let signed = evidence(&runtime, EventKind::SubmissionSigned);
+    let accepted = evidence(&runtime, EventKind::SubmissionAccepted);
+    let posts = venue.submissions();
+
+    let (ack, acknowledged) = oneshot::channel();
+    quiesce.send(ack).unwrap();
+    timeout(Duration::from_secs(3), acknowledged)
+        .await
+        .unwrap()
+        .unwrap();
+    drop(events);
+    producers_done.send(()).unwrap();
+    timeout(Duration::from_secs(3), pump)
+        .await
+        .unwrap()
+        .unwrap();
+    let feed = runtime.gateway.inner.feed.state();
+    let runtime = Arc::try_unwrap(runtime)
+        .ok()
+        .expect("drained pump retains runtime");
+    runtime.shutdown().await;
+    venue.shutdown().await;
+
+    assert!(
+        !after_tick.reconciled,
+        "market tick reopened order admission"
+    );
+    assert_eq!(open.len(), 1);
+    assert_eq!(open[0].scope, subscription.key());
+    assert_eq!(open[0].opened_ts_ms, dropped_at as i64);
+    assert!(open[0].closed_ts_ms.is_none());
+    assert!(fills_before_recovery.is_empty());
+    for reply in [&during_gap, &during_recovery] {
+        assert_eq!(reply["status"], "rejected", "{reply}");
+        assert_eq!(
+            reply["refusal"]["unevaluable"], "unreconciled_account",
+            "{reply}"
+        );
+    }
+    assert!(!during_recovery_state.reconciled);
+    assert_eq!(closed.len(), 1);
+    assert_eq!(closed[0].gap_id, open[0].gap_id);
+    assert_eq!(closed[0].closed_ts_ms, Some(resumed_at as i64));
+    assert_eq!(posts_during_recovery, posts_before);
+    assert!(outstanding.is_empty());
+    assert_eq!(
+        fills.len(),
+        1,
+        "gap fill must be durably recorded exactly once"
+    );
+    assert_eq!(fills[0].payload.as_ref().unwrap()["cloid"], cloid.as_str());
+    assert_eq!(recovered.net_realized_pnl_usd, Decimal::from(-5));
+    assert_eq!(
+        recovered.halt,
+        Some(PilotStop::Exhausted {
+            metric: PilotMetric::RealizedLoss,
+            observed_usd: Decimal::from(5),
+            limit_usd: Decimal::from(5),
+        })
+    );
+    assert_eq!(halted.halt, recovered.halt);
+    assert_eq!(after_recovery["status"], "rejected", "{after_recovery}");
+    assert_eq!(
+        after_recovery["refusal"]["refusal"], "pilot_budget",
+        "{after_recovery}"
+    );
+    assert_eq!(signed, signed_before);
+    assert_eq!(accepted, accepted_before);
+    assert_eq!(posts, posts_before);
+    assert!(feed.failure.is_none(), "{feed:?}");
+}
+
 #[tokio::test]
 async fn processed_disconnect_during_key_loading_refuses_order_before_signing() {
     disconnect_during_key_loading(false, false).await;

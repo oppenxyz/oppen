@@ -286,8 +286,20 @@ before expanding features:
    automated working-diff review found no remaining blockers. Exact-head review
    and green CI remain required. Synthetic regressions cover account-read,
    key/ledger/publication/dispatch waits and recovery epoch changes; they do not
-   pass the live disconnect or sleep/wake gate. Buffered frames after a long
-   process pause remain a separate transport investigation.
+   pass the live disconnect or sleep/wake gate. Expired-silence buffered-frame
+   handling is tracked in ES33 below.
+   ES33 on `fix/buffered-frame-gap` checks expired silence before a buffered
+   text frame can refresh its receipt clock, preserving the prior gap anchor.
+   The actual loopback socket regression first failed, then passed for market,
+   pong and unknown-channel text. A separate injected-lifecycle regression keeps
+   one pump alive through the gap, blocks admission during catch-up, records the
+   recovered fill once and latches its exhausted loss budget before another
+   order can submit. Full workspace: 1,155 Rust tests pass, 15 live/keychain-gated
+   tests ignored; all-target Clippy, formatting and dependency checks pass.
+   Separate automated working-diff review found no blockers; exact-head review
+   and green CI remain required. This keeps the existing idle timeout (75 seconds
+   by default); it does not claim detection of every shorter pause, post-admission
+   pause or pump backlog, nor completion of the live sleep/wake gate.
    No dedicated-account activity has been performed during this development.
 4. **Recovery:** PR #44 merged as `06fc0e3` after green CI and separate automated
    review. The durable submission journal has SQLite reopen, independent
