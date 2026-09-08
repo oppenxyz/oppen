@@ -19,7 +19,8 @@ test("persistent halt banner distinguishes uncertain durability, retrying cancel
       phase: "listening", network: "testnet", agent: "bound-agent", account: "0x1111111111111111111111111111111111111111",
       listener: "127.0.0.1:7433", reconciled: true, account_feeds_ready: true, orders_inhibited: true, detail: null,
       supervision_last_completed_ms: 123, supervision_in_progress: false, supervision_error: null,
-      halt: { phase: "uncertain", cancellation: "retrying", requested_at_ms: 100, durable_revision: null,
+      policy_status: null, cached_effective_kill: null,
+      halt: { owner_id: "fixture-halt-1", stop_generation: 1, released_stop_generation: null, released_engine_stop_generation: null, previous: null, phase: "uncertain", cancellation: "retrying", requested_at_ms: 100, durable_revision: null,
         error: "<img src=x onerror=alert(1)>" + "uncertain-diagnostic/".repeat(30), cancellation_error: "Cancel retry failed" },
     };
     state.status = status;

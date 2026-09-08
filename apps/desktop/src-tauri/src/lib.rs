@@ -12,6 +12,7 @@ mod mcp_runtime;
 mod operator_activation;
 mod operator_approvals;
 mod operator_halt;
+mod operator_release;
 mod policy_setup;
 mod runtime;
 mod updates;
@@ -492,6 +493,68 @@ async fn stop_mcp(runtime: State<'_, Runtime>) -> Result<RuntimeStatus, ConsoleE
 }
 
 #[tauri::command]
+fn kill_release_status(
+    runtime: State<'_, Runtime>,
+    agent: String,
+    account: String,
+) -> Result<operator_release::ReleaseStatus, ConsoleError> {
+    runtime
+        .kill_release_status(agent, account)
+        .map_err(ConsoleError::from)
+}
+
+#[tauri::command]
+fn review_kill_release(
+    runtime: State<'_, Runtime>,
+    agent: String,
+    account: String,
+    scope: oppen_core::guardrail::KillScope,
+) -> Result<operator_release::ReleaseStatus, ConsoleError> {
+    runtime
+        .review_kill_release(agent, account, scope)
+        .map_err(ConsoleError::from)
+}
+
+#[tauri::command]
+fn confirm_kill_release(
+    runtime: State<'_, Runtime>,
+    agent: String,
+    account: String,
+    owner_id: String,
+    review_id: String,
+) -> Result<operator_release::ReleaseStatus, ConsoleError> {
+    runtime
+        .confirm_kill_release(agent, account, owner_id, review_id)
+        .map_err(ConsoleError::from)
+}
+
+#[tauri::command]
+fn discard_kill_release(
+    runtime: State<'_, Runtime>,
+    agent: String,
+    account: String,
+    owner_id: String,
+    review_id: String,
+) -> Result<operator_release::ReleaseStatus, ConsoleError> {
+    runtime
+        .discard_kill_release(agent, account, owner_id, review_id)
+        .map_err(ConsoleError::from)
+}
+
+#[tauri::command]
+fn reconcile_kill_release(
+    runtime: State<'_, Runtime>,
+    agent: String,
+    account: String,
+    owner_id: String,
+    operation_id: String,
+) -> Result<operator_release::ReleaseStatus, ConsoleError> {
+    runtime
+        .reconcile_kill_release(agent, account, owner_id, operation_id)
+        .map_err(ConsoleError::from)
+}
+
+#[tauri::command]
 fn activation_status(
     runtime: State<'_, Runtime>,
     agent: String,
@@ -650,6 +713,11 @@ pub fn run() {
             halt_mcp,
             approval_queue_status,
             activation_status,
+            kill_release_status,
+            review_kill_release,
+            confirm_kill_release,
+            discard_kill_release,
+            reconcile_kill_release,
             review_activation,
             confirm_activation,
             discard_activation,

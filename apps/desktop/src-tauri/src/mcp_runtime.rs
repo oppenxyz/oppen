@@ -27,6 +27,7 @@ use tokio_util::sync::CancellationToken;
 use crate::operator_activation::ActivationControl;
 use crate::operator_approvals::ApprovalQueueControl;
 use crate::operator_halt::{HaltControl, HaltStatus};
+use crate::operator_release::ReleaseControl;
 
 const PORT: u16 = 7433;
 
@@ -58,6 +59,8 @@ pub(crate) struct McpStatus {
     pub orders_inhibited: bool,
     /// Local engine observation only; neither a receipt nor full order eligibility.
     pub policy_status: Option<oppen_core::guardrail::PolicyStatus>,
+    pub cached_effective_kill: Option<oppen_core::guardrail::KillSwitch>,
+    pub kill_release_in_progress: bool,
     pub halt: HaltStatus,
     pub detail: Option<String>,
 }
@@ -77,6 +80,8 @@ impl McpStatus {
             supervision_error: None,
             orders_inhibited: true,
             policy_status: None,
+            cached_effective_kill: None,
+            kill_release_in_progress: false,
             halt: HaltStatus::default(),
             detail: None,
         }
@@ -205,6 +210,7 @@ pub(crate) struct OwnedMcp {
     halt: Option<Arc<HaltControl>>,
     approvals: Option<Arc<ApprovalQueueControl>>,
     activation: Option<Arc<ActivationControl>>,
+    release: Option<Arc<ReleaseControl>>,
 }
 
 impl Drop for OwnedMcp {
@@ -239,6 +245,7 @@ impl OwnedMcp {
                 halt: None,
                 approvals: None,
                 activation: None,
+                release: None,
             });
         }
         let source = VenueSource::new(Network::Testnet).map_err(|error| error.to_string())?;
@@ -298,6 +305,8 @@ impl OwnedMcp {
             status.detail = result.as_ref().err().cloned();
             status.orders_inhibited = true;
             status.policy_status = None;
+            status.cached_effective_kill = None;
+            status.kill_release_in_progress = false;
             result
         });
         let mut owned = Self {
@@ -307,12 +316,14 @@ impl OwnedMcp {
             halt: None,
             approvals: None,
             activation: None,
+            release: None,
         };
         match observing.await {
-            Ok((halt, approvals, activation)) => {
+            Ok((halt, approvals, activation, release)) => {
                 owned.halt = Some(halt);
                 owned.approvals = Some(approvals);
                 owned.activation = Some(activation);
+                owned.release = Some(release);
             }
             Err(_) => owned.shutdown_and_drain().await?,
         }
@@ -334,6 +345,10 @@ impl OwnedMcp {
 
     pub(crate) async fn shutdown_and_drain(&mut self) -> Result<(), String> {
         self.stop.cancel();
+        let release_close_error = self
+            .release
+            .as_ref()
+            .and_then(|control| control.close().err());
         let activation_close_error = self
             .activation
             .as_ref()
@@ -362,6 +377,17 @@ impl OwnedMcp {
         // Save the parent result before another await: a dropped drain waiter
         // must not poll the completed parent handle twice or lose its failure.
         self.completed = Some(result.clone());
+        if let Some(control) = &self.release
+            && let Err(error) = control.close_and_drain().await
+            && result.is_ok()
+        {
+            result = Err(error);
+        }
+        if result.is_ok()
+            && let Some(error) = release_close_error
+        {
+            result = Err(error);
+        }
         if let Some(control) = &self.activation
             && let Err(error) = control.close_and_drain().await
             && result.is_ok()
@@ -382,6 +408,7 @@ impl OwnedMcp {
         self.halt = None;
         self.approvals = None;
         self.activation = None;
+        self.release = None;
         self.completed = Some(result.clone());
         result
     }
@@ -391,7 +418,20 @@ impl OwnedMcp {
             .as_ref()
             .ok_or_else(|| "MCP activation owner is unavailable".into())
     }
+
+    pub(crate) fn release(&self) -> Result<&Arc<ReleaseControl>, String> {
+        self.release
+            .as_ref()
+            .ok_or_else(|| "MCP release owner is unavailable".into())
+    }
 }
+
+type NativeControllers = (
+    Arc<HaltControl>,
+    Arc<ApprovalQueueControl>,
+    Arc<ActivationControl>,
+    Arc<ReleaseControl>,
+);
 
 async fn run<S, F>(
     prepared: Prepared,
@@ -400,11 +440,7 @@ async fn run<S, F>(
     pool: F,
     status: SharedStatus,
     stop: CancellationToken,
-    ready: oneshot::Sender<(
-        Arc<HaltControl>,
-        Arc<ApprovalQueueControl>,
-        Arc<ActivationControl>,
-    )>,
+    ready: oneshot::Sender<NativeControllers>,
 ) -> Result<(), String>
 where
     S: ReconcileSource + Send + 'static,
@@ -435,6 +471,13 @@ where
         prepared.binding.clone(),
         bound.operator_control(),
         prepared.activation_info.clone(),
+        stop.clone(),
+    )?;
+    let release = ReleaseControl::new(
+        prepared.engine.clone(),
+        prepared.binding.clone(),
+        prepared.pairings.clone(),
+        halt.clone(),
         stop.clone(),
     )?;
     let (pool, mut events) = pool().map_err(|error| error.to_string())?;
@@ -512,6 +555,7 @@ where
         let observed_halt = halt.clone();
         let observed_engine = prepared.engine.clone();
         let observed_agent = prepared.binding.agent.clone();
+        let observed_release = release.clone();
         // Monitoring can fail independently. The parent keeps every actual
         // task handle and still drains them if this observer panics.
         let monitor = tauri::async_runtime::spawn(async move {
@@ -528,6 +572,7 @@ where
                             Subscription::UserFills { user: account },
                             Subscription::OrderUpdates { user: account }
                         ]).is_empty();
+                        let release_in_progress = observed_release.in_progress();
                         {
                             let mut status = status_lock(&observed_status);
                             status.supervision_last_completed_ms = sweep.last_completed_ms;
@@ -538,9 +583,13 @@ where
                             if status.phase == McpPhase::Listening {
                                 status.policy_status = Some(observed_engine.policy_status());
                                 status.orders_inhibited = observed_engine.cancellation_needed(&observed_agent);
+                                status.cached_effective_kill = Some(observed_engine.kill_switch());
+                                status.kill_release_in_progress = release_in_progress;
                             } else {
                                 status.policy_status = None;
                                 status.orders_inhibited = true;
+                                status.cached_effective_kill = None;
+                                status.kill_release_in_progress = false;
                             }
                         }
                         if let Some(detail) = feed.failure { return Some(detail); }
@@ -551,7 +600,12 @@ where
                 }
             }
         });
-        let _ = ready.send((halt.clone(), approvals.clone(), activation.clone()));
+        let _ = ready.send((
+            halt.clone(),
+            approvals.clone(),
+            activation.clone(),
+            release.clone(),
+        ));
         failure = match monitor.await {
             Ok(failure) => failure,
             Err(error) => Some(format!("MCP monitor task: {error}")),
@@ -562,6 +616,11 @@ where
         status.phase = McpPhase::Stopping;
         status.orders_inhibited = true;
         status.policy_status = None;
+        status.cached_effective_kill = None;
+        status.kill_release_in_progress = false;
+    }
+    if let Err(error) = release.close_and_drain().await {
+        failure.get_or_insert(error);
     }
     if let Err(error) = activation.close_and_drain().await {
         failure.get_or_insert(error);
@@ -1381,6 +1440,7 @@ mod tests {
                 halt: None,
                 approvals: Some(queue.clone()),
                 activation: None,
+                release: None,
             };
             assert!(
                 tokio::time::timeout(
@@ -1949,6 +2009,461 @@ mod tests {
             },
             keys,
         )
+    }
+
+    async fn release_settled(
+        control: &ReleaseControl,
+        binding: &Binding,
+    ) -> crate::operator_release::ReleaseStatus {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !control.task_finished() {
+                tokio::task::yield_now().await;
+            }
+            control.snapshot(binding).unwrap()
+        })
+        .await
+        .expect("actual release worker must finish")
+    }
+
+    async fn halt_settled(owned: &OwnedMcp) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !owned.halt.as_ref().unwrap().work_terminal() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("actual HALT worker and sweep must finish");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn native_kill_release_repeated_halt_and_read_only_recovery_without_agent_permission() {
+        native_kill_release_case("repeat").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn native_kill_release_publication_halt_supersedes_latch_and_retains_actual_work() {
+        native_kill_release_case("publication_halt").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn native_kill_release_absent_foreign_core_review_remains_unknown_until_commit() {
+        native_kill_release_case("foreign_absence").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn native_kill_release_absent_terminal_refusal_is_proven_without_retrying_mutation() {
+        native_kill_release_case("stale_review").await;
+    }
+
+    async fn native_kill_release_case(mode: &str) {
+        use crate::operator_release::{Phase, Resolution};
+        use oppen_core::guardrail::KillScope;
+        let publication_halt = mode == "publication_halt";
+        let fixture = Fixture::authorized();
+        let venue = LocalVenue::start_with_pending_handshake(true).await;
+        let mut prepared = fixture.prepare().unwrap();
+        let publication_gate: ActivationPublicationGate = Arc::new(Mutex::new(None));
+        if publication_halt {
+            let path = fixture
+                .dir
+                .path()
+                .join(oppen_core::db_file_name(Network::Testnet));
+            let ledger = Arc::new(
+                Ledger::open_anchored(
+                    &path,
+                    Network::Testnet,
+                    Some(Box::new(ActivationPublicationAnchor {
+                        inner: oppen_core::ledger::FileAnchor::beside(&path),
+                        gate: publication_gate.clone(),
+                    })),
+                )
+                .unwrap(),
+            );
+            let registry = Arc::new(
+                RegistryJournal::open(ledger.clone(), Arc::new(HmacKey::from_bytes([11; 32])))
+                    .unwrap(),
+            );
+            prepared.engine = Arc::new(
+                GuardrailEngine::new_supervised_alpha(
+                    Arc::new(PolicyJournal::new(registry)),
+                    Arc::new(FixtureKeys),
+                    prepared.feed.clone(),
+                )
+                .unwrap(),
+            );
+            prepared.ledger = ledger.clone();
+            prepared.gateway = Gateway::new(
+                Network::Testnet,
+                prepared.engine.clone(),
+                EventViews::new(ledger),
+                Arc::new(Journal::open(fixture.dir.path().join("journal-testnet.db")).unwrap()),
+                prepared.alerts.clone(),
+                prepared.quotes.clone(),
+            )
+            .unwrap();
+        }
+        let original = activation_pilot_evidence(prepared.ledger.clone(), fixture.binding.account);
+        let engine = prepared.engine.clone();
+        let weak = Arc::downgrade(&prepared.ledger);
+        if mode == "repeat" {
+            let mut policy = engine.guardrails(&fixture.binding.agent).unwrap();
+            policy.max_order_usd = 15.into();
+            policy.risk.max_leverage = 1;
+            policy.risk.max_open_exposure_usd = Some(25.into());
+            policy.symbols.insert("TEST".into());
+            engine
+                .operator_set_guardrails(
+                    &fixture.binding.agent,
+                    policy,
+                    u64::try_from(now_ms()).unwrap(),
+                )
+                .unwrap();
+            let route = engine.route_for_agent(&fixture.binding.agent).unwrap();
+            *venue.activation_wallet.lock().unwrap() = Some((
+                fixture.binding.account,
+                route.binding.wallet.address,
+                route.binding.wallet.valid_until_ms,
+            ));
+            prepared.activation_info = oppen_hl::InfoClient::loopback_fixture(venue.port).unwrap();
+        }
+        let pairings = prepared.pairings.clone();
+        let id = pairings
+            .read()
+            .unwrap()
+            .authenticate(fixture.token.as_deref().unwrap())
+            .unwrap()
+            .id;
+        let mode_revoke = mode != "repeat";
+        tokio::task::spawn_blocking(move || {
+            if mode_revoke {
+                pairings.write().unwrap().revoke(id).unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        prepared.gateway = prepared.gateway.with_loopback_fixture(venue.port).unwrap();
+        let port = venue.port;
+        let status = Arc::new(Mutex::new(McpStatus::starting(&fixture.binding)));
+        let mut owned = OwnedMcp::launch(
+            prepared,
+            0,
+            FixtureSource,
+            move || WsPool::loopback_fixture(port),
+            status.clone(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let release = owned.release().unwrap().clone();
+        controller_reconciled(&engine.feed()).await;
+        if mode == "foreign_absence" {
+            let core = engine.clone();
+            let foreign = tokio::task::spawn_blocking(move || {
+                core.review_kill_release(KillScope::Global, &|| u64::try_from(now_ms()).unwrap())
+            })
+            .await
+            .unwrap()
+            .unwrap();
+            let operation_id = foreign.display().operation_id.clone();
+            let owner_id = release.snapshot(&fixture.binding).unwrap().owner_id;
+            let head = weak.upgrade().unwrap().chain_head().unwrap();
+            release
+                .reconcile(&fixture.binding, &owner_id, operation_id.clone())
+                .unwrap();
+            let absent = release_settled(&release, &fixture.binding).await;
+            assert!(
+                matches!(absent.resolution, Some(Resolution::Unknown { .. })),
+                "{absent:?}"
+            );
+            assert_eq!(weak.upgrade().unwrap().chain_head().unwrap(), head);
+            let core = engine.clone();
+            let committed = tokio::task::spawn_blocking(move || {
+                core.confirm_kill_release(foreign, &|| u64::try_from(now_ms()).unwrap(), &|| Ok(()))
+            })
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                committed.operation_id, operation_id,
+                "the foreign core owner really could still commit"
+            );
+            release
+                .reconcile(&fixture.binding, &owner_id, operation_id)
+                .unwrap();
+            assert!(matches!(
+                release_settled(&release, &fixture.binding).await.resolution,
+                Some(Resolution::Committed { .. })
+            ));
+            let core = engine.clone();
+            tokio::task::spawn_blocking(move || {
+                core.operator_engage_kill(
+                    KillScope::Global,
+                    oppen_core::guardrail::KillReason::Operator,
+                    u64::try_from(now_ms()).unwrap(),
+                )
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        }
+        // Seed a real completed native HALT so publication races exercise the old latch too.
+        owned.request_halt(&fixture.binding).unwrap();
+        halt_settled(&owned).await;
+        let first_halt = status_lock(&status).halt.clone();
+        assert_eq!(first_halt.phase, crate::operator_halt::HaltPhase::Persisted);
+        let old_sweep = owned.halt.as_ref().unwrap().last_sweep();
+        let scope = if publication_halt {
+            KillScope::Agent {
+                agent: fixture.binding.agent.clone(),
+            }
+        } else {
+            KillScope::Global
+        };
+        let command = release.clone();
+        let binding = fixture.binding.clone();
+        std::thread::spawn(move || command.review(&binding, scope))
+            .join()
+            .unwrap()
+            .unwrap();
+        let reviewed = release_settled(&release, &fixture.binding).await;
+        assert_eq!(reviewed.phase, Phase::ReviewReady, "{reviewed:?}");
+        let review = reviewed.review.unwrap();
+        assert_eq!(review.display.affected.len(), 1);
+        assert_eq!(
+            review.display.affected[0].route.binding.container,
+            fixture.binding.account
+        );
+        assert!(
+            release
+                .confirm(&fixture.binding, "wrong-owner", review.id.clone())
+                .is_err()
+        );
+        if mode == "stale_review" {
+            owned.request_halt(&fixture.binding).unwrap();
+            halt_settled(&owned).await;
+        }
+        let mut gate_release = None;
+        let mut entering = None;
+        if publication_halt {
+            let (entered, began) = oneshot::channel();
+            let (done, wait) = std::sync::mpsc::channel();
+            *publication_gate.lock().unwrap() = Some((entered, wait));
+            gate_release = Some(done);
+            entering = Some(began);
+        }
+        drop(
+            release
+                .confirm(&fixture.binding, &reviewed.owner_id, review.id.clone())
+                .unwrap(),
+        );
+        if let Some(entering) = entering {
+            tokio::time::timeout(Duration::from_secs(5), entering)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                release
+                    .reconcile(
+                        &fixture.binding,
+                        &reviewed.owner_id,
+                        review.display.operation_id.clone()
+                    )
+                    .is_err(),
+                "running work is not proof of absence"
+            );
+            owned.request_halt(&fixture.binding).unwrap();
+            let second = status_lock(&status).halt.clone();
+            assert!(second.stop_generation > first_halt.stop_generation);
+            assert_eq!(second.phase, crate::operator_halt::HaltPhase::Persisting);
+            assert!(!owned.halt.as_ref().unwrap().observe(&old_sweep));
+            assert_eq!(
+                status_lock(&status).halt.stop_generation,
+                second.stop_generation
+            );
+            assert!(engine.policy_status().admission_inhibited);
+            assert!(!release.task_finished());
+            gate_release.take().unwrap().send(()).unwrap();
+        }
+        let outcome = release_settled(&release, &fixture.binding).await;
+        assert_eq!(
+            outcome.phase,
+            if publication_halt {
+                Phase::Uncertain
+            } else if mode == "stale_review" {
+                Phase::Refused
+            } else {
+                Phase::Released
+            },
+            "{outcome:?}"
+        );
+        assert!(engine.policy_status().acknowledgment.is_none());
+        assert!(
+            release
+                .confirm(&fixture.binding, &reviewed.owner_id, review.id)
+                .is_err()
+        );
+        halt_settled(&owned).await;
+        if publication_halt {
+            assert!(
+                release
+                    .reconcile(
+                        &fixture.binding,
+                        &reviewed.owner_id,
+                        "unrelated-operation".into()
+                    )
+                    .is_err()
+            );
+        }
+        let head = weak.upgrade().unwrap().chain_head().unwrap();
+        release
+            .reconcile(
+                &fixture.binding,
+                &reviewed.owner_id,
+                review.display.operation_id.clone(),
+            )
+            .unwrap();
+        let recovered = release_settled(&release, &fixture.binding).await;
+        if mode == "stale_review" {
+            assert!(
+                matches!(
+                    recovered.resolution,
+                    Some(Resolution::NotCommitted {
+                        proof: crate::operator_release::AbsenceProof::WorkerTerminal,
+                        ..
+                    })
+                ),
+                "{recovered:?}"
+            );
+        } else {
+            assert!(
+                matches!(recovered.resolution, Some(Resolution::Committed { .. })),
+                "{recovered:?}"
+            );
+        }
+        assert_eq!(
+            weak.upgrade().unwrap().chain_head().unwrap(),
+            head,
+            "outcome recovery must not mutate"
+        );
+        if !publication_halt && mode != "stale_review" {
+            release
+                .review(
+                    &fixture.binding,
+                    KillScope::Agent {
+                        agent: fixture.binding.agent.clone(),
+                    },
+                )
+                .unwrap();
+            let reviewed = release_settled(&release, &fixture.binding).await;
+            let next = reviewed.review.unwrap();
+            let rearm = (mode == "repeat").then(|| owned.halt.as_ref().unwrap().watch_rearm());
+            release
+                .confirm(&fixture.binding, &reviewed.owner_id, next.id)
+                .unwrap();
+            if let Some((entered, resume)) = rearm {
+                tokio::time::timeout(Duration::from_secs(5), entered)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let held_status = status.clone();
+                let (held, holding) = oneshot::channel();
+                let (unlock, wait) = std::sync::mpsc::channel();
+                let holder = tokio::task::spawn_blocking(move || {
+                    let _guard = status_lock(&held_status);
+                    held.send(()).unwrap();
+                    let _ = wait.recv();
+                });
+                holding.await.unwrap();
+                let available = release.state_available();
+                resume.send(()).unwrap();
+                unlock.send(()).unwrap();
+                holder.await.unwrap();
+                assert!(
+                    available,
+                    "rearm must not retain release state while acquiring shared status"
+                );
+            }
+            let released = release_settled(&release, &fixture.binding).await;
+            assert_eq!(released.phase, Phase::Released);
+            assert_eq!(engine.kill_switch(), Default::default());
+            assert!(engine.policy_status().acknowledgment.is_none());
+            assert_eq!(
+                status_lock(&status).halt.released_stop_generation,
+                Some(first_halt.stop_generation)
+            );
+            assert_eq!(
+                status_lock(&status).halt.released_engine_stop_generation,
+                Some(engine.policy_status().stop_generation)
+            );
+            if mode == "repeat" {
+                controller_reconciled(&engine.feed()).await;
+                let activation = owned.activation().unwrap();
+                activation.request_review(&fixture.binding).unwrap();
+                let ready = activation_settled(activation, &fixture.binding).await;
+                assert_eq!(
+                    ready.phase,
+                    crate::operator_activation::Phase::ReviewReady,
+                    "{ready:?}"
+                );
+                let review = ready.review.unwrap();
+                activation
+                    .discard(&fixture.binding, &ready.owner_id, &review.id)
+                    .unwrap();
+            }
+            owned.request_halt(&fixture.binding).unwrap();
+            let second = status_lock(&status).halt.clone();
+            assert_eq!(second.released_stop_generation, None);
+            assert_eq!(second.released_engine_stop_generation, None);
+            owned
+                .halt
+                .as_ref()
+                .unwrap()
+                .release_confirmed(released.receipt.as_ref().unwrap());
+            assert_eq!(status_lock(&status).halt.released_stop_generation, None);
+            assert!(second.stop_generation > first_halt.stop_generation);
+            assert_eq!(second.owner_id, first_halt.owner_id);
+            assert_eq!(
+                second.previous.unwrap().stop_generation,
+                first_halt.stop_generation
+            );
+            assert!(!owned.halt.as_ref().unwrap().observe(&old_sweep));
+            halt_settled(&owned).await;
+        }
+        assert!(
+            serde_json::to_value(engine.kill_switch()).unwrap()["agents"]
+                [fixture.binding.agent.as_str()]
+            .is_object()
+        );
+        assert_eq!(
+            activation_pilot_evidence(weak.upgrade().unwrap(), fixture.binding.account),
+            original
+        );
+        owned.shutdown_and_drain().await.unwrap();
+        assert!(release.review(&fixture.binding, KillScope::Global).is_err());
+        drop(release);
+        drop(engine);
+        drop(owned);
+        let posted = venue
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|request| request.path == "/exchange");
+        venue.shutdown().await;
+        assert!(!posted);
+        assert_eq!(weak.strong_count(), 0);
+        fixture.assert_pairing_owner_released();
+        let reopened = fixture.prepare().unwrap();
+        assert_eq!(
+            activation_pilot_evidence(reopened.ledger.clone(), fixture.binding.account),
+            original
+        );
+        assert!(reopened.engine.policy_status().acknowledgment.is_none());
+        assert!(
+            serde_json::to_value(reopened.engine.kill_switch()).unwrap()["agents"]
+                [fixture.binding.agent.as_str()]
+            .is_object()
+        );
     }
 
     async fn activation_settled(
@@ -3610,7 +4125,12 @@ mod tests {
                 fixture.binding.account.to_string(),
             )
             .unwrap();
-        assert_eq!(duplicate.halt.requested_at_ms, halted.halt.requested_at_ms);
+        assert_eq!(duplicate.halt.owner_id, halted.halt.owner_id);
+        assert!(duplicate.halt.stop_generation > halted.halt.stop_generation);
+        assert_eq!(
+            duplicate.halt.previous.as_ref().unwrap().stop_generation,
+            halted.halt.stop_generation
+        );
         let token = fixture.token.as_deref().unwrap();
         let (code, session, body) = rpc(&address, token, None, serde_json::json!({
             "jsonrpc":"2.0", "id":1, "method":"initialize",
@@ -3704,6 +4224,22 @@ mod tests {
         }
         assert!(runtime.mcp_status().orders_inhibited);
         assert_ne!(runtime.mcp_status().account_feeds_ready, Some(true));
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let current = runtime.mcp_status().halt;
+                assert_eq!(current.owner_id, duplicate.halt.owner_id);
+                assert_eq!(current.stop_generation, duplicate.halt.stop_generation);
+                assert_ne!(current.phase, HaltPhase::Uncertain, "{current:?}");
+                if current.phase == HaltPhase::Persisted
+                    && current.cancellation == CancellationPhase::Acknowledged
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("renewed HALT needs its own qualifying cancellation acknowledgment");
         tokio::time::timeout(Duration::from_secs(5), runtime.shutdown())
             .await
             .unwrap()
@@ -3843,6 +4379,15 @@ mod tests {
 
     #[tokio::test]
     async fn halt_failed_sweep_retries_on_existing_supervisor_without_another_mutation() {
+        halt_failed_sweep(false).await;
+    }
+
+    #[tokio::test]
+    async fn halt_shutdown_after_failed_attempt_preserves_stop_without_claiming_cleanup() {
+        halt_failed_sweep(true).await;
+    }
+
+    async fn halt_failed_sweep(stop_after_attempt: bool) {
         let fixture = Fixture::authorized();
         let venue = LocalVenue::start().await;
         let mut prepared = fixture.prepare().unwrap();
@@ -3912,6 +4457,32 @@ mod tests {
         assert_eq!(retrying.halt.phase, HaltPhase::Persisted);
         assert!(retrying.halt.cancellation_error.is_some());
         let revision = engine.policy_status().cached_revision;
+        if stop_after_attempt {
+            let stopped = tokio::time::timeout(Duration::from_secs(5), runtime.shutdown())
+                .await
+                .unwrap();
+            let status = runtime.mcp_status();
+            release.send(()).unwrap();
+            holder.await.unwrap();
+            assert!(
+                stopped.is_err(),
+                "a failed cancellation attempt cannot acknowledge cleanup"
+            );
+            assert_eq!(status.phase, McpPhase::Failed);
+            assert_eq!(status.halt.phase, HaltPhase::Persisted);
+            assert_ne!(status.halt.cancellation, CancellationPhase::Acknowledged);
+            assert_eq!(engine.policy_status().cached_revision, revision);
+            drop(pairings);
+            drop(engine);
+            drop(runtime);
+            fixture.assert_pairing_owner_released();
+            let reopened = fixture.prepare().unwrap();
+            let kill = serde_json::to_value(reopened.engine.kill_switch()).unwrap();
+            assert!(kill["agents"][fixture.binding.agent.as_str()].is_object());
+            assert!(reopened.engine.policy_status().acknowledgment.is_none());
+            venue.shutdown().await;
+            return;
+        }
         release.send(()).unwrap();
         holder.await.unwrap();
         tokio::time::timeout(Duration::from_secs(10), async {

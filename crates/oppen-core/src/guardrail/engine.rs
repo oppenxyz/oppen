@@ -61,9 +61,15 @@ use super::{AgentId, CancelContext, CancelIntent, CancelTarget};
 
 #[path = "activation.rs"]
 mod activation;
+#[path = "kill_release.rs"]
+mod kill_release;
 pub use activation::{
     ActivationDisplay, ActivationEvidence, ActivationObservation, ActivationReceipt,
     ActivationReview,
+};
+pub use kill_release::{
+    KillReleaseDisplay, KillReleaseError, KillReleaseMember, KillReleaseReceipt,
+    KillReleaseResolution, KillReleaseReview,
 };
 
 /// One basis point is a ten-thousandth.
@@ -809,6 +815,27 @@ pub struct PolicyAcknowledgment {
     pub stop_generation: u64,
 }
 
+/// Local HALT has already taken effect; only its durable work remains.
+#[derive(Debug)]
+pub struct PendingOperatorKill {
+    owner: Arc<()>,
+    incarnation: Arc<()>,
+    requested_reason: KillReason,
+    effect: KillEffect,
+    engagement: Engagement,
+    generation: u64,
+    at_ms: u64,
+}
+
+impl PendingOperatorKill {
+    pub fn effect(&self) -> &KillEffect {
+        &self.effect
+    }
+    pub fn stop_generation(&self) -> u64 {
+        self.generation
+    }
+}
+
 /// Local observation only, not a fresh verification or activation guarantee.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct PolicyStatus {
@@ -826,6 +853,7 @@ struct EngineState {
     activation_scope: Option<AuthorizedRoute>,
     stop_generation: u64,
     emergency: BTreeMap<KillScope, Engagement>,
+    kill_incarnations: BTreeMap<KillScope, Arc<()>>,
     guardrails: BTreeMap<AgentId, AgentGuardrails>,
     account_limits: LossLimits,
     kill: KillSwitch,
@@ -1108,6 +1136,7 @@ impl GuardrailEngine {
             activation_scope: None,
             stop_generation: 0,
             emergency: BTreeMap::new(),
+            kill_incarnations: BTreeMap::new(),
             guardrails: BTreeMap::new(),
             account_limits: LossLimits::UNSET,
             kill: KillSwitch::new(),
@@ -1421,27 +1450,80 @@ impl GuardrailEngine {
         reason: KillReason,
         now_ms: u64,
     ) -> Result<KillEffect, GuardrailError> {
-        // Stop locally before waiting for any persistence or mutation lock.
+        self.persist_operator_kill(self.begin_operator_kill(scope, reason, now_ms))
+    }
+
+    /// I/O-free request-boundary HALT, including while earlier durable work waits.
+    pub fn begin_operator_kill(
+        &self,
+        scope: KillScope,
+        reason: KillReason,
+        now_ms: u64,
+    ) -> PendingOperatorKill {
+        let requested_reason = reason.clone();
         let engagement = Engagement {
             engaged_at_ms: now_ms,
-            reason: reason.clone(),
+            reason,
         };
-        let effect = self.state().stop(scope.clone(), engagement.clone());
+        let mut state = self.state();
+        let effect = state.stop(scope.clone(), engagement.clone());
+        let engagement = state.emergency.get(&scope).cloned().unwrap_or(engagement);
+        let incarnation = state
+            .kill_incarnations
+            .entry(scope)
+            .or_insert_with(|| Arc::new(()))
+            .clone();
+        PendingOperatorKill {
+            owner: self.submission_owner.clone(),
+            incarnation,
+            requested_reason,
+            effect,
+            engagement,
+            generation: state.stop_generation,
+            at_ms: now_ms,
+        }
+    }
+
+    /// Synchronous persistence; the native owner retains this work through IPC loss.
+    pub fn persist_operator_kill(
+        &self,
+        pending: PendingOperatorKill,
+    ) -> Result<KillEffect, GuardrailError> {
+        if !Arc::ptr_eq(&pending.owner, &self.submission_owner) {
+            return Err(GuardrailError::Policy {
+                detail: "pending HALT belongs to another engine".into(),
+            });
+        }
         let _mutation = self.mutation_lock()?;
+        if !self
+            .state()
+            .kill_incarnations
+            .get(&pending.effect.scope)
+            .is_some_and(|current| Arc::ptr_eq(current, &pending.incarnation))
+        {
+            return Err(GuardrailError::Policy {
+                detail: "pending HALT was replaced or explicitly released".into(),
+            });
+        }
+        // A preceding release may have committed before reporting uncertainty.
+        // Re-read verified policy before this restrictive, one-scope mutation;
+        // refresh neither acknowledges policy nor clears emergency overlays.
+        self.refresh_policy()?;
         let (revision, mut next) = self.policy_candidate()?;
-        next.kill.engage(scope, engagement);
-        self.commit_policy(revision, &next, now_ms)?;
+        next.kill
+            .engage(pending.effect.scope.clone(), pending.engagement.clone());
+        self.commit_policy(revision, &next, pending.at_ms)?;
         self.record_operator(
             None,
-            now_ms,
+            pending.at_ms,
             &OperatorAction::KillEngaged {
-                scope: effect.scope.clone(),
-                reason,
-                newly_engaged: effect.newly_engaged,
-                cancel_for: effect.cancel_for.clone(),
+                scope: pending.effect.scope.clone(),
+                reason: pending.requested_reason,
+                newly_engaged: pending.effect.newly_engaged,
+                cancel_for: pending.effect.cancel_for.clone(),
             },
         );
-        Ok(effect)
+        Ok(pending.effect)
     }
 
     pub fn operator_release_kill(
@@ -1470,6 +1552,7 @@ impl GuardrailEngine {
             let mut state = self.state();
             if state.stop_generation == generation {
                 state.emergency.remove(scope);
+                state.kill_incarnations.remove(scope);
             } else {
                 return Err(GuardrailError::Policy {
                     detail: "new stop arrived while releasing policy".into(),

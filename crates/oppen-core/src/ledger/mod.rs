@@ -58,6 +58,7 @@ mod hash;
 mod pairing;
 mod pilot;
 mod policy;
+pub(crate) use policy::release;
 mod registry;
 mod schema;
 mod submission;

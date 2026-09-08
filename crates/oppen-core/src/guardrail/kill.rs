@@ -117,6 +117,12 @@ pub struct KillSwitch {
 }
 
 impl KillSwitch {
+    pub(crate) fn engagement(&self, scope: &KillScope) -> Option<&Engagement> {
+        match scope {
+            KillScope::Global => self.global.as_ref(),
+            KillScope::Agent { agent } => self.agents.get(agent),
+        }
+    }
     pub(super) fn new() -> Self {
         KillSwitch::default()
     }
@@ -176,7 +182,7 @@ impl KillSwitch {
     /// Releases the switch. Releasing global does not release per-agent
     /// engagements: an agent stopped by its own loss breaker stays stopped
     /// when the operator lifts the global pause.
-    pub(super) fn release(&mut self, scope: &KillScope) -> bool {
+    pub(crate) fn release(&mut self, scope: &KillScope) -> bool {
         match scope {
             KillScope::Global => self.global.take().is_some(),
             KillScope::Agent { agent } => self.agents.remove(agent).is_some(),

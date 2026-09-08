@@ -1383,6 +1383,12 @@ the depth measurement problem in §14, and whether the sub-account owner rule
 | UP3 | First private channel reuses the owner's existing GitHub CLI login, explicitly authorized. | No embedded repository token and no new OAuth service. Read credentials only in Rust, accept release asset URLs only from oppenxyz/oppen, and expose static errors to the UI. Homebrew GitHub CLI is required on this personal Mac. |
 | UP4 | Personal macOS builds use ad-hoc Apple code signing plus mandatory Tauri update signatures. | Owner has no Apple Developer account. These builds are not Apple-notarized; public distribution requires a separate Developer ID/notarization setup. Keep the installed identifier `xyz.oppen.desktop` so preferences survive. |
 
+### Reviewed kill release - 2026-09-08
+
+| ID | Decision | Rationale |
+|---|---|---|
+| ES38 | Add an explicit, reviewed TESTNET kill-release ceremony after ES37, separate from activation and initial consent. | The desktop currently cannot release the global pause created by policy setup, and its HALT owner is lifetime-latched. Bind exact scope, policy/stop generation, affected authority and pilot evidence under core coordination; preserve permanent stops and budgets, keep acknowledgment absent, and safely re-arm subsequent HALT. See [operator-kill-release.md](specs/operator-kill-release.md). Planned, not implemented or live-authorized. |
+
 ### Numeric change cue
 
 | ID | Decision | Rationale |

@@ -14,6 +14,17 @@ function after(callback: () => void, ms: number): () => void {
 function terminal(status: Readonly<McpStatus> | null): boolean {
   return status?.phase === "failed" || status?.phase === "stopping" || status?.phase === "stopped";
 }
+export function haltReleased(status: Readonly<McpStatus> | null): boolean {
+  if (!status?.agent || status.network !== "testnet" || status.phase !== "listening") return false;
+  const marker = status.halt.released_stop_generation;
+  const releasedEngine = status.halt.released_engine_stop_generation;
+  const currentEngine = status.policy_status?.stop_generation;
+  return marker != null && marker === status.halt.stop_generation
+    && releasedEngine != null && currentEngine != null && Number.isSafeInteger(releasedEngine)
+    && Number.isSafeInteger(currentEngine) && releasedEngine >= 0 && releasedEngine <= currentEngine
+    && status.cached_effective_kill != null && status.cached_effective_kill.global === null
+    && !status.cached_effective_kill.agents[status.agent];
+}
 
 export function supervisionInputError(network: McpStatus["network"], agent: string, account: string): string | null {
   if (network !== "testnet") return "Supervision can only start from TESTNET. The network will not be switched automatically.";
@@ -33,14 +44,33 @@ export function createSupervision(
     command: "start" | "stop" | null; reading: boolean; checkedAt: number | null;
     stopRequested: boolean; runtime: RuntimeStatus | null;
     haltPending: boolean; haltRequested: boolean; haltNotAdmitted: boolean; haltError: string | null;
-  }>({ status: null, error: null, commandError: null, command: null, reading: false, checkedAt: null, stopRequested: false, runtime: null, haltPending: false, haltRequested: false, haltNotAdmitted: false, haltError: null });
+    releaseActive: boolean;
+  }>({ status: null, error: null, commandError: null, command: null, reading: false, checkedAt: null, stopRequested: false, runtime: null, haltPending: false, haltRequested: false, haltNotAdmitted: false, haltError: null, releaseActive: false });
   let active = false;
   let generation = 0;
   let version = 0;
   let observations = 0;
-  let rejectedHalt: { agent: string; account: string } | null = null;
+  let rejectedHalt: { agent: string; account: string; owner: string; generation: number } | null = null;
   let starting = false;
   let stopping = false;
+  let haltToken: symbol | null = null;
+  let haltFence: { owner: string; minimum: number } | null = null;
+  const retiredOwners = new Set<string>();
+  function acceptStatus(status: McpStatus): boolean {
+    const previous = state.status;
+    if (retiredOwners.has(status.halt.owner_id)) return false;
+    if (previous?.halt.owner_id && previous.halt.owner_id === status.halt.owner_id) {
+      if (status.halt.stop_generation < previous.halt.stop_generation) return false;
+      if (previous.policy_status && status.policy_status && status.policy_status.stop_generation < previous.policy_status.stop_generation) return false;
+      if (terminal(previous) && !terminal(status)) return false;
+    } else if (previous?.halt.owner_id) retiredOwners.add(previous.halt.owner_id);
+    state.status = status;
+    if (haltReleased(status) && (!haltFence || (haltFence.owner === status.halt.owner_id && status.halt.stop_generation >= haltFence.minimum))) {
+      state.haltRequested = false; state.haltPending = false; state.haltError = null; state.haltNotAdmitted = false;
+      haltToken = null; haltFence = null; rejectedHalt = null;
+    }
+    return true;
+  }
   let cancelPoll: (() => void) | null = null;
   let cancelDeadline: (() => void) | null = null;
 
@@ -57,14 +87,16 @@ export function createSupervision(
     try {
       const status = await transport.status();
       if (!active || owner !== generation || observed !== version || expired) return;
-      state.status = status;
+      if (!acceptStatus(status)) return;
       observations += 1;
       state.error = null;
       state.checkedAt = Date.now();
       if (rejectedHalt !== null && !state.stopRequested && state.command !== "start"
-        && status.network === "testnet" && status.phase === "listening" && status.halt.phase === "idle"
+        && status.network === "testnet" && status.phase === "listening" && (status.halt.phase === "idle" || haltReleased(status))
+        && status.halt.owner_id === rejectedHalt.owner && status.halt.stop_generation === rejectedHalt.generation
         && status.agent === rejectedHalt.agent && status.account === rejectedHalt.account) {
         state.haltRequested = false;
+        haltFence = null;
         rejectedHalt = null;
       }
     } catch (error) {
@@ -156,12 +188,12 @@ export function createSupervision(
     if (state.command === "start") return "Runtime startup has not completed; agent halt is not yet available.";
     if (state.status?.phase !== "listening" || !state.status.agent || !state.status.account) return "No listening runtime agent/account binding has been read.";
     if (state.error !== null) return "Current runtime binding is unavailable; halt has not been submitted.";
-    if (state.haltPending || state.haltRequested || state.status.halt?.phase !== "idle") return "A halt has already been requested; inspect persistence and cancellation evidence.";
+    if (!state.releaseActive && (state.haltPending || state.haltRequested || (state.status.halt?.phase !== "idle" && !haltReleased(state.status)))) return "A halt has already been requested; inspect persistence and cancellation evidence.";
     return null;
   }
 
   async function halt(network: McpStatus["network"], confirmed: { agent: string; account: string }): Promise<void> {
-    if (state.haltPending || state.haltRequested) return;
+    if (!state.releaseActive && (state.haltPending || state.haltRequested)) return;
     state.haltError = haltBlocker(network);
     if (state.haltError !== null) return;
     const binding = state.status!;
@@ -169,7 +201,12 @@ export function createSupervision(
       state.haltError = "The runtime binding changed. Confirm the current agent and account before halting.";
       return;
     }
+    const retrySafe = !state.haltPending && !state.haltRequested;
     state.haltPending = true;
+    haltFence = { owner: binding.halt.owner_id,
+      minimum: Math.max(binding.halt.stop_generation, haltFence?.owner === binding.halt.owner_id ? haltFence.minimum : 0) + 1 };
+    const token = Symbol("halt");
+    haltToken = token;
     state.haltRequested = true;
     state.haltNotAdmitted = false;
     rejectedHalt = null;
@@ -178,26 +215,28 @@ export function createSupervision(
     try {
       const status = await transport.halt(binding.agent!, binding.account!);
       // Admission replies can lag newer poll evidence, including a terminal stop.
-      if (observations === observed && !state.stopRequested && !terminal(state.status)
+      if (haltToken === token && observations === observed && !state.stopRequested && !terminal(state.status)
         && state.status?.agent === binding.agent && state.status.account === binding.account
         && status.agent === binding.agent && status.account === binding.account && status.network === "testnet") {
-        state.status = status;
+        if (!acceptStatus(status)) return;
         state.checkedAt = Date.now();
         version += 1;
       }
     } catch (error) {
+      if (haltToken !== token) return;
       state.haltError = detail(error);
       if (isConsoleError(error) && error.kind === "halt_not_admitted") {
         state.haltNotAdmitted = true;
-        rejectedHalt = { agent: binding.agent!, account: binding.account! };
+        if (retrySafe) rejectedHalt = { agent: binding.agent!, account: binding.account!, owner: binding.halt.owner_id, generation: binding.halt.stop_generation };
       }
       // Only reads admitted after this rejection may unlock an explicit retry.
       version += 1;
     }
-    finally { state.haltPending = false; void refresh(); }
+    finally { if (haltToken === token) { haltToken = null; state.haltPending = false; void refresh(); } }
   }
 
-  return { state: readonly(state), refresh, startPolling, stopPolling, start, stop, halt, haltBlocker };
+  return { state: readonly(state), refresh, startPolling, stopPolling, start, stop, halt, haltBlocker,
+    setReleaseActive: (active: boolean) => { state.releaseActive = active; } };
 }
 
 export const supervision = createSupervision({ status: fetchMcpStatus, start: startMcp, stop: stopMcp, halt: haltMcp }, inTauri);
@@ -229,7 +268,8 @@ export function haltNotice(reading: {
     acknowledged: "Cancellation acknowledged", unavailable: "Cancellation unavailable",
   };
   return {
-    title: halt?.phase === "idle" && reading.haltNotAdmitted ? "Halt not admitted" : halt?.phase === "idle" && !reading.haltRequested ? "Halt not submitted" : phases[halt?.phase ?? "idle"],
+    title: !reading.haltRequested && haltReleased(reading.status) ? "Previous agent halt released; activation required"
+      : halt?.phase === "idle" && reading.haltNotAdmitted ? "Halt not admitted" : halt?.phase === "idle" && !reading.haltRequested ? "Halt not submitted" : phases[halt?.phase ?? "idle"],
     cancellation: reading.haltRequested && !reading.haltNotAdmitted && (!halt || halt.phase === "idle") ? "Cancellation unconfirmed" : cancellations[halt?.cancellation ?? "not_requested"],
     revision: halt?.durable_revision ?? null,
   };

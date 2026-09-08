@@ -277,6 +277,30 @@ pub(super) fn activation_state_in(
     Ok(state)
 }
 
+pub(super) fn release_state_in(
+    registry: &super::RegistryJournal,
+    connection: &Connection,
+    route: &super::AuthorizedRoute,
+) -> Result<PilotState> {
+    let history = history(registry.ledger(), connection, true)?;
+    authority::verify(registry, connection, &history)?;
+    authority::verify_authorized_route(registry, connection, &history, route)?;
+    let authority = history
+        .authorities
+        .iter()
+        .find(|a| a.data.agent == route.binding.agent && a.data.account == route.binding.container)
+        .ok_or_else(|| unavailable("matching authenticated pilot consent required"))?;
+    let state = project(&history, authority)?;
+    if state
+        .halt
+        .as_ref()
+        .is_some_and(|halt| !matches!(halt, PilotStop::AwaitingReconciliation))
+    {
+        return Err(unavailable("permanent pilot stop cannot be released"));
+    }
+    Ok(state)
+}
+
 pub(super) fn status(ledger: &Ledger, account: Address) -> Result<Option<PilotStatus>> {
     let mut guard = ledger.lock()?;
     let tx = guard.transaction_with_behavior(TransactionBehavior::Deferred)?;

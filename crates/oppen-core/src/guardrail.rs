@@ -107,9 +107,11 @@ pub use engine::{
     ActivationDisplay, ActivationEvidence, ActivationObservation, ActivationReceipt,
     ActivationReview, ApprovalReview, ApprovalReviewDisplay, AuditEntry, AuditError, AuditOutcome,
     AuditSink, CancelApprovalReviewDisplay, Clearance, Cleared, ClearedKind, GuardedSignature,
-    GuardrailEngine, GuardrailError, OperatorAction, OrderApprovalReviewDisplay, OrderIntent,
-    PolicyAcknowledgment, PolicyStatus, Proposal, ProposalIntent, SignClearedError,
-    SignedCancellation, SignedSubmission, SigningPermit, SubmissionPostError, Utilization, Verdict,
+    GuardrailEngine, GuardrailError, KillReleaseDisplay, KillReleaseError, KillReleaseMember,
+    KillReleaseReceipt, KillReleaseResolution, KillReleaseReview, OperatorAction,
+    OrderApprovalReviewDisplay, OrderIntent, PendingOperatorKill, PolicyAcknowledgment,
+    PolicyStatus, Proposal, ProposalIntent, SignClearedError, SignedCancellation, SignedSubmission,
+    SigningPermit, SubmissionPostError, Utilization, Verdict,
 };
 pub use kill::{Engagement, KillEffect, KillReason, KillScope, KillSwitch};
 pub use refusal::{PilotMetric, ReduceOnlyBreach, Refusal, Unevaluable, VenueRule};

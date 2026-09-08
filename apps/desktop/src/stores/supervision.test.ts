@@ -1,5 +1,6 @@
 import type { McpStatus, RuntimeStatus } from "../lib/bridge";
 import { createSupervision, haltNotice, pauseSweepLabel, supervisionInputError } from "./supervision";
+import { activationContext } from "./activation";
 
 interface Assertions { toBe(expected: unknown): void; toEqual(expected: unknown): void; toContain(expected: string): void }
 declare const describe: (name: string, body: () => void) => void;
@@ -8,7 +9,8 @@ declare const expect: (value: unknown) => Assertions;
 
 const ACCOUNT = "0x1111111111111111111111111111111111111111";
 const IDLE: McpStatus = {
-  halt: { phase: "idle", cancellation: "not_requested", requested_at_ms: null, durable_revision: null, error: null, cancellation_error: null },
+  halt: { owner_id: "halt-1", stop_generation: 0, released_stop_generation: null, released_engine_stop_generation: null, previous: null, phase: "idle", cancellation: "not_requested", requested_at_ms: null, durable_revision: null, error: null, cancellation_error: null },
+  policy_status: null, cached_effective_kill: null,
   phase: "idle", network: "testnet", agent: null, account: null, listener: null,
   reconciled: null, orders_inhibited: true, detail: null, account_feeds_ready: null,
   supervision_last_completed_ms: null, supervision_in_progress: false, supervision_error: null,
@@ -50,6 +52,91 @@ function fixture() {
 }
 
 describe("explicit TESTNET supervision", () => {
+  it("rejects an old engine-generation poll after a newer effective kill was observed", async () => {
+    const released: McpStatus = { ...HALTED, halt: { ...HALTED.halt, stop_generation: 1, released_stop_generation: 1, released_engine_stop_generation: 7 },
+      policy_status: { cached_revision: 43, acknowledgment: null, stop_generation: 7, admission_inhibited: true }, cached_effective_kill: { global: null, agents: {} } };
+    const f = fixture(); await f.opened(released);
+    let reading = f.monitor.refresh(); f.reads[1]!.resolve({ ...released,
+      policy_status: { ...released.policy_status!, stop_generation: 8 },
+      cached_effective_kill: { global: { engaged_at_ms: 200, reason: { reason: "feed_failure" } }, agents: {} } }); await reading;
+    reading = f.monitor.refresh(); f.reads[2]!.resolve(released); await reading;
+    expect(f.monitor.state.status?.policy_status?.stop_generation).toBe(8);
+    expect(f.monitor.state.status?.cached_effective_kill?.global?.reason.reason).toBe("feed_failure");
+    expect(activationContext("testnet", f.monitor.state)?.blocked).toContain("HALT"); f.monitor.stopPolling();
+  });
+  it("permits explicit retry after released-HALT typed refusal only on a fresh same-owner observation", async () => {
+    const released: McpStatus = { ...HALTED, halt: { ...HALTED.halt, stop_generation: 1, released_stop_generation: 1, released_engine_stop_generation: 7 },
+      policy_status: { cached_revision: 43, acknowledgment: null, stop_generation: 8, admission_inhibited: true }, cached_effective_kill: { global: null, agents: {} } };
+    for (const kind of ["halt_not_admitted", "local_status"]) {
+      const f = fixture(); await f.opened(released);
+      const oldRead = f.monitor.refresh();
+      const command = f.monitor.halt("testnet", { agent: "alpha", account: ACCOUNT });
+      f.halts[0]!.reply.reject({ kind, detail: "Not admitted" }); await command;
+      f.reads[1]!.resolve(released); await oldRead; await settle();
+      expect(f.monitor.state.haltRequested).toBe(true);
+      f.reads[2]!.resolve(released); await settle();
+      expect(f.monitor.state.haltRequested).toBe(kind !== "halt_not_admitted");
+      expect(f.halts.length).toBe(1);
+      if (kind === "halt_not_admitted") {
+        const retry = f.monitor.halt("testnet", { agent: "alpha", account: ACCOUNT });
+        expect(f.halts.length).toBe(2);
+        f.halts[1]!.reply.resolve({ ...HALTED, halt: { ...HALTED.halt, stop_generation: 2 } }); await retry;
+      }
+      f.monitor.stopPolling();
+    }
+    const f = fixture(); await f.opened(released);
+    const command = f.monitor.halt("testnet", { agent: "alpha", account: ACCOUNT });
+    f.halts[0]!.reply.reject({ kind: "halt_not_admitted", detail: "Not admitted" }); await command;
+    f.reads[1]!.resolve({ ...released, halt: { ...released.halt, owner_id: "replacement" } }); await settle();
+    expect(f.monitor.state.haltRequested).toBe(true); f.monitor.stopPolling();
+  });
+  it("rearms only a verified matching release and never clears the next HALT from an old marker", async () => {
+    const f = fixture(); await f.opened(LISTENING);
+    const first = f.monitor.halt("testnet", { agent: "alpha", account: ACCOUNT });
+    const halted = { ...HALTED, halt: { ...HALTED.halt, stop_generation: 1 } };
+    f.halts[0]!.reply.resolve(halted); await first;
+    const released: McpStatus = { ...halted, halt: { ...halted.halt, released_stop_generation: 1, released_engine_stop_generation: 7 },
+      policy_status: { cached_revision: 43, acknowledgment: null, stop_generation: 7, admission_inhibited: true },
+      cached_effective_kill: { global: null, agents: {} } };
+    f.reads[1]!.resolve({ ...released, policy_status: { ...released.policy_status!, stop_generation: 6 } }); await settle();
+    expect(f.monitor.state.haltRequested).toBe(true);
+    let read = f.monitor.refresh(); f.reads[2]!.resolve(released); await read;
+    expect(f.monitor.state.haltRequested).toBe(false);
+    expect(f.monitor.haltBlocker("testnet")).toBe(null);
+    expect(activationContext("testnet", f.monitor.state)?.blocked).toBe(null);
+    expect(activationContext("testnet", { ...f.monitor.state,
+      status: { ...released, policy_status: { ...released.policy_status!, stop_generation: 8 } } })?.blocked).toBe(null);
+    expect(f.monitor.state.status?.policy_status?.acknowledgment).toBe(null);
+    const second = f.monitor.halt("testnet", { agent: "alpha", account: ACCOUNT });
+    read = f.monitor.refresh(); f.reads[3]!.resolve(released); await read;
+    expect(f.monitor.state.haltRequested).toBe(true);
+    expect(activationContext("testnet", f.monitor.state)?.blocked).toContain("HALT");
+    f.halts[1]!.reply.resolve({ ...halted, halt: { ...halted.halt, stop_generation: 2 } }); await second;
+    expect(f.halts.length).toBe(2); expect(f.stops.length).toBe(0); f.monitor.stopPolling();
+  });
+  it("does not unblock activation when an effective global or bound-agent stop remains", () => {
+    const released: McpStatus = { ...HALTED, halt: { ...HALTED.halt, released_stop_generation: 0, released_engine_stop_generation: 0 },
+      policy_status: { cached_revision: 43, acknowledgment: null, stop_generation: 0, admission_inhibited: true },
+      cached_effective_kill: { global: { engaged_at_ms: 1, reason: { reason: "operator" } }, agents: {} } };
+    const reading = { status: released, command: null, error: null, stopRequested: false, haltRequested: false };
+    expect(activationContext("testnet", reading)?.blocked).toContain("HALT");
+    reading.status = { ...released, cached_effective_kill: { global: null, agents: { alpha: { engaged_at_ms: 1, reason: { reason: "operator" } } } } };
+    expect(activationContext("testnet", reading)?.blocked).toContain("HALT");
+  });
+  it("accepts a new explicit HALT during release despite a hung old observer and rejects old generations", async () => {
+    const f = fixture(); await f.opened(LISTENING);
+    const first = f.monitor.halt("testnet", { agent: "alpha", account: ACCOUNT });
+    f.monitor.setReleaseActive(true);
+    const second = f.monitor.halt("testnet", { agent: "alpha", account: ACCOUNT });
+    expect(f.halts.length).toBe(2);
+    f.halts[1]!.reply.resolve({ ...HALTED, halt: { ...HALTED.halt, stop_generation: 9 } }); await second;
+    f.halts[0]!.reply.resolve({ ...ADMITTED, halt: { ...ADMITTED.halt, stop_generation: 8 } }); await first;
+    expect(f.monitor.state.status?.halt.stop_generation).toBe(9);
+    f.reads[1]!.resolve({ ...LISTENING, halt: { ...LISTENING.halt, stop_generation: 8 } }); await settle();
+    expect(f.monitor.state.status?.halt.stop_generation).toBe(9);
+    expect(f.monitor.state.haltRequested).toBe(true);
+    expect(f.stops.length).toBe(0); f.monitor.stopPolling();
+  });
   it("halts only explicitly using the confirmed runtime binding, without stopping supervision", async () => {
     const f = fixture();
     try {

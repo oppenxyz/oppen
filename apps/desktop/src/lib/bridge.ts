@@ -404,6 +404,13 @@ export function fetchRuntimeStatus(): Promise<RuntimeStatus> {
 
 export interface McpStatus {
   halt: {
+    owner_id: string;
+    stop_generation: number;
+    released_stop_generation: number | null;
+    released_engine_stop_generation: number | null;
+    previous: { stop_generation: number; phase: "idle" | "persisting" | "persisted" | "uncertain";
+      cancellation: "not_requested" | "pending" | "retrying" | "acknowledged" | "unavailable";
+      requested_at_ms: number | null; error: string | null; cancellation_error: string | null } | null;
     phase: "idle" | "persisting" | "persisted" | "uncertain";
     cancellation: "not_requested" | "pending" | "retrying" | "acknowledged" | "unavailable";
     requested_at_ms: number | null;
@@ -422,6 +429,8 @@ export interface McpStatus {
   supervision_in_progress: boolean;
   supervision_error: string | null;
   orders_inhibited: boolean;
+  policy_status: PolicyStatus | null;
+  cached_effective_kill: KillSwitch | null;
   detail: string | null;
 }
 
@@ -483,6 +492,56 @@ export interface ActivationStatus {
   receipt: ActivationReceipt | null;
   error: { kind: "refusal" | "worker"; detail: string } | null;
   policy_status: PolicyStatus;
+}
+
+export type KillScope = { scope: "global" } | { scope: "agent"; agent: string };
+export interface KillEngagement {
+  engaged_at_ms: number;
+  reason: { reason: "operator" | "agent_wallet_expired" | "feed_failure" }
+    | { reason: "loss_limit"; kind: "daily" | "drawdown"; observed_usd: string; limit_usd: string };
+}
+export interface KillSwitch { global: KillEngagement | null; agents: Record<string, KillEngagement> }
+export interface KillReleaseDisplay {
+  operation_id: string; network: "testnet" | "mainnet"; scope: KillScope;
+  persisted_engagement: KillEngagement | null; local_engagement: KillEngagement | null;
+  policy_revision: number; stop_generation: number;
+  affected: { route: AuthorizedRoute; pilot: ActivationPilotState }[];
+  remaining_kill: KillSwitch; reviewed_at_ms: number; expires_at_ms: number;
+}
+export interface KillReleaseReceipt {
+  operation_id: string; network: "testnet" | "mainnet"; scope: KillScope;
+  reviewed_stop_generation: number; policy_revision: number; recorded_at_ms: number;
+  seq: number; hash: string; remaining_kill: KillSwitch;
+}
+export type ReleaseOperation = { kind: "review"; scope: KillScope }
+  | { kind: "confirm" | "discard"; review_id: string } | { kind: "reconcile"; operation_id: string };
+export type ReleaseResolution = {
+  status: "committed"; receipt: KillReleaseReceipt; current_policy_revision: number;
+  current_persisted_kill: KillSwitch; current_effective_kill: KillSwitch; current_stop_generation: number;
+} | { status: "not_committed"; operation_id: string; proof: "worker_terminal" }
+  | { status: "unknown"; operation_id: string; detail: string };
+export interface ReleaseStatus {
+  owner_id: string; agent: string; account: string; operation_seq: number; last_operation: ReleaseOperation | null;
+  phase: "idle" | "reviewing" | "review_ready" | "confirming" | "released" | "reconciling" | "refused" | "uncertain" | "closed";
+  review: { id: string; display: KillReleaseDisplay } | null;
+  receipt: KillReleaseReceipt | null; resolution: ReleaseResolution | null;
+  error: { status: "refused"; detail: string } | { status: "uncertain"; operation_id: string | null; detail: string } | null;
+  policy_status: PolicyStatus; cached_effective_kill: KillSwitch;
+}
+export function fetchKillReleaseStatus(agent: string, account: string): Promise<ReleaseStatus> {
+  return invoke<ReleaseStatus>("kill_release_status", { agent, account });
+}
+export function reviewKillRelease(agent: string, account: string, scope: KillScope): Promise<ReleaseStatus> {
+  return invoke<ReleaseStatus>("review_kill_release", { agent, account, scope });
+}
+export function confirmKillRelease(agent: string, account: string, ownerId: string, reviewId: string): Promise<ReleaseStatus> {
+  return invoke<ReleaseStatus>("confirm_kill_release", { agent, account, ownerId, reviewId });
+}
+export function discardKillRelease(agent: string, account: string, ownerId: string, reviewId: string): Promise<ReleaseStatus> {
+  return invoke<ReleaseStatus>("discard_kill_release", { agent, account, ownerId, reviewId });
+}
+export function reconcileKillRelease(agent: string, account: string, ownerId: string, operationId: string): Promise<ReleaseStatus> {
+  return invoke<ReleaseStatus>("reconcile_kill_release", { agent, account, ownerId, operationId });
 }
 export function fetchActivationStatus(agent: string, account: string): Promise<ActivationStatus> {
   return invoke<ActivationStatus>("activation_status", { agent, account });

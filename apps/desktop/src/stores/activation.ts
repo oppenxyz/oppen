@@ -1,4 +1,5 @@
 import { reactive, readonly, type DeepReadonly } from "vue";
+import { haltReleased } from "./supervision";
 import {
   confirmActivation, discardActivation, fetchActivationStatus, inTauri, isConsoleError, reviewActivation,
   type ActivationStatus, type McpStatus,
@@ -33,7 +34,8 @@ export function activationContext(network: "testnet" | "mainnet", mcp: {
   return { network, agent: status.agent, account: status.account,
     blocked: status.network !== "testnet" || status.phase !== "listening" || mcp.stopRequested
       ? "A listening TESTNET runtime is required; stop and startup failure require restart."
-      : mcp.haltRequested || status.halt.phase !== "idle" ? "HALT has been requested. Activation does not release stops."
+      : mcp.haltRequested || (status.halt.phase !== "idle" && !haltReleased(status)) ? "HALT has been requested. Activation does not release stops."
+      : status.cached_effective_kill?.global || status.cached_effective_kill?.agents[status.agent] ? "An effective stop remains. Activation does not release stops."
       : mcp.command ? "A supervision command is in progress."
       : mcp.error ? "Current supervision status is unavailable." : null };
 }
@@ -71,6 +73,7 @@ export function createActivation(
   let observations = 0;
   let cancelPoll: (() => void) | null = null;
   let pending: { owner: string; seq: number; operation: NonNullable<ActivationStatus["last_operation"]> } | null = null;
+  let commandToken: symbol | null = null;
   const retiredOwners = new Set<string>();
 
   function setContext(context: ActivationContext | null): void {
@@ -105,6 +108,8 @@ export function createActivation(
     if (pending && pending.owner !== status.owner_id) {
       state.previousUnknown.push(`Previous owner ${pending.owner}: ${pending.operation.kind} operation ${pending.seq} outcome remains unknown. Replacement does not verify its completion.`);
       pending = null;
+      commandToken = null;
+      state.command = null;
       state.outcomeUnknown = false;
       state.commandError = null;
     }
@@ -118,6 +123,8 @@ export function createActivation(
         || (pending.operation.kind === "confirm" && status.phase === "acknowledged")
         || (pending.operation.kind === "discard" && status.phase === "idle"))) {
       pending = null;
+      commandToken = null;
+      state.command = null;
       state.outcomeUnknown = false;
     }
     return true;
@@ -181,6 +188,8 @@ export function createActivation(
   async function command(kind: Command, invoke: () => Promise<ActivationStatus>): Promise<void> {
     const current = state.status!;
     if (!Number.isSafeInteger(current.operation_seq + 1)) { state.commandError = "Activation operation sequence exhausted."; return; }
+    const token = Symbol(kind);
+    commandToken = token;
     state.command = kind;
     state.commandError = null;
     state.outcomeUnknown = true;
@@ -191,18 +200,21 @@ export function createActivation(
     const observed = observations;
     try {
       const status = await invoke();
-      if (owner === generation && observations === observed && status.owner_id === current.owner_id) {
+      if (commandToken === token && owner === generation && observations === observed && status.owner_id === current.owner_id) {
         accept(status);
       }
     } catch (error) {
-      if (owner === generation) {
+      if (commandToken === token && owner === generation) {
         state.commandError = detail(error);
         if (pending?.owner === current.owner_id) state.readError = "Command reply failed. Awaiting fresh native status.";
       }
     } finally {
-      version += 1;
-      state.command = null;
-      void refresh();
+      if (commandToken === token) {
+        commandToken = null;
+        version += 1;
+        state.command = null;
+        void refresh();
+      } else if (commandToken === null) void refresh();
     }
   }
   async function review(): Promise<void> {

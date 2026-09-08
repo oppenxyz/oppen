@@ -550,7 +550,7 @@ impl std::fmt::Debug for HmacKey {
 /// Fills `dst` from the OS CSPRNG. See `HmacKey::generate` for the platform
 /// gap this leaves open.
 #[cfg(unix)]
-fn os_entropy(dst: &mut [u8]) -> Result<(), KeyStoreError> {
+pub(crate) fn os_entropy(dst: &mut [u8]) -> Result<(), KeyStoreError> {
     use std::io::Read;
 
     let mut file =
@@ -567,7 +567,7 @@ fn os_entropy(dst: &mut [u8]) -> Result<(), KeyStoreError> {
 /// dependency, so key generation fails closed here rather than inventing
 /// entropy. See `HmacKey::generate`.
 #[cfg(not(unix))]
-fn os_entropy(_dst: &mut [u8]) -> Result<(), KeyStoreError> {
+pub(crate) fn os_entropy(_dst: &mut [u8]) -> Result<(), KeyStoreError> {
     Err(KeyStoreError::EntropyUnavailable {
         detail: "oppen-core has no OS RNG dependency on this platform; \
                  supply the key with HmacKey::from_bytes"
